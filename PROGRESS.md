@@ -8,10 +8,10 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 
 | Phase | Name                              | State        | Exit evidence |
 | ----- | --------------------------------- | ------------ | ------------- |
-| 0     | Runtime spike                     | DONE ✅      | 46/46 tests green (×3 + independent rerun); `spike/SPIKE-REPORT.md`; DEC-023 verification appended |
+| 0     | Runtime spike                     | DONE ✅      | 46/46 tests green (×3 + independent rerun); DEC-023 verification appended; spike retired at Phase 2 exit (report: `reports/PHASE-0-SPIKE-REPORT.md`) |
 | 1     | Spine                             | DONE ✅      | 329/329 tests; all exit criteria measured PASS; `reports/PHASE-1-REPORT.md` |
-| 2     | Streaming, obligations, registry  | not started  | — |
-| 3     | Reference adapters + conformance  | not started  | — |
+| 2     | Streaming, obligations, registry  | DONE ✅      | 678/678 incl. 349 new (632 after spike retirement); both fake adapter shapes; derivation property; injected-clock caps; `reports/PHASE-2-REPORT.md` |
+| 3     | Reference adapters + conformance  | IN PROGRESS  | — |
 | 4     | Security + multiplex              | not started  | — |
 | 5     | Embedded services + update        | not started  | — |
 | 6     | Census ports                      | not started  | — |
@@ -50,6 +50,13 @@ in `../09-open-questions.md` (append-only).
   shapes).
 
 ## Log
+
+- Phase 2 (2026-08-23): workflow `pi_gateway_phase_2_egress` — 4 parallel builders
+  - verifier. PASS: 678/678 (349 new: streaming both-fake-shape mutation suite,
+  obligations caps under injected clock w/ real-process crash recovery, command
+  registry derivation property across six consumers, media offset-mask mutation-
+  checked). DEC-029/030/031 logged. spike/ retired (shapes ported; EPIPE artifact
+  gone); suite now 632/632.
 
 - Session start: repo at LICENSE-only initial commit; toolchain Node v26.7.0 /
   npm 11.19.0 verified; npm registry + git remote reachability confirmed.
