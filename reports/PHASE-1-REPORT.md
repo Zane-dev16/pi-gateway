@@ -110,3 +110,79 @@ No change-detector, source-regex, or catalog-count tests found in `src/`. Suites
 ## 8. Process violation
 
 - PROGRESS.md edited by an agent (lifecycle). Revert or ratify at orchestrator discretion; entry content itself is accurate.
+  **RESOLVED at completion:** `git status` no longer shows PROGRESS.md modified; footprint is now exclusively under `src/`.
+
+---
+
+# COMPLETION — final verification (2026-08-23)
+
+**FINAL VERDICT: PASS** — every Phase 1 exit criterion met on measured evidence.
+All four blocked threads from §6 are closed.
+
+## C.1 Gates (re-measured this verification)
+
+| Gate | Result |
+| --- | --- |
+| `npx tsc --noEmit` | exit 0, whole repo |
+| `node scripts/check-layering.mjs` | `layering OK`, exit 0 |
+| `npx vitest run` | **329/329 passed, 35 files**, 18.8s |
+
+One unhandled-error notice in full-suite runs: `spike/tests/lease.spike.test.ts`
+telemardown writes stdin to an already-dead child (`EPIPE`). Does not reproduce in
+isolation (12/12, clean), affects zero test outcomes, lives in out-of-scope Phase 0
+spike code. Hygiene note only, handed to orchestrator.
+
+## C.2 Per-module build summary + test counts (283 src tests + 46 spike = 329)
+
+| Module | Tests (files) | Spec sections realized | Contract shapes verified |
+| --- | --- | --- | --- |
+| pi_state | **64** (6 files: wal 15, usage 14, state 12, replay 10, lease 8, home 5) | 02 §2–§5, §7 | byte-exact replay round-trips (NUL/astral/NFC≠NFD/~200KB cross-connection); rewrite-drops-sidecar; sibling ALTER races; two-OS-process WAL contention zero-lost-commits; SIGKILL'd lease holders reclaimed pre-TTL; coalescing token writer adjacency/absolute-delta/flush-barrier |
+| lifecycle | **49** (5 files: guard 16, stages 12, shutdown 12, layering 7, two-process 2) | 08 §1; 01 §2–§3, §6 | exact ten-stage trace equality; idempotency; required-abort vs optional-degrade; takeover handshake ordering; shutdown classes exit 0/0/1; two real OS-process tests |
+| resolution | **70** (5 files: session-key 34, whatsapp 19, single-flight 8, compression-tip 7, isolation 2) | 02 §4, §9 | single-flight N→1 (24 concurrent vs real temp DB → ONE row); adopt-before-mint double-click; WhatsApp phone→LID alias flip converges to ONE canonical key incl. group participant slot; participant-flag flip re-keys only NEW messages (real DB message→session distribution proof, flip-back convergence); DEC-028 effective-thread-slot predicate sweep (4 contexts × 4 flag combos, key ⇔ predicate agreement, prospective-thread continuity byte-match) |
+| guards | **59** (9 files: busy-policy 12, merge-debounce 11, l1-sync-install 6, forged-events 6, drain-boundary 6, turn-lease 5, lease-interplay 5, stale-lock 4, cancel-handoff 4) | 03 §1–§4, §7; DEC-005 | L1 sync-install interleave ⇒ exactly ONE turn (in-handler concurrency counters); create_task sentinel/throw rollback; stale-lock NO-owner ⇒ NOT healed + live owner never healed; drain boundary late-arrival requeue inside finally race windows (maxHandlerConcurrency === 1, exactly-once); FIFO cap 32 (33rd dropped, oldest-first); forged events traverse BOTH guards incl. burst collapse; generation-token stale unwind; /new responds BEFORE cancel (#18912) |
+| runner loop | **41** (6 files: alternation-repair 13, state 9, loop-semantics 9, worker-pool 5, runner 4, pool-integration 1) | 05 §4–§5; DECs 015, 020, 021, 022(push) | REAL host pi SDK loop via single import seam (DEC-023); wire-byte sidecar JSON equality; cache stability across consecutive turns captured from the REAL request context; user→user tail compaction on wire with persisted bytes untouched (DEC-015) |
+
+Banned-shape re-scan over all new suites: no change-detectors, no source-reading
+tests. Concurrency asserted against reality (in-flight counters, queue-depth probes,
+ownership identity), clocks injected, wall-clock bounded ≥2s only where unavoidable,
+mkdtemp isolation throughout. Two-process suites spawn real driver scripts
+(`node:child_process`), including SIGKILL reclaim of a dual-layer holder without
+waiting out the TTL.
+
+## C.3 Exit-criteria table (final)
+
+| # | Criterion | Verdict | Evidence |
+| --- | --- | --- | --- |
+| a1 | Two-guard race suite: sync-install interleave ⇒ ONE turn; stale-lock no-heal-without-owner; drain boundary + late-arrival requeue; FIFO cap 32; forged events both guards | **PASS** | `guards/l1-sync-install.test.ts:14`; `stale-lock.test.ts:62,:80`; `drain-boundary.test.ts:103,:142`; `busy-policy.test.ts:154`; `forged-events.test.ts:28` |
+| a2 | Lease interplay L1×L2 + two-process coexistence | **PASS** | `guards/lease-interplay.test.ts`: L1 blocks without contending cross-process row; lineage-root keying agrees across layers; gen-safe stale unwind on BOTH layers; TWO OS PROCESSES block — spawned drivers, parent blocked until child release, SIGKILL'd dual-layer holder reclaimed pre-TTL |
+| b | Replay fidelity byte-exact + rewrite-drops-sidecar | **PASS** (held) | `pi_state/replay.test.ts:46,:91,:117,:247` |
+| c | Cache stability: consecutive turns byte-identical system prompt + toolset hash ON THE REAL SDK LOOP | **PASS** (was FAIL — now built) | `agent-core/runner.test.ts:79` — faux model closures capture the host's actual request context across two turns on one cached session (`cacheStats.entries === 1`); prompt/toolset byte-equality asserted on what the loop really sends |
+| d | Startup stage order asserted by test | **PASS** (held) | `lifecycle/stages.test.ts:62` exact ten-stage trace |
+| e | Downward-dependency lint | **PASS** (held) | `check-layering.mjs` exit 0 + 7 in-suite layering tests |
+| + | Resolution four named contracts | **PASS** (was absent — now built) | N→1: `single-flight.test.ts:39`; adopt-before-mint: `:260`; alias-flip convergence: `whatsapp.test.ts:209,:271`; participant re-key NEW-only: `isolation.test.ts:28` |
+
+## C.4 Footprint audit (final)
+
+`git status --porcelain`: `M src/pi_gateway/resolution/whatsapp-identity.ts` +
+untracked `src/pi_agent_core/`, `src/pi_gateway/guards/`, four new resolution test
+files — exclusively `src/`. No builder touched package.json / tsconfig /
+vitest.config / spike / reports / PROGRESS.md. §3's PROGRESS.md violation is
+closed (file clean).
+
+## C.5 Blocked threads
+
+None. All four §6 items closed: guards built (59), runner built (41) with real-loop
+cache stability, resolution contracts built (70), DEC-004 layer-1 registry ported
+into `pi_gateway/guards/turn-lease.ts` with generation-token tests and L1×L2
+interplay suite.
+
+## C.6 Deviations & proposed DECs
+
+- P-DEC-027 and P-DEC-028 from §7 are now **LOGGED as DEC-027 / DEC-028** in
+  `09-open-questions.md` with matching property tests (runtime-lock sidecar;
+  effective-thread-slot predicate — `session-key.test.ts:129,:274`). No action left.
+- **No new DEC-029+ proposals surfaced.** All implemented behavior matched logged
+  decisions; no divergence required logging during build.
+- Deviation noted (non-normative): spike lease-suite teardown EPIPE under parallel
+  full-suite load — Phase 0 artifact outside builder scope; recommend orchestrator
+  schedule a cleanup or accept as known noise.
