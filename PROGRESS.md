@@ -8,7 +8,7 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 
 | Phase | Name                              | State        | Exit evidence |
 | ----- | --------------------------------- | ------------ | ------------- |
-| 0     | Runtime spike                     | IN PROGRESS  | — |
+| 0     | Runtime spike                     | DONE ✅      | 46/46 tests green (×3 + independent rerun); `spike/SPIKE-REPORT.md`; DEC-023 verification appended |
 | 1     | Spine                             | not started  | — |
 | 2     | Streaming, obligations, registry  | not started  | — |
 | 3     | Reference adapters + conformance  | not started  | — |
@@ -40,3 +40,10 @@ in `../09-open-questions.md` (append-only).
 
 - Session start: repo at LICENSE-only initial commit; toolchain Node v26.7.0 /
   npm 11.19.0 verified; npm registry + git remote reachability confirmed.
+- Phase 0 (2026-08-23): workflow `pi_gateway_phase_0_spike` — scaffold + 3 parallel
+  proof agents + verifier. PASS: 46/46 (12 lease / 8 stream / 22 WAL contracts +
+  4 driver-evidence), tsc clean, footprint confined to spike/ + harness configs.
+  Commits `8e85b9f` (scaffold) + `f76b515` (proofs) pushed to origin/main.
+  DEC-023 verification entry appended in ../09-open-questions.md. Residuals for
+  later phases: SIGHUP→SIG_IGN installability, ws transport, Windows-gated test
+  variant.
