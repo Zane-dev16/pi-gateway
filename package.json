@@ -1,0 +1,20 @@
+{
+  "name": "pi-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Messaging gateway for the pi coding agent (Hermes Gateway parity).",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  }
+}
