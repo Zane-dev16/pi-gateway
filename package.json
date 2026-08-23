@@ -6,7 +6,8 @@
   "description": "Messaging gateway for the pi coding agent (Hermes Gateway parity).",
   "scripts": {
     "build": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:layering": "node scripts/check-layering.mjs"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
