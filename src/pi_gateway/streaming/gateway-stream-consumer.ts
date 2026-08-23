@@ -1,65 +1,38 @@
-// Spike proof: GatewayStreamConsumer parity (04-platform-adapters.md §5, DEC-006).
+// pi_gateway/streaming/gateway-stream-consumer — the production stream
+// consumer (04-platform-adapters.md §5.2; DEC-006).
 //
-// Ported from the READ-ONLY Hermes reference (/usr/local/lib/hermes-agent),
-// semantics only, cited as file:symbol anchors — no code vendored:
-//   - gateway/stream_consumer.py:GatewayStreamConsumer (queue drain loop, finish())
-//   - gateway/stream_consumer.py:StreamConsumer.finish        (authoritative final)
-//   - gateway/stream_consumer.py:GatewayStreamConsumer._stream_is_message
-//   - gateway/stream_consumer.py:GatewayStreamConsumer._send_draft_frame
-//   - gateway/stream_consumer.py:GatewayStreamConsumer._send_commentary
-//   - gateway/stream_consumer.py:GatewayStreamConsumer._reset_segment_state
-//   - gateway/stream_consumer.py:GatewayStreamConsumer._metadata_for_send
-//   - gateway/stream_consumer.py:GatewayStreamConsumer.delivered_final_matches
-//   - gateway/platforms/base.py:supports_draft_streaming       (per-chat METHOD probe)
+// Ported from the READ-ONLY Hermes reference, semantics only, cited as
+// file:symbol anchors — no code vendored:
+//   - gateway/stream_consumer.py:GatewayStreamConsumer  (queue drain loop)
+//   - gateway/stream_consumer.py:StreamConsumer.finish  (authoritative final, EXACTLY ONCE)
+//   - gateway/stream_consumer.py:_stream_is_message / _resolve_draft_streaming
+//   - gateway/stream_consumer.py:_send_draft_frame    (+ prefix-stability guard, invariant 1)
+//   - gateway/stream_consumer.py:_send_or_edit        (edit-based preview path)
+//   - gateway/stream_consumer.py:_reset_segment_state (tool-boundary segments)
+//   - gateway/stream_consumer.py:_metadata_for_send   (`_interim_send` producer)
+//   - gateway/stream_consumer.py:delivered_final_matches
+//   - gateway/run.py:_interim_metadata                (commentary = interim lane)
+//
+// The four invariants (04 §5) this class enforces:
+//   1. Draft frames are PREFIX-STABLE; a violating frame is DETECTED and the
+//      draft lane is permanently disabled for the run (graceful degradation).
+//   2. finish(final_text) declares the AUTHORITATIVE final; adoption REPLACES
+//      the accumulator exactly once — never concatenates.
+//   3. Interim sends carry `_interim_send`; the egress-door chokepoint pops it.
+//   4. Beside an already-sealed stream, delivery reconciles BY EDIT via the
+//      door's lane registry — never a second plain send.
 
-/**
- * Gateway-internal metadata marker for any consumer-side send that is NOT the
- * turn-final (04 §5 invariant 3). Producers:
- *   - gateway/stream_consumer.py:_send_commentary            (`_md["_interim_send"] = True`)
- *   - gateway/stream_consumer.py:_flush_segment_tail_on_edit_failure
- *   - gateway/run.py:_interim_metadata                       (heartbeats, advisories)
- * It is popped/stripped at the adapter egress doors — see fake-relay-adapter.ts
- * (DEC-006 single audited chokepoint).
- */
-export const INTERIM_SEND_MARKER = "_interim_send";
+import {
+	INTERIM_SEND_MARKER,
+	REPLY_TO_METADATA_KEY,
+	type Metadata,
+	type SendResult,
+	type StreamEgressAdapter,
+	type StreamLogger,
+} from "./adapter-seam.js";
+import { StreamingCapabilities } from "./capability.js";
 
-export type Metadata = Record<string, unknown>;
-
-export interface SendResult {
-	success: boolean;
-	messageId?: string | null | undefined;
-	error?: string | null | undefined;
-}
-
-/** The slice of a platform adapter the consumer drives. Implemented by FakeRelayAdapter. */
-export interface StreamEgressAdapter {
-	/** Per-chat METHOD probe, not class data (DEC-006; base.py:supports_draft_streaming). */
-	supportsDraftStreaming?(chatType?: string | undefined): boolean;
-	sendDraft(args: {
-		chatId: string;
-		draftId: number;
-		content: string;
-		metadata?: Metadata | undefined;
-	}): Promise<SendResult>;
-	send(
-		chatId: string,
-		content: string,
-		replyTo?: string | undefined,
-		metadata?: Metadata | undefined,
-	): Promise<SendResult>;
-	editMessage(
-		chatId: string,
-		messageId: string,
-		content: string,
-		opts?: { finalize?: boolean | undefined } | undefined,
-	): Promise<SendResult>;
-	/** Per-chat probe preferred by the consumer (relay/adapter.py:stream_is_message_for_chat). */
-	streamIsMessageForChat?(chatId: string): boolean;
-	/** Class-level fallback (relay/adapter.py construction: `draft_stream_is_message`). */
-	draftStreamIsMessage?: boolean | undefined;
-}
-
-/** Observable evidence that a draft frame mutated previously-emitted prefix content. */
+/** Observable evidence that a draft frame mutated previously-emitted content. */
 export interface PrefixViolation {
 	kind: "non_prefix_frame";
 	prevFrame: string;
@@ -67,29 +40,40 @@ export interface PrefixViolation {
 }
 
 export interface StreamConsumerConfig {
-	/** Minimum ms between mid-stream flushes (stream_consumer.py:StreamConsumerConfig.edit_interval). */
+	/** Minimum ms between mid-stream flushes (stream_consumer.py:edit_interval). */
 	editIntervalMs?: number | undefined;
 	/** Buffered-growth chars required before a mid-stream flush (buffer_threshold). */
 	bufferThreshold?: number | undefined;
-	/** Streaming cursor suffix; stripped from every frame (finding #6). Default none. */
+	/** Streaming cursor suffix; stripped from every frame. Default none. */
 	cursor?: string | undefined;
 	/** Transport selection (StreamConsumerConfig.transport): auto prefers drafts. */
 	transport?: "auto" | "draft" | "edit" | undefined;
 	chatType?: string | undefined;
 	/**
 	 * Composition-time transform applied to the ACCUMULATED buffer when building
-	 * each MID-STREAM DRAFT FRAME ONLY (never the finalize payload — "only the
-	 * finalize path may transform the real final", 04 §5 invariant 1). This seam
+	 * each MID-STREAM DRAFT FRAME ONLY (never the finalize payload — only the
+	 * finalize path may transform the real final, invariant 1/2). This seam
 	 * models the historically banned transforms (fence-closing, cursor suffix,
 	 * segment-state resets): a composeFrame that breaks prefix stability is the
 	 * exact bug class the MUTATION contract test injects.
 	 */
 	composeFrame?: ((accumulated: string) => string) | undefined;
+	/**
+	 * REQUIRES_EDIT_FINALIZE override (base.py, checked `is True`); defaults to
+	 * the adapter's flag. True forces the redundant final edit even when the
+	 * preview already matches.
+	 */
+	requiresEditFinalize?: boolean | undefined;
+	/**
+	 * Shared per-chat capability latch (04 §5). Pass one resolver per adapter
+	 * so probes latch across turns; defaults to a private resolver.
+	 */
+	capabilities?: StreamingCapabilities | undefined;
+	log?: StreamLogger | undefined;
 	/** Injected clock for editIntervalMs decisions (flake discipline). */
 	now?: (() => number) | undefined;
 }
 
-/** Resolved config — every knob has a concrete value after construction. */
 interface ResolvedConfig {
 	editIntervalMs: number;
 	bufferThreshold: number;
@@ -97,7 +81,8 @@ interface ResolvedConfig {
 	transport: "auto" | "draft" | "edit";
 	chatType: string | undefined;
 	composeFrame: ((accumulated: string) => string) | undefined;
-	now: (() => number) | undefined;
+	requiresEditFinalize: boolean;
+	now: () => number;
 }
 
 type QueueItem =
@@ -106,7 +91,7 @@ type QueueItem =
 	| { kind: "final-text"; text: string }
 	| { kind: "done" };
 
-/** Worker-thread → drain-loop queue (Python queue.Queue parity). Single reader. */
+/** Worker-thread → drain-loop queue (queue.Queue parity). Single reader. */
 class DeltaQueue {
 	private buf: QueueItem[] = [];
 	private closed = false;
@@ -158,6 +143,8 @@ export class GatewayStreamConsumer {
 	private readonly adapter: StreamEgressAdapter;
 	private readonly chatId: string;
 	private readonly cfg: ResolvedConfig;
+	private readonly caps: StreamingCapabilities;
+	private readonly log: StreamLogger | undefined;
 	private readonly metadata: Metadata | undefined;
 	private readonly initialReplyToId: string | undefined;
 	private readonly queue = new DeltaQueue();
@@ -169,22 +156,22 @@ export class GatewayStreamConsumer {
 	private messageId: string | null = null;
 	// Drafts do NOT set this — it gates the gateway's fallback final-send path
 	// (stream_consumer.py:_send_or_edit comment).
-	private _alreadySent = false;
+	private alreadySentInternal = false;
 	private useDraftStreaming = false;
 	private draftId: number | null = null;
 	private gotDone = false;
 	private finished = false; // finish() latch — absorbed EXACTLY once
-	private finalAdopted = false; // _FINAL_TEXT adoption latch
+	private finalAdopted = false; // authoritative-final adoption latch
 	private lastFlushAt = Number.NEGATIVE_INFINITY;
 	private deliveredSegmentTexts: string[] = [];
 	private deliveredCommentaryTexts: string[] = [];
 	private deliveredFinalText: string | null = null;
 
-	// Runner-read properties after drain (spec §5.2 sketch).
-	private _finalResponseSent = false;
-	private _finalContentDelivered = false;
+	// Runner-read properties after drain (04 §5.2 sketch).
+	private finalResponseSentInternal = false;
+	private finalContentDeliveredInternal = false;
 
-	/** Observable non-prefix-stability detections (04 §5 invariant 1 enforcement). */
+	/** Observable non-prefix-stability detections (invariant 1 enforcement). */
 	readonly prefixViolations: PrefixViolation[] = [];
 
 	constructor(
@@ -203,45 +190,43 @@ export class GatewayStreamConsumer {
 			transport: config?.transport ?? "auto",
 			chatType: config?.chatType,
 			composeFrame: config?.composeFrame,
-			now: config?.now,
+			requiresEditFinalize:
+				(config?.requiresEditFinalize ?? adapter.requiresEditFinalize) === true,
+			now: config?.now ?? (() => Date.now()),
 		};
+		this.log = config?.log;
+		this.caps =
+			config?.capabilities ?? new StreamingCapabilities(adapter, this.log);
 		this.metadata = metadata;
 		this.initialReplyToId = initialReplyToId;
 	}
 
-	// ── probes ────────────────────────────────────────────────────────────
+	// ── probes (latched per chat; DEC-006 method probes) ──────────────────
 
-	/**
-	 * Whether THIS chat's transport treats the stream as the message. Port of
-	 * gateway/stream_consumer.py:GatewayStreamConsumer._stream_is_message:
-	 * per-chat METHOD probe preferred (one relay adapter fronts N platforms),
-	 * class attribute as fallback.
-	 */
+	/** Whether THIS chat's transport treats the stream as the message. */
 	private streamIsMessage(): boolean {
-		const probe = this.adapter.streamIsMessageForChat;
-		if (typeof probe === "function") {
-			try {
-				return probe.call(this.adapter, String(this.chatId)) === true;
-			} catch {
-				return false;
-			}
-		}
-		return this.adapter.draftStreamIsMessage === true;
+		return this.caps.streamIsMessage(String(this.chatId));
 	}
 
 	/**
-	 * Transport gate. Port of
-	 * gateway/stream_consumer.py:GatewayStreamConsumer._resolve_draft_streaming
-	 * (capability via per-chat method probe, base.py:supports_draft_streaming).
+	 * Transport gate. Port of _resolve_draft_streaming: capability via per-chat
+	 * METHOD probe (base.py:supports_draft_streaming), "edit"/"off" never drafts.
 	 */
 	private resolveDraftStreaming(): void {
-		const transport = this.cfg.transport ?? "auto";
-		if (transport === "edit") return;
-		const supports =
-			this.adapter.supportsDraftStreaming?.(this.cfg.chatType) ?? false;
-		if (supports) {
+		if (this.cfg.transport === "edit") return;
+		const supported = this.caps.supportsDraftStreaming(
+			this.cfg.chatType,
+			this.metadata,
+			this.chatId,
+		);
+		if (supported) {
 			this.useDraftStreaming = true;
 			this.draftId = nextDraftId();
+		} else if (this.cfg.transport === "draft") {
+			this.log?.debug(
+				"draft streaming requested but unsupported — falling back to edit",
+				{ chatId: String(this.chatId) },
+			);
 		}
 	}
 
@@ -249,24 +234,30 @@ export class GatewayStreamConsumer {
 
 	/**
 	 * Thread-safe delta callback. `null` signals a tool boundary / segment break
-	 * (gateway/stream_consumer.py:GatewayStreamConsumer.on_delta).
+	 * (stream_consumer.py:on_delta). Post-finish stragglers are dropped: the
+	 * turn is over and their bytes must never reach the wire.
 	 */
 	onDelta(text: string | null): void {
-		if (this.finished) return; // post-finish straggler: the turn is over
+		if (this.finished) return;
 		if (text === null) {
 			this.queue.push({ kind: "segment-break" });
 			return;
 		}
-		if (text === "") return; // falsy-but-not-None is ignored (on_delta parity)
+		if (text === "") return; // falsy-but-not-None ignored (on_delta parity)
 		this.queue.push({ kind: "delta", text });
+	}
+
+	/** Explicit segment-break primitive for render hooks (sink contract). */
+	onSegmentBreak(): void {
+		this.onDelta(null);
 	}
 
 	/**
 	 * Signal completion. `finalText`, when provided, is the AUTHORITATIVE
 	 * completed final_response — including post-stream augmentation the
 	 * accumulator never saw — and is absorbed EXACTLY ONCE (latch below).
-	 * Port of gateway/stream_consumer.py:StreamConsumer.finish; bare finish()
-	 * keeps legacy behavior.
+	 * Port of stream_consumer.py:StreamConsumer.finish; bare finish() keeps
+	 * legacy behavior. Racing/double calls are inert.
 	 */
 	finish(finalText?: string | undefined): void {
 		if (this.finished) return; // second/racing finish is inert
@@ -278,28 +269,40 @@ export class GatewayStreamConsumer {
 		this.queue.close();
 	}
 
-	// ── runner-read properties (spec §5.2) ────────────────────────────────
+	// ── runner-read properties (04 §5.2) ──────────────────────────────────
 
 	get alreadySent(): boolean {
-		return this._alreadySent;
+		return this.alreadySentInternal;
 	}
 
 	get finalResponseSent(): boolean {
-		return this._finalResponseSent;
+		return this.finalResponseSentInternal;
 	}
 
 	get finalContentDelivered(): boolean {
-		return this._finalContentDelivered;
+		return this.finalContentDeliveredInternal;
 	}
 
 	get message_id(): string | null {
 		return this.messageId;
 	}
 
+	get draftIdUsed(): number | null {
+		return this.draftId;
+	}
+
+	get deliveredSegments(): readonly string[] {
+		return this.deliveredSegmentTexts;
+	}
+
+	get deliveredCommentary(): readonly string[] {
+		return this.deliveredCommentaryTexts;
+	}
+
 	/**
 	 * Whether the recorded turn-final payload reconciles with `finalText`.
-	 * Port of gateway/stream_consumer.py:delivered_final_matches (null = nothing
-	 * was recorded — legacy-trust rules apply upstream).
+	 * Port of stream_consumer.py:delivered_final_matches (null = nothing was
+	 * recorded — legacy-trust rules apply upstream).
 	 */
 	deliveredFinalMatches(finalText: string): boolean | null {
 		const delivered = this.deliveredFinalText;
@@ -343,8 +346,7 @@ export class GatewayStreamConsumer {
 				await this.finalizeTurn();
 				return;
 			}
-			const flushable = dirty;
-			if (flushable && this.shouldFlushNow()) {
+			if (dirty && this.shouldFlushNow()) {
 				this.lastFlushAt = this.nowMs();
 				await this.flushCurrent();
 			}
@@ -352,7 +354,7 @@ export class GatewayStreamConsumer {
 	}
 
 	private nowMs(): number {
-		return this.cfg.now !== undefined ? this.cfg.now() : Date.now();
+		return this.cfg.now();
 	}
 
 	private shouldFlushNow(): boolean {
@@ -363,7 +365,7 @@ export class GatewayStreamConsumer {
 		);
 	}
 
-	// ── frame emission (stream_consumer.py:_send_or_edit + _send_draft_frame)
+	// ── frame emission (_send_or_edit + _send_draft_frame) ────────────────
 
 	private async flushCurrent(): Promise<void> {
 		// Mid-turn boundaries on stream-is-message adapters emit another
@@ -374,13 +376,13 @@ export class GatewayStreamConsumer {
 			if (ok) return; // drafts don't set already_sent (fallback-send gating)
 			// Failure (incl. detected prefix violation) permanently disabled the
 			// draft lane; traffic reroutes through the edit-based path below
-			// (04 §5 verified behaviors: graceful degradation).
+			// (graceful degradation, 04 §5 verified behaviors).
 		}
 		const frame = this.stripCursor(this.accumulated);
 		if (!frame.trim() || frame === this.lastSentText) return;
 		if (this.messageId === null) {
 			// First send of the edit-based preview. NOTE: this send goes through
-			// the adapter door UNMARKED — on a stream-is-message adapter with an
+			// the adapter door UNMARKED — on a stream-is-message chat with an
 			// armed open draft the DOOR seal-intercepts it, converting the live
 			// stream into a normal editable message (04 §5.1).
 			const res = await this.adapter.send(
@@ -392,7 +394,7 @@ export class GatewayStreamConsumer {
 			if (res.success) {
 				this.messageId = res.messageId ?? null;
 				this.lastSentText = frame;
-				this._alreadySent = true;
+				this.alreadySentInternal = true;
 			}
 		} else if (frame !== this.lastSentText) {
 			const res = await this.adapter.editMessage(
@@ -402,21 +404,20 @@ export class GatewayStreamConsumer {
 			);
 			if (res.success) {
 				this.lastSentText = frame;
-				this._alreadySent = true;
+				this.alreadySentInternal = true;
 			}
 		}
 	}
 
 	/**
 	 * Emit one cumulative draft frame. Port of
-	 * gateway/stream_consumer.py:GatewayStreamConsumer._send_draft_frame plus
-	 * the PREFIX-STABILITY GUARD: frame N must be a string prefix of frame N+1
-	 * (04 §5 invariant 1). A violating frame is DETECTED here — recorded in
-	 * `prefixViolations` — and the draft lane is PERMANENTLY disabled for the
-	 * remainder of the run (graceful degradation); the caller falls through to
-	 * the edit-based path. Removing the guard makes the violation invisible and
-	 * leaves the draft lane armed, which is exactly what the MUTATION contract
-	 * test asserts against.
+	 * stream_consumer.py:_send_draft_frame plus the PREFIX-STABILITY GUARD:
+	 * frame N must be a string prefix of frame N+1 (invariant 1). A violating
+	 * frame is DETECTED here — recorded in `prefixViolations` — and the draft
+	 * lane is PERMANENTLY disabled for the remainder of the run (graceful
+	 * degradation); the caller falls through to the edit-based path. Removing
+	 * the guard makes the violation invisible and leaves the draft lane armed,
+	 * which is exactly what the MUTATION contract test asserts against.
 	 */
 	private async sendDraftFrame(text: string): Promise<boolean> {
 		if (!this.useDraftStreaming || this.draftId === null) return false;
@@ -429,8 +430,8 @@ export class GatewayStreamConsumer {
 			this.useDraftStreaming = false; // permanent disable for this run
 			return false;
 		}
-		// Carry the per-turn identity on EVERY frame (review B2 parity in
-		// _send_draft_frame) so the final can find the open stream.
+		// Carry the per-turn identity on EVERY frame (_send_draft_frame review
+		// B2 parity) so the final can find the open stream.
 		const res = await this.adapter.sendDraft({
 			chatId: this.chatId,
 			draftId: this.draftId,
@@ -467,9 +468,9 @@ export class GatewayStreamConsumer {
 			if (finalized !== "") this.deliveredSegmentTexts.push(finalized);
 		}
 		// Stream-is-the-message adapters keep ONE stream per turn and the
-		// boundary emits NOTHING (finding #4 "Alice" / finding #5): the
-		// connector appends the fresh segment whole. Edit-path adapters
-		// finalize the segment as a real message first.
+		// boundary emits NOTHING (findings #4/#5): the connector appends the
+		// fresh segment whole. Edit-path adapters finalize the segment as a
+		// real message first.
 		if (!this.streamIsMessage() && this.messageId !== null) {
 			const frame = this.stripCursor(this.accumulated);
 			if (frame.trim() !== "" && frame !== this.lastSentText) {
@@ -493,7 +494,7 @@ export class GatewayStreamConsumer {
 
 	/**
 	 * Adopt the authoritative final EXACTLY ONCE. Port of the _FINAL_TEXT
-	 * handler in gateway/stream_consumer.py:GatewayStreamConsumer.run: adoption
+	 * handler in stream_consumer.py:GatewayStreamConsumer.run: adoption
 	 * REPLACES the accumulator (it must never concatenate — the payload is the
 	 * complete response) and fires only when this consumer actually streamed
 	 * something (a no-stream turn keeps gateway-owned delivery).
@@ -513,13 +514,14 @@ export class GatewayStreamConsumer {
 	private async finalizeTurn(): Promise<void> {
 		// Only the finalize path may transform the real final — and the
 		// authoritative payload rides INSIDE the seal/final edit verbatim
-		// (04 §5 invariant 2; live finding #11).
+		// (invariants 1+2; live finding #11).
 		const finalText = this.stripCursor(this.accumulated);
 		if (finalText.trim() === "") return;
 		if (this.messageId !== null) {
 			// Already-on-screen preview: skip a verbatim finalize edit unless the
-			// content changed (no-op short-circuit parity in _send_or_edit).
-			if (finalText === this.lastSentText) {
+			// content changed — UNLESS the adapter REQUIRES_EDIT_FINALIZE (checked
+			// `is True`), which forces the redundant edit through.
+			if (finalText === this.lastSentText && !this.cfg.requiresEditFinalize) {
 				this.markTurnFinalDelivered(finalText);
 				return;
 			}
@@ -535,7 +537,7 @@ export class GatewayStreamConsumer {
 		if (
 			this.accumulated !== "" ||
 			this.lastSentText !== "" ||
-			this._alreadySent
+			this.alreadySentInternal
 		) {
 			// Regular sendMessage — the ADAPTER DOOR seal-intercepts it for
 			// stream-is-message chats (04 §5.1; relay/adapter.py:send).
@@ -560,9 +562,9 @@ export class GatewayStreamConsumer {
 
 	private markTurnFinalDelivered(text: string): void {
 		this.deliveredFinalText = text;
-		this._finalResponseSent = true;
-		this._finalContentDelivered = true;
-		this._alreadySent = true;
+		this.finalResponseSentInternal = true;
+		this.finalContentDeliveredInternal = true;
+		this.alreadySentInternal = true;
 	}
 
 	// ── metadata helpers (stream_consumer.py:_metadata_for_send) ──────────
@@ -570,7 +572,7 @@ export class GatewayStreamConsumer {
 	private metadataForSend(opts?: { final?: boolean | undefined }): Metadata {
 		const meta: Metadata = { ...(this.metadata ?? {}) };
 		if (this.initialReplyToId !== undefined) {
-			meta["reply_to_message_id"] = this.initialReplyToId;
+			meta[REPLY_TO_METADATA_KEY] = this.initialReplyToId;
 		}
 		if (opts?.final === true) meta["notify"] = true;
 		return meta;
@@ -585,16 +587,21 @@ export class GatewayStreamConsumer {
 
 	/**
 	 * Send a completed interim assistant commentary message. Declares interim
-	 * intent via `_interim_send` (04 §5 invariant 3): a stream-is-the-message
-	 * adapter's seal-interception must not convert this into a seal. Does NOT
-	 * set already_sent (#10454 parity — the final must never be suppressed).
+	 * intent via `_interim_send` (invariant 3): the door chokepoint pops the
+	 * marker and must NOT seal-intercept this send. Does NOT set already_sent
+	 * (#10454 parity — the final must never be suppressed by commentary).
 	 */
 	async sendCommentary(text: string): Promise<boolean> {
 		if (text.trim() === "") return false;
 		const meta = this.metadataForSend();
 		meta[INTERIM_SEND_MARKER] = true;
 		try {
-			const res = await this.adapter.send(this.chatId, text, undefined, meta);
+			const res: SendResult = await this.adapter.send(
+				this.chatId,
+				text,
+				undefined,
+				meta,
+			);
 			if (res.success) {
 				this.deliveredCommentaryTexts.push(text);
 				return true;
