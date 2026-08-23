@@ -165,21 +165,36 @@ export function expandWhatsappAliases(
 
 	const sessionDir = opts.sessionDir ?? defaultWhatsappSessionDir();
 	const resolved = new Set<string>([normalized]); // spec: ALWAYS contains input
+	// FIX (Phase 1 resolution contracts): the walk previously pre-seeded
+	// `resolved` with the input and reused it as the DEQUEUE guard, so the seed
+	// skipped its own mapping reads — no alias was ever expanded, silently
+	// reopening the §4.3 fork/deny bug class this module exists to close.
+	// Port parity of gateway/whatsapp_identity.py:expand_whatsapp_aliases:
+	// visited-at-processing-time (`expanded`) drives termination while
+	// `resolved` remains the returned alias set (seeded with the input).
+	const expanded = new Set<string>();
 	const queue: string[] = [normalized];
 
 	while (queue.length > 0) {
 		const current = queue.shift() as string;
-		if (!current || resolved.has(current)) continue;
+		if (!current || expanded.has(current)) continue;
 		// Defense-in-depth: reject identifiers that could sneak path
 		// separators / traversal segments into the lid-mapping-{current}
 		// filename join. Unsafe shapes are excluded from expansion entirely.
 		if (!SAFE_IDENTIFIER_RE.test(current)) continue;
 
+		expanded.add(current);
 		for (const suffix of ["", "_reverse"] as const) {
 			const mapped = readMappedIdentifier(
 				mappingPath(sessionDir, current, suffix),
 			);
-			if (mapped && !resolved.has(mapped)) queue.push(mapped);
+			if (!mapped || resolved.has(mapped)) continue;
+			// A hostile-shaped LINK contributes nothing: never followed, never
+			// admitted to the alias set (parity: the Python walk drops such ids
+			// at dequeue without ever entering `resolved`).
+			if (!SAFE_IDENTIFIER_RE.test(mapped)) continue;
+			resolved.add(mapped);
+			queue.push(mapped);
 		}
 	}
 	return resolved;
