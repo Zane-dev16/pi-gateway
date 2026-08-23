@@ -47,3 +47,19 @@ in `../09-open-questions.md` (append-only).
   DEC-023 verification entry appended in ../09-open-questions.md. Residuals for
   later phases: SIGHUP→SIG_IGN installability, ws transport, Windows-gated test
   variant.
+- Phase 1 / lifecycle skeleton (2026-08-23): `src/pi_gateway/lifecycle/**` —
+  binding ten-stage startup engine (01 §3.1; optional stages 7–9 degrade loudly
+  per-service, required abort), duplicate-instance guard (PID file O_EXCL,
+  SQLite-held runtime lock, getRunningPid evidence chain), takeover handshake
+  (marker-before-SIGTERM, ≤10s @0.5s, force+confirm, give-up cleanup), boot
+  fingerprint + code_skew detect, gateway_state.json stamps (08 §4 field set),
+  shutdown classes takeover/planned/unexpected (#42675 stop-persist suppression,
+  exit codes 0/0/1), ordered drain with flush-before-clear backstop +
+  pending_messages recovery files + replay-on-boot, double-signal fast-exit
+  releasing locks pre-exit. Layering lint `scripts/check-layering.mjs` wired as
+  npm `check:layering`. Tests: 49/49 lifecycle (stages 12 · guard 16 ·
+  two-process takeover 2 · shutdown 12 · layering gate 7); full repo 159/159;
+  tsc clean. Proposed DEC-027: runtime lock held as open BEGIN IMMEDIATE on a
+  dedicated `<home>/gateway.lock.db` sidecar (Node core has no flock; new lock
+  deps suspect per 01 §5.2) — semantics identical to fcntl locks (live-process
+  ownership, OS auto-release on death).
