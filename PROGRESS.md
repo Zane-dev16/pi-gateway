@@ -11,7 +11,7 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 | 0     | Runtime spike                     | DONE ✅      | 46/46 tests green (×3 + independent rerun); DEC-023 verification appended; spike retired at Phase 2 exit (report: `reports/PHASE-0-SPIKE-REPORT.md`) |
 | 1     | Spine                             | DONE ✅      | 329/329 tests; all exit criteria measured PASS; `reports/PHASE-1-REPORT.md` |
 | 2     | Streaming, obligations, registry  | DONE ✅      | 678/678 incl. 349 new (632 after spike retirement); both fake adapter shapes; derivation property; injected-clock caps; `reports/PHASE-2-REPORT.md` |
-| 3     | Reference adapters + conformance  | IN PROGRESS  | — |
+| 3     | Reference adapters + conformance  | DONE ✅      | 873/873 (74 files), tsc clean, layering clean; all three adapters pass ALL applicable §8 rows; ws gate `allApplicablePassed === true`, zero deferred (DEC-032); DEC-033/034 satisfied by execution; `reports/PHASE-3-REPORT.md` |
 | 4     | Security + multiplex              | not started  | — |
 | 5     | Embedded services + update        | not started  | — |
 | 6     | Census ports                      | not started  | — |
@@ -50,6 +50,8 @@ in `../09-open-questions.md` (append-only).
   shapes).
 
 ## Log
+
+- Phase 3 close (2026-08-24): verifier sweep of the persistent-ws completion thread — real-engine `WsSubject` + five-row transport fixture + 25 engine tests + ws wiring suite; suite 844→873 (+29, +2 files); footprint confined to `src/pi_platforms/{persistent-ws,conformance,kit}/`; lying-fixture negative validation green; no new DECs required. FINAL verdict PASS (`reports/PHASE-3-REPORT.md`).
 
 - Phase 2 (2026-08-23): workflow `pi_gateway_phase_2_egress` — 4 parallel builders
   - verifier. PASS: 678/678 (349 new: streaming both-fake-shape mutation suite,
