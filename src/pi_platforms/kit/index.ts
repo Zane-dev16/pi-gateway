@@ -171,3 +171,10 @@ export type {
 	RetryLadderOptions,
 	SendErrorClass,
 } from "./send-retry.js";
+
+export {
+	REDACTED_PLACEHOLDER,
+	SecretRedactor,
+	createRedactingLogger,
+	MIN_REDACTABLE_LENGTH,
+} from "./log-redaction.js";

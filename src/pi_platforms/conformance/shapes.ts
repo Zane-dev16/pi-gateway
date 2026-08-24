@@ -18,6 +18,9 @@ export const TRANSPORT_ROW_REQUIREMENTS: Record<Shape, readonly string[]> = {
 	ws: [
 		"transport.ws.resubscribe-replay",
 		"transport.ws.heartbeat-watchdog-recovery",
+		"transport.ws.retry-after-capture",
+		"transport.ws.capability-latch-permanent",
+		"transport.ws.dual-path-markdown",
 	],
 	webhook: [
 		"transport.webhook.flags-and-trust-boundary",
@@ -140,9 +143,13 @@ export function makePollingRows(fixture: PollingFixture): ConformanceRow[] {
 }
 
 /**
- * Named hook: WS fixture contract (§8 ws row). Resubscribe replay must cover
- * messages sent during the disconnect; the heartbeat watchdog recovers a dead
- * socket without dropping in-flight turns.
+ * Named hook: WS fixture contract (§8 ws row + DEC-032/034 completion set).
+ * Resubscribe replay must cover messages sent during the disconnect; the
+ * heartbeat watchdog recovers a dead socket without dropping in-flight turns;
+ * Retry-After captured from close payloads AND REST results shapes the next
+ * ladder delay; feature-gate errors latch native streaming off permanently;
+ * markdown dispatch is DUAL-PATH (native RAW / REST converted / link-preview
+ * suppression on text sends only).
  */
 export interface WsFixture {
 	resubscribeReplay(): Promise<{
@@ -152,6 +159,31 @@ export interface WsFixture {
 	watchdogRecovery(): Promise<{
 		detectedDeadSocket: boolean;
 		resumedWithoutLoss: boolean;
+	}>;
+	/** Close-payload AND REST-result Retry-After capture shapes next delay. */
+	retryAfterCapture(): Promise<{
+		closeCapturedSeconds: number;
+		nextDelayMs: number;
+		delayAuthoritative: boolean;
+		restCapturedSeconds: number;
+	}>;
+	/** A23: feature-gate failure latches native streaming OFF for the session. */
+	capabilityLatchPermanence(): Promise<{
+		latchedOnFirstFailure: boolean;
+		latchCount: number;
+		wireAttemptsAfterSkip: number;
+		supportsStreamingFalse: boolean;
+		transientDidNotLatch: boolean;
+	}>;
+	/** DEC-034 dual-path evidence: native RAW / REST converts / flag scope. */
+	dualPathMarkdown(): Promise<{
+		nativeRawByteExact: boolean;
+		nativePrefixStable: boolean;
+		restConvertedBold: boolean;
+		restConvertedLink: boolean;
+		restConvertedTable: boolean;
+		linkPreviewOnAllTextSends: boolean;
+		linkPreviewAbsentOffTextSends: boolean;
 	}>;
 }
 
@@ -192,7 +224,7 @@ export function makeWsRows(fixture: WsFixture): ConformanceRow[] {
 	return [
 		mk(
 			"transport.ws.resubscribe-replay",
-			"ws: resubscribe replay covers messages sent during disconnect",
+			"ws: resubscribe replay covers messages sent during disconnect — cursor-exact, exactly-once downstream",
 			() => fixture.resubscribeReplay(),
 			(r) =>
 				r.replayedAfterResubscribe === r.sentDuringDisconnect
@@ -207,6 +239,61 @@ export function makeWsRows(fixture: WsFixture): ConformanceRow[] {
 				r.detectedDeadSocket === true && r.resumedWithoutLoss === true
 					? null
 					: "watchdog must detect death AND resume cleanly",
+		),
+		mk(
+			"transport.ws.retry-after-capture",
+			"ws: Retry-After captured from close payload AND REST result; captured value IS the next reconnect delay (authoritative)",
+			() => fixture.retryAfterCapture(),
+			(r) => {
+				if (
+					Number(r.closeCapturedSeconds) <= 0 ||
+					Number(r.restCapturedSeconds) <= 0
+				)
+					return "Retry-After must be captured from BOTH sources";
+				if (r.delayAuthoritative !== true)
+					return "captured value must drive an AUTHORITATIVE ladder step";
+				return Number(r.nextDelayMs) === Number(r.closeCapturedSeconds) * 1000
+					? null
+					: `next delay ${String(r.nextDelayMs)}ms does not honor captured ${String(r.closeCapturedSeconds)}s`;
+			},
+		),
+		mk(
+			"transport.ws.capability-latch-permanent",
+			"ws: feature-gate error latches native streaming OFF permanently; later attempts skip the wire entirely; transient failures never latch",
+			() => fixture.capabilityLatchPermanence(),
+			(r) => {
+				if (
+					r.latchedOnFirstFailure !== true ||
+					r.supportsStreamingFalse !== true
+				)
+					return "feature-gate error must latch streaming off immediately";
+				if (Number(r.wireAttemptsAfterSkip) !== 1)
+					return "post-latch attempts must SKIP the wire (attempt count frozen at 1)";
+				if (r.transientDidNotLatch !== true)
+					return "transient failures must NOT latch";
+				return Number(r.latchCount) === 1
+					? null
+					: "latch fires at most ONCE per session";
+			},
+		),
+		mk(
+			"transport.ws.dual-path-markdown",
+			"ws dual-path markdown (DEC-034): native stream ships RAW prefix-stable bytes; REST path converts to mrkdwn; link-preview suppression is a text-send-only flag",
+			() => fixture.dualPathMarkdown(),
+			(r) => {
+				for (const leg of [
+					"nativeRawByteExact",
+					"nativePrefixStable",
+					"restConvertedBold",
+					"restConvertedLink",
+					"restConvertedTable",
+					"linkPreviewOnAllTextSends",
+					"linkPreviewAbsentOffTextSends",
+				] as const) {
+					if (r[leg] !== true) return `${leg} violated`;
+				}
+				return null;
+			},
 		),
 	];
 }

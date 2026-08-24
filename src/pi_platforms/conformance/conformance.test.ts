@@ -112,6 +112,34 @@ describe("transport-specific named hooks", () => {
 			async watchdogRecovery() {
 				return { detectedDeadSocket: true, resumedWithoutLoss: true };
 			},
+			async retryAfterCapture() {
+				return {
+					closeCapturedSeconds: 5,
+					nextDelayMs: 5000,
+					delayAuthoritative: true,
+					restCapturedSeconds: 3,
+				};
+			},
+			async capabilityLatchPermanence() {
+				return {
+					latchedOnFirstFailure: true,
+					latchCount: 1,
+					wireAttemptsAfterSkip: 1,
+					supportsStreamingFalse: true,
+					transientDidNotLatch: true,
+				};
+			},
+			async dualPathMarkdown() {
+				return {
+					nativeRawByteExact: true,
+					nativePrefixStable: true,
+					restConvertedBold: true,
+					restConvertedLink: true,
+					restConvertedTable: true,
+					linkPreviewOnAllTextSends: true,
+					linkPreviewAbsentOffTextSends: true,
+				};
+			},
 		});
 		const wsReport = await runConformanceSuite({
 			subjectName: "ref-ws",

@@ -52,6 +52,7 @@ import {
 	TokenLockConflictError,
 	type DisableReason,
 } from "./lifecycle-state.js";
+import { SecretRedactor, createRedactingLogger } from "./log-redaction.js";
 import type { TokenLockManagerSeam, LockAcquisition } from "./token-lock.js";
 import type { CapabilityManifest } from "./capabilities.js";
 import { capabilityFlag, DEFAULT_CAPABILITIES } from "./capabilities.js";
@@ -75,7 +76,14 @@ export interface BaseAdapterDeps {
 export abstract class BasePlatformAdapter {
 	readonly manifestName: string;
 	readonly lifecycle: AdapterLifecycleState;
+	/**
+	 * DEC-033: the base wraps EVERY injected logger with redaction, so all
+	 * adapters inherit §8 log hygiene (tokens/session keys/secrets never in
+	 * emitted lines). Subclasses register resolved secret values through
+	 * registerLogSecret; credential SHAPES are scrubbed even unregistered.
+	 */
 	protected readonly logger: StreamLogger | undefined;
+	private readonly logRedactor = new SecretRedactor();
 	private readonly caps: Partial<CapabilityManifest>;
 	private readonly lengthUnitDefault: LengthUnit;
 	private readonly scalarMaxUnits: number;
@@ -97,11 +105,21 @@ export abstract class BasePlatformAdapter {
 
 	constructor(deps: BaseAdapterDeps) {
 		this.manifestName = deps.manifestName;
-		this.logger = deps.logger;
+		this.logger = createRedactingLogger(deps.logger, this.logRedactor);
 		this.caps = deps.capabilities ?? {};
 		this.lengthUnitDefault = deps.lengthUnit ?? "chars";
 		this.scalarMaxUnits = deps.scalarMaxUnits ?? MAX_MESSAGE_LENGTH_DEFAULT;
 		this.lifecycle = new AdapterLifecycleState(this.logger);
+	}
+
+	/** DEC-033 seam: adapters register resolved secret VALUES post-enablement. */
+	protected registerLogSecret(value: string): void {
+		this.logRedactor.register(value);
+	}
+
+	/** The session redactor (subject/test observability + row probes). */
+	get redactor(): SecretRedactor {
+		return this.logRedactor;
 	}
 
 	// ── capabilities are DATA (getattr-with-default parity) ─────────────────
@@ -162,9 +180,7 @@ export abstract class BasePlatformAdapter {
 	}
 
 	/** Relay-shaped override point: per-chat descriptor or undefined. */
-	protected chatDescriptorFor(
-		_chatId: string,
-	):
+	protected chatDescriptorFor(_chatId: string):
 		| {
 				maxMessageLength?: number | undefined;
 				lenUnit?: LengthUnit | undefined;

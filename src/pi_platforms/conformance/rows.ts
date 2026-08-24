@@ -22,6 +22,10 @@ import {
 	clarifyChoiceActionId,
 	renderBlocks,
 } from "../kit/index.js";
+import { BasePlatformAdapter } from "../kit/index.js";
+import type { SendResult } from "../../pi_gateway/streaming/adapter-seam.js";
+import type { EgressChokepoint } from "../../pi_gateway/streaming/egress-door.js";
+import type { StreamLogger } from "../../pi_gateway/streaming/adapter-seam.js";
 import { GatewayStreamConsumer } from "../../pi_gateway/streaming/gateway-stream-consumer.js";
 import {
 	internalWakeEvent,
@@ -723,7 +727,113 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 		},
 	);
 
-	// ── WAKE LANES (03 §11 rows; DEC-022) ───────────────────────────────────
+	// ── LOG REDACTION (§8; DEC-033 — guard/logger-level shared property) ─────
+
+	add(
+		"logs.sensitive-redacted",
+		"log redaction: session keys/tokens/secrets never appear in emitted lines — kit base logger inherits the filter to every adapter",
+		"all",
+		async () => {
+			const { SecretRedactor, createRedactingLogger } = await import(
+				"../kit/log-redaction.js"
+			);
+
+			// ── leg 1: THE seam itself under adversarial payloads ──
+			const emitted: Array<{ level: string; message: string; meta?: unknown }> =
+				[];
+			const sink: StreamLogger = {
+				debug: (m, meta) => emitted.push({ level: "debug", message: m, meta }),
+				warn: (m, meta) => emitted.push({ level: "warn", message: m, meta }),
+				error: (m, meta) => emitted.push({ level: "error", message: m, meta }),
+				info: (m, meta) => emitted.push({ level: "info", message: m, meta }),
+			};
+			const redactor = new SecretRedactor();
+			const tokenValue = "xoxb-2400-987654321098-zzAAqq11ccDD";
+			const sessionKey = "ws-ref:chat-private-7788";
+			redactor.register(tokenValue);
+			redactor.register(sessionKey);
+			const log = createRedactingLogger(sink, redactor);
+			if (log === undefined)
+				throw new Error("redacting wrapper dropped the sink");
+
+			log.warn(`dispatch for ${sessionKey}`, {
+				event: { payload: { bot_token: tokenValue } }, // secret in an UNEXPECTED field
+			});
+			log.error("send failed: HTTP 403", {
+				authorization: `Bearer sk-proj-abcdef1234567890abcd`, // UNREGISTERED shape
+				nested: [{ chat_key: sessionKey }],
+			});
+			log.info?.(`token ${tokenValue} embedded mid-message`);
+
+			expectTrue(
+				emitted.length === 3,
+				"all three emissions reached exactly one sink",
+			);
+			for (const line of emitted) {
+				const blob = JSON.stringify(line);
+				expectTrue(
+					!blob.includes(tokenValue),
+					`registered token leaked: ${blob.slice(0, 160)}`,
+				);
+				expectTrue(
+					!blob.includes(sessionKey),
+					`session key leaked: ${blob.slice(0, 160)}`,
+				);
+				expectTrue(
+					!blob.includes("sk-proj-abcdef1234567890"),
+					`unregistered credential shape leaked: ${blob.slice(0, 160)}`,
+				);
+			}
+			expectTrue(
+				emitted[0]?.message.includes("[redacted]") &&
+					emitted[0]?.message.includes("dispatch for"),
+				"benign log text survives; sensitive span replaced, not dropped",
+			);
+
+			// ── leg 2: INHERITANCE — any adapter built on the kit base gets the
+			// filter on its real emission paths (lifecycle disable reasons embed
+			// error blobs; formatting-ladder warnings embed error text). A minimal
+			// inline adapter proves the BASE wraps what it is handed.
+			class RedactionProbeAdapter extends BasePlatformAdapter {
+				constructor(rawSink: StreamLogger | undefined) {
+					super({ manifestName: "redaction-probe", logger: rawSink });
+				}
+				protected override get chokepoint(): EgressChokepoint {
+					throw new Error("unused");
+				}
+				protected override async wireSend(): Promise<SendResult> {
+					return { success: false };
+				}
+				async connect(): Promise<boolean> {
+					return true;
+				}
+				async disconnect(): Promise<void> {}
+				exposeLogger(): StreamLogger | undefined {
+					return this.logger;
+				}
+			}
+			const rawCapture: string[] = [];
+			const rawSink: StreamLogger = {
+				debug: () => {},
+				warn: (m) => rawCapture.push(m),
+				error: (m) => rawCapture.push(m),
+				info: () => {},
+			};
+			const probe = new RedactionProbeAdapter(rawSink);
+			probe
+				.exposeLogger()
+				?.error(
+					`credential check failed for ghpatvalue ghp_ABCDEFGHIJKLMNOPQRSTUVWX12`,
+				);
+			expectTrue(rawCapture.length === 1, "base-wrapped path emitted once");
+			expectTrue(
+				!rawCapture[0]?.includes("ghp_ABCDEFGHIJKLMNOPQRSTUVWX12"),
+				`credential leaked through a base-built adapter's logger: ${rawCapture[0]}`,
+			);
+		},
+	);
+
+	// ── WAKE LANES (03 §11 rows; DEC-022) ────────────────────────────────────
 
 	add(
 		"wake.lane-declaration-consistent",
