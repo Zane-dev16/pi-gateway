@@ -127,8 +127,26 @@ describe("two-process rail contracts (real processes)", () => {
 		await waitForFile(claimedMarker);
 		expect(doomed.pid).toBeDefined();
 		doomed.kill("SIGKILL");
-		await new Promise<void>((resolvePromise) => {
-			doomed.once("close", resolvePromise);
+		// Bounded close-wait: a SIGKILL'd child wedged in D-state (uninterruptible
+		// I/O, observed under cold-cache full-suite load) never emits "close" and
+		// previously hung the whole test to its timeout cap. Fail fast + diagnose
+		// instead; the durability contract itself needs only that the row was
+		// committed before the kill, which BOOT 2's restore proves either way.
+		await new Promise<void>((resolvePromise, rejectPromise) => {
+			const bail = setTimeout(
+				() =>
+					rejectPromise(
+						new Error(
+							`SIGKILL'd holder pid=${String(doomed.pid)} did not close within 30s ` +
+							`(check /proc/${String(doomed.pid)}/status for D-state)`,
+						),
+				),
+				30_000,
+			);
+			doomed.once("close", () => {
+				clearTimeout(bail);
+				resolvePromise();
+			});
 		});
 
 		// BOOT 2: restore hands the row to exactly ONE consumer.
