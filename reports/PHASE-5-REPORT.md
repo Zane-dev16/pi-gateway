@@ -125,3 +125,89 @@ the update pipeline + receipts subsystem was never built.** Gates: tsc clean,
 layering clean, secret-scope clean, 1596/1597 suite (single load-flake, passes in
 isolation). The phase cannot be declared complete until the update drill and
 receipts-on-every-path rows have real implementations and green contracts.
+
+---
+
+## Completion — Final Verification (update subsystem landed)
+
+**Date:** 2026-08-24 · **Verifier:** independent trust-nothing pass over the
+completed Phase 5 footprint (`src/pi_embedded/update/**`, 24 files ≈ 5 008 LOC).
+
+### Mechanical gates — both runs measured
+
+| Gate | Run 1 | Run 2 |
+| --- | --- | --- |
+| `npx tsc --noEmit` | exit 0 | — (static, re-checked once) |
+| `node scripts/check-layering.mjs` | OK (downward-only holds) | — |
+| `node scripts/check-secret-scope.mjs` | OK (258 files under src/) | — |
+| `npx vitest run` FULL | **1694/1694 passed, 153 files, 51.4s** | **1694/1694 passed, 153 files, 51.5s** |
+
+Delta vs pre-update verified baseline (1610/1610 over 143 files): **+84 tests /
++10 test files**, exactly the update suite (64 pure contracts + 20 two-process
+contracts). Zero failures, zero skips, byte-identical counts across the two
+DEC-041-discipline runs (~51s each — the old real-process starvation is gone;
+DEC-041 serialization works).
+
+### Exit-criteria table — final
+
+| # | Criterion | Verdict | Evidence |
+| --- | --- | --- | --- |
+| a | Cron bounds edges (catchup clamp, one-shot grace, true-inactivity; injected clock; #87644 tick lock; DEC-012 memory gate) | **PASS** | unchanged from interim report §3 |
+| b | Handoff E2E through NORMAL pipeline | **PASS** | unchanged |
+| c | Update drill on TWO-PROFILE host ⇒ fleet matrix; stale gateway FAILS run (partial + exit 1) AND receipt for THAT failure | **PASS** (was FAIL) | `update/pipeline-two-process.test.ts`: REAL git tree + TWO spawned units; stale arm asserts `outcome=partial`, `exitCode=1`, error names staleness, fleet matrix marks default=current / work=stale, `latest.json` pointer reads `outcome:"partial"`; all-current arm exits 0 with success pointer and pulled code verifiably on disk |
+| d | Embedded services degrade loudly without blocking (01 §3 stage-9) | **PASS** | stage wiring per DEC-040 landed in commit 8b4f7f5; per-service entries unchanged-green |
+| e | Idle-gate race + ownership matrix completes Phase-4 rail | **PASS** | unchanged |
+| f | Receipts on EVERY path incl. refusals; parser-derived matchers only (adversarial argv matrix green) | **PASS** (was FAIL) | receipts: success/refusal(zip-package, dirty-tree)/partial/escaped-exception paths each persist exactly one idempotent receipt + atomic `latest.json` pointer (`writeJsonAtomically` temp→rename); bounded prune keeps 20, floors keep≥1. Matchers: token-based subcommand extraction, value-flag set DERIVED from single `TOP_LEVEL_OPTION_SPECS` table (#91869 class proven), `/proc` enumeration numeric-only, mimic matrix (`vim my-gateway-run-notes.txt`, `pi --profile gateway status`, fake basenames…) rejected while the one real unit matches |
+
+Supplementary (all green): snapshot caps — 1 GiB-class skip WITH reason,
+zeroed-SQLite guard, post-copy `quick_check` round-trip on real WAL db, keep=1
+prune floored, pruning suppressed when protected files skipped, fleet parity of
+snapshot ids across profiles (#66140); apply — real fast-forward pull,
+diverged-tree fails GIT-classified with NO zip fallback on POSIX and local
+commit survives, dep-install failures never clobber (#87304 rationale),
+double dirty refusal up-front + TOCTOU with staging-artifact filter under
+`--untracked-files=all`, `.git`/`.env`/`node_modules` preserved through the
+two-phase swap, dist/ graft rides the swap; restart — fleet SIGUSR1 drain on
+real spawned units, wedged unit stopped-after-window then fail-closed
+incomplete with healthy unit still drained, verdict table
+`_restart_phase_failure_is_incomplete` ported verbatim; verify — settle ~2s
+ONLY after actual restarts on injected clock, unknown never fails; hangup —
+two-exec-hop SIGHUP survival, `/proc/<pid>/status` SigIgn bit evidence for
+non-Node children, unwrapped control dies BY SIGHUP, window absorption +
+idempotent restore (DEC-042).
+
+### Footprint audit
+
+`git status --porcelain --untracked-files=all`: **only** modified
+`PROGRESS.md` (protocol bookkeeping log entry) + untracked
+`src/pi_embedded/update/**`. No other tracked file touched. Wall-clock reads
+exist ONLY in `clock.ts` (the seam); stage logic is injection-clean.
+
+### Blocked threads
+
+**None.** Interim report gaps resolved: (1) update subsystem built and green;
+(2) lifecycle wiring landed per DEC-040; (3) full-suite starvation fixed by
+DEC-041 serialization (311s flaky → 51s ×2 stable); (4) zero skipped/todo tests
+remain.
+
+### Proposed DECs
+
+None required — no divergence from Hermes semantics found during verification.
+DEC-039..042 (sidecar tick lock, stage-wiring debt, suite serialization,
+hangup protection) were logged pre/post implementation and are all accepted in
+`09-open-questions.md`.
+
+### Cosmetic notes (non-blocking, left untouched)
+
+- `pipeline-two-process.test.ts`: duplicated JSDoc block above `makeDrill`
+  (stale comment left above its replacement).
+- `latest.json` torn-write safety is by-construction (temp+rename) and
+  exercised via terminal-path assertions; crash-mid-write itself has no unit
+  test (not unit-testable without fault injection).
+
+## Final verdict
+
+**Phase 5 = COMPLETE PASS.** All six exit-criteria rows (a)–(f) measured PASS.
+Gates: tsc clean, layering clean, secret-scope clean, **1694/1694 over 153
+files — twice consecutively**. Footprint exactly as scoped. No blocked threads,
+no new DECs proposed.

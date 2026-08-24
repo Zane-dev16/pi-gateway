@@ -13,8 +13,8 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 | 2     | Streaming, obligations, registry  | DONE ✅      | 678/678 incl. 349 new (632 after spike retirement); both fake adapter shapes; derivation property; injected-clock caps; `reports/PHASE-2-REPORT.md` |
 | 3     | Reference adapters + conformance  | DONE ✅      | 873/873 (74 files), tsc clean, layering clean; all three adapters pass ALL applicable §8 rows; ws gate `allApplicablePassed === true`, zero deferred (DEC-032); DEC-033/034 satisfied by execution; `reports/PHASE-3-REPORT.md` |
 | 4     | Security + multiplex              | DONE ✅      | 1204/1204 tests; grep gate clean + provably failing; poisoned-env/sig-matrix/kill-holder/exactly-once-restore all PASS; `reports/PHASE-4-REPORT.md` |
-| 5     | Embedded services + update        | IN PROGRESS  | — |
-| 6     | Census ports                      | not started  | — |
+| 5     | Embedded services + update        | DONE ✅      | 1694/1694 ×2 runs; all (a)–(f) measured PASS incl. two-profile fleet drill w/ stale-gateway exit 1 + receipts-on-refusal; `reports/PHASE-5-REPORT.md` |
+| 6     | Census ports                      | IN PROGRESS  | — |
 
 ## Phase 0 — Runtime spike
 
@@ -48,6 +48,38 @@ in `../09-open-questions.md` (append-only).
   EPIPE in spike/tests/lease.spike.test.ts teardown under full parallel load
   (Phase 0 throwaway; disappears when spike/ is retired after Phase 2 ports its
   shapes).
+
+- Phase 5 / update pipeline (2026-08-24): `src/pi_embedded/update/**` — the
+  transactional update subsystem (08 §5–§10): plan stage (deployment-kind
+  classification from code-scoped `.install_method` stamp → .git → package.json,
+  config.py:detect_install_method parity; UpdatePlan/RuntimeRecord schema),
+  snapshot stage (#66140 per-profile state-snapshots, identical critical set,
+  1 GiB cap skip-with-reason, keep=1 prune with pruning suppression on protected
+  skips, zeroed-db guard + post-copy quick_check), apply stage (argv/git-CLASSIFIED
+  failure gates; ZIP fallback strictly git-classified AND win32; #87304 double
+  dirty-tree refusal up-front + TOCTOU with staging-artifact filter and -uall;
+  two-phase staging swap preserving .git/.env/node_modules; built-artifact graft),
+  restart-per-kind (fleet-wide drain-first SIGUSR1, launchers resolved before any
+  signal, per-unit isolation, survivors stopped after window, fail-closed verdict
+  table `_restart_phase_failure_is_incomplete` ported verbatim), verify stage
+  (settle ~2s ONLY after actual restarts on injected clock; fleet sha matrix;
+  stale ⇒ partial + exit 1; unknown never fails), receipts (JSON receipt +
+  atomic latest.json pointer on EVERY terminal path incl. refusals/exceptions;
+  bounded prune keeps 20), canonical process matchers (08 §9: token-based
+  gateway/holder subcommand extraction, parser-DERIVED value-flag set from a
+  single option-spec table, /proc cmdline enumeration; adversarial argv matrix),
+  SIGHUP hangup protection (DEC-042: window listener-absorption + trap-wrapped
+  child exec delivering true inherited SIG_IGN to git/package-manager children).
+  Tests: 84 new across 10 files — 64 pure contracts + 20 two-process contracts
+  (real git pull/diverge/overlay drills; SIGUSR1 fleet drain on spawned units;
+  SIGHUP survival across two exec hops + /proc SigIgn evidence; TWO-PROFILE
+  stale-gateway drill ⇒ partial + exit 1 per roadmap exit criteria c/f).
+  FULL: 1694/1694 green, tsc clean, layering + secretscope gates green.
+  DEC-042 logged pre-implementation (Node cannot express SIG_IGN in-process;
+  measured caveat recorded: Node resets its own inherited SIGHUP at bootstrap,
+  so the binding property targets non-Node children). Layering note: update owns
+  a reader for the DOCUMENTED gateway_state.json schema instead of importing
+  pi_gateway/lifecycle (01 §5.3); shared contract is the spec field set.
 
 ## Log
 
