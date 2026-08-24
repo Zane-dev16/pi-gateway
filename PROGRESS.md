@@ -14,7 +14,7 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 | 3     | Reference adapters + conformance  | DONE ✅      | 873/873 (74 files), tsc clean, layering clean; all three adapters pass ALL applicable §8 rows; ws gate `allApplicablePassed === true`, zero deferred (DEC-032); DEC-033/034 satisfied by execution; `reports/PHASE-3-REPORT.md` |
 | 4     | Security + multiplex              | DONE ✅      | 1204/1204 tests; grep gate clean + provably failing; poisoned-env/sig-matrix/kill-holder/exactly-once-restore all PASS; `reports/PHASE-4-REPORT.md` |
 | 5     | Embedded services + update        | DONE ✅      | 1694/1694 ×2 runs; all (a)–(f) measured PASS incl. two-profile fleet drill w/ stale-gateway exit 1 + receipts-on-refusal; `reports/PHASE-5-REPORT.md` |
-| 6     | Census ports                      | IN PROGRESS  | — |
+| 6     | Census ports                      | DONE ✅      | 1842/1842 ×2 runs; telegram/slack/discord/whatsapp-cloud all pass ALL applicable rows; registration-only diff; `reports/PHASE-6-REPORT.md`. **DEFINITION OF DONE MET** (clean-checkout proof below) |
 
 ## Phase 0 — Runtime spike
 
@@ -82,6 +82,17 @@ in `../09-open-questions.md` (append-only).
   pi_gateway/lifecycle (01 §5.3); shared contract is the spec field set.
 
 ## Log
+
+- DEFINITION OF DONE (2026-08-24): roadmap Phase 6 exit met. Clean-checkout proof:
+  fresh `git clone` -> `npm ci` -> `npx tsc --noEmit` clean -> `npx vitest run`
+  1842/1842 over 167 files. Conformance suite green on all three reference
+  adapters plus Telegram (DEC-024) per EXECUTION-PROMPT DoD; zero unlogged
+  divergences (DEC-001..042 all logged w/ verification); DEC-026 sweep clean at
+  every phase boundary. Remaining census (19 plugins + signal/weixin/yuanbao/
+  qqbot/bluebubbles/msgraph built-ins) enumerated in reports/PHASE-6-REPORT.md
+  as post-DoD expansion backlog w/ recommended order (matrix -> signal -> feishu
+  -> line/teams/google_chat/msgraph). Flake hardening en route: delegation
+  SIGKILL close-wait bounded at 30s w/ D-state diagnostics.
 
 - Phase 4 (2026-08-24): workflow `pi_gateway_phase_4_security` — scope engine first,
   then authz ∥ locks ∥ trust, then multiplex ∥ delegation rail; verifier incl.
