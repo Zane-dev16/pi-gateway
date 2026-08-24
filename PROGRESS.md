@@ -12,8 +12,8 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 | 1     | Spine                             | DONE ✅      | 329/329 tests; all exit criteria measured PASS; `reports/PHASE-1-REPORT.md` |
 | 2     | Streaming, obligations, registry  | DONE ✅      | 678/678 incl. 349 new (632 after spike retirement); both fake adapter shapes; derivation property; injected-clock caps; `reports/PHASE-2-REPORT.md` |
 | 3     | Reference adapters + conformance  | DONE ✅      | 873/873 (74 files), tsc clean, layering clean; all three adapters pass ALL applicable §8 rows; ws gate `allApplicablePassed === true`, zero deferred (DEC-032); DEC-033/034 satisfied by execution; `reports/PHASE-3-REPORT.md` |
-| 4     | Security + multiplex              | not started  | — |
-| 5     | Embedded services + update        | not started  | — |
+| 4     | Security + multiplex              | DONE ✅      | 1204/1204 tests; grep gate clean + provably failing; poisoned-env/sig-matrix/kill-holder/exactly-once-restore all PASS; `reports/PHASE-4-REPORT.md` |
+| 5     | Embedded services + update        | IN PROGRESS  | — |
 | 6     | Census ports                      | not started  | — |
 
 ## Phase 0 — Runtime spike
@@ -50,6 +50,13 @@ in `../09-open-questions.md` (append-only).
   shapes).
 
 ## Log
+
+- Phase 4 (2026-08-24): workflow `pi_gateway_phase_4_security` — scope engine first,
+  then authz ∥ locks ∥ trust, then multiplex ∥ delegation rail; verifier incl.
+  self-tested grep gate. PASS: 1204/1204 (331 new). DEC-035..038 logged. Roadmap
+  v1.2 erratum recorded (Phase-4/5 text duplication owned by Phase 5). Flake fix:
+  two-process rail test timeout raised to 300s against fork starvation on 4 CPUs
+  (contract unchanged; passes in isolation in ~1.5s).
 
 - Phase 3 close (2026-08-24): verifier sweep of the persistent-ws completion thread — real-engine `WsSubject` + five-row transport fixture + 25 engine tests + ws wiring suite; suite 844→873 (+29, +2 files); footprint confined to `src/pi_platforms/{persistent-ws,conformance,kit}/`; lying-fixture negative validation green; no new DECs required. FINAL verdict PASS (`reports/PHASE-3-REPORT.md`).
 
