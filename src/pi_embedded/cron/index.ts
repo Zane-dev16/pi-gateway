@@ -122,3 +122,8 @@ export {
 	newOriginSessionId,
 	stateStoreMirrorAppender,
 } from "./transcript-sink.js";
+
+export {
+	CRON_TICKER_SERVICE_NAME,
+	cronTickerServiceEntry,
+} from "./stage-entry.js";

@@ -9,9 +9,12 @@
 // boot-fingerprint, status-stamp, shutdown).
 //
 // Skeleton posture (roadmap Phase 1 item 5): the stage FRAMEWORK is built
-// now; cron / watchers / adapters land in Phases 5+ through `stageBodies` —
-// the default bodies for stages 7–9 report "nothing configured yet" and
-// succeed, which keeps the binding order exercised end-to-end today.
+// now; adapters land in Phases 3+ through `stageBodies` — the default body
+// for stage 9 reports "nothing configured yet" and succeeds. Stages 7–8 are
+// WIRED (DEC-040): per-service entries registered via `registerService()` /
+// the `services` option run inside their stage bodies with per-service loud
+// degradation; the engine stays service-agnostic (structural entries, no
+// pi_embedded imports — layering 01 §5.3).
 
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -51,9 +54,11 @@ import {
 	type ShutdownClass,
 } from "./shutdown.js";
 import {
+	SERVICE_STAGE_IDS,
 	STAGE_IDS,
 	canTransition,
 	isOptionalStage,
+	type ServiceStageId,
 	type StageEvent,
 	type StageId,
 	type StartupState,
@@ -68,6 +73,43 @@ import {
 export interface ServiceHandle {
 	name: string;
 	stop?: () => Promise<void>;
+}
+
+/**
+ * Classified result of ONE registered optional-stage service entry (DEC-040,
+ * 01 §3.1 per-service degraded start). A throw inside start() is ALSO a
+ * classification — the engine converts it to `{ ok:false, degraded:true }`.
+ */
+export interface ServiceStartOutcome {
+	ok: boolean;
+	/**
+	 * true (with ok=false) ⇒ loud per-service DEGRADE — startup continues.
+	 * Absent/falsy with ok=false ⇒ disabled/skipped: loud, but NOT a failure
+	 * (e.g. an env gate off, or the singleton dispatcher role held elsewhere).
+	 */
+	degraded?: boolean;
+	/** Machine-readable degrade/disable reason (carried in the loud log). */
+	reason?: string;
+	/** Stoppable handle; appended to ctx.services.{cron|watchers}. */
+	handle?: ServiceHandle;
+}
+
+/**
+ * One named service bound to an OPTIONAL stage (DEC-040). Structural contract
+ * only: embedded services expose conforming entries WITHOUT importing this
+ * module (pi_embedded may not reach pi_gateway/lifecycle — 01 §5.3); the
+ * composition root registers them here before startup.
+ */
+export interface ServiceEntry {
+	name: string;
+	start(ctx: StageContext): Promise<ServiceStartOutcome> | ServiceStartOutcome;
+}
+
+/** Per-service degradation recorded during startup (DEC-040), in fire order. */
+export interface ServiceDegradation {
+	stage: ServiceStageId;
+	service: string;
+	reason: string;
 }
 
 export interface AdapterRecord {
@@ -123,6 +165,11 @@ export interface LifecycleOptions {
 	replace?: boolean;
 	/** Stage-body overrides: production seams (Phases 2–5) and test spies. */
 	stageBodies?: Partial<Record<StageId, StageBody>>;
+	/**
+	 * Per-service optional-stage entries registered BEFORE startup (DEC-040).
+	 * Equivalent to calling registerService() for each entry pre-startup.
+	 */
+	services?: Partial<Record<ServiceStageId, ServiceEntry[]>>;
 	stateStorePath?: string;
 	stateStoreOptions?: StateStoreOptions;
 	/** Active-turn grace window for the drain (default 0 — interrupting chat
@@ -212,6 +259,11 @@ export class GatewayLifecycle {
 	private readonly selfPid: number;
 	private readonly log: Logger;
 	private readonly bodies: Partial<Record<StageId, StageBody>>;
+	private readonly serviceEntries: Record<ServiceStageId, ServiceEntry[]> = {
+		cron_scheduler: [],
+		embedded_watchers: [],
+	};
+	private readonly serviceDegradations: ServiceDegradation[] = [];
 	private readonly completedStages = new Set<StageId>();
 	private readonly degradedStages = new Set<StageId>();
 
@@ -236,6 +288,11 @@ export class GatewayLifecycle {
 		this.homeValue = options.home ?? resolvePiHome();
 		this.selfPid = options.selfPid ?? process.pid;
 		this.bodies = options.stageBodies ?? {};
+		for (const stage of SERVICE_STAGE_IDS) {
+			for (const entry of options.services?.[stage] ?? []) {
+				this.registerService(stage, entry);
+			}
+		}
 		this.ctx = {
 			home: this.homeValue,
 			selfPid: this.selfPid,
@@ -265,6 +322,21 @@ export class GatewayLifecycle {
 
 	get degraded(): StageId[] {
 		return [...this.degradedStages];
+	}
+
+	/** Per-service degradations recorded during startup (DEC-040), in order. */
+	get degradedServices(): ReadonlyArray<ServiceDegradation> {
+		return [...this.serviceDegradations];
+	}
+
+	/**
+	 * Register one per-service optional-stage entry (DEC-040). Entries run when
+	 * their stage body executes — AFTER every earlier required stage succeeded,
+	 * in REGISTRATION order, each isolated from its siblings' failures.
+	 */
+	registerService(stage: ServiceStageId, entry: ServiceEntry): this {
+		this.serviceEntries[stage].push(entry);
+		return this;
 	}
 
 	/** True when an UNEXPECTED signal initiated the shutdown (08 §1.2 mirror). */
@@ -444,16 +516,78 @@ export class GatewayLifecycle {
 	}
 
 	private async stageCronScheduler(ctx: StageContext): Promise<void> {
-		// 08 §1.1 step 6 first half; provider lands Phase 5. Optional: failures
-		// degrade loudly without blocking later stages.
-		ctx.services.cron = [];
-		ctx.log.info("cron scheduler: nothing configured yet (lands Phase 5)");
+		// 08 §1.1 step 6 first half / 01 §3.1 stage 7 (optional): registered cron
+		// providers start HERE, each isolated (DEC-040) — one provider's failure
+		// degrades THAT provider loudly without blocking siblings or later stages.
+		const entries = this.serviceEntries.cron_scheduler;
+		if (entries.length === 0) {
+			ctx.log.info("cron scheduler: nothing configured yet (lands Phase 5)");
+			return;
+		}
+		for (const entry of entries) {
+			await this.startRegisteredService(ctx, "cron_scheduler", entry);
+		}
 	}
 
 	private async stageEmbeddedWatchers(ctx: StageContext): Promise<void> {
-		// 08 §1.1 step 6 second half; supervised watchers land Phase 5.
-		ctx.services.watchers = [];
-		ctx.log.info("embedded watchers: nothing configured yet (lands Phase 5)");
+		// 08 §1.1 step 6 second half / 01 §3.1 stage 8 (optional): registered
+		// embedded watchers/extensions start HERE under the same per-service
+		// isolation (DEC-040).
+		const entries = this.serviceEntries.embedded_watchers;
+		if (entries.length === 0) {
+			ctx.log.info("embedded watchers: nothing configured yet (lands Phase 5)");
+			return;
+		}
+		for (const entry of entries) {
+			await this.startRegisteredService(ctx, "embedded_watchers", entry);
+		}
+	}
+
+	/**
+	 * Start ONE registered service with per-service isolation (01 §3.1, DEC-040):
+	 * a thrown error OR a degraded outcome is logged loudly and recorded WITHOUT
+	 * blocking sibling services or later stages; a disabled outcome is loud but
+	 * not a failure. NEVER throws — the stage slot is consumed either way.
+	 */
+	private async startRegisteredService(
+		ctx: StageContext,
+		stage: ServiceStageId,
+		entry: ServiceEntry,
+	): Promise<void> {
+		let outcome: ServiceStartOutcome;
+		try {
+			outcome = await entry.start(ctx);
+		} catch (err) {
+			outcome = {
+				ok: false,
+				degraded: true,
+				reason: err instanceof Error ? err.message : String(err),
+			};
+		}
+		if (outcome.ok) {
+			if (outcome.handle !== undefined) {
+				if (stage === "cron_scheduler") ctx.services.cron.push(outcome.handle);
+				else ctx.services.watchers.push(outcome.handle);
+			}
+			ctx.log.info(`service ${entry.name} started (stage ${stage})`, {
+				stage,
+				service: entry.name,
+			});
+			return;
+		}
+		const reason = outcome.reason ?? "unspecified";
+		if (outcome.degraded === true) {
+			this.serviceDegradations.push({ stage, service: entry.name, reason });
+			ctx.log.error(
+				`service ${entry.name} DEGRADED at stage ${stage}: ${reason}`,
+				{ stage, service: entry.name, reason_code: "degraded_start" },
+			);
+			return;
+		}
+		ctx.log.warn(
+			`service ${entry.name} not started (stage ${stage}): ${reason}`,
+			{ stage, service: entry.name },
+		);
 	}
 
 	private async stagePlatformAdapters(ctx: StageContext): Promise<void> {
@@ -804,6 +938,7 @@ export class GatewayLifecycle {
 
 export type {
 	GatewayRuntimeState,
+	ServiceStageId,
 	StageEvent,
 	StageId,
 	StartupState,

@@ -59,3 +59,9 @@ export {
 	type EmbeddedExtensionsSnapshot,
 	type StartupEmbeddedExtensionsOptions,
 } from "./startup.js";
+
+export {
+	EMBEDDED_EXTENSIONS_SERVICE_NAME,
+	extensionsServiceEntry,
+	type ExtensionsServiceEntry,
+} from "./stage-entry.js";

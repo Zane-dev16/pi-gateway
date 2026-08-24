@@ -37,6 +37,20 @@ export function isOptionalStage(id: StageId): boolean {
 	return OPTIONAL_STAGES.has(id);
 }
 
+/**
+ * The two optional stages that host REGISTERED per-service entries (DEC-040):
+ * cron providers in stage 7, embedded watchers/extensions in stage 8. Each
+ * registered entry starts in isolation — one service's failure degrades THAT
+ * service loudly without blocking siblings or later stages (01 §3.1), while a
+ * stage body throwing still degrades the whole stage exactly as before.
+ */
+export const SERVICE_STAGE_IDS = [
+	"cron_scheduler",
+	"embedded_watchers",
+] as const;
+
+export type ServiceStageId = (typeof SERVICE_STAGE_IDS)[number];
+
 export interface StageEvent {
 	stage: StageId;
 	ok: boolean;

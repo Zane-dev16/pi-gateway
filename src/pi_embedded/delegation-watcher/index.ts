@@ -40,3 +40,8 @@ export {
 	type DelegationTickReport,
 	type DelegationWatcherDeps,
 } from "./watcher.js";
+export {
+	DELEGATION_WATCHER_SERVICE_NAME,
+	delegationWatcherServiceEntry,
+	type DelegationWatcherEntryInput,
+} from "./stage-entry.js";

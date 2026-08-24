@@ -49,3 +49,8 @@ export type {
 	NewCard,
 	SpawnFn,
 } from "./types.js";
+export {
+	KANBAN_DISPATCHER_SERVICE_NAME,
+	kanbanDispatcherServiceEntry,
+	type KanbanDispatcherEntryDeps,
+} from "./stage-entry.js";

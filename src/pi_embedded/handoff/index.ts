@@ -21,3 +21,4 @@ export * from "./pipeline.js";
 export * from "./dispatcher.js";
 export * from "./watcher.js";
 export * from "./cli-client.js";
+export * from "./stage-entry.js";

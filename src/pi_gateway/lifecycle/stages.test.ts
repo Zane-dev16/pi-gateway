@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { STAGE_IDS, type StageId } from "./stages.js";
 import {
 	GatewayLifecycle,
+	type ServiceEntry,
+	type ServiceStartOutcome,
 	type StageBody,
 	type StageContext,
 } from "./lifecycle.js";
@@ -58,21 +60,89 @@ function captureLogger(): {
 	};
 }
 
+/** Recording entry factory: fires are pushed onto the shared timeline. */
+function recordingEntry(
+	name: string,
+	timeline: string[],
+	outcome?: () => ServiceStartOutcome | Promise<ServiceStartOutcome>,
+): ServiceEntry {
+	return {
+		name,
+		start: async () => {
+			timeline.push(`service:${name}`);
+			return outcome ? outcome() : { ok: true };
+		},
+	};
+}
+
 describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 	it("event trace equals EXACTLY the declared ten-stage sequence", async () => {
-		const calls: StageId[] = [];
-		const { bodies } = spyBodies(calls);
-		const lifecycle = new GatewayLifecycle({ home, stageBodies: bodies });
+		// Stages 1–6 and 9–10 are spied; stages 7–8 keep their DEFAULT bodies so
+		// the DEC-040 registered entries fire through the real wiring.
+		const timeline: string[] = [];
+		const bodies: Partial<Record<StageId, StageBody>> = {};
+		for (const id of STAGE_IDS) {
+			if (id === "cron_scheduler" || id === "embedded_watchers") continue;
+			bodies[id] = async () => {
+				timeline.push(`stage:${id}`);
+			};
+		}
+		const captured = captureLogger();
+		const lifecycle = new GatewayLifecycle({
+			home,
+			stageBodies: bodies,
+			logger: captured.logger,
+			services: {
+				cron_scheduler: [recordingEntry("cron.ticker", timeline)],
+				embedded_watchers: [
+					recordingEntry("hooks.extensions", timeline),
+					recordingEntry("kanban.dispatcher", timeline),
+					recordingEntry("delegation.watcher", timeline),
+					recordingEntry("handoff.watcher", timeline),
+				],
+			},
+		});
 
 		const result = await lifecycle.startup();
 
 		expect(result.ok).toBe(true);
-		expect(calls).toEqual([...STAGE_IDS]);
-		// Trace relationship: one ok event per stage, in stage order.
+		// The ten-stage ORDER stays binding at the trace level…
 		expect(lifecycle.events.map((e) => e.stage)).toEqual([...STAGE_IDS]);
 		expect(lifecycle.events.every((e) => e.ok && !e.degraded)).toBe(true);
 		expect(lifecycle.state).toBe("running");
 		expect(result.degradedStages).toEqual([]);
+		// …and each registered service fired strictly INSIDE its own stage slot
+		// (cron providers in stage 7, watcher-slot entries in stage 8, siblings
+		// in registration order, nothing firing anywhere else). The default 7/8
+		// bodies don't write timeline markers — the ENGINE's own per-service start
+		// logs carry the stage attribution instead.
+		expect(timeline).toEqual([
+			"stage:profile_override",
+			"stage:load_config",
+			"stage:boot_fingerprint",
+			"stage:duplicate_guard",
+			"stage:runtime_lock",
+			"stage:open_state_db",
+			"service:cron.ticker",
+			"service:hooks.extensions",
+			"service:kanban.dispatcher",
+			"service:delegation.watcher",
+			"service:handoff.watcher",
+			"stage:platform_adapters",
+			"stage:runtime_identity",
+		]);
+		const started = (name: string): string | undefined =>
+			captured.lines.find((l) => l.msg.includes(`service ${name} started`))
+				?.msg;
+		expect(started("cron.ticker")).toContain("(stage cron_scheduler)");
+		for (const name of [
+			"hooks.extensions",
+			"kanban.dispatcher",
+			"delegation.watcher",
+			"handoff.watcher",
+		]) {
+			expect(started(name)).toContain("(stage embedded_watchers)");
+		}
 	});
 
 	it("startup is IDEMPOTENT: a second call re-runs nothing", async () => {
@@ -207,5 +277,191 @@ describe("required-stage failure aborts startup", () => {
 		const second = await lifecycle.startup();
 		expect(second.ok).toBe(false); // memoized result, not a re-run
 		expect(second.failedStage).toBe(first.failedStage);
+	});
+});
+
+describe("registered per-service entries: isolation + shutdown (DEC-040)", () => {
+	function partialBodies(timeline: string[]): {
+		bodies: Partial<Record<StageId, StageBody>>;
+		lateCtx: StageContext[];
+	} {
+		const lateCtx: StageContext[] = [];
+		const bodies: Partial<Record<StageId, StageBody>> = {};
+		for (const id of STAGE_IDS) {
+			if (id === "cron_scheduler" || id === "embedded_watchers") continue;
+			bodies[id] = async (ctx) => {
+				timeline.push(`stage:${id}`);
+				if (id === "platform_adapters") lateCtx.push(ctx);
+			};
+		}
+		return { bodies, lateCtx };
+	}
+
+	it("a THROWING or degraded service is isolated: siblings still start, later stages still run, the STAGE completes ok", async () => {
+		const timeline: string[] = [];
+		const { bodies, lateCtx } = partialBodies(timeline);
+		const captured = captureLogger();
+		const lifecycle = new GatewayLifecycle({
+			home,
+			stageBodies: bodies,
+			logger: captured.logger,
+			services: {
+				cron_scheduler: [
+					{
+						name: "cron.ticker",
+						start: async () => {
+							timeline.push("service:cron.ticker");
+							throw new Error("tick lock exploded");
+						},
+					},
+					{
+						name: "cron.backup",
+						start: async () => {
+							timeline.push("service:cron.backup");
+							return {
+								ok: true,
+								handle: { name: "cron.backup", stop: async () => {} },
+							};
+						},
+					},
+				],
+				embedded_watchers: [
+					{
+						name: "kanban.dispatcher",
+						start: async () => {
+							timeline.push("service:kanban.dispatcher");
+							return { ok: false, degraded: true, reason: "board refused" };
+						},
+					},
+					{
+						name: "handoff.watcher",
+						start: async () => {
+							timeline.push("service:handoff.watcher");
+							return {
+								ok: true,
+								handle: { name: "handoff.watcher", stop: async () => {} },
+							};
+						},
+					},
+				],
+			},
+		});
+
+		const result = await lifecycle.startup();
+
+		// Startup CONTINUES and the stage slots complete ok — degradation is
+		// PER SERVICE, never a stage-level event here.
+		expect(result.ok).toBe(true);
+		expect(result.degradedStages).toEqual([]);
+		for (const stage of ["cron_scheduler", "embedded_watchers"] as const) {
+			const event = lifecycle.events.find((e) => e.stage === stage);
+			expect(event?.ok).toBe(true);
+			expect(event?.degraded).toBeUndefined();
+		}
+		// Both failures recorded per service, in fire order…
+		expect(lifecycle.degradedServices).toEqual([
+			{
+				stage: "cron_scheduler",
+				service: "cron.ticker",
+				reason: "tick lock exploded",
+			},
+			{
+				stage: "embedded_watchers",
+				service: "kanban.dispatcher",
+				reason: "board refused",
+			},
+		]);
+		// …logged LOUDLY at ERROR level with the degraded_start reason code.
+		const loud = captured.lines.filter((l) => l.level === "error");
+		expect(
+			loud.some(
+				(l) =>
+					l.msg.includes("cron.ticker DEGRADED") &&
+					l.msg.includes("tick lock exploded"),
+			),
+		).toBe(true);
+		expect(
+			loud.some(
+				(l) =>
+					l.msg.includes("kanban.dispatcher DEGRADED") &&
+					l.msg.includes("board refused"),
+			),
+		).toBe(true);
+		// Sibling services fired AFTER their failing peers; later stages ran.
+		expect(timeline.indexOf("service:cron.backup")).toBeGreaterThan(
+			timeline.indexOf("service:cron.ticker"),
+		);
+		expect(timeline.indexOf("service:handoff.watcher")).toBeGreaterThan(
+			timeline.indexOf("service:kanban.dispatcher"),
+		);
+		expect(timeline).toContain("stage:platform_adapters");
+		expect(timeline).toContain("stage:runtime_identity");
+		// Successful handles landed in the supervised ctx slots (drain input).
+		const ctx = lateCtx[0];
+		if (!ctx) throw new Error("stage 9 body never received ctx");
+		expect(ctx.services.cron.map((s) => s.name)).toEqual(["cron.backup"]);
+		expect(ctx.services.watchers.map((s) => s.name)).toEqual([
+			"handoff.watcher",
+		]);
+	});
+
+	it("a DISABLED outcome (ok:false, no degraded flag) is loud but NOT a degradation", async () => {
+		const timeline: string[] = [];
+		const { bodies, lateCtx } = partialBodies(timeline);
+		const captured = captureLogger();
+		const lifecycle = new GatewayLifecycle({
+			home,
+			stageBodies: bodies,
+			logger: captured.logger,
+		});
+		lifecycle.registerService("embedded_watchers", {
+			name: "kanban.dispatcher",
+			start: async () => ({
+				ok: false,
+				reason: "disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+			}),
+		});
+
+		const result = await lifecycle.startup();
+
+		expect(result.ok).toBe(true);
+		expect(lifecycle.degradedServices).toEqual([]);
+		const warns = captured.lines.filter((l) => l.level === "warn");
+		expect(
+			warns.some((l) => l.msg.includes("kanban.dispatcher not started")),
+		).toBe(true);
+		expect(captured.lines.some((l) => l.level === "error")).toBe(false);
+		expect(lateCtx[0]?.services.watchers).toEqual([]);
+		expect(timeline).toContain("stage:runtime_identity");
+	});
+
+	it("registered handles are STOPPED by the graceful drain", async () => {
+		let stopped = false;
+		const bodies: Partial<Record<StageId, StageBody>> = {};
+		for (const id of STAGE_IDS) {
+			if (id === "cron_scheduler" || id === "embedded_watchers") continue;
+			bodies[id] = async () => {};
+		}
+		const lifecycle = new GatewayLifecycle({
+			home,
+			stageBodies: bodies,
+		});
+		lifecycle.registerService("embedded_watchers", {
+			name: "handoff.watcher",
+			start: async () => ({
+				ok: true,
+				handle: {
+					name: "handoff.watcher",
+					stop: async () => {
+						stopped = true;
+					},
+				},
+			}),
+		});
+		await lifecycle.startup();
+
+		await lifecycle.requestShutdown();
+
+		expect(stopped).toBe(true);
 	});
 });
