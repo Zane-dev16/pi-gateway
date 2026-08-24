@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vitest run",
-    "check:layering": "node scripts/check-layering.mjs"
+    "check:layering": "node scripts/check-layering.mjs",
+    "check:secrets": "node scripts/check-secret-scope.mjs"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
