@@ -115,7 +115,7 @@ in `../09-open-questions.md` (append-only).
 - Phase 0 (2026-08-23): workflow `pi_gateway_phase_0_spike` — scaffold + 3 parallel
   proof agents + verifier. PASS: 46/46 (12 lease / 8 stream / 22 WAL contracts +
   4 driver-evidence), tsc clean, footprint confined to spike/ + harness configs.
-  Commits `8e85b9f` (scaffold) + `f76b515` (proofs) pushed to origin/main.
+  Commits `9fc1a20` (scaffold) + `2618c14` (proofs) pushed to origin/main.
   DEC-023 verification entry appended in ../09-open-questions.md. Residuals for
   later phases: SIGHUP→SIG_IGN installability, ws transport, Windows-gated test
   variant.
