@@ -97,11 +97,14 @@ export abstract class BasePlatformAdapter {
 	protected guard: AdapterSessionGuard | null = null;
 
 	/**
-	 * THE session-scoped formatting ladder — ONE instance per adapter so the
-	 * rich-downgrade latch persists for the session (probe once per process,
-	 * §10.1). Subclasses override wireRich/wireSend; the ladder binds lazily.
+	 * Session-scoped rich-downgrade latch state (§10.1 "probe once per
+	 * process"). The FormattingLadder instance itself is per-chunk (its
+	 * transport closures bind the CURRENT delivery's chat); this state is
+	 * carried in and out of every chunk so the latch still persists across
+	 * chunks and sends. Subclasses override wireRich/wireSend.
 	 */
-	private ladder: FormattingLadder | null = null;
+	private ladderRichDisabled = false;
+	private ladderLatchCount = 0;
 
 	constructor(deps: BaseAdapterDeps) {
 		this.manifestName = deps.manifestName;
@@ -334,25 +337,30 @@ export abstract class BasePlatformAdapter {
 		chunk: string,
 		metadata: Metadata,
 	): Promise<SendResult> {
-		// ONE session-scoped ladder instance — the rich-downgrade latch must
-		// persist across chunks and sends (§10.1 "probe once per process").
-		if (this.ladder === null) {
-			this.ladder = new FormattingLadder(
-				{
-					tryRich: (c, md) => this.wireRich(c, md),
-					sendConverted: (c, md) => this.wireSend(chatId, c, md),
-					sendPlain: (c, md) => this.wireSend(chatId, c, md),
-				},
-				{
-					log: this.logger?.warn
-						? (m, meta) => this.logger?.warn?.(m, meta)
-						: undefined,
-				},
-			);
-		}
-		const ladder = this.ladder;
+		// The rich-downgrade latch is SESSION-scoped (§10.1 "probe once per
+		// process") — but the transport seams must bind THIS delivery's chat:
+		// caching ONE ladder whose closures capture the first chatId misroutes
+		// every later cross-chat tier-2/tier-3 send. So: fresh ladder per
+		// chunk, latch state carried in and back out (identical observable
+		// semantics, correct chat routing).
+		const ladder = new FormattingLadder(
+			{
+				tryRich: (c, md) => this.wireRich(c, md),
+				sendConverted: (c, md) => this.wireSend(chatId, c, md),
+				sendPlain: (c, md) => this.wireSend(chatId, c, md),
+			},
+			{
+				log: this.logger?.warn
+					? (m, meta) => this.logger?.warn?.(m, meta)
+					: undefined,
+			},
+		);
+		ladder.richSendDisabled = this.ladderRichDisabled;
+		ladder.richLatchCount = this.ladderLatchCount;
 
 		const outcome = await ladder.sendText(chunk, metadata);
+		this.ladderRichDisabled = ladder.richSendDisabled;
+		this.ladderLatchCount = ladder.richLatchCount;
 		if (outcome.success) return outcome;
 
 		// A transient RICH failure is NEVER legacy-resent (§10.1 duplicate
