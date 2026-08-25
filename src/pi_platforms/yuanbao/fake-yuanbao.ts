@@ -161,7 +161,7 @@ export class FakeYuanbaoGateway {
 	/** Client→server frames received (identify/ping/ack audit). */
 	readonly receivedFrames: Array<{ kind: string; msgId?: string | undefined }> =
 		[];
-/** Decoded client→server send_message frames, in wire order (row audit). */
+	/** Decoded client→server send_message frames, in wire order (row audit). */
 	readonly sentMessages: YbWireSend[] = [];
 	/** Per-group member-list responses served for get_group_member_list;
 	 * an absent group answers code=50004 "group not found" with no members. */

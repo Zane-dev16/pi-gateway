@@ -365,7 +365,9 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 						{ msg_type: "TIMTextElem", msg_content: { text: "binary hi" } },
 					],
 				});
-				await eventually(() => engine.turnLog.includes("binary hi"));
+				// Inbound pushes park in the per-sender DEBOUNCE_WINDOW (injected
+				// time) — pump the clock until the merged turn delivers.
+				await eventuallyPumped(() => engine.turnLog.includes("binary hi"), fx);
 				expect(gateway.pushLog[0]?.acked).toBe(true);
 				expect(gateway.receivedFrames.some((f) => f.kind === "push-ack")).toBe(
 					true,
@@ -415,7 +417,10 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 					fx,
 				);
 
-				// Duplicate id drops exactly-once.
+				// Duplicate id drops exactly-once: the redelivered bin-1 arrives
+				// in a LATER debounce window (the original already flushed) and
+				// dedup absorbs it — NO additional turn may appear.
+				const turnsBeforeDup = engine.turnLog.length;
 				gateway.pushMessage({
 					from_account: "u_bin",
 					msg_id: "bin-1",
@@ -424,8 +429,12 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 						{ msg_type: "TIMTextElem", msg_content: { text: "binary hi" } },
 					],
 				});
-				await new Promise<void>((r) => setTimeout(r, 20));
+				for (let i = 0; i < 30; i++) {
+					await fx.clock.advance(100);
+					await new Promise<void>((r) => setTimeout(r, 2));
+				}
 				expect(engine.turnLog.filter((t) => t === "binary hi")).toHaveLength(1);
+				expect(engine.turnLog.length).toBe(turnsBeforeDup);
 			},
 		),
 		mk(
@@ -438,12 +447,41 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 
 				subject.adapter.holdTurns(true);
 				gateway.pushMessage(pushTextHeld("hb-1", "u_hb"));
-				// While held: RUNNING ticks accumulate; FINISH never fires yet.
-				await new Promise<void>((r) => setTimeout(r, 120));
-				const runningCount = engine.replyHeartbeats.filter(
-					(h) => h.val === 1 && h.chatId === "direct:u_hb",
-				).length;
-				expect(runningCount).toBeGreaterThanOrEqual(2);
+				// The push parks in the DEBOUNCE_WINDOW (injected time): pump the
+				// clock until the held turn starts RUNNING (real-timer ticks at
+				// replyHeartbeatIntervalMs=20 once dispatched) AND stays held past
+				// slowResponseTimeoutMs so the notice fires mid-turn.
+				let runningCount = 0;
+				const noticeSeen = () =>
+					engine.serverSends.some((s) => s.text.includes("任务有点复杂"));
+				for (
+					let i = 0;
+					i < 200 &&
+					(runningCount < 2 || !noticeSeen()) &&
+					!engine.replyHeartbeats.some(
+						(h) => h.val === 2 && h.chatId === "direct:u_hb",
+					);
+					i++
+				) {
+					await world.clock.advance(50);
+					await new Promise<void>((r) => setTimeout(r, 10));
+					runningCount = engine.replyHeartbeats.filter(
+						(h) => h.val === 1 && h.chatId === "direct:u_hb",
+					).length;
+				}
+				// While held: RUNNING ticks accumulated and the slow-response
+				// notice already fired mid-turn; FINISH never fires yet.
+				expect(
+					engine.replyHeartbeats.filter(
+						(h) => h.val === 1 && h.chatId === "direct:u_hb",
+					).length,
+				).toBeGreaterThanOrEqual(2);
+				expect(noticeSeen()).toBe(true);
+				expect(
+					engine.replyHeartbeats.some(
+						(h) => h.val === 2 && h.chatId === "direct:u_hb",
+					),
+				).toBe(false);
 
 				subject.adapter.holdTurns(false);
 				await eventually(() =>
@@ -490,7 +528,7 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 					false,
 				);
 
-				// DM pairing admits; @-stripped delivery on groups via open policy.
+				// DM pairing admits.
 				gateway.pushMessage({
 					from_account: "u_dm",
 					msg_id: "d-1",
@@ -499,27 +537,53 @@ function ybDeltaRows(newFixture: () => Promise<YbFixture>): ConformanceRow[] {
 						{ msg_type: "TIMTextElem", msg_content: { text: "dm hello" } },
 					],
 				});
-				await eventually(() => engine.turnLog.includes("dm hello"));
-
-				(engine as unknown as { groupPolicy: string }).groupPolicy = "open";
-				(engine as unknown as { botNickname: string }).botNickname = "Helper";
-				gateway.pushMessage({
-					from_account: "u_grp2",
-					msg_id: "g-2",
-					group_code: "g_open",
-					callback_command: "",
-					msg_body: [
-						{
-							msg_type: "TIMTextElem",
-							msg_content: { text: "@Helper do thing" },
-						},
-					],
-				});
-				await eventually(() =>
-					engine.turnLog.some((t) => t.includes("do thing")),
+				await eventuallyPumped(
+					() => engine.turnLog.includes("dm hello"),
+					world,
 				);
-				const delivered = engine.turnLog.find((t) => t.includes("do thing"))!;
-				expect(delivered.startsWith("@")).toBe(false); // mention STRIPPED
+
+				// 'open' policy is OPT-IN ONLY (AccessPolicy._open_dm_opted_in
+				// parity): without GATEWAY/YUANBAO_ALLOW_ALL_USERS both the group
+				// and DM open policies DENY; the env flag alone unlocks them.
+				(engine as unknown as { dmPolicy: string }).dmPolicy = "open";
+				(engine as unknown as { groupPolicy: string }).groupPolicy = "open";
+				expect(engine.isDmIntakeAllowed("u_anyone")).toBe(false);
+				expect(engine.isGroupAllowed("g_any")).toBe(false);
+
+				const prevGatewayFlag = process.env["GATEWAY_ALLOW_ALL_USERS"];
+				const prevYbFlag = process.env["YUANBAO_ALLOW_ALL_USERS"];
+				try {
+					process.env["GATEWAY_ALLOW_ALL_USERS"] = "true";
+					expect(engine.isDmIntakeAllowed("u_anyone")).toBe(true);
+					expect(engine.isGroupAllowed("g_any")).toBe(true);
+
+					(engine as unknown as { botNickname: string }).botNickname = "Helper";
+					gateway.pushMessage({
+						from_account: "u_grp2",
+						msg_id: "g-2",
+						group_code: "g_open",
+						callback_command: "",
+						msg_body: [
+							{
+								msg_type: "TIMTextElem",
+								msg_content: { text: "@Helper do thing" },
+							},
+						],
+					});
+					await eventuallyPumped(
+						() => engine.turnLog.some((t) => t.includes("do thing")),
+						world,
+					);
+					const delivered = engine.turnLog.find((t) => t.includes("do thing"))!;
+					expect(delivered.startsWith("@")).toBe(false); // mention STRIPPED
+				} finally {
+					if (prevGatewayFlag === undefined)
+						delete process.env["GATEWAY_ALLOW_ALL_USERS"];
+					else process.env["GATEWAY_ALLOW_ALL_USERS"] = prevGatewayFlag;
+					if (prevYbFlag === undefined)
+						delete process.env["YUANBAO_ALLOW_ALL_USERS"];
+					else process.env["YUANBAO_ALLOW_ALL_USERS"] = prevYbFlag;
+				}
 
 				// Self-skip: bot-authored messages never become turns.
 				const before = engine.turnLog.length;

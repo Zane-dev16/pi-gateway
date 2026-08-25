@@ -255,8 +255,7 @@ export class YuanbaoAdapter extends BasePlatformAdapter {
 			opts.replyHeartbeatIntervalMs ?? REPLY_HEARTBEAT_INTERVAL_S * 1000;
 		this.slowResponseTimeoutMs =
 			opts.slowResponseTimeoutMs ?? SLOW_RESPONSE_TIMEOUT_S * 1000;
-		this.debounceWindowMs =
-			opts.debounceWindowMs ?? DEBOUNCE_WINDOW_S * 1000;
+		this.debounceWindowMs = opts.debounceWindowMs ?? DEBOUNCE_WINDOW_S * 1000;
 		this.egressCapture = opts.egressCapture;
 		this.richProbe = opts.richProbe;
 		this.richHasScriptFn = opts.richHasScript;
@@ -547,7 +546,7 @@ export class YuanbaoAdapter extends BasePlatformAdapter {
 		}
 	}
 
-async disconnect(): Promise<void> {
+	async disconnect(): Promise<void> {
 		this.running = false;
 		this.isLive = false;
 		this.socket?.close(1000);
@@ -558,9 +557,9 @@ async disconnect(): Promise<void> {
 		this.debounceBuffers.clear();
 		this.debounceTokens.clear();
 		this.signManager.clearLocks();
-}
+	}
 
-private openAndAuth(tokenData: SignTokenData): Promise<void> {
+	private openAndAuth(tokenData: SignTokenData): Promise<void> {
 		return new Promise<void>((resolve, reject) => {
 			const listener: YbSocketListener = {
 				onOpen: () => {},
@@ -581,17 +580,17 @@ private openAndAuth(tokenData: SignTokenData): Promise<void> {
 					// the handshake FAILS CLOSED — if BIND_ACK has not resolved the
 					// wait within 10s the connect rejects (never hangs unbounded).
 					void this.sleepFn(AUTH_TIMEOUT_S * 1000).then(() => {
-										if (this.pendingBind === pending) {
-												this.pendingBind = null;
-												reject(new Error("AUTH_BIND timeout"));
-										}
+						if (this.pendingBind === pending) {
+							this.pendingBind = null;
+							reject(new Error("AUTH_BIND timeout"));
+						}
 					});
 				})
 				.catch((err: unknown) =>
 					reject(err instanceof Error ? err : new Error(String(err))),
 				);
 		});
-}
+	}
 
 	private async waitForOpen(): Promise<void> {
 		for (let i = 0; i < 100 && this.socket?.readyState !== "open"; i++) {
@@ -1412,8 +1411,7 @@ function encodeAuthBindRaw(
 		appVersion: SIGN_APP_VERSION,
 		operationSystem: process.platform,
 		botVersion: SIGN_BOT_VERSION,
-		routeEnv:
-			adapter.routeEnv !== "" ? adapter.routeEnv : tokenData.route_env,
+		routeEnv: adapter.routeEnv !== "" ? adapter.routeEnv : tokenData.route_env,
 	});
 }
 

@@ -25,7 +25,7 @@
 
 import { FakePlatformWire } from "../conformance/wire.js";
 import type { WsFixture } from "../conformance/shapes.js";
-import type { ManualClock } from "../persistent-ws/manual-clock.js";
+import { ManualClock } from "../persistent-ws/manual-clock.js";
 import { chunkWithFenceCarry } from "../kit/chunking.js";
 import { eventually } from "./eventually.js";
 import { FakeYuanbaoGateway } from "./fake-yuanbao.js";
@@ -144,7 +144,11 @@ export function makeRealYBFixture(): WsFixture {
 			gateway.pushMessage(pushText("r-1", "u_replay", "r1"));
 			await world.clock.advance(2_000); // flush the dup's own window
 			await new Promise<void>((r) => setTimeout(r, 4));
-			if (engine.turnLog.some((t) => t.split("\n").includes("r1") && t !== "r1\nr2")) {
+			if (
+				engine.turnLog.some(
+					(t) => t.split("\n").includes("r1") && t !== "r1\nr2",
+				)
+			) {
 				throw new Error(
 					`exactly-once violated for r-1: ${JSON.stringify(engine.turnLog)}`,
 				);
