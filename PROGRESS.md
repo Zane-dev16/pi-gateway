@@ -83,6 +83,75 @@ in `../09-open-questions.md` (append-only).
 
 ## Log
 
+- STABILITY FIX CLUSTER `simplex-r2` (2026-08-25): round-2 findings spx-1..spx-5
+  applied toward Hermes truth (/tmp/hermes-upstream plugins/platforms/simplex/
+  adapter.py anchors). spx-1 image/video doors (send_image/send_image_file/
+  send_video @~1010-1105): sendImage accepts file:// (unquote) and http(s)
+  (cache seam → default fetch+tempdir port of base.py:cache_image_from_url),
+  PNG-prepares via an injectable_prepare_image seam (default = Hermes'
+  no-converter fallback posture: original bytes, empty thumb, logged), ships
+  the correlated '/_send @id|#gid json [{filePath,msgContent:{type:"image",
+  image:<thumb-data-uri>,text}}]' shape byte-exact (awaited reply; null ⇒
+  "Failed to send image"), video routes send_document, +sendMultipleImages so
+  the post-stream rescan lane stops skipping images. spx-2 listChannels
+  (:870-935): correlated '/contacts'+'/groups' (10s bounds) parse display-
+  name/id-only/[groupInfo,pair] forms into {id,name,type} entries; disconnected
+  or unresponsive ⇒ NULL (never []) so the directory keeps prior targets;
+  failed /groups tolerated with contacts kept; false "list_channels out of
+  scope" header claim DELETED (no report backs it). spx-3 __init__ env
+  resolution (@157-176): SIMPLEX_AUTO_ACCEPT ('0/false/no/empty'⇒false,
+  case-insensitive, set-but-empty disables even over an injected true; env
+  beats opt), SIMPLEX_GROUP_ALLOWED comma-split via _parse_comma_list parity
+  (set-but-empty falls back to opt like Python `getenv(K,"") or extra.get`),
+  HERMES_SIMPLEX_TEXT_BATCH_DELAY seconds through THE batch-delay helper which
+  now has a caller (env wins over opt; invalid ⇒ default 0.8s). spx-4
+  probeReachability races open_timeout=10 (:296): stalled-handshake daemons
+  resolve FALSE at the bound instead of hanging connect(), probe socket closed.
+  spx-5 keepalive carrier (_ws_listener ping_interval=20/ping_timeout=20):
+  SimplexConnection gains optional ping() + listener onPong(), adapter-side
+  wsKeepaliveLoop pings every 20s, a ping unanswered past 20s closes 1011
+  "ping timeout" into the SAME ladder (websockets abort parity); FakeSimplexDaemon
+  answers pongs 1:1 unless stallPongs() (wedged-zombie shape); health monitor
+  stays LOG-ONLY now that the carrier exists; false "websockets client already
+  pings" comments corrected in manifest/adapter headers (pi embeds no websockets
+  library — the SEAM owns liveness). Tests: five new delta rows
+  (image-video-doors / channel-directory / env-config-resolution /
+  probe-open-timeout / ping-pong-keepalive) through the real engine fixture;
+  pre-existing rows re-proven (keepalive pings bypass the JSON command stream,
+  pongs don't mask application-idle posture). Area green (simplex-rows 8/8);
+  tsc clean in cluster files; layering+secret gates green; full-suite failures
+  confined to OTHER clusters' in-flight areas (qqbot/a2a/weixin mid-edit).
+
+- STABILITY FIX CLUSTER `buzz-r2` (2026-08-25): round-2 findings buzz-1/2/3 applied
+  toward Hermes truth (/tmp/hermes-upstream plugins/platforms/buzz/adapter.py anchors).
+  buzz-1: THE LIVE NIP-42 WEBSOCKET LOOP PORTED behind the wsStarter establishment seam
+  (_websocket_url/_start_websocket/_authenticate_websocket/_subscribe_websocket/
+  _handle_membership_event/_websocket_loop) — new relay-wire.ts injects the socket MEDIUM
+  (the port never opens real sockets; FakeBuzzCli precedent): AUTH-challenge parse
+  (NOTICE/CLOSED/garbage ⇒ ConnectionError ladder), ['AUTH',signed kind-22242] reply via
+  nostr-auth buildAuthEvent (+BUZZ_AUTH_TAG), OK-wait keyed on OUR event id (false ⇒
+  rejected(reason)), per-channel REQ {'kinds':[9],'#h':[ch],'since':max(watermark,now)−1}
+  - membership REQ {'kinds':[44100],'#p':[pk]} (sub ids hermes-buzz-N /
+  hermes-buzz-membership), EVENT/CLOSED/NOTICE routing through THE poll-plane handleEvent
+  machinery (dedupe/mention-gate/DM-latch identical), live DM rediscovery on kind-44100
+  (new subs hermes-buzz-dm-N, fresh watermark ⇒ history dispatches once), 1→30s reconnect
+  backoff with disconnect-interruptible sleeps + post-auth reset, ready window 20+5s ⇒
+  teardown (auto falls back to POLL; pinned websocket fails FATAL ws_auth_failed retryable
+  — source truth); no factory wired keeps the pre-loop posture. FakeBuzzRelay VERIFIES
+  auth events independently (NIP-01 id recompute + spec BIP-340 verify over exported
+  primitives). buzz-2: resolveCliPath ~/bin/buzz fallback EXPANDS (adapter.py Path.home()/'bin'/'buzz'
+  parity) — probed AND returned expanded; literal tilde argv[0] gone. buzz-3: runCli races
+  the executor against BUZZ_CLI_TIMEOUT_S=30 returning rc124 {"error":"timeout",
+  "message":"buzz <sub> timed out after 30s"} kill-parity (_exec_buzz asyncio.wait_for) —
+  AbortSignal handed to executors for cooperative kill, abandoned calls contained, loser
+  timers cancelled (injected-clock deterministic). Tests: resolveCliPath row re-pinned to
+  conforming expansion; NEW delta rows ws-live-handshake-subscription / ws-event-routing-dedupe /
+  ws-kind-filter-parity (SECOND mutant detector — gate updated to two detectors, one per
+  inbound lane) / ws-closed-reconnect-backoff / ws-membership-live-dm-discovery /
+  ws-auth-failure-ladder / cli-executor-timeout-race. Buzz area 11/11 ×2; tsc clean in cluster;
+  layering + secret gates green; full-suite failures confined to foreign in-flight areas
+  (qqbot/signal — proven independent by stash-run). No DEC required: implementation REMOVES
+  the divergence (medium-only substitution documented in manifest exclusions #1 rewrite).
 - STABILITY FIX CLUSTER `photon-r2` (2026-08-25): round-2 findings ph-1..ph-5 applied
   toward Hermes truth at /tmp/hermes-upstream anchors (plugins/platforms/photon/
   adapter.py + gateway/platforms/base.py). ph-1: sendClarify renders base.py:send_clarify's
@@ -669,6 +738,42 @@ in `../09-open-questions.md` (append-only).
   receiver-side verification now exercises spaced separators); tsc clean for
   cluster files; layering/secret gates green (residual full-tree failures are
   the sibling qqbot cluster's untracked scratch files — zero a2a overlap).
+
+- Stability round-2 fix cluster `signal-r2` (2026-08-26): signal platform
+  moved onto Hermes truth at /tmp/hermes-upstream/gateway/platforms/signal.py
+  anchors. sigbb-2: SignalCliTransport.openEventStream(account) — the SSE
+  listener passes this.account on EVERY open (connect + reconnect ladder),
+  matching GET /api/v1/events?account={quote(account, safe='')}
+  (signal.py:_sse_listener :454); FakeSignalCliServer records the account per
+  connectionLog entry so the account-scoped routing is assertable on the wire
+  seam; harness bridge signature updated (still fixture-only). sigbb-3: the
+  rpc seam gains optional timeoutMs threaded adapter.rpc → transport.rpc, and
+  batchSendAttachments passes signalSendTimeout(n) per batch RPC ('void
+  timeout' removed) — max(60s, 5s·n) with the 30s n≤0 default
+  (signal_rate_limit.py:_signal_send_timeout); fake captures timeoutMs per
+  call. sigbb-4: deliverText converts the WHOLE message via markdownToSignal
+  FIRST, then splits the CONVERTED UTF-16 text via splitSignalFormattedMessage
+  (port of_split_signal_formatted_message/_utf16_offsets/_styles_for_chunk,
+  signal.py :1080-1180) translating bodyRanges per chunk — convert-after-chunk
+  lost boundary-crossing styles and leaked literal ** markers. Chunks carry "
+  (i/n)" labels post-translation; wireSend wires pre-translated ranges through
+  a per-chunk activeChunkStyles binding (reconverting converted text would
+  drop every range); §6.1 plain-text fallback for single-chunk deliveries
+  resends the ORIGINAL content bytes (rows.ts parse-failure-resend contract
+  preserved unmodified). DEC-047 plan-byte-exact engine rows re-expressed in
+  converted-plan shape (byte-exact splitter output + label + translated
+  ranges). sigbb-8: batchSendAttachments stat-gates every entry BEFORE slicing
+  — missing files and >SIGNAL_MAX_ATTACHMENT_SIZE entries skipped
+  (send_multiple_images :1325-1355 parity; zero valid ⇒ zero RPCs/outcomes);
+  DEC-019 single-attachment verdict-shaped gates untouched. Tests conformed:
+  batch rows use REAL files (sparse truncateSync oversize), NEW contracts for
+  account-scoped stream opens (connect+reconnect), timeout scaling (160s/60s
+  floor), stat-gate skip lanes, cross-boundary style preservation, span-clip
+  across 4 chunks, no-marker leakage. Suite: signal-engine 58/58 +
+  conformance/signal-rows 7/7 (full-catalog merge gate green); tsc clean;
+  residual full-tree failures are the sibling qqbot cluster's untracked files
+  (dbg2/qqbot-attachments — zero signal imports).
+
 - Stability round-2 fix cluster `weixin-r2` (2026-08-26): weixin adapter moved onto Hermes
   truth at /tmp/hermes-upstream/gateway/platforms/weixin.py anchors (all seven findings; no
   DEC deltas — every change converges toward reference behavior). wx-1: generic vendor send
@@ -717,3 +822,50 @@ in `../09-open-questions.md` (append-only).
   wrap ×4, wx-6 mime-prefix ×2, wx-7 opt-in gates ×3); weixin-rows 8/8 incl. full-catalog merge
   gate + transport rows; tsc clean for cluster scope. Residual full-tree failures confined to
   sibling clusters' in-flight files (qqbot attachments/dbg2, signal engine — zero weixin imports).
+
+- Stability round-2 fix cluster `qqbot-r2` (2026-08-25): 5 findings, single-owner
+  slice (cn-exotics axis), all parity restorations toward Hermes truth with DEC-055/056
+  logged for the two deliberate scoping deltas. qq-1: inbound attachment processing
+  PORTED (adapter.py:_process_attachments/_stt_voice_attachment/_call_stt) — CDN GETs
+  carry 'QQBot <token>' (_qq_media_headers, '//'-URL https-normalization), voice chain
+  asr_refer_text → pre-converted voice_wav_url → DIRECT HTTPS POST
+  {base_url}/audio/transcriptions (Bearer + multipart model+audio/wav parts; parses BOTH
+  GLM choices[0].message.content and OpenAI {text}), '[Voice] …' block appends so
+  VOICE-ONLY turns deliver instead of hitting the empty-text/no-image drop gate; the
+  FALSE 'external ffmpeg+whisper daemons' exclusion comment replaced with honest seams:
+  _call_stt is a direct call (production defaultByteFetch over node:http(s), 30s abort,
+  redirect re-gated) and SILK→WAV rides an injected convertVoiceToWav bridge
+  (absent ⇒ '[语音识别失败]' exactly like Hermes without ffmpeg); tools/url_safety.
+  is_safe_url ported at the production sink (scheme/private-IP/DNS fail-closed +
+  PI_QQ_MEDIA_HOST_ALLOWLIST suffix lock-down per hop). qq-2: MessageEvent
+  media_urls/media_types populate from image attachments (cached paths under optional
+  mediaCacheDir — DEC-056 — else vendor URLs), '[file|video: name (ref)]'
+  attachment-info lines append for files/videos, msg_type-103 quoted attachments run
+  the SAME pipeline with quoted images unioning onto the media lists and quoted voice
+  riding inside the quote block; event messageType from adapter.py:_detect_message_type
+  (media wins over text). qq-3: transmitMedia falls back to a '{caption}\n{image_url}'
+  TEXT send after ANY http(s)-source IMAGE failure (adapter.py:send_image verbatim;
+  local-file/voice/video/document lanes never fall back). qq-4: wireSend,
+  transmitMedia AND sendWithKeyboard gate on the listener ahead of ALL REST legs —
+  bounded _wait_for_reconnection polls (15s × 0.5s via the injected sleep seam) then
+  retryable 'Not connected'; gate scoped to live-gateway faces per DEC-055 (capture
+  faces stay open); DEC-044 Retry-After capture untouched, DEC-046 timeout-no-retry
+  preserved. qq-7: timeoutS now ENFORCED through QQRestTransport legs — apiRequest
+  races the transport against the injected clock ('QQ Bot API timeout [path]'
+  classification shape), DEFAULT_API_TIMEOUT(30s) on API/token/gateway-url/interaction-
+  ACK legs, FILE_UPLOAD_TIMEOUT(120s) on upload legs (COS PUT keeps its 300s),
+  ONBOARD_API_TIMEOUT(10s) threaded into createBindTask/pollBindResult; hung legs
+  raise INTO classification instead of stalling forever. Manifest data: reconnect-wait/
+  poll, media HTTP timeout, STT provider table + env names + default models. Fixture/
+  subject gained byteFetch/stt/mediaCacheDir/convertVoiceToWav passthroughs. New
+  behavior-contract suite qqbot-attachments.test.ts (16 rows: STT chain ×5, media-ref
+  carriage ×4, connection gate ×4, per-leg timeouts ×3 incl. DEC-046 single-attempt
+  proof); qqbot-media no-file_info row conformed to the send_image fallback truth (+new
+  raw-lane no-fallback row). qqbot suites 37/37, conformance qqbot-rows 8/8 (shared +
+  transport family + deltas + full catalog), tsc clean for cluster scope. Full-tree
+  failures confined to sibling clusters' in-flight files (irc/bluebubbles/email/photon/
+  weixin — zero qqbot imports; kit/ and pi_gateway/ untouched by any cluster).
+  FORENSICS NOTE: mid-cluster, a concurrent cluster's `git reset --hard` wiped this
+  tree's uncommitted qqbot baseline (recovered byte-exact from dangling WIP commit
+  b47129d) and an over-broad `git add -A` sweep committed partial qqbot fixture state
+  under the telegram-r2 commit; this cluster's own commit is scoped to its paths only.

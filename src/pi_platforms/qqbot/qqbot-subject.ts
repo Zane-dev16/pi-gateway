@@ -24,7 +24,12 @@ import {
 	type ConformanceSubject,
 } from "../conformance/harness.js";
 
-import { QQBotAdapter, type QQRestTransport } from "./qqbot-adapter.js";
+import {
+	QQBotAdapter,
+	type QQRestTransport,
+	type QQByteFetch,
+	type QQSttOptions,
+} from "./qqbot-adapter.js";
 import { FakeQQGateway } from "./fake-qq-gateway.js";
 import { QQBOT_PLUGIN_MANIFEST } from "./manifest.js";
 
@@ -41,6 +46,16 @@ export interface QQSubjectOptions {
 	markdownSupport?: boolean | undefined;
 	/** Local-media byte seam (fixtures inject; production reads the fs). */
 	readFileBytes?: ((path: string) => Buffer) | undefined;
+	/** Byte-level HTTPS seam for CDN/STT attachment planes (fixtures script). */
+	byteFetch?: QQByteFetch | undefined;
+	/** Inbound media cache dir (Hermes cache_*_from_bytes parity). */
+	mediaCacheDir?: string | undefined;
+	/** STT backend config (adapter.py:_resolve_stt_config priority 1). */
+	stt?: QQSttOptions | undefined;
+	/** SILK/raw-audio → WAV bridge seam (fixtures script). */
+	convertVoiceToWav?:
+		| ((audio: Buffer, filename: string) => Promise<Buffer | null>)
+		| undefined;
 }
 
 /**
@@ -157,6 +172,14 @@ export class QQBotSubject implements ConformanceSubject {
 				: {}),
 			...(opts.readFileBytes !== undefined
 				? { readFileBytes: opts.readFileBytes }
+				: {}),
+			...(opts.byteFetch !== undefined ? { byteFetch: opts.byteFetch } : {}),
+			...(opts.mediaCacheDir !== undefined
+				? { mediaCacheDir: opts.mediaCacheDir }
+				: {}),
+			...(opts.stt !== undefined ? { stt: opts.stt } : {}),
+			...(opts.convertVoiceToWav !== undefined
+				? { convertVoiceToWav: opts.convertVoiceToWav }
 				: {}),
 			rest: makeRestCapture(this.wire, this.gateway),
 			wsFactory: this.gateway,

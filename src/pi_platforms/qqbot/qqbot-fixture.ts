@@ -53,6 +53,16 @@ export interface MakeQQWorldOptions {
 	markdownSupport?: boolean | undefined;
 	/** Local-media byte seam (fixtures inject; production reads the fs). */
 	readFileBytes?: ((path: string) => Buffer) | undefined;
+	/** Byte-level HTTPS seam for CDN/STT attachment planes (fixtures script). */
+	byteFetch?: import("./qqbot-adapter.js").QQByteFetch | undefined;
+	/** Inbound media cache dir (Hermes cache_*_from_bytes parity; fixtures tmpdir). */
+	mediaCacheDir?: string | undefined;
+	/** STT backend config (adapter.py:_resolve_stt_config priority 1). */
+	stt?: import("./qqbot-adapter.js").QQSttOptions | undefined;
+	/** SILK/raw-audio → WAV bridge seam (fixtures script). */
+	convertVoiceToWav?:
+		| ((audio: Buffer, filename: string) => Promise<Buffer | null>)
+		| undefined;
 }
 
 /** Push a C2C_MESSAGE_CREATE dispatch through the fake gateway. */
@@ -92,6 +102,14 @@ export function makeQQWorld(opts: MakeQQWorldOptions = {}): QQWorld {
 		markdownSupport: opts.markdownSupport,
 		...(opts.readFileBytes !== undefined
 			? { readFileBytes: opts.readFileBytes }
+			: {}),
+		...(opts.byteFetch !== undefined ? { byteFetch: opts.byteFetch } : {}),
+		...(opts.mediaCacheDir !== undefined
+			? { mediaCacheDir: opts.mediaCacheDir }
+			: {}),
+		...(opts.stt !== undefined ? { stt: opts.stt } : {}),
+		...(opts.convertVoiceToWav !== undefined
+			? { convertVoiceToWav: opts.convertVoiceToWav }
 			: {}),
 	});
 	// Injected clock: the engine sleeps through THIS clock for ladders/retries.

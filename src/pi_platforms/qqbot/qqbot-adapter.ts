@@ -8,22 +8,62 @@
 //   adapter.py:_listen_loop              — close-code classes, quick-disconnect,
 //                                          fixed backoff tiers [2,5,10,30,60]
 //   adapter.py:_handle_c2c/group/guild/dm_message — intake ACLs, @-strip,
-//                                          quoted-context merge (msg_type 103)
+//                                          quoted-context merge (msg_type 103),
+//                                          uniform attachment processing
+//   adapter.py:_process_attachments      — inbound attachment pipeline: images →
+//                                          cached media refs (media_urls/types),
+//                                          voice → asr_refer_text → voice_wav_url
+//                                          → STT POST {base}/audio/transcriptions
+//                                          ('[Voice] …'), files/videos →
+//                                          '[file|video: name (path)]' lines
+//   adapter.py:_qq_media_headers         — 'QQBot <token>' auth on CDN GETs
+//   adapter.py:send_image                — URL-source failure falls back to a
+//                                          text send '{caption}\n{image_url}'
+//   adapter.py:_wait_for_reconnection    — sends gate on is_connected and poll
+//                                          reconnect ≤15s before REST legs;
+//                                          exhaustion ⇒ retryable 'Not connected'
 //   adapter.py:send/_send_chunk          — markdown v2 body, msg_seq, retry
 //   adapter.py:send_with_keyboard        — keyboard attach (c2c/group only)
+//   adapter.py:_send_media               — native media lane: upload →
+//                                          file_info → msg_type=7 body
+//                                          {media:{file_info},content?,msg_id?,msg_seq}
+//   adapter.py:send_typing               — msg_type=6 input_notify, ~50s
+//                                          debounced, C2C-only, last-msg-id driven
+//   adapter.py:_api_request              — per-leg httpx timeout raising INTO
+//                                          classification ('QQ Bot API timeout')
+//   utils.py:build_user_agent            — descriptive UA on gateway-url GET,
+//                                          every _api_request and interaction ACK
 //   adapter.py:_on_interaction           — prompt ACK then dispatch
 //   adapter.py:_is_duplicate             — 300s window / 1000-entry bound
 //
 // Probe-computed exclusions (documented honestly, never faked green):
-//   • Voice STT / silk→wav conversion (Hermes delegates to external ffmpeg +
-//     whisper daemons) — voice attachments surface an attachment-info line.
+//   • SILK→WAV audio conversion (Hermes shells out to local ffmpeg/pilk via
+//     _convert_audio_to_wav) rides the convertVoiceToWav option — hosts wire
+//     their own bridge. The STT API call itself (adapter.py:_call_stt) is a
+//     DIRECT HTTPS POST to {base_url}/audio/transcriptions (Bearer +
+//     multipart), NOT an external daemon. Without a converter OR Tencent's
+//     pre-converted voice_wav_url, raw-SILK voices surface
+//     '[Voice] [语音识别失败]' exactly like Hermes without ffmpeg installed.
+//   • tools/url_safety.is_safe_url is ported at the production byte-fetch sink
+//     (scheme allowlist, internal hostnames, private/reserved IP literals and
+//     DNS-resolved addresses blocked fail-closed, plus an optional
+//     PI_QQ_MEDIA_HOST_ALLOWLIST suffix lock-down on every redirect hop); fixture-injected seams
+//     script trusted URLs.
 //   • Local-file reads ride an injected byte seam in fixtures; the COS PUT
 //     plane is exercised against the fake server's scripted REST face.
 
+import { readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import dns from "node:dns";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import type {
 	Metadata,
 	SendResult,
 } from "../../pi_gateway/streaming/adapter-seam.js";
+import { REPLY_TO_METADATA_KEY } from "../../pi_gateway/streaming/adapter-seam.js";
 import { EgressChokepoint } from "../../pi_gateway/streaming/egress-door.js";
 import type {
 	CommandRegistry,
@@ -47,11 +87,21 @@ import {
 import {
 	QQ_IDENTIFY_INTENTS,
 	QQBOT_MAX_QUICK_DISCONNECT_COUNT,
+	QQ_MEDIA_TYPE_FILE,
+	QQ_MEDIA_TYPE_IMAGE,
+	QQ_MEDIA_TYPE_VIDEO,
+	QQ_MEDIA_TYPE_VOICE,
+	QQ_MSG_TYPE_INPUT_NOTIFY,
 	QQ_MSG_TYPE_MARKDOWN,
+	QQ_MSG_TYPE_MEDIA,
 	QQ_MSG_TYPE_TEXT,
+	QQ_TYPING_DEBOUNCE_MS,
+	QQ_TYPING_INPUT_SECONDS,
+	QQBOT_USER_AGENT,
 	QQBOT_API_BASE,
 	QQBOT_DEDUP_MAX_SIZE,
 	QQBOT_DEDUP_WINDOW_SECONDS,
+	QQBOT_DEFAULT_API_TIMEOUT_S,
 	QQBOT_FILE_UPLOAD_TIMEOUT_S,
 	QQBOT_GATEWAY_URL_PATH,
 	QQ_HEARTBEAT_FRACTION_OF_INTERVAL,
@@ -62,9 +112,19 @@ import {
 	QQBOT_RECONNECT_BACKOFF_S,
 	QQ_SEND_MAX_ATTEMPTS,
 	QQ_SEND_RETRY_BASE_DELAY_S,
+	QQ_STT_DEFAULT_BASE_URL_ZAI,
+	QQ_STT_DEFAULT_MODEL_EXPLICIT,
+	QQ_STT_DEFAULT_MODEL_ZAI,
+	QQ_STT_ENV_API_KEY,
+	QQ_STT_ENV_BASE_URL,
+	QQ_STT_ENV_MODEL,
+	QQ_STT_PROVIDER_BASE_URLS,
 	QQ_TOKEN_DEFAULT_EXPIRES_IN_S,
 	QQ_TOKEN_REFRESH_MARGIN_S,
 	QQBOT_TOKEN_URL,
+	QQ_MEDIA_HTTP_TIMEOUT_S,
+	QQ_RECONNECT_POLL_INTERVAL_S,
+	QQ_RECONNECT_WAIT_S,
 } from "./manifest.js";
 import {
 	buildApprovalKeyboard,
@@ -75,7 +135,12 @@ import {
 	type InteractionEvent,
 	type InlineKeyboardWire,
 } from "./keyboards.js";
-import { ChunkedUploader } from "./chunked-uploader.js";
+import {
+	ChunkedUploader,
+	UploadDailyLimitExceededError,
+	UploadFileTooLargeError,
+	formatSize,
+} from "./chunked-uploader.js";
 import type {
 	FakeQQGateway,
 	QQClientSocket,
@@ -94,6 +159,37 @@ export interface QQRestTransport {
 	): Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
+/**
+ * Raw byte-level HTTPS seam for the attachment planes Hermes serves with its
+ * shared httpx client (adapter.py:_download_and_cache, _stt_voice_attachment,
+ * _call_stt): CDN attachment GETs and the STT multipart transcription POST.
+ * Production default is global fetch behind an is_safe_url-parity SSRF gate
+ * (_call_stt is a DIRECT HTTPS call, not an external daemon); fixtures inject
+ * scripted responses. Messages without attachments never trigger this seam.
+ */
+export interface QQByteRequest {
+	method: "GET" | "POST";
+	url: string;
+	headers?: Record<string, string> | undefined;
+	body?: Buffer | undefined;
+}
+
+export interface QQByteResponse {
+	status: number;
+	bytes: Buffer;
+}
+
+export type QQByteFetch = (req: QQByteRequest) => Promise<QQByteResponse>;
+
+/** STT backend config (adapter.py:_resolve_stt_config result shape). */
+export interface QQSttOptions {
+	baseUrl?: string | undefined;
+	apiKey?: string | undefined;
+	model?: string | undefined;
+	/** Provider shorthand when only apiKey is configured (_PROVIDER_BASE_URLS). */
+	provider?: string | undefined;
+}
+
 export interface QQAdapterOptions {
 	appId?: string | undefined;
 	clientSecret?: string | undefined;
@@ -107,10 +203,35 @@ export interface QQAdapterOptions {
 	wsFactory: FakeQQGateway;
 	sleepMs?: ((ms: number) => Promise<void>) | undefined;
 	nowMs?: (() => number) | undefined;
+	/**
+	 * Local-media byte seam (production: fs.readFileSync; fixtures inject).
+	 * Chunked uploads read file bytes ONLY through this seam.
+	 */
+	readFileBytes?: ((path: string) => Buffer) | undefined;
 	/** Scripted §10.1 tier-1 rich probe (fixture seam; production: absent). */
 	richProbe?: ((content: string) => Promise<SendResult>) | undefined;
 	/** Whether a rich script was deliberately programmed (probe gating). */
 	richHasScript?: (() => boolean) | undefined;
+	/**
+	 * Inbound media cache directory. When set, downloaded images/files are
+	 * written here and event refs become local paths (adapter.py
+	 * cache_image_from_bytes/cache_document_from_bytes parity). When absent,
+	 * caching is disabled and event refs stay vendor-shaped CDN URLs (feishu
+	 * mediaCacheDir posture); voice STT is unaffected either way.
+	 */
+	mediaCacheDir?: string | undefined;
+	/** STT backend config (adapter.py:_resolve_stt_config priority 1); env fallbacks apply. */
+	stt?: QQSttOptions | undefined;
+	/** Byte-level HTTPS seam for CDN GETs + the STT POST (production: fetch). */
+	byteFetch?: QQByteFetch | undefined;
+	/**
+	 * SILK/raw-audio → WAV bridge (adapter.py:_convert_audio_to_wav parity —
+	 * Hermes shells out to ffmpeg/pilk). Production hosts wire their own;
+	 * absent ⇒ non-WAV voices cannot transcribe ([语音识别失败]).
+	 */
+	convertVoiceToWav?:
+		| ((audio: Buffer, filename: string) => Promise<Buffer | null>)
+		| undefined;
 }
 
 /** One authoritative-or-computed reconnect wait (ladder observability). */
@@ -118,6 +239,237 @@ export interface QQReconnectStep {
 	delayMs: number;
 	authoritative: boolean;
 	attempt: number;
+}
+
+/** Media-lane carriage metadata (adapter-internal; never a text body). */
+export interface QQMediaDirective {
+	source: string;
+	fileType: number;
+	caption?: string | undefined;
+	replyTo?: string | undefined;
+	fileName?: string | undefined;
+}
+
+/** Internal metadata key routing a chokepoint admission onto the media lane. */
+const QQ_MEDIA_DIRECTIVE_KEY = "_qq_media_directive";
+
+/** Multipart boundaries are deterministic (no randomness needed on the wire). */
+let sttMultipartCounter = 0;
+
+/**
+ * Production byte-fetch: direct HTTPS via node:http(s) with a hard 30s abort
+ * (adapter.py httpx timeout=30 on every media/STT call), following up to 3
+ * redirects — EACH hop re-passes the outbound gate below.
+ */
+const defaultByteFetch: QQByteFetch = async (req) => {
+	let url = req.url;
+	for (let hop = 0; ; hop++) {
+		await assertSafeMediaUrl(url);
+		const target = new URL(url);
+		const transport = target.protocol === "https:" ? httpsRequest : httpRequest;
+		const res = await new Promise<{
+			status: number;
+			bytes: Buffer;
+			location?: string | undefined;
+		}>((resolve, reject) => {
+			const r = transport(
+				target,
+				{
+					method: req.method,
+					headers: req.headers,
+				},
+				(outgoing) => {
+					const chunks: Buffer[] = [];
+					outgoing.on("data", (c: Buffer) => chunks.push(c));
+					outgoing.on("end", () => {
+						resolve({
+							status: outgoing.statusCode ?? 0,
+							bytes: Buffer.concat(chunks),
+							location:
+								typeof outgoing.headers.location === "string"
+									? outgoing.headers.location
+									: undefined,
+						});
+					});
+					outgoing.on("error", reject);
+				},
+			);
+			r.on("error", reject);
+			r.setTimeout(QQ_MEDIA_HTTP_TIMEOUT_S * 1000, () => {
+				r.destroy(
+					new Error(
+						`media request timed out after ${QQ_MEDIA_HTTP_TIMEOUT_S}s`,
+					),
+				);
+			});
+			if (req.body !== undefined) r.write(req.body);
+			r.end();
+		});
+		const redirecting =
+			(res.status === 301 ||
+				res.status === 302 ||
+				res.status === 303 ||
+				res.status === 307 ||
+				res.status === 308) &&
+			res.location !== undefined;
+		if (!redirecting) {
+			return { status: res.status, bytes: res.bytes };
+		}
+		if (hop >= 3) {
+			throw new Error("too many media redirects");
+		}
+		url = new URL(res.location as string, target).toString();
+	}
+};
+
+/** tools/url_safety._BLOCKED_HOSTNAMES (+ localhost shapes), lowercased. */
+const BLOCKED_MEDIA_HOSTNAMES: ReadonlySet<string> = new Set([
+	"metadata.google.internal",
+	"metadata",
+	"metadata.goog",
+	"localhost",
+]);
+
+/** True when `host` parses as a dotted-quad IPv4 literal. */
+function isIpv4Literal(host: string): boolean {
+	return /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(host);
+}
+
+/** True when `host` looks like an IPv6 literal (brackets stripped). */
+function isIpv6Literal(host: string): boolean {
+	return host.includes(":");
+}
+
+/** True when `host` is an IP literal in a private/reserved/metadata range. */
+function isPrivateIpLiteral(host: string): boolean {
+	if (isIpv4Literal(host)) {
+		const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+		const a = Number(m![1]);
+		const b = Number(m![2]);
+		if (a === 10 || a === 127 || a === 0) return true;
+		if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
+		if (a === 172 && b >= 16 && b <= 31) return true;
+		if (a === 192 && b === 168) return true;
+		return false;
+	}
+	return isPrivateIpv6(host);
+}
+
+function isPrivateIpv6(addr: string): boolean {
+	const h = addr.toLowerCase();
+	return (
+		h === "::1" ||
+		h === "::" ||
+		h.startsWith("fc") ||
+		h.startsWith("fd") ||
+		h.startsWith("fe8") ||
+		h.startsWith("fe9") ||
+		h.startsWith("fea") ||
+		h.startsWith("feb")
+	);
+}
+
+/**
+ * Fail-closed SSRF gate (tools/url_safety.is_safe_url parity): only http(s)
+ * URLs to public hosts pass. DNS-resolved addresses are checked too; any
+ * resolution error BLOCKS (stricter than Hermes' proxy-configured escape
+ * hatch — this port has no proxy-side resolution contract to preserve).
+ */
+async function assertSafeMediaUrl(url: string): Promise<void> {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+	}
+	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+		throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+	}
+	const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+	if (
+		hostname === "" ||
+		BLOCKED_MEDIA_HOSTNAMES.has(hostname) ||
+		isPrivateIpLiteral(hostname)
+	) {
+		throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+	}
+	// A PUBLIC IP literal needs no resolution — every other shape is checked
+	// against its resolved addresses below.
+	const bareHost = hostname.replace(/^\[/, "").replace(/\]$/, "");
+	if (isIpv4Literal(bareHost) || isIpv6Literal(bareHost)) return;
+	try {
+		const records = await dns.promises.lookup(bareHost, {
+			all: true,
+			verbatim: true,
+		});
+		if (records.length === 0) throw new Error("dns-empty");
+		for (const rec of records) {
+			const bad =
+				rec.family === 4
+					? isPrivateIpLiteral(rec.address)
+					: isPrivateIpv6(rec.address);
+			if (bad) throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+		}
+	} catch (err) {
+		if (err instanceof Error && err.message.startsWith("Blocked unsafe")) {
+			throw err;
+		}
+		throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+	}
+	// Explicit deployment allowlist (PI_QQ_MEDIA_HOST_ALLOWLIST): when set,
+	// the hostname MUST match one of the comma-separated suffixes.
+	const allowlist = (process.env["PI_QQ_MEDIA_HOST_ALLOWLIST"] ?? "")
+		.split(",")
+		.map((s) => s.trim().toLowerCase())
+		.filter((s) => s !== "");
+	if (
+		allowlist.length > 0 &&
+		!allowlist.some((suffix) =>
+			suffix.startsWith(".")
+				? bareHost.endsWith(suffix)
+				: bareHost === suffix || bareHost.endsWith(`.${suffix}`),
+		)
+	) {
+		throw new Error(`Blocked non-allowlisted media URL: ${url.slice(0, 80)}`);
+	}
+}
+
+/** adapter.py:_is_url — http(s) sources upload by URL, everything else is local. */
+function isHttpUrl(source: string): boolean {
+	return /^https?:\/\//i.test(String(source ?? ""));
+}
+
+/** File name resolved from an URL path (adapter.py:urlparse(path).name). */
+function urlFileName(source: string): string {
+	try {
+		const parsed = new URL(source);
+		const base = parsed.pathname
+			.split("/")
+			.filter((s) => s.length > 0)
+			.pop();
+		return base ?? "media";
+	} catch {
+		return "media";
+	}
+}
+
+/** Path.expanduser parity for local media sources. */
+function expandUserPath(source: string): string {
+	if (source === "~") return homedir();
+	if (source.startsWith("~/")) return `${homedir()}/${source.slice(2)}`;
+	return source;
+}
+
+/** Upload response file_info extraction (upload.data wrapping tolerated). */
+function extractFileInfo(upload: Record<string, unknown>): string | null {
+	const direct = upload["file_info"];
+	if (typeof direct === "string" && direct !== "") return direct;
+	const data = upload["data"];
+	if (data !== null && typeof data === "object") {
+		const nested = (data as Record<string, unknown>)["file_info"];
+		if (typeof nested === "string" && nested !== "") return nested;
+	}
+	return null;
 }
 
 const PERMANENT_SEND_PATTERNS = [
@@ -156,10 +508,17 @@ export class QQBotAdapter extends BasePlatformAdapter {
 	private readonly gateway: FakeQQGateway;
 	private readonly sleepFn: (ms: number) => Promise<void>;
 	private readonly nowFn: () => number;
+	private readonly readMediaBytes: (path: string) => Buffer;
 	private readonly richProbe:
 		| ((content: string) => Promise<SendResult>)
 		| undefined;
 	private readonly richHasScriptFn: (() => boolean) | undefined;
+	private readonly mediaCacheDir: string | undefined;
+	private readonly sttOptions: QQSttOptions | undefined;
+	private readonly byteFetchFn: QQByteFetch;
+	private readonly convertVoiceFn:
+		| ((audio: Buffer, filename: string) => Promise<Buffer | null>)
+		| undefined;
 	private richWireAttemptsCount = 0;
 
 	// ── gateway state ────────────────────────────────────────────────────────
@@ -177,6 +536,8 @@ export class QQBotAdapter extends BasePlatformAdapter {
 	readonly chatTypeMap = new Map<string, QQChatType>();
 	/** Last inbound message id per chat — passive reply_to context (_last_msg_id). */
 	readonly lastMsgIdByChat = new Map<string, string>();
+	/** chat_id → last input_notify send time (send_typing debounce state). */
+	private readonly typingSentAtMs = new Map<string, number>();
 
 	private readonly seenMessages: BoundedSeenSet;
 
@@ -239,8 +600,13 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		this.sleepFn =
 			opts.sleepMs ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
 		this.nowFn = opts.nowMs ?? (() => Date.now());
+		this.readMediaBytes = opts.readFileBytes ?? ((p) => readFileSync(p));
 		this.richProbe = opts.richProbe;
 		this.richHasScriptFn = opts.richHasScript;
+		this.mediaCacheDir = opts.mediaCacheDir;
+		this.sttOptions = opts.stt;
+		this.byteFetchFn = opts.byteFetch ?? defaultByteFetch;
+		this.convertVoiceFn = opts.convertVoiceToWav;
 
 		if (this.appId === "" || this.clientSecret === "") {
 			// Loud-disable parity: connect() refuses without credentials; the
@@ -261,8 +627,15 @@ export class QQBotAdapter extends BasePlatformAdapter {
 
 		this.cp = new EgressChokepoint({
 			streamIsMessageForChat: () => false, // no native draft lanes on QQ v2 wire
-			transmitSend: async (chatId, content, metadata) =>
-				this.wireSend(chatId, content, metadata),
+			transmitSend: async (chatId, content, metadata) => {
+				// Media admissions ride the SAME audited chokepoint; the directive
+				// key routes them onto the native msg_type=7 lane (_send_media).
+				const media = metadata[QQ_MEDIA_DIRECTIVE_KEY];
+				if (media !== null && typeof media === "object") {
+					return this.transmitMedia(chatId, media as QQMediaDirective);
+				}
+				return this.wireSend(chatId, content, metadata);
+			},
 			transmitEdit: async () => ({ success: false, error: "Not supported" }),
 			transmitSeal: async () => ({ success: false, error: "Not supported" }),
 		});
@@ -317,7 +690,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		return undefined;
 	}
 
-	// ── guard wiring (reference-fixture inheritance) ──────────────────────────
+	// ── guard wiring (reference-fixture inheritance) ──────────────────────
 
 	attachStandardGuard(spawner?: TaskSpawner | undefined): void {
 		const spawnerOpts = spawner === undefined ? {} : { spawner };
@@ -396,7 +769,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		this.allowAllClickers = allow;
 	}
 
-	// ── egress doors ──────────────────────────────────────────────────────────
+	// ── egress doors ──────────────────────────────────────────────────────
 
 	protected override get chokepoint(): EgressChokepoint {
 		return this.cp;
@@ -409,7 +782,8 @@ export class QQBotAdapter extends BasePlatformAdapter {
 	/**
 	 * Wire transport for ONE delivered chunk (base deliverChunk lane). Routes
 	 * to c2c/group/guild REST sends by learned chat kind (_guess_chat_type
-	 * fallback "c2c"), wrapped in the _send_chunk retry ladder.
+	 * fallback "c2c"), wrapped in the _send_chunk retry ladder behind the
+	 * _wait_for_reconnection connection gate (adapter.py:send).
 	 */
 	protected override async wireSend(
 		chatId: string,
@@ -428,6 +802,8 @@ export class QQBotAdapter extends BasePlatformAdapter {
 				error: "Bad Request: can't parse entities",
 			};
 		}
+		const notConnected = await this.notConnectedGateResult();
+		if (notConnected !== null) return notConnected;
 		const replyToRaw = metadata["reply_to"];
 		const replyTo = typeof replyToRaw === "string" ? replyToRaw : undefined;
 		return this.sendChunkWithRetry(chatId, content, replyTo);
@@ -451,7 +827,43 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		return this.richWireAttemptsCount;
 	}
 
-	// ── connection lifecycle (connect/disconnect parity) ─────────────────────
+	// ── send-path connection gate (adapter.py:_wait_for_reconnection) ──────
+
+	/**
+	 * THE pre-REST connection gate (adapter.py:send :2486, send_with_keyboard
+	 * :2634, _send_media :2913). While the gateway listener is DOWN mid-life
+	 * (running && !isLive — outage, reconnect ladder in flight, fatal close),
+	 * sends poll is_connected for up to QQ_RECONNECT_WAIT_S before returning
+	 * the retryable 'Not connected' failure WITHOUT firing any REST leg.
+	 *
+	 * When the adapter is NOT running as a live gateway (never connected —
+	 * host-managed capture faces / conformance subjects drive egress through
+	 * scripted transports), liveness is not ours to assert: the gate stays
+	 * open (yuanbao egressCapture posture — fabricating 'Not connected' on a
+	 * capture face breaks the seam contract those rows exist to exercise).
+	 */
+	private async notConnectedGateResult(): Promise<SendResult | null> {
+		if (!(this.running && !this.isConnected)) return null;
+		if (await this.waitForReconnection()) return null;
+		return { success: false, error: "Not connected", retryable: true };
+	}
+
+	/**
+	 * Poll isConnected every 0.5s for up to 15s
+	 * (adapter.py:_wait_for_reconnection — _RECONNECT_WAIT_SECONDS ×
+	 * _RECONNECT_POLL_INTERVAL). True when the listener came back.
+	 */
+	private async waitForReconnection(): Promise<boolean> {
+		let waitedS = 0.0;
+		while (waitedS < QQ_RECONNECT_WAIT_S) {
+			await this.sleepFn(QQ_RECONNECT_POLL_INTERVAL_S * 1000);
+			waitedS += QQ_RECONNECT_POLL_INTERVAL_S;
+			if (this.isConnected) return true;
+		}
+		return false;
+	}
+
+	// ── connection lifecycle (connect/disconnect parity) ─────────────────
 
 	async connect(_opts: { isReconnect: boolean }): Promise<boolean> {
 		if (this.appId === "" || this.clientSecret === "") {
@@ -503,7 +915,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		await Promise.resolve();
 	}
 
-	// ── token management (_ensure_token parity) ─────────────────────────────
+	// ── token management (_ensure_token parity) ─────────────────────────
 
 	async ensureToken(): Promise<string> {
 		const cached = this.accessToken;
@@ -516,10 +928,15 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		// Singleflight: concurrent callers share one fetch.
 		if (this.tokenFetch !== null) return this.tokenFetch;
 		this.tokenFetch = (async () => {
-			const resp = await this.rest.request("POST", QQBOT_TOKEN_URL, {
-				appId: this.appId,
-				clientSecret: this.clientSecret,
-			});
+			// adapter.py:_ensure_token — DEFAULT_API_TIMEOUT per token leg.
+			const resp = await this.withRestTimeout(
+				this.rest.request("POST", QQBOT_TOKEN_URL, {
+					appId: this.appId,
+					clientSecret: this.clientSecret,
+				}),
+				QQBOT_DEFAULT_API_TIMEOUT_S,
+				QQBOT_TOKEN_URL,
+			);
 			if (resp.status >= 400) {
 				throw new Error(
 					`Failed to get QQ Bot access token: HTTP ${resp.status}`,
@@ -545,11 +962,16 @@ export class QQBotAdapter extends BasePlatformAdapter {
 
 	private async getGatewayUrl(): Promise<string> {
 		const token = await this.ensureToken();
-		const resp = await this.rest.request(
-			"GET",
-			`${QQBOT_API_BASE}${QQBOT_GATEWAY_URL_PATH}`,
-			{},
-			{ Authorization: `QQBot ${token}` },
+		// adapter.py:_get_gateway_url — DEFAULT_API_TIMEOUT per gateway leg.
+		const resp = await this.withRestTimeout(
+			this.rest.request(
+				"GET",
+				`${QQBOT_API_BASE}${QQBOT_GATEWAY_URL_PATH}`,
+				{},
+				{ Authorization: `QQBot ${token}`, "User-Agent": QQBOT_USER_AGENT },
+			),
+			QQBOT_DEFAULT_API_TIMEOUT_S,
+			QQBOT_GATEWAY_URL_PATH,
 		);
 		if (resp.status >= 400) {
 			throw new Error(`Failed to get QQ Bot gateway URL: HTTP ${resp.status}`);
@@ -561,7 +983,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		return url;
 	}
 
-	// ── op-code routing (_dispatch_payload parity) ───────────────────────────
+	// ── op-code routing (_dispatch_payload parity) ───────────────────────
 
 	dispatchPayload(payload: QQGatewayPayload): void {
 		if (typeof payload.s === "number") {
@@ -661,7 +1083,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		});
 	}
 
-	// ── heartbeat loop (_heartbeat_loop parity) ─────────────────────────────
+	// ── heartbeat loop (_heartbeat_loop parity) ─────────────────────────
 
 	protected async heartbeatLoop(): Promise<void> {
 		while (this.running) {
@@ -675,7 +1097,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		}
 	}
 
-	// ── close-code classes (_listen_loop parity) ─────────────────────────────
+	// ── close-code classes (_listen_loop parity) ────────────────────────
 
 	async handleClose(code: number, reason: string): Promise<void> {
 		if (code === 1000) {
@@ -802,32 +1224,35 @@ export class QQBotAdapter extends BasePlatformAdapter {
 
 		switch (eventType) {
 			case "C2C_MESSAGE_CREATE":
-				this.handleC2CMessage(d, msgId, content, author);
+				void this.handleC2CMessage(d, msgId, content, author);
 				return;
 			case "GROUP_AT_MESSAGE_CREATE":
-				this.handleGroupMessage(d, msgId, content, author);
+				void this.handleGroupMessage(d, msgId, content, author);
 				return;
 			case "GUILD_MESSAGE_CREATE":
 			case "GUILD_AT_MESSAGE_CREATE":
-				this.handleGuildMessage(d, msgId, content, author);
+				void this.handleGuildMessage(d, msgId, content, author);
 				return;
 			case "DIRECT_MESSAGE_CREATE":
-				this.handleGuildDmMessage(d, msgId, content, author);
+				void this.handleGuildDmMessage(d, msgId, content, author);
 				return;
 		}
 	}
 
-	private handleC2CMessage(
+	private async handleC2CMessage(
 		d: Record<string, unknown>,
 		msgId: string,
 		content: string,
 		author: Record<string, unknown>,
-	): void {
+	): Promise<void> {
 		const userOpenid = String(author["user_openid"] ?? "");
 		if (userOpenid === "") return;
 		if (!this.isDmIntakeAllowed(userOpenid)) return;
-		const imageUrls = collectAttachmentUrls(d);
-		const text = mergeQuote(content, extractQuoteBlock(d));
+		let text = content;
+		const processed = await this.processInboundAttachments(d, text);
+		text = processed.text;
+		const imageUrls = processed.imageUrls;
+		const imageMediaTypes = processed.imageMediaTypes;
 		if (text.trim() === "" && imageUrls.length === 0) return;
 		this.chatTypeMap.set(userOpenid, "c2c");
 		this.lastMsgIdByChat.set(userOpenid, msgId);
@@ -837,22 +1262,27 @@ export class QQBotAdapter extends BasePlatformAdapter {
 			userId: userOpenid,
 			text,
 			messageId: msgId,
+			imageUrls,
+			imageMediaTypes,
 		});
 		void this.deliverInbound(event, `qqbot:dm:${userOpenid}:${userOpenid}`);
 	}
 
-	private handleGroupMessage(
+	private async handleGroupMessage(
 		d: Record<string, unknown>,
 		msgId: string,
 		content: string,
 		author: Record<string, unknown>,
-	): void {
+	): Promise<void> {
 		const groupOpenid = String(d["group_openid"] ?? "");
 		if (groupOpenid === "") return;
 		const memberOpenid = String(author["member_openid"] ?? "");
 		if (!this.isGroupAllowed(groupOpenid, memberOpenid)) return;
-		const imageUrls = collectAttachmentUrls(d);
-		const text = mergeQuote(stripAtMention(content), extractQuoteBlock(d));
+		let text = stripAtMention(content);
+		const processed = await this.processInboundAttachments(d, text);
+		text = processed.text;
+		const imageUrls = processed.imageUrls;
+		const imageMediaTypes = processed.imageMediaTypes;
 		if (text.trim() === "" && imageUrls.length === 0) return;
 		this.chatTypeMap.set(groupOpenid, "group");
 		this.lastMsgIdByChat.set(groupOpenid, msgId);
@@ -862,6 +1292,8 @@ export class QQBotAdapter extends BasePlatformAdapter {
 			userId: memberOpenid,
 			text,
 			messageId: msgId,
+			imageUrls,
+			imageMediaTypes,
 		});
 		void this.deliverInbound(
 			event,
@@ -869,12 +1301,12 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		);
 	}
 
-	private handleGuildMessage(
+	private async handleGuildMessage(
 		d: Record<string, unknown>,
 		msgId: string,
 		content: string,
 		author: Record<string, unknown>,
-	): void {
+	): Promise<void> {
 		const channelId = String(d["channel_id"] ?? "");
 		if (channelId === "") return;
 		const guildId = String(d["guild_id"] ?? "");
@@ -884,8 +1316,11 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		if (!this.isGroupAllowed(guildId === "" ? channelId : guildId, authorId)) {
 			return;
 		}
-		const imageUrls = collectAttachmentUrls(d);
-		const text = mergeQuote(content, extractQuoteBlock(d));
+		let text = content;
+		const processed = await this.processInboundAttachments(d, text);
+		text = processed.text;
+		const imageUrls = processed.imageUrls;
+		const imageMediaTypes = processed.imageMediaTypes;
 		if (text.trim() === "" && imageUrls.length === 0) return;
 		this.chatTypeMap.set(channelId, "guild");
 		this.lastMsgIdByChat.set(channelId, msgId);
@@ -895,22 +1330,27 @@ export class QQBotAdapter extends BasePlatformAdapter {
 			userId: authorId,
 			text,
 			messageId: msgId,
+			imageUrls,
+			imageMediaTypes,
 		});
 		void this.deliverInbound(event, `qqbot:guild:${channelId}:${authorId}`);
 	}
 
-	private handleGuildDmMessage(
+	private async handleGuildDmMessage(
 		d: Record<string, unknown>,
 		msgId: string,
 		content: string,
 		author: Record<string, unknown>,
-	): void {
+	): Promise<void> {
 		const guildId = String(d["guild_id"] ?? "");
 		if (guildId === "") return;
 		const authorId = String(author["id"] ?? "");
 		if (!this.isDmIntakeAllowed(authorId)) return;
-		const imageUrls = collectAttachmentUrls(d);
-		const text = mergeQuote(content, extractQuoteBlock(d));
+		let text = content;
+		const processed = await this.processInboundAttachments(d, text);
+		text = processed.text;
+		const imageUrls = processed.imageUrls;
+		const imageMediaTypes = processed.imageMediaTypes;
 		if (text.trim() === "" && imageUrls.length === 0) return;
 		this.chatTypeMap.set(guildId, "dm");
 		this.lastMsgIdByChat.set(guildId, msgId);
@@ -920,8 +1360,373 @@ export class QQBotAdapter extends BasePlatformAdapter {
 			userId: authorId,
 			text,
 			messageId: msgId,
+			imageUrls,
+			imageMediaTypes,
 		});
 		void this.deliverInbound(event, `qqbot:dm:${guildId}:${authorId}`);
+	}
+
+	// ── attachment processing (adapter.py:_process_attachments parity) ──────
+
+	/**
+	 * ONE uniform inbound pipeline shared by c2c/group/guild/dm handlers
+	 * (adapter.py:_handle_*_message bodies): process main-message attachments
+	 * (images → cached refs, voice → '[Voice]' transcript block, files/videos
+	 * → attachment-info lines) appended to the text body, THEN merge quoted
+	 * context (message_type=103) whose images union onto the media lists.
+	 */
+	private async processInboundAttachments(
+		d: Record<string, unknown>,
+		text: string,
+	): Promise<{
+		text: string;
+		imageUrls: string[];
+		imageMediaTypes: string[];
+	}> {
+		const main = await this.processAttachments(d["attachments"]);
+		let merged = appendBlock(text, main.voiceBlock);
+		merged = appendBlock(merged, main.attachmentInfo);
+		// Quoted-context merge (msg_type 103): quote PREPENDS; quoted images
+		// union onto the media lists (adapter.py:_process_quoted_context).
+		const quoted = await this.processQuotedContext(d);
+		merged = mergeQuote(merged, quoted.quoteBlock);
+		return {
+			text: merged,
+			imageUrls: [...main.imageUrls, ...quoted.imageUrls],
+			imageMediaTypes: [...main.imageMediaTypes, ...quoted.imageMediaTypes],
+		};
+	}
+
+	/**
+	 * Process inbound attachments uniformly (adapter.py:_process_attachments):
+	 * mirrors the Hermes dict result — image_urls/image_media_types feed
+	 * MessageEvent.media_urls/media_types, voice_transcripts join into the
+	 * '[Voice]' block, other attachments join into the attachment_info text.
+	 */
+	private async processAttachments(attachmentsRaw: unknown): Promise<{
+		imageUrls: string[];
+		imageMediaTypes: string[];
+		voiceBlock: string;
+		attachmentInfo: string;
+	}> {
+		const imageUrls: string[] = [];
+		const imageMediaTypes: string[] = [];
+		const voiceLines: string[] = [];
+		const infoLines: string[] = [];
+		if (Array.isArray(attachmentsRaw)) {
+			for (const att of attachmentsRaw) {
+				if (att === null || typeof att !== "object") continue;
+				const rec = att as Record<string, unknown>;
+				const ct = String(rec["content_type"] ?? "")
+					.trim()
+					.toLowerCase();
+				const filename = String(rec["filename"] ?? "");
+				const url = normalizeAttachmentUrl(String(rec["url"] ?? "").trim());
+				if (url === "") continue;
+
+				if (isVoiceContentType(ct, filename)) {
+					// Voice: QQ's asr_refer_text first, then voice_wav_url, then STT.
+					const transcript = await this.transcribeVoiceAttachment(rec, url);
+					voiceLines.push(
+						transcript !== null
+							? `[Voice] ${transcript}`
+							: "[Voice] [语音识别失败]",
+					);
+				} else if (ct.startsWith("image/")) {
+					// Image: download and cache locally (when a cache dir exists).
+					const ref = await this.cacheInboundBytes(url, filename, true);
+					if (ref !== null) {
+						imageUrls.push(ref);
+						imageMediaTypes.push(ct === "" ? "image/jpeg" : ct);
+					}
+				} else {
+					// Other attachments (video, file, …): record with their ref.
+					const ref = await this.cacheInboundBytes(url, filename, false);
+					if (ref !== null) {
+						const name =
+							filename !== ""
+								? filename
+								: urlFileName(url) || ct || "qq_attachment";
+						infoLines.push(
+							ct.startsWith("video/")
+								? `[video: ${name} (${ref})]`
+								: `[file: ${name} (${ref})]`,
+						);
+					}
+				}
+			}
+		}
+		return {
+			imageUrls,
+			imageMediaTypes,
+			voiceBlock: voiceLines.join("\n"),
+			attachmentInfo: infoLines.join("\n"),
+		};
+	}
+
+	/**
+	 * Download + cache one image/file attachment (adapter.py:_download_and_cache
+	 * surface). With mediaCacheDir configured the bytes land on disk and the
+	 * ref is the cached path; without it caching is disabled and the vendor
+	 * CDN URL itself is the reference (feishu mediaCacheDir posture — nothing
+	 * is fetched). Download/write failures yield NO ref (absent, not broken).
+	 */
+	private async cacheInboundBytes(
+		url: string,
+		originalName: string,
+		isImage: boolean,
+	): Promise<string | null> {
+		if (this.mediaCacheDir === undefined) return url;
+		const bytes = await this.tryFetchBytes(url);
+		if (bytes === null) return null;
+		try {
+			await mkdir(this.mediaCacheDir, { recursive: true });
+			const uuid12 = randomUUID().replaceAll("-", "").slice(0, 12);
+			const fileName = isImage
+				? `img_${uuid12}.jpg`
+				: `doc_${uuid12}_${sanitizeCacheName(originalName)}`;
+			const outPath = `${this.mediaCacheDir}/${fileName}`;
+			await writeFile(outPath, bytes);
+			return outPath;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Voice STT chain (adapter.py:_stt_voice_attachment): 1. Tencent's own
+	 * asr_refer_text (free, no API call); 2. self-hosted STT on the
+	 * pre-converted voice_wav_url; 3. self-hosted STT on the raw attachment
+	 * (requires SILK→WAV conversion via the convertVoiceToWav bridge).
+	 */
+	private async transcribeVoiceAttachment(
+		att: Record<string, unknown>,
+		url: string,
+	): Promise<string | null> {
+		const asrRefer = String(att["asr_refer_text"] ?? "").trim();
+		if (asrRefer !== "") return asrRefer;
+
+		let downloadUrl = url;
+		const wavRaw = String(att["voice_wav_url"] ?? "").trim();
+		if (wavRaw.startsWith("//")) downloadUrl = `https:${wavRaw}`;
+		else if (wavRaw !== "") downloadUrl = wavRaw;
+		const isPreWav = wavRaw !== "";
+		if (!isHttpUrl(downloadUrl)) return null;
+
+		// QQ's multimedia CDN requires the bot-token auth header.
+		const audio = await this.tryFetchBytes(downloadUrl);
+		if (audio === null || audio.length < 10) return null;
+
+		let wav: Buffer | null;
+		if (isPreWav) {
+			wav = audio; // pre-converted WAV rides straight to STT
+		} else if (this.convertVoiceFn === undefined) {
+			wav = null; // no conversion bridge wired — Hermes-without-ffmpeg shape
+		} else {
+			wav = await this.convertVoiceFn(audio, String(att["filename"] ?? ""));
+		}
+		if (wav === null) return null;
+		return this.callStt(wav);
+	}
+
+	/**
+	 * Call an OpenAI-compatible STT API (adapter.py:_call_stt): DIRECT HTTPS
+	 * POST {base_url}/audio/transcriptions, Bearer auth + multipart form
+	 * (model field + audio/wav file part). Parses BOTH Zhipu/GLM
+	 * ({choices:[{message:{content}}]}) and OpenAI/Whisper ({text}) formats.
+	 */
+	private async callStt(wav: Buffer): Promise<string | null> {
+		const cfg = this.resolveSttConfig();
+		if (cfg === null) return null; // STT unconfigured — built-in ASR covers it
+		sttMultipartCounter += 1;
+		const boundary = `pi-qq-stt-${sttMultipartCounter}`;
+		const body = Buffer.concat([
+			Buffer.from(
+				`--${boundary}\r\n` +
+					'Content-Disposition: form-data; name="model"\r\n\r\n' +
+					`${cfg.model}\r\n` +
+					`--${boundary}\r\n` +
+					'Content-Disposition: form-data; name="file"; filename="voice.wav"\r\n' +
+					"Content-Type: audio/wav\r\n\r\n",
+			),
+			wav,
+			Buffer.from(`\r\n--${boundary}--\r\n`),
+		]);
+		try {
+			const resp = await this.byteFetchFn({
+				method: "POST",
+				url: `${cfg.baseUrl}/audio/transcriptions`,
+				headers: {
+					Authorization: `Bearer ${cfg.apiKey}`,
+					"Content-Type": `multipart/form-data; boundary=${boundary}`,
+				},
+				body,
+			});
+			if (resp.status >= 400) return null;
+			const parsed = JSON.parse(resp.bytes.toString("utf8")) as Record<
+				string,
+				unknown
+			>;
+			const choices = Array.isArray(parsed["choices"])
+				? (parsed["choices"] as Array<Record<string, unknown>>)
+				: [];
+			const message = choices[0]?.["message"] as
+				| Record<string, unknown>
+				| undefined;
+			const content =
+				typeof message?.["content"] === "string"
+					? message["content"].trim()
+					: "";
+			if (content !== "") return content;
+			const text =
+				typeof parsed["text"] === "string" ? parsed["text"].trim() : "";
+			return text !== "" ? text : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Resolve STT backend config (adapter.py:_resolve_stt_config priority):
+	 * 1. explicit stt config (baseUrl+apiKey, or apiKey+provider map);
+	 * 2. QQ-specific env vars (QQ_STT_API_KEY / QQ_STT_BASE_URL /
+	 *    QQ_STT_MODEL). null ⇒ STT skipped (built-in ASR still works).
+	 */
+	private resolveSttConfig(): {
+		baseUrl: string;
+		apiKey: string;
+		model: string;
+	} | null {
+		const stt = this.sttOptions;
+		if (stt !== undefined) {
+			const baseUrl = (stt.baseUrl ?? "").trim();
+			const apiKey = (stt.apiKey ?? "").trim();
+			const model = (stt.model ?? "").trim();
+			if (baseUrl !== "" && apiKey !== "") {
+				return {
+					baseUrl: baseUrl.replace(/\/+$/, ""),
+					apiKey,
+					model: model === "" ? QQ_STT_DEFAULT_MODEL_EXPLICIT : model,
+				};
+			}
+			// Provider-only config maps through the provider table.
+			if (apiKey !== "") {
+				const provider = (stt.provider ?? "zai").toLowerCase();
+				const mapped = QQ_STT_PROVIDER_BASE_URLS[provider];
+				if (mapped !== undefined) {
+					return {
+						baseUrl: mapped,
+						apiKey,
+						model:
+							model === ""
+								? provider === "openai"
+									? QQ_STT_DEFAULT_MODEL_EXPLICIT
+									: QQ_STT_DEFAULT_MODEL_ZAI
+								: model,
+					};
+				}
+			}
+		}
+		const envKey = (process.env[QQ_STT_ENV_API_KEY] ?? "").trim();
+		if (envKey !== "") {
+			const envBase = (process.env[QQ_STT_ENV_BASE_URL] ?? "").trim();
+			const envModel = (process.env[QQ_STT_ENV_MODEL] ?? "").trim();
+			return {
+				baseUrl: (envBase === ""
+					? QQ_STT_DEFAULT_BASE_URL_ZAI
+					: envBase
+				).replace(/\/+$/, ""),
+				apiKey: envKey,
+				model: envModel === "" ? QQ_STT_DEFAULT_MODEL_ZAI : envModel,
+			};
+		}
+		return null;
+	}
+
+	/**
+	 * Authorization headers for QQ multimedia CDN downloads
+	 * (adapter.py:_qq_media_headers): the cached bot token, verbatim — no
+	 * proactive refresh, exactly like the reference reads self._access_token.
+	 */
+	private qqMediaHeaders(): Record<string, string> {
+		if (this.accessToken !== null) {
+			return { Authorization: `QQBot ${this.accessToken}` };
+		}
+		return {};
+	}
+
+	/** Media GET with graceful failure (download errors ⇒ null, never throw). */
+	private async tryFetchBytes(url: string): Promise<Buffer | null> {
+		try {
+			const headers = this.qqMediaHeaders();
+			const resp = await this.byteFetchFn({
+				method: "GET",
+				url,
+				...(Object.keys(headers).length > 0 ? { headers } : {}),
+			});
+			if (resp.status >= 400) return null;
+			return resp.bytes;
+		} catch {
+			// Download failures degrade silently (adapter.py debug-log parity).
+			return null;
+		}
+	}
+
+	/**
+	 * Quoted-context processing (adapter.py:_process_quoted_context):
+	 * message_type=103 → msg_elements carry the referenced content AND its
+	 * attachments, which run through the SAME _process_attachments pipeline —
+	 * quoted voice gets transcripts, quoted images join the media lists.
+	 */
+	private async processQuotedContext(d: Record<string, unknown>): Promise<{
+		quoteBlock: string;
+		imageUrls: string[];
+		imageMediaTypes: string[];
+	}> {
+		const empty = {
+			quoteBlock: "",
+			imageUrls: [] as string[],
+			imageMediaTypes: [] as string[],
+		};
+		// Short-circuit: only message_type 103 indicates a quote.
+		if ((Number(d["message_type"] ?? 0) || 0) !== 103) return empty;
+		const elements = d["msg_elements"];
+		if (!Array.isArray(elements) || elements.length === 0) return empty;
+
+		const quotedTextParts: string[] = [];
+		const allAttachments: Record<string, unknown>[] = [];
+		for (const elem of elements) {
+			if (elem === null || typeof elem !== "object") continue;
+			const rec = elem as Record<string, unknown>;
+			const etext = String(rec["content"] ?? "").trim();
+			if (etext !== "") quotedTextParts.push(etext);
+			if (Array.isArray(rec["attachments"])) {
+				for (const a of rec["attachments"] as unknown[]) {
+					if (a !== null && typeof a === "object") {
+						allAttachments.push(a as Record<string, unknown>);
+					}
+				}
+			}
+		}
+
+		const processed = await this.processAttachments(allAttachments);
+		const lines: string[] = [];
+		if (quotedTextParts.length > 0) lines.push(quotedTextParts.join(" "));
+		for (const t of processed.voiceBlock.split("\n")) {
+			if (t !== "") lines.push(t);
+		}
+		if (processed.attachmentInfo !== "") lines.push(processed.attachmentInfo);
+
+		if (lines.length === 0 && processed.imageUrls.length === 0) return empty;
+		const quoteBlock =
+			lines.length > 0
+				? `[Quoted message]:\n${lines.join("\n")}`
+				: "[Quoted message]: (image)";
+		return {
+			quoteBlock,
+			imageUrls: processed.imageUrls,
+			imageMediaTypes: processed.imageMediaTypes,
+		};
 	}
 
 	// ── ACL intake gates (_is_dm_intake_allowed / _is_group_allowed) ────────
@@ -982,11 +1787,20 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		// error icon otherwise. ACK happens BEFORE dispatch.
 		try {
 			const token = await this.ensureToken();
-			const resp = await this.rest.request(
-				"PUT",
-				`${QQBOT_API_BASE}/interactions/${event.id}`,
-				{ code: 0 },
-				{ Authorization: `QQBot ${token}` },
+			// adapter.py:_acknowledge_interaction — DEFAULT_API_TIMEOUT per ACK leg.
+			const resp = await this.withRestTimeout(
+				this.rest.request(
+					"PUT",
+					`${QQBOT_API_BASE}/interactions/${event.id}`,
+					{ code: 0 },
+					{
+						Authorization: `QQBot ${token}`,
+						"Content-Type": "application/json",
+						"User-Agent": QQBOT_USER_AGENT,
+					},
+				),
+				QQBOT_DEFAULT_API_TIMEOUT_S,
+				`/interactions/${event.id}`,
 			);
 			this.interactionAcks.push({
 				id: event.id,
@@ -1078,6 +1892,9 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		keyboard: InlineKeyboardWire,
 		replyTo?: string | undefined,
 	): Promise<SendResult> {
+		// adapter.py:send_with_keyboard :2634 gates on is_connected like send().
+		const notConnected = await this.notConnectedGateResult();
+		if (notConnected !== null) return notConnected;
 		const chatType = this.guessChatType(chatId);
 		const truncated = this.formatMessage(content).slice(
 			0,
@@ -1193,6 +2010,258 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		});
 	}
 
+	// ── outbound: native media (_send_media parity through the chokepoint) ──
+
+	/**
+	 * THE native media lane (adapter.py:_send_media): upload first — HTTP(S)
+	 * URLs ride a single POST /v2/{users|groups}/{id}/files {url} while local
+	 * files ride the three-step chunked flow — then deliver msg_type=7 with
+	 * body {media:{file_info}, content?, msg_id?, msg_seq}. Admissions route
+	 * THROUGH the egress chokepoint so every user-visible transmission is
+	 * audited on one path (DEC-006 posture).
+	 */
+	async sendMedia(opts: {
+		chatId: string;
+		source: string;
+		fileType: number;
+		caption?: string | undefined;
+		replyTo?: string | undefined;
+		fileName?: string | undefined;
+	}): Promise<SendResult> {
+		const metadata: Metadata = {
+			[QQ_MEDIA_DIRECTIVE_KEY]: {
+				source: opts.source,
+				fileType: opts.fileType,
+				...(opts.caption !== undefined ? { caption: opts.caption } : {}),
+				...(opts.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
+				...(opts.fileName !== undefined ? { fileName: opts.fileName } : {}),
+			},
+		};
+		if (opts.replyTo !== undefined) {
+			metadata[REPLY_TO_METADATA_KEY] = opts.replyTo;
+		}
+		return this.cp.admit({
+			door: "send",
+			chatId: opts.chatId,
+			content: opts.caption ?? "",
+			metadata,
+		});
+	}
+
+	/** adapter.py:send_image — URL or local path, optional caption + reply. */
+	sendImage(
+		chatId: string,
+		imageSource: string,
+		caption?: string | undefined,
+		replyTo?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendMedia({
+			chatId,
+			source: imageSource,
+			fileType: QQ_MEDIA_TYPE_IMAGE,
+			caption,
+			replyTo,
+		});
+	}
+
+	// ── post-stream media hooks (run.py:_deliver_media_from_response surface;
+	// DEC-019 explicit-tag delivery — WITHOUT these the pipeline degrades every
+	// attachment to plain text) ────────────────────────────────────────────
+
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		const results: SendResult[] = [];
+		for (const image of images) {
+			results.push(await this.sendImage(chatId, image));
+		}
+		return results;
+	}
+
+	sendVoice(chatId: string, audioPath: string): Promise<SendResult> {
+		return this.sendMedia({
+			chatId,
+			source: audioPath,
+			fileType: QQ_MEDIA_TYPE_VOICE,
+		});
+	}
+
+	sendVideo(chatId: string, videoPath: string): Promise<SendResult> {
+		return this.sendMedia({
+			chatId,
+			source: videoPath,
+			fileType: QQ_MEDIA_TYPE_VIDEO,
+		});
+	}
+
+	sendDocument(chatId: string, filePath: string): Promise<SendResult> {
+		return this.sendMedia({
+			chatId,
+			source: filePath,
+			fileType: QQ_MEDIA_TYPE_FILE,
+		});
+	}
+
+	/**
+	 * The raw wire leg behind a media admission (adapter.py:_send_media body
+	 * + send_image URL-fallback). Gates on the _wait_for_reconnection posture
+	 * BEFORE any REST leg; after a failed HTTP(S)-source IMAGE upload the
+	 * caption+URL degrade to a text send so the link still arrives
+	 * (adapter.py:send_image — local-file sources never fall back).
+	 */
+	private async transmitMedia(
+		chatId: string,
+		directive: QQMediaDirective,
+	): Promise<SendResult> {
+		// adapter.py:_send_media :2913 gate — before guild refusal AND upload.
+		const notConnected = await this.notConnectedGateResult();
+		if (notConnected !== null) return notConnected;
+		const result = await this.transmitMediaLegs(chatId, directive);
+		// adapter.py:send_image — ANY non-success on an http(s) IMAGE source
+		// degrades to a text send of '{caption}\n{image_url}' (reply threading
+		// carried); the fallback rides the SAME wireSend ladder + gate.
+		if (
+			!result.success &&
+			directive.fileType === QQ_MEDIA_TYPE_IMAGE &&
+			isHttpUrl(directive.source)
+		) {
+			const fallback =
+				directive.caption !== undefined && directive.caption !== ""
+					? `${directive.caption}\n${directive.source}`
+					: directive.source;
+			return this.wireSend(
+				chatId,
+				fallback,
+				directive.replyTo !== undefined ? { reply_to: directive.replyTo } : {},
+			);
+		}
+		return result;
+	}
+
+	/** Upload + msg_type=7 delivery (adapter.py:_send_media body verbatim). */
+	private async transmitMediaLegs(
+		chatId: string,
+		directive: QQMediaDirective,
+	): Promise<SendResult> {
+		const chatType = this.guessChatType(chatId);
+		if (chatType === "guild") {
+			// Guild channels don't support native media upload in this shape.
+			return {
+				success: false,
+				error: "Guild media send not supported via this path",
+				retryable: false,
+			};
+		}
+		try {
+			let upload: Record<string, unknown>;
+			if (isHttpUrl(directive.source)) {
+				upload = await this.uploadMedia({
+					chatType: chatType as "c2c" | "group",
+					targetId: chatId,
+					fileType: directive.fileType,
+					url: directive.source,
+					srvSendMsg: false,
+					...(directive.fileType === QQ_MEDIA_TYPE_FILE
+						? {
+								fileName: directive.fileName ?? urlFileName(directive.source),
+							}
+						: {}),
+				});
+			} else {
+				const localPath = expandUserPath(directive.source);
+				const bytes = this.readMediaBytes(localPath);
+				upload = await this.chunkedUploader().upload({
+					chatType: chatType as "c2c" | "group",
+					targetId: chatId,
+					data: bytes,
+					fileType: directive.fileType,
+					fileName: directive.fileName ?? basenameOf(localPath),
+				});
+			}
+
+			const fileInfo = extractFileInfo(upload);
+			if (fileInfo === null) {
+				return {
+					success: false,
+					error: `Upload returned no file_info: ${JSON.stringify(upload).slice(0, 200)}`,
+					retryable: false,
+				};
+			}
+
+			// RichMedia message body: msg_type=7 + {media:{file_info}}.
+			const body: Record<string, unknown> = {
+				msg_type: QQ_MSG_TYPE_MEDIA,
+				media: { file_info: fileInfo },
+				msg_seq: nextMsgSeq(this.nowFn),
+			};
+			if (directive.caption !== undefined && directive.caption !== "") {
+				body["content"] = directive.caption.slice(0, QQBOT_MAX_MESSAGE_LENGTH);
+			}
+			if (directive.replyTo !== undefined) body["msg_id"] = directive.replyTo;
+
+			const path =
+				chatType === "c2c"
+					? `/v2/users/${chatId}/messages`
+					: `/v2/groups/${chatId}/messages`;
+			const data = await this.apiRequest("POST", path, body);
+			return { success: true, messageId: String(data["id"] ?? "unknown") };
+		} catch (err) {
+			if (err instanceof UploadDailyLimitExceededError) {
+				return {
+					success: false,
+					error: `QQ daily upload limit exceeded for '${err.fileName}' (${formatSize(err.fileSize)}). Retry tomorrow.`,
+					retryable: false,
+				};
+			}
+			if (err instanceof UploadFileTooLargeError) {
+				return {
+					success: false,
+					error: `'${err.fileName}' (${formatSize(err.fileSize)}) exceeds the QQ per-file upload limit (${err.limitBytes > 0 ? formatSize(err.limitBytes) : "unknown"}).`,
+					retryable: false,
+				};
+			}
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	// ── typing indicator (adapter.py:send_typing parity) ─────────────────
+
+	/**
+	 * Send an input notify to a C2C user ONLY (the API supports no group
+	 * typing): msg_type=6 body {input_notify:{input_type:1,input_second:60},
+	 * msg_id:last_inbound, msg_seq}. Debounced to one request per ~50s per
+	 * chat; requires a captured inbound message id; failures are swallowed.
+	 */
+	async sendTyping(chatId: string): Promise<void> {
+		if (!this.isLive) return;
+		if (this.guessChatType(chatId) !== "c2c") return;
+		const msgId = this.lastMsgIdByChat.get(chatId);
+		if (msgId === undefined || msgId === "") return;
+
+		const now = this.nowFn();
+		const lastSent = this.typingSentAtMs.get(chatId) ?? 0;
+		if (now - lastSent < QQ_TYPING_DEBOUNCE_MS) return;
+
+		try {
+			await this.apiRequest("POST", `/v2/users/${chatId}/messages`, {
+				msg_type: QQ_MSG_TYPE_INPUT_NOTIFY,
+				msg_id: msgId,
+				input_notify: {
+					input_type: 1,
+					input_second: QQ_TYPING_INPUT_SECONDS,
+				},
+				msg_seq: nextMsgSeq(this.nowFn),
+			});
+			this.typingSentAtMs.set(chatId, now); // success-only debounce stamp
+		} catch {
+			// send_typing failures are debug-class (never block the turn)
+		}
+	}
+
 	// ── outbound: REST text sends (_build_text_body + per-type paths) ───────
 
 	guessChatType(chatId: string): QQChatType {
@@ -1229,23 +2298,43 @@ export class QQBotAdapter extends BasePlatformAdapter {
 		};
 	}
 
+	/**
+	 * Per-leg REST timeout race (adapter.py:_api_request httpx timeout
+	 * semantics): a hung leg raises 'QQ Bot API timeout [label]' — classified
+	 * timeout — instead of stalling forever. The timer rides the injected
+	 * sleep seam so fixture clocks drive it deterministically.
+	 */
+	private withRestTimeout<T>(
+		p: Promise<T>,
+		timeoutS: number,
+		label: string,
+	): Promise<T> {
+		const timer = this.sleepFn(timeoutS * 1000).then((): T => {
+			throw new Error(`QQ Bot API timeout [${label}]`);
+		});
+		timer.catch(() => undefined); // losing timer never rejects unhandled
+		return Promise.race([p, timer]);
+	}
+
 	async apiRequest(
 		method: "POST" | "GET" | "PUT",
 		path: string,
 		body?: Record<string, unknown> | Buffer | undefined,
-		timeoutS: number = 30,
+		timeoutS: number = QQBOT_DEFAULT_API_TIMEOUT_S,
 	): Promise<Record<string, unknown>> {
-		void timeoutS;
 		const token = await this.ensureToken();
 		const payload: Record<string, unknown> | Buffer = body ?? {};
-		const resp = await this.rest.request(
-			method,
-			`${QQBOT_API_BASE}${path}`,
-			payload,
-			{
+		// adapter.py:_api_request — per-leg timeout raises INTO classification
+		// ('QQ Bot API timeout [path]') instead of hanging forever; DEC-046:
+		// timeout-classified sends are never retried by any ladder.
+		const resp = await this.withRestTimeout(
+			this.rest.request(method, `${QQBOT_API_BASE}${path}`, payload, {
 				Authorization: `QQBot ${token}`,
 				"Content-Type": "application/json",
-			},
+				"User-Agent": QQBOT_USER_AGENT,
+			}),
+			timeoutS,
+			path,
 		);
 		if (resp.status >= 400) {
 			const vendorMessage = String(
@@ -1297,7 +2386,8 @@ export class QQBotAdapter extends BasePlatformAdapter {
 				// landed — duplicate risk, §6.1 base ladder parity).
 				if (classifySendError(err) === "timeout") break;
 				// Server-authoritative retry_after honored ONCE over the local
-				// schedule (_send_with_retry parity) and captured for the ladder.
+				// schedule (_send_with_retry honor-once parity) and captured for
+				// the ladder (DEC-044 capture knob).
 				if (!honoredRetryAfterOnce) {
 					const raErr = extractRetryAfterSeconds(err);
 					if (raErr !== null && raErr >= 0) {
@@ -1387,6 +2477,13 @@ function entryMatches(entries: readonly string[], target: string): boolean {
 	return false;
 }
 
+/** Path basename for local media sources (Path(...).name parity). */
+function basenameOf(path: string): string {
+	const parts = String(path ?? "").split("/");
+	const base = parts[parts.length - 1] ?? "";
+	return base === "" ? "media" : base;
+}
+
 function stripAtMention(content: string): string {
 	return content.trim().replace(/^@\S+\s*/, "");
 }
@@ -1406,18 +2503,74 @@ export function nextMsgSeq(nowMs: () => number): number {
 	return (timePart ^ rand) % 65536;
 }
 
-/** Attachment URL extraction (attachments[].url carries media URLs). */
-function collectAttachmentUrls(d: Record<string, unknown>): string[] {
-	const atts = d["attachments"];
-	if (!Array.isArray(atts)) return [];
-	const urls: string[] = [];
-	for (const a of atts) {
-		if (a !== null && typeof a === "object") {
-			const url = (a as Record<string, unknown>)["url"];
-			if (typeof url === "string" && url !== "") urls.push(url);
-		}
-	}
-	return urls;
+/** '//'-prefixed CDN URLs normalize onto https (adapter.py attachment loop). */
+function normalizeAttachmentUrl(raw: string): string {
+	if (raw.startsWith("//")) return `https:${raw}`;
+	return raw;
+}
+
+/**
+ * Voice/audio detection (adapter.py:_is_voice_content_type): content_type
+ * "voice" or "audio/*", or a voice-extension filename. QQ file uploads carry
+ * content_type="file" — NEVER misrouted into the STT pipeline.
+ */
+function isVoiceContentType(contentType: string, filename: string): boolean {
+	const ct = contentType.trim().toLowerCase();
+	const fn = filename.trim().toLowerCase();
+	if (ct === "voice" || ct.startsWith("audio/")) return true;
+	if (ct === "file") return false;
+	const voiceExtensions = [
+		".silk",
+		".amr",
+		".mp3",
+		".wav",
+		".ogg",
+		".m4a",
+		".aac",
+		".speex",
+		".flac",
+	];
+	return voiceExtensions.some((ext) => fn.endsWith(ext));
+}
+
+/** Cached-image extension (adapter.py ext_for_mime fallback ".jpg" shape). */
+function imageExtensionFor(contentType: string): string {
+	const ct = contentType.toLowerCase();
+	if (ct.includes("png")) return ".png";
+	if (ct.includes("gif")) return ".gif";
+	if (ct.includes("webp")) return ".webp";
+	if (ct.includes("bmp")) return ".bmp";
+	return ".jpg";
+}
+
+/** Sanitized cache filename (cache_document_from_bytes Path(...).name shape). */
+function sanitizeCacheName(filename: string): string {
+	const base = basenameOf(filename).replaceAll("\x00", "").trim();
+	return base === "" || base === "." || base === ".." ? "document" : base;
+}
+
+/**
+ * Message-type detection from media lists (adapter.py:_detect_message_type):
+ * media wins over text — photo/voice/video classification rides the FIRST
+ * media type; no media ⇒ text.
+ */
+function detectMessageType(
+	mediaUrls: readonly string[],
+	mediaTypes: readonly string[],
+): IncomingEvent["messageType"] {
+	if (mediaUrls.length === 0) return "text";
+	if (mediaTypes.length === 0) return "photo";
+	const first = (mediaTypes[0] ?? "").toLowerCase();
+	if (/audio|voice|silk/.test(first)) return "voice";
+	if (first.includes("video")) return "video";
+	if (/image|photo/.test(first)) return "photo";
+	return "text";
+}
+
+/** Hermes inline append: (text + "\n\n" + block).strip() when text non-empty. */
+function appendBlock(text: string, block: string): string {
+	if (block === "") return text;
+	return text.trim() === "" ? block : `${text}\n\n${block}`.trim();
 }
 
 /**
@@ -1425,24 +2578,6 @@ function collectAttachmentUrls(d: Record<string, unknown>): string[] {
  * message_type=103 → msg_elements carry the referenced content; the quote
  * block PREPENDS with a blank-line separator (_merge_quote_into).
  */
-function extractQuoteBlock(d: Record<string, unknown>): string {
-	const messageType = Number(d["message_type"] ?? 0) || 0;
-	if (messageType !== 103) return "";
-	const elements = d["msg_elements"];
-	if (!Array.isArray(elements) || elements.length === 0) return "";
-	const parts: string[] = [];
-	for (const elem of elements) {
-		if (elem !== null && typeof elem === "object") {
-			const etext = String(
-				(elem as Record<string, unknown>)["content"] ?? "",
-			).trim();
-			if (etext !== "") parts.push(etext);
-		}
-	}
-	if (parts.length === 0) return "[Quoted message]: (image)";
-	return `[Quoted message]:\n${parts.join("\n")}`;
-}
-
 function mergeQuote(text: string, quoteBlock: string): string {
 	if (quoteBlock === "") return text;
 	const emptyBody = text.trim() === "";
@@ -1476,11 +2611,11 @@ function buildTextEvent(o: {
 	userId: string;
 	text: string;
 	messageId: string;
+	imageUrls: readonly string[];
+	imageMediaTypes: readonly string[];
 }): IncomingEvent {
-	const hasText = o.text !== "";
-	const kind = hasText ? ("text" as const) : ("other" as const);
 	return {
-		messageType: kind,
+		messageType: detectMessageType(o.imageUrls, o.imageMediaTypes),
 		text: o.text,
 		source: {
 			platform: "qqbot",
@@ -1489,7 +2624,10 @@ function buildTextEvent(o: {
 			chatId: o.chatId,
 		},
 		messageId: o.messageId,
-		mediaUrls: [],
+		...(o.imageUrls.length > 0 ? { mediaUrls: [...o.imageUrls] } : {}),
+		...(o.imageMediaTypes.length > 0
+			? { mediaTypes: [...o.imageMediaTypes] }
+			: {}),
 		metadata: {},
 	};
 }
