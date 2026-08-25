@@ -14,7 +14,7 @@ detail. Orchestrated via multi-agent workflows; commits are atomic per workstrea
 | 3     | Reference adapters + conformance  | DONE ✅      | 873/873 (74 files), tsc clean, layering clean; all three adapters pass ALL applicable §8 rows; ws gate `allApplicablePassed === true`, zero deferred (DEC-032); DEC-033/034 satisfied by execution; `reports/PHASE-3-REPORT.md` |
 | 4     | Security + multiplex              | DONE ✅      | 1204/1204 tests; grep gate clean + provably failing; poisoned-env/sig-matrix/kill-holder/exactly-once-restore all PASS; `reports/PHASE-4-REPORT.md` |
 | 5     | Embedded services + update        | DONE ✅      | 1694/1694 ×2 runs; all (a)–(f) measured PASS incl. two-profile fleet drill w/ stale-gateway exit 1 + receipts-on-refusal; `reports/PHASE-5-REPORT.md` |
-| 6     | Census ports                      | DONE ✅      | 1842/1842 ×2 runs; telegram/slack/discord/whatsapp-cloud all pass ALL applicable rows; registration-only diff; `reports/PHASE-6-REPORT.md`. **DEFINITION OF DONE MET** (clean-checkout proof below) |
+| 6     | Census ports                      | DONE ✅      | 31 surfaces PORTED + honest exclusions (DEC-043 dingtalk); 2152/2152 ×2 runs; census table closed; `reports/PHASE-6-REPORT.md` |
 
 ## Phase 0 — Runtime spike
 
@@ -82,6 +82,15 @@ in `../09-open-questions.md` (append-only).
   pi_gateway/lifecycle (01 §5.3); shared contract is the spec field set.
 
 ## Log
+
+- CENSUS CLOSED (2026-08-24): workflow `pi_gateway_census_completion` — 9 family
+  agents + verifier. ALL remaining platforms ported behind the gate: 31 surfaces
+  PORTED, relay excluded by nature (no Hermes adapter module), local absorbed by
+  host loop per DEC-023, dingtalk scope-excluded per DEC-043. Suite
+  1842→2152 (+310) ×2 identical runs. Closure caught + fixed a REAL kit defect
+  (deliverChunk cached first-delivery chatId closures → cross-chat misrouting)
+  and a partial yuanbao delivery (fatal-close heartbeat stop, reply-heartbeat
+  lifecycle, ms-vs-s unit bug). DEC-044..047 logged. Zero core diffs.
 
 - DEFINITION OF DONE (2026-08-24): roadmap Phase 6 exit met. Clean-checkout proof:
   fresh `git clone` -> `npm ci` -> `npx tsc --noEmit` clean -> `npx vitest run`
