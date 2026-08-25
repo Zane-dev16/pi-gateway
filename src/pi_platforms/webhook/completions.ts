@@ -437,9 +437,7 @@ function sessionKeyEcho(
 ): Record<string, string> {
 	return {
 		"x-hermes-session-id": sessionId,
-		...(sessionKey !== undefined
-			? { "x-hermes-session-key": sessionKey }
-			: {}),
+		...(sessionKey !== undefined ? { "x-hermes-session-key": sessionKey } : {}),
 	};
 }
 

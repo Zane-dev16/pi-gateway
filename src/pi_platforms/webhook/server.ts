@@ -294,7 +294,7 @@ export class WebhookHttpServer {
 								completion_tokens: view.usage.completionTokens,
 								total_tokens: view.usage.totalTokens,
 							},
-					  }
+						}
 					: {}),
 				...(view.pendingSteer !== undefined
 					? { pending_steer: view.pendingSteer }

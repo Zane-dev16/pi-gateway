@@ -228,6 +228,139 @@ describe("approvals — hold-open + pop-or-409 (approval namespace = run_id)", (
 		// The slot survives — a real choice still resolves.
 		expect(registry.respondApproval(approvalId, "always").ok).toBe(true);
 	});
+
+	describe("approval response shape (api-1) + resolve_all (api-2)", () => {
+		it("by-run resolution returns resolved count; the SSE event carries it", async () => {
+			const registry = new RunRegistry();
+			const requestSeen = deferred<number>();
+			const responded =
+				deferred<Extract<RunEvent, { type: "approval.responded" }>>();
+			const done = deferred<void>();
+			let runId = "";
+			registry.start("a", async (controls) => {
+				runId = controls.runId;
+				registry.subscribe(runId, (e) => {
+					if (e.type === "approval.request") requestSeen.resolve(e.approvalId);
+					if (e.type === "approval.responded") responded.resolve(e);
+				});
+				await controls.requestApproval("cmd");
+				done.resolve();
+				return "ok";
+			});
+			await requestSeen.promise;
+			// hermes.run.approval_response seam data: choice + resolved COUNT.
+			expect(registry.respondApprovalForRun(runId, "once")).toEqual({
+				ok: true,
+				choice: "once",
+				resolved: 1,
+			});
+			const frame = await responded.promise;
+			expect(frame).toMatchObject({ runId, resolved: 1 });
+			await done.promise;
+		});
+
+		it("resolve_all drains EVERY live approval for the run FIFO with ONE counted frame", async () => {
+			const registry = new RunRegistry();
+			const opened = deferred<[number, number]>();
+			const frames: Extract<RunEvent, { type: "approval.responded" }>[] = [];
+			const done = deferred<void>();
+			const finished = deferred<void>();
+			let runId = "";
+			registry.start("multi", async (controls) => {
+				runId = controls.runId;
+				registry.subscribe(runId, (e) => {
+					if (e.type === "approval.responded") frames.push(e);
+					if (e.type === "run.completed") finished.resolve();
+				});
+				const first = controls.requestApproval("cmd-1");
+				const second = controls.requestApproval("cmd-2");
+				opened.resolve([0, 0]); // both gates open
+				const [a, b] = await Promise.all([first, second]);
+				if (a === "deny" && b === "deny") done.resolve();
+				return `${a},${b}`;
+			});
+			await opened.promise;
+			await new Promise<void>((r) => setTimeout(r, 5));
+			const outcome = registry.respondApprovalForRun(runId, "deny", {
+				resolveAll: true,
+			});
+			expect(outcome).toEqual({ ok: true, choice: "deny", resolved: 2 });
+			await done.promise;
+			await finished.promise;
+			// ONE summary frame carrying the drained count (api_server.py @8147).
+			expect(frames.length).toBe(1);
+			expect(frames[0]).toMatchObject({ runId, resolved: 2 });
+			// The run resumed (both gates answered).
+			expect(registry.status(runId)?.status).toBe("completed");
+		});
+	});
+
+	describe("status-view model/usage/pending_steer (api-3)", () => {
+		it("model rides start opts onto the queued/completed view", async () => {
+			const registry = new RunRegistry({
+				spawn: (task) => {
+					void task().catch(() => {});
+				},
+			});
+			const done = deferred<void>();
+			registry.start(
+				"x",
+				async () => {
+					done.resolve();
+					return "out";
+				},
+				{ model: "custom-model-9" },
+			);
+			const runId = registry.runIds()[0] ?? "";
+			expect(registry.status(runId)?.model).toBe("custom-model-9");
+			await done.promise;
+			expect(registry.status(runId)?.model).toBe("custom-model-9");
+			expect(registry.status(runId)?.usage).toBeUndefined();
+		});
+
+		it("executor RunCompletion usage lands on the completed view", async () => {
+			const registry = new RunRegistry();
+			const done = deferred<void>();
+			registry.start("x", async () => {
+				done.resolve();
+				return {
+					output: "done",
+					usage: { promptTokens: 11, completionTokens: 7, totalTokens: 18 },
+				};
+			});
+			await done.promise;
+			const runId = registry.runIds()[0] ?? "";
+			expect(registry.status(runId)?.usage).toEqual({
+				promptTokens: 11,
+				completionTokens: 7,
+				totalTokens: 18,
+			});
+		});
+
+		it("undelivered steer text rides the completed view + terminal event", async () => {
+			const registry = new RunRegistry();
+			const gateOpen = deferred<void>();
+			const completed =
+				deferred<Extract<RunEvent, { type: "run.completed" }>>();
+			let runId = "";
+			registry.start("x", async (controls) => {
+				runId = controls.runId;
+				registry.subscribe(runId, (e) => {
+					if (e.type === "run.completed") completed.resolve(e);
+				});
+				gateOpen.resolve();
+				// Executor NEVER consumes the steer text.
+				await new Promise<void>((r) => setTimeout(r, 15));
+				return "finished anyway";
+			});
+			await gateOpen.promise;
+			expect(registry.steer(runId, "late guidance").ok).toBe(true);
+			const event = await completed.promise;
+			expect(event.pendingSteer).toBe("late guidance");
+			const runIdFinal = runId;
+			expect(registry.status(runIdFinal)?.pendingSteer).toBe("late guidance");
+		});
+	});
 });
 
 describe("steer — only running runs accept text", () => {
@@ -324,7 +457,7 @@ describe("stop — COOPERATIVE interruption", () => {
 		expect(registry.status(runId)?.status).toBe("cancelled");
 	});
 
-	it("terminal runs refuse stop", async () => {
+	it("terminal runs have no live refs ⇒ stop answers run_not_found (api-4)", async () => {
 		const registry = new RunRegistry();
 		const completed = deferred<string>();
 		let runId = "";
@@ -335,10 +468,10 @@ describe("stop — COOPERATIVE interruption", () => {
 		});
 		await completed.promise;
 		await new Promise<void>((r) => setTimeout(r, 2));
-		expect(registry.stop(runId)).toEqual({
-			ok: false,
-			code: "run_already_finished",
-		});
+		// Hermes parity (_handle_stop_run @8199): once terminal the agent/task
+		// refs are popped, so a late stop is indistinguishable from an unknown
+		// id — 404 run_not_found, never 409 run_already_finished.
+		expect(registry.stop(runId)).toEqual({ ok: false, code: "unknown_run" });
 	});
 });
 

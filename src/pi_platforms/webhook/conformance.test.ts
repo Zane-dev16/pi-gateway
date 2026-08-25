@@ -107,7 +107,10 @@ interface E2EHarness {
 	server: import("./server.js").WebhookHttpServer;
 	adapter: WebhookAdapter;
 	runs: import("./runs.js").RunRegistry;
+	completions: import("./completions.js").CompletionsEndpoint;
 	parsedBodies: { count: number };
+	/** Memory scopes adopted by RUNS-lane starts (api-5 observability). */
+	boundRunMemoryScopes: string[];
 	close(): Promise<void>;
 }
 
@@ -192,8 +195,8 @@ async function makeE2E(): Promise<E2EHarness> {
 			nowMs: () => nowMsValue,
 		}),
 		nowMs: () => nowMsValue,
-		runDirectTurn: async ({ rawSessionId, prompt }) =>
-			adapter.runDirectTurnForTest(rawSessionId, prompt),
+		runDirectTurn: async ({ rawSessionId, prompt, sessionKey }) =>
+			adapter.runDirectTurnForTest(rawSessionId, prompt, sessionKey),
 	});
 	const server = new WebhookHttpServer({
 		pipeline,
@@ -204,27 +207,50 @@ async function makeE2E(): Promise<E2EHarness> {
 		apiKeyProvider: () => API_KEY,
 	});
 	// Runs started over HTTP get the lifecycle-complete default executor.
-	server.startRunWithDefaultExecutor = (input, sessionId) =>
-		runs.start(
+	// api-3/api-5 seams: queued model + adopted memory-scope key ride start opts
+	// (Hermes _create_agent gateway_session_key parity — bound observably here).
+	const boundRunMemoryScopes: string[] = [];
+	server.startRunWithDefaultExecutor = (
+		input,
+		sessionId,
+		model,
+		memoryScopeKey,
+	) => {
+		if (memoryScopeKey !== undefined) boundRunMemoryScopes.push(memoryScopeKey);
+		return runs.start(
 			input,
 			async (controls, text) => {
 				controls.emitDelta(`working on ${text}`);
+				const USAGE = {
+					promptTokens: 12,
+					completionTokens: 8,
+					totalTokens: 20,
+				};
 				if (text.includes("need-approval")) {
 					await controls.requestApproval("rm -rf /tmp/staging");
-					return "output after approval"; // approval runs complete after the choice
+					return { output: "output after approval", usage: USAGE };
+				}
+				if (text.includes("need-double-approval")) {
+					// TWO concurrent gates under ONE run — the resolve_all target.
+					const [a, b] = await Promise.all([
+						controls.requestApproval("cmd-one"),
+						controls.requestApproval("cmd-two"),
+					]);
+					return { output: `double:${a},${b}`, usage: USAGE };
 				}
 				while (!controls.shouldStop()) {
 					const steered = runs.consumeSteer(controls.runId);
 					if (steered !== null) {
 						controls.emitDelta(`steered:${steered}`);
-						return "output after steer";
+						return { output: "output after steer", usage: USAGE };
 					}
 					await new Promise<void>((r) => setTimeout(r, 2));
 				}
 				throw new Error("stopped");
 			},
-			{ sessionId },
+			{ sessionId, model },
 		);
+	};
 
 	const baseUrl = await server.listen();
 	void nowMsValue;
@@ -233,7 +259,9 @@ async function makeE2E(): Promise<E2EHarness> {
 		server,
 		adapter,
 		runs,
+		completions,
 		parsedBodies,
+		boundRunMemoryScopes,
 		close: () => server.close(),
 	};
 }
@@ -433,17 +461,29 @@ describe("E2E pipeline row — real loopback sockets", () => {
 			);
 			// Give the run a moment to open the approval gate…
 			await new Promise<void>((r) => setTimeout(r, 15));
-			// SINGULAR /approval is the documented route (webhook-45).
+			// SINGULAR /approval is the documented route (webhook-45). The 200
+			// body is the hermes.run.approval_response envelope with the
+			// resolved COUNT — no invented status field (api-1, @8140-8146).
 			const approveRes = await postRun(h.baseUrl, `/v1/runs/${runA}/approval`, {
 				choice: "once",
 			});
 			expect(approveRes.status).toBe(200);
+			expect(await approveRes.json()).toEqual({
+				object: "hermes.run.approval_response",
+				run_id: runA,
+				choice: "once",
+				resolved: 1,
+			});
 			const seenA = await framesA;
 			const typesA = seenA.map((f) => f.type);
 			expect(typesA).toContain("assistant.delta");
 			expect(typesA).toContain("approval.request");
 			expect(typesA).toContain("approval.responded");
 			expect(typesA).toContain("run.completed");
+			// The approval.responded frame carries the resolved count (@8147).
+			const respondedFrame = seenA.find((f) => f.type === "approval.responded");
+			expect(respondedFrame?.payload["resolved"]).toBe(1);
+			expect(respondedFrame?.payload["choice"]).toBe("once");
 			// Terminal done sentinel closes every stream (webhook-46).
 			expect(typesA[typesA.length - 1]).toBe("done");
 			// snake_case payload parity on the wire.
@@ -479,6 +519,41 @@ describe("E2E pipeline row — real loopback sockets", () => {
 			});
 			expect([409, 400]).toContain(again.status); // invalid_choice(400): slot popped ⇒ not active
 
+			// ── RESOLVE_ALL: body booleans drain every gate under ONE run ──
+			const startD = await postRun(h.baseUrl, "/v1/runs", {
+				input: "deploy need-double-approval please",
+			});
+			const { run_id: runD } = (await startD.json()) as { run_id: string };
+			await new Promise<void>((r) => setTimeout(r, 15));
+			// coerceRequestBool parity: STRING "yes" is truthy for all/resolve_all.
+			const resolveAllRes = await postRun(
+				h.baseUrl,
+				`/v1/runs/${runD}/approval`,
+				{ choice: "deny", all: "yes" },
+			);
+			expect(resolveAllRes.status).toBe(200);
+			expect(await resolveAllRes.json()).toEqual({
+				object: "hermes.run.approval_response",
+				run_id: runD,
+				choice: "deny",
+				resolved: 2,
+			});
+			await new Promise<void>((r) => setTimeout(r, 10));
+			expect(h.runs.status(runD)?.status).toBe("completed");
+
+			// Explicit false strings do NOT trigger the drain (single resolve).
+			const startE = await postRun(h.baseUrl, "/v1/runs", {
+				input: "deploy need-double-approval again",
+			});
+			const { run_id: runE } = (await startE.json()) as { run_id: string };
+			await new Promise<void>((r) => setTimeout(r, 15));
+			const singleRes = await postRun(h.baseUrl, `/v1/runs/${runE}/approval`, {
+				choice: "once",
+				resolve_all: "false",
+			});
+			expect(singleRes.status).toBe(200);
+			expect(await singleRes.json()).toMatchObject({ resolved: 1 });
+
 			// ── STEER: only while running; text reaches the executor. ──
 			const startB = await postRun(h.baseUrl, "/v1/runs", {
 				input: "refactor steerable-target",
@@ -507,6 +582,15 @@ describe("E2E pipeline row — real loopback sockets", () => {
 			const seenC = await framesC;
 			expect(seenC.some((f) => f.type === "run.cancelled")).toBe(true);
 			expect(seenC[seenC.length - 1]?.type).toBe("done");
+
+			// Terminal runs have NO live refs ⇒ late stop answers 404
+			// run_not_found, NEVER 409 run_already_finished (api-4, @8199).
+			await new Promise<void>((r) => setTimeout(r, 5));
+			const lateStop = await postRun(h.baseUrl, `/v1/runs/${runC}/stop`, {});
+			expect(lateStop.status).toBe(404);
+			expect(
+				((await lateStop.json()) as { error: { code: string } }).error.code,
+			).toBe("run_not_found");
 
 			// UNKNOWN runs answer 404 run_not_found envelopes (webhook-50),
 			// never 409 and never a crash.
@@ -666,6 +750,8 @@ describe("E2E pipeline row — real loopback sockets", () => {
 				created_at: expect.any(Number),
 				updated_at: expect.any(Number),
 				session_id: "agent:main:api_server:dm:probe",
+				// Queued-status model field (@7690): body value or default.
+				model: "pi-gateway",
 			});
 			await postRun(h.baseUrl, `/v1/runs/${run_id}/approval`, {
 				choice: "once",
@@ -680,11 +766,228 @@ describe("E2E pipeline row — real loopback sockets", () => {
 				run_id,
 				status: "completed",
 				session_id: "agent:main:api_server:dm:probe",
+				model: "pi-gateway",
+				usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
 				output: "output after approval",
 				last_event: "run.completed",
 			});
+			// pending_steer stays ABSENT when no steer text is undelivered.
+			expect(view["pending_steer"]).toBeUndefined();
 		} finally {
 			await h.close();
+		}
+	});
+
+	it("api-3: explicit body model lands on the queued view; pending_steer surfaces", async () => {
+		const h = await makeE2E();
+		try {
+			const started = await postRun(h.baseUrl, "/v1/runs", {
+				input: "endless loop work",
+				model: "custom-model-9",
+			});
+			expect(started.status).toBe(202);
+			const { run_id } = (await started.json()) as { run_id: string };
+			await new Promise<void>((r) => setTimeout(r, 10));
+			const mid = await fetch(`${h.baseUrl}/v1/runs/${run_id}`, {
+				headers: { authorization: `Bearer ${API_KEY}` },
+			});
+			expect(((await mid.json()) as { model?: string }).model).toBe(
+				"custom-model-9",
+			);
+			// Steer text that the executor never consumes rides the completed
+			// status as pending_steer (@7926-7936).
+			await postRun(h.baseUrl, `/v1/runs/${run_id}/steer`, {
+				input: "undelivered guidance",
+			});
+			await postRun(h.baseUrl, `/v1/runs/${run_id}/stop`, {});
+			await new Promise<void>((r) => setTimeout(r, 15));
+			// Cancelled runs do NOT carry pending_steer (Hermes sets it on the
+			// COMPLETED branch only) — drive a completing run instead.
+			const start2 = await postRun(h.baseUrl, "/v1/runs", {
+				input: "refactor steerable-target",
+				model: "custom-model-9",
+			});
+			const { run_id: run2 } = (await start2.json()) as { run_id: string };
+			await postRun(h.baseUrl, `/v1/runs/${run2}/steer`, {
+				input: "late-but-consumed",
+			});
+			await new Promise<void>((r) => setTimeout(r, 20));
+			const doneView = h.runs.status(run2);
+			expect(doneView?.status).toBe("completed");
+			expect(doneView?.pendingSteer).toBeUndefined(); // executor CONSUMED it
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("api-5: X-Hermes-Session-Key ladder gates POST /v1/runs and echoes the scope", async () => {
+		const h = await makeE2E();
+		try {
+			// Over-length rejects at _MAX_SESSION_HEADER_LEN=256 BEFORE any run
+			// starts (control-character rejection is covered at the trust-engine
+			// unit layer — HTTP clients cannot transmit raw \r\n\x00 header bytes).
+			expect(h.runs.runIds().length).toBe(0);
+			const tooLong = await postRun(
+				h.baseUrl,
+				"/v1/runs",
+				{
+					input: "x",
+				},
+				{ "x-hermes-session-key": "k".repeat(257) },
+			);
+			expect(tooLong.status).toBe(400);
+			expect(await tooLong.json()).toEqual({
+				error: {
+					message: "Session key too long",
+					type: "invalid_request_error",
+				},
+			});
+
+			// A valid key starts the run, echoes back on the 202…
+			const ok = await postRun(
+				h.baseUrl,
+				"/v1/runs",
+				{
+					input: "scoped work",
+				},
+				{ "x-hermes-session-key": `  memory-scope-A  ` },
+			);
+			expect(ok.status).toBe(202);
+			expect(ok.headers.get("x-hermes-session-key")).toBe("memory-scope-A");
+			// …and BINDS the memory scope for the run's turn (DEC-017).
+			await new Promise<void>((r) => setTimeout(r, 5));
+			expect(h.boundRunMemoryScopes).toContain("memory-scope-A");
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("api-5: completions lane honors the session-key ladder, echo, and binding", async () => {
+		const h = await makeE2E();
+		try {
+			const BEARER = { authorization: `Bearer ${API_KEY}` };
+			// Echo + memory-scope binding on the JSON lane.
+			const res = await fetch(`${h.baseUrl}/v1/chat/completions`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					...BEARER,
+					"x-hermes-session-key": "scope-json-1",
+				},
+				body: JSON.stringify({
+					model: "pi-gateway",
+					messages: [{ role: "user", content: "scoped probe" }],
+				}),
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("x-hermes-session-key")).toBe("scope-json-1");
+			expect(res.headers.get("x-hermes-session-id")).toBeTruthy();
+			await res.text();
+			expect(h.adapter.memoryScopeBindings()).toContain("scope-json-1");
+
+			// The SSE chunk-stream lane echoes the key too (@5427 parity).
+			const stream = await fetch(`${h.baseUrl}/v1/chat/completions`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					...BEARER,
+					"x-hermes-session-key": "scope-sse-1",
+				},
+				body: JSON.stringify({
+					model: "pi-gateway",
+					messages: [{ role: "user", content: "scoped stream" }],
+					stream: true,
+				}),
+			});
+			expect(stream.headers.get("x-hermes-session-key")).toBe("scope-sse-1");
+			await stream.text();
+			expect(h.adapter.memoryScopeBindings()).toContain("scope-sse-1");
+
+			// Injection + over-length 400s ride the shared trust-engine verdicts,
+			// rendered verbatim by the lane ({message,type} dicts like Hermes).
+			for (const [hostile, message] of [
+				["bad\nk", "Invalid session key"],
+				["k".repeat(257), "Session key too long"],
+			] as const) {
+				const bad = await h.completions.handle({
+					headers: {
+						authorization: BEARER.authorization,
+						"x-hermes-session-key": hostile,
+					},
+					bodyText: JSON.stringify({
+						messages: [{ role: "user", content: "x" }],
+					}),
+				});
+				expect(bad.status).toBe(400);
+				expect(bad.json).toEqual({
+					error: { message, type: "invalid_request_error" },
+				});
+			}
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("api-5: WITHOUT a configured API key the session key is 403-rejected, never anonymous", async () => {
+		// Key-less server (vendor no-key wiring): the /v1/runs lanes are
+		// ungated BUT adopting a memory scope still requires auth — the
+		// _parse_session_key_header ladder answers 403 (@2318-2328).
+		const [
+			{ WebhookHttpServer },
+			{ WebhookIngressPipeline, createTimeoutSeam },
+			{ RunRegistry },
+			{ webhookTrustBoundary },
+			{ SlidingWindowRateLimiter },
+			{ DeliveryIdempotencyStore },
+		] = await Promise.all([
+			import("./server.js"),
+			import("./http-ingress.js"),
+			import("./runs.js"),
+			import("./manifest.js"),
+			import("./rate-limit.js"),
+			import("./idempotency.js"),
+		]);
+		const nowMsValue = Date.now();
+		const server = new WebhookHttpServer({
+			pipeline: new WebhookIngressPipeline({
+				trust: webhookTrustBoundary(),
+				routes: new Map(),
+				rateLimiter: new SlidingWindowRateLimiter({
+					limit: 10,
+					nowMs: () => nowMsValue,
+				}),
+				idempotency: new DeliveryIdempotencyStore({
+					maxEntries: 16,
+					nowMs: () => nowMsValue,
+				}),
+				nowSeconds: () => Math.floor(nowMsValue / 1000),
+				timers: createTimeoutSeam(),
+				parseJson: (text) => JSON.parse(text) as Record<string, unknown>,
+				runAgentTurn: async () => null,
+			}),
+			completions: {} as never,
+			runs: new RunRegistry(),
+			bodyCapBytes: 64 * 1024,
+			// NO apiKeyProvider ⇒ ungated runs lanes.
+		});
+		const baseUrl = await server.listen();
+		try {
+			const res = await fetch(`${baseUrl}/v1/runs`, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-hermes-session-key": "sneaky-scope",
+				},
+				body: JSON.stringify({ input: "anonymous scope grab" }),
+			});
+			expect(res.status).toBe(403);
+			const body = (await res.json()) as {
+				error: { type: string; message: string };
+			};
+			expect(body.error.type).toBe("gateway_auth_error");
+			expect(body.error.message).toMatch(/requires API key authentication/);
+		} finally {
+			await server.close();
 		}
 	});
 

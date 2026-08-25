@@ -4,7 +4,11 @@
 // and over-length headers reject, absence adopts nothing (stateless default).
 
 import { describe, expect, it } from "vitest";
-import { MAX_SESSION_HEADER_LEN, extractOptInSessionHeaders } from "./index.js";
+import {
+	MAX_SESSION_HEADER_LEN,
+	extractOptInSessionHeaders,
+	extractSessionKeyHeader,
+} from "./index.js";
 
 describe("X-Hermes-Session-Key requires API-key auth", () => {
 	it("key WITHOUT configured API key ⇒ 403 gateway_auth_error, never anonymous", () => {
@@ -121,5 +125,65 @@ describe("opt-in semantics", () => {
 				{ apiKeyConfigured: false },
 			),
 		).toEqual({ ok: true, sessionId: "sess-7", sessionKey: null });
+	});
+});
+
+describe("extractSessionKeyHeader — the key-only lane core (api-5)", () => {
+	it("mirrors _parse_session_key_header: absent/blank adopt nothing", () => {
+		expect(extractSessionKeyHeader({}, { apiKeyConfigured: true })).toEqual({
+			ok: true,
+			sessionKey: null,
+		});
+		expect(
+			extractSessionKeyHeader(
+				{ "x-hermes-session-key": "   " },
+				{ apiKeyConfigured: false },
+			),
+		).toEqual({ ok: true, sessionKey: null });
+	});
+
+	it("no API key configured ⇒ 403 gateway_auth_error (never anonymous)", () => {
+		const verdict = extractSessionKeyHeader(
+			{ "x-hermes-session-key": "scope" },
+			{ apiKeyConfigured: false },
+		);
+		expect(verdict).toEqual({
+			ok: false,
+			status: 403,
+			error: expect.stringMatching(/requires API key authentication/),
+			errorType: "gateway_auth_error",
+		});
+	});
+
+	it("injection chars and over-length reject with the Hermes 400 bodies", () => {
+		const injected = extractSessionKeyHeader(
+			{ "x-hermes-session-key": "a\u0000b" },
+			{ apiKeyConfigured: true },
+		);
+		expect(injected).toEqual({
+			ok: false,
+			status: 400,
+			error: "Invalid session key",
+			errorType: "invalid_request_error",
+		});
+		const tooLong = extractSessionKeyHeader(
+			{ "x-hermes-session-key": "k".repeat(257) },
+			{ apiKeyConfigured: true },
+		);
+		expect(tooLong).toEqual({
+			ok: false,
+			status: 400,
+			error: "Session key too long",
+			errorType: "invalid_request_error",
+		});
+	});
+
+	it("valid keys are adopted trimmed; the pair helper composes this core", () => {
+		expect(
+			extractSessionKeyHeader(
+				{ "x-hermes-session-key": "  scope-7  " },
+				{ apiKeyConfigured: true },
+			),
+		).toEqual({ ok: true, sessionKey: "scope-7" });
 	});
 });

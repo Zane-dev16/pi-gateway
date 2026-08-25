@@ -510,3 +510,63 @@ in `../09-open-questions.md` (append-only).
   reply_to_text hydration via capture guard. Suite: whatsapp-cloud 55→68 files-tests
   74/74 green (+13), conformance wa rows green; layering + secret gates green;
   tsc clean (whole-tree window verified during sibling-cluster settle).
+
+- Conformity round-2 fix cluster `yuanbao-r2` (2026-08-25): 8 findings,
+  single-owner pass over src/pi_platforms/yuanbao (+conformance/yuanbao-rows).
+  yb-1: encodeAuthBindRaw carries SIGN_APP_VERSION/SIGN_BOT_VERSION ('0.20.5',
+  not hardcoded '1.0.0'), source = token_data.source-or-'bot', env_name field 5
+  routeEnv = adapter.routeEnv || token_data.route_env (SignManager.fetch now
+  parses source/route_env into SignTokenData; fake records decoded AUTH_BINDs).
+  yb-2: scheduleReconnect calls signManager.forceRefresh before EVERY dial —
+  cache-valid reuse after drops would re-auth on server-rotated credentials;
+  bot_id refresh threaded per _do_reconnect. yb-3: backoff min(2**(n-1),60)
+  reaches the 60s cap (was 16s forever). yb-4: YB_MAX_TEXT_CHUNK=4000 manifest
+  constant is the ADAPTER-default scalarMaxUnits (subjects keep explicit 64
+  harness budget). yb-5: per-sender 1.5s DEBOUNCE_WINDOW (_push_to_inbound
+  parity) — companion pushes merge into ONE dispatchPush run, base push +
+  "\n" TIMTextElem separator between companions (DecodeMiddleware merge),
+  window RESETS per arrival, buffers dropped on disconnect; fixture rows
+  resubscribeReplay/watchdogRecovery + yb.* delta rows conformed to merged-turn
+  truth with cross-window dedup exactly-once. yb-6: dmPolicy/groupPolicy
+  'open' branches consult GATEWAY_ALLOW_ALL_USERS / YUANBAO_ALLOW_ALL_USERS
+  opt-in env flags (truthy true/1/yes case-insensitive; deny-by-default).
+  yb-7: optional group-origin code rides metadata yuanbao_group_code onto
+  SendC2CMessageReq field 6 (send_dm→send_c2c_msg_body parity); fake decodes
+  C2C field 6. yb-8: openAndAuth races pendingBind against AUTH_TIMEOUT_S=10
+  under the INJECTED clock — withheld BIND_ACK fails connect CLOSED (fatal),
+  never hangs. NEW contracts: yuanbao-conformity.test.ts yb-r2 describe
+  (auth identity vectors incl. token fallbacks, force-refresh-per-dial +
+  backoff ladder data [1000,2000,4000,…60000 cap], debounce merge/reset/
+  sender-isolation, open-policy env matrix, C2C origin field 6 wire shape,
+  bind-timeout fail-closed). Suite: yuanbao-conformity 21/21, yuanbao-rows
+  8/8 green; tsc clean for the cluster window. Note: an interleaved sibling
+  sweep committed intermediate yuanbao states inside 3c37c13 (telegram-wire-r2);
+  this cluster's final state landed as the follow-up yuanbao-r2 commit.
+
+- Stability round-2 fix cluster `api-server-r2` (2026-08-26): webhook /v1/runs +
+  completions lanes moved onto Hermes truth at /tmp/hermes-upstream anchors.
+  api-1: POST /v1/runs/{id}/approval answers {object:'hermes.run.approval_response',
+  run_id, choice, resolved} (@8140-8146) — invented status:'approval_responded'
+  removed; SSE approval.responded frame carries the resolved count (@8147).
+  api-2: body all/resolve_all honored via coerceRequestBool → resolve_gateway_approval
+  parity — registry drains EVERY live approval under the run FIFO
+  (OneShotPendingStore.oldestIdForSession IS the session queue, tools/approval.py:2850)
+  with ONE counted frame; string booleans normalize ("false" never misroutes).
+  api-3: RunView stores+returns model (queued @7690, body value or default) + usage
+  (executor RunCompletion seam, bare-string executors still compile) + pending_steer
+  (undelivered steer rides completed status AND terminal event @7926-7936); GET
+  renders snake_case usage triple. api-4: terminal runs have no live refs ⇒ stop
+  answers 404 run_not_found (@8199) — 409 run_already_finished deleted from lane and
+  registry. api-5: X-Hermes-Session-Key ladder COMPLETES DEC-017 on both lanes via a
+  new key-only core extractSessionKeyHeader in pi_gateway/security/trust/session-headers
+  (pair helper refactored onto it, zero drift): 403 requires-auth when no API key
+  configured (never anonymous, runs lane gated BEFORE body parse), 400 control-char /
+  400 over-length rendered as Hermes' plain {message,type} dicts, echo on 202 start +
+  every completion response/SSE stream (@4689/:5343/:5427), memory-scope binding
+  observable adapter-side (memoryScopeBindings + metadata.memory_scope; routing keys
+  untouched). Suite: webhook+trust scoped 187/187→201/201 with new contracts
+  (approval envelope, FIFO drain w/ counted frame, model/usage/pending_steer views,
+  late-stop 404, key ladder incl. key-less-server 403); tsc clean for cluster files;
+  layering + secret gates green. NOTE: shared-tree commit d28d0b3 absorbed most of
+  this cluster's file state mid-flight; this commit finalizes it (test contracts +
+  formatting).
