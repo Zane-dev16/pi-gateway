@@ -144,6 +144,7 @@ export class MattermostSubject implements ConformanceSubject {
 				...wireMetadata,
 				mm_props: payload["props"],
 				mm_root_id: payload["root_id"],
+				mm_file_ids: payload["file_ids"],
 			});
 			if (!result.success) {
 				throw Object.assign(new Error(result.error ?? "send failed"), {

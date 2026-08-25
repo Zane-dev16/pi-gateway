@@ -12,7 +12,13 @@
 //   gateway/dead_targets.py:DeadTargetRegistry → DeadTargetRegistry
 //   gateway/dead_targets.py:_DEAD_ERROR_KINDS  → DEAD_ERROR_KINDS
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 /** Error kinds meaning the WHOLE chat is unreachable (never transient/thread-level). */
@@ -27,6 +33,11 @@ export function isDeadErrorKind(errorKind: string | null | undefined): boolean {
 
 function normalizeKey(platform: string, chatId: string): string {
 	return `${platform.trim().toLowerCase()}:${chatId.trim()}`;
+}
+
+/** Best-effort tmp residue cleanup after a failed rename. */
+function cleanupTmp(tmpPath: string): void {
+	unlinkSync(tmpPath);
 }
 
 interface DeadEntry {
@@ -65,16 +76,32 @@ export class DeadTargetRegistry {
 		}
 	}
 
-	/** Atomic tmp+replace flush; failure keeps in-memory state only. */
+	/**
+	 * Atomic tmp+replace flush (dead_targets.py:_flush_locked): the JSON
+	 * snapshot is written to a sibling tmp file and RENAMED over the target, so
+	 * readers never observe partial/corrupt state. Failure keeps in-memory
+	 * state only and cleans the tmp residue up — never breaks delivery.
+	 */
 	private flush(): void {
 		if (!this.path) return;
 		try {
 			mkdirSync(dirname(this.path), { recursive: true });
+			const tmp = `${this.path}.tmp-${process.pid}`;
 			writeFileSync(
-				this.path,
+				tmp,
 				JSON.stringify(Object.fromEntries(this.dead), null, 2),
 				"utf8",
 			);
+			try {
+				renameSync(tmp, this.path);
+			} catch (renameErr) {
+				try {
+					cleanupTmp(tmp);
+				} catch {
+					// residue cleanup best-effort
+				}
+				throw renameErr;
+			}
 		} catch {
 			// best-effort — never break delivery on persistence failure
 		}

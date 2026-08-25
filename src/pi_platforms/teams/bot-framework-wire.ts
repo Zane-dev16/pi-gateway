@@ -63,7 +63,10 @@ export interface BotFrameworkTransport {
 		bearer: string,
 		metadata?: Record<string, unknown> | undefined,
 	): Promise<ActivityPostResponse>;
-	sendTypingActivity(conversationId: string): Promise<void>;
+	sendTypingActivity(
+		conversationId: string,
+		activity: BotFrameworkJson,
+	): Promise<void>;
 	fetchAttachmentBytes(url: string): Promise<{ status: number; bytes: Buffer }>;
 }
 
@@ -74,12 +77,19 @@ export interface BotFrameworkTransport {
 export class FakeBotFrameworkServer implements BotFrameworkTransport {
 	readonly tokenRequests: BotFrameworkTokenRequest[] = [];
 	readonly activities: RecordedActivity[] = [];
-	readonly typingActivities: string[] = [];
+	/** Recorded Typing activity POSTs (body carries {type:"typing"}). */
+	readonly typingActivities: Array<{
+		conversationId: string;
+		activity: BotFrameworkJson;
+	}> = [];
 	readonly attachmentFetches: string[] = [];
 
 	private tokenScripts: TokenEndpointResponse[] = [];
 	private activityFailScripts: ActivityPostResponse[] = [];
 	private replyFailScripts: ActivityPostResponse[] = [];
+	/** Scripted TRANSPORT THROWS — request raises instead of answering. */
+	private replyThrowScripts: unknown[] = [];
+	private activityThrowScripts: unknown[] = [];
 	private seqCounter = 0;
 
 	/** Program token-endpoint responses (FIFO; default 200 + access_token). */
@@ -95,6 +105,20 @@ export class FakeBotFrameworkServer implements BotFrameworkTransport {
 	/** Script threaded-reply failures — the group-chat 400 shape. */
 	scriptReplyFail(...responses: ActivityPostResponse[]): void {
 		this.replyFailScripts.push(...responses);
+	}
+
+	/**
+	 * Script threaded-reply TRANSPORT THROWS (webhook-40): postReply RAISES
+	 * instead of answering — nothing is recorded because the request never
+	 * completed. Exercises the adapter's thrown-error flat-send fallback.
+	 */
+	scriptReplyThrow(...errors: unknown[]): void {
+		this.replyThrowScripts.push(...errors);
+	}
+
+	/** Script flat-send transport throws (both-lanes-down posture). */
+	scriptActivityThrow(...errors: unknown[]): void {
+		this.activityThrowScripts.push(...errors);
 	}
 
 	async getAccessToken(
@@ -114,6 +138,8 @@ export class FakeBotFrameworkServer implements BotFrameworkTransport {
 		activity: BotFrameworkJson,
 		bearer: string,
 	): Promise<ActivityPostResponse> {
+		const thrown = this.activityThrowScripts.shift();
+		if (thrown !== undefined) throw thrown;
 		this.seqCounter += 1;
 		this.activities.push({
 			conversationId,
@@ -133,6 +159,8 @@ export class FakeBotFrameworkServer implements BotFrameworkTransport {
 		activity: BotFrameworkJson,
 		bearer: string,
 	): Promise<ActivityPostResponse> {
+		const thrown = this.replyThrowScripts.shift();
+		if (thrown !== undefined) throw thrown;
 		this.seqCounter += 1;
 		this.activities.push({
 			conversationId,
@@ -146,8 +174,11 @@ export class FakeBotFrameworkServer implements BotFrameworkTransport {
 		return { status: 200, json: { id: `bf-${this.seqCounter}` } };
 	}
 
-	async sendTypingActivity(conversationId: string): Promise<void> {
-		this.typingActivities.push(conversationId);
+	async sendTypingActivity(
+		conversationId: string,
+		activity: BotFrameworkJson,
+	): Promise<void> {
+		this.typingActivities.push({ conversationId, activity });
 	}
 
 	async fetchAttachmentBytes(
@@ -217,7 +248,10 @@ export class WireBridgeTransport implements BotFrameworkTransport {
 		return this.toResponse(result);
 	}
 
-	async sendTypingActivity(): Promise<void> {
+	async sendTypingActivity(
+		_conversationId: string,
+		_activity: BotFrameworkJson,
+	): Promise<void> {
 		throw new Error("typing requires the FakeBotFrameworkServer fixture");
 	}
 

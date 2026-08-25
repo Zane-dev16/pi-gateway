@@ -21,6 +21,9 @@
 //   4. Full-catalog gate: allApplicablePassed === true, deferred === [].
 //   5. The gate DETECTS: an inflating mutant fixture fails ITS OWN named row.
 
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { ManualScheduler } from "../../pi_gateway/guards/testing/manual-spawner.js";
@@ -168,7 +171,7 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 	return [
 		mk(
 			"transport.teams.activity-ingress-pipeline",
-			"teams: _on_message pipeline — bot-id self filter skips silently; <at>@mention</at> stripped; TTL dedupe kills redelivery and EXPIRES on the injected clock; conversation_type maps to dm/group/channel",
+			"teams: _on_message pipeline — bot-id self filter skips silently; <at>@mention</at> stripped; TTL dedupe kills redelivery and EXPIRES on the injected clock; conversation_type maps to dm/group/channel; activity POSTs ack 200 with EMPTY bodies (accepted and skipped alike); non-message activities (conversationUpdate/typing pings) are IGNORED per the SDK's per-activity handler registration; source.chatName rides the CONVERSATION (sender name is the DM-only fallback)",
 			async (fx) => {
 				// Self-authored echo never becomes a turn.
 				const self = await fx.postMessageActivity(
@@ -180,6 +183,9 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 					}),
 				);
 				expect(self.status).toBe(200);
+				// webhook-41: skipped POSTs ack 200 with an EMPTY body too —
+				// skip reasons live in counters, never on the wire.
+				expect(self.json).toBeUndefined();
 				expect(fx.adapter.counters.selfMessagesSkipped).toBe(1);
 				expect(fx.adapter.turnLog).toEqual([]);
 
@@ -188,7 +194,10 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 					id: "act-m1",
 					text: "<at>Hermes</at> deploy the gateway",
 				});
-				await fx.postMessageActivity(mentioned);
+				const mentionedResp = await fx.postMessageActivity(mentioned);
+				// webhook-41: accepted activity POSTs ack 200 with NO body
+				// (_AiohttpBridgeAdapter answers web.Response(status) bare).
+				expect(mentionedResp.json).toBeUndefined();
 				await new Promise<void>((r) => setTimeout(r, 20));
 				expect(fx.adapter.turnLog).toEqual(["deploy the gateway"]);
 
@@ -225,6 +234,47 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 				expect(fx.adapter.turnLog).toContain("group hello");
 				expect(fx.adapter.turnLog).toContain("dm hello");
 
+				// webhook-39: source.chatName is the CONVERSATION's name — a channel
+				// session is never named after whoever spoke.
+				const namedChannel = await fx.postMessageActivity(
+					fx.messageActivity({
+						id: "act-name",
+						text: "who goes there",
+						fromName: "Alice Sender",
+						conversationName: "Deploy Channel",
+					}),
+				);
+				expect(namedChannel.status).toBe(200);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.adapter.sourceChatNames.at(-1)).toBe("Deploy Channel");
+
+				// Nameless channel: chatName stays EMPTY (the sender name never
+				// leaks into it).
+				const unnamedChannel = await fx.postMessageActivity(
+					fx.messageActivity({
+						id: "act-chan-unnamed",
+						text: "unnamed channel",
+						fromName: "Carol Sender",
+					}),
+				);
+				expect(unnamedChannel.status).toBe(200);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.adapter.sourceChatNames.at(-1)).toBe("");
+
+				// DM fallback ONLY: a nameless personal conversation borrows the
+				// sender's name (Hermes builds chat_name and user_name apart).
+				const namedDm = await fx.postMessageActivity(
+					fx.messageActivity({
+						id: "act-dmname",
+						text: "dm naming",
+						fromName: "Bob Sender",
+						conversationType: "personal",
+					}),
+				);
+				expect(namedDm.status).toBe(200);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.adapter.sourceChatNames.at(-1)).toBe("Bob Sender");
+
 				// Malformed bodies answer 400 (never dispatched).
 				const badJson = await fx.postActivityBody("{nope");
 				expect(badJson.status).toBe(400);
@@ -235,6 +285,40 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 				const big = Buffer.alloc(1_048_577, 0x20);
 				const oversized = await fx.postActivityBody(big);
 				expect(oversized.status).toBe(413);
+
+				// Non-message activities NEVER become pipeline traffic (the SDK
+				// registers on_message for MessageActivity ONLY @850-859):
+				// conversationUpdate/typing pings ack 200 EMPTY and are dropped.
+				const turnsBeforePings = fx.adapter.turnLog.length;
+				const acceptedBeforePings = fx.adapter.counters.activitiesAccepted;
+				const convUpdate = await fx.postActivityBody(
+					JSON.stringify({
+						type: "conversationUpdate",
+						membersAdded: [{ id: "bot-id" }],
+						conversation: {
+							id: "19:meeting123@thread.tacv2",
+							conversation_type: "channel",
+						},
+					}),
+				);
+				expect(convUpdate.status).toBe(200);
+				expect(convUpdate.json).toBeUndefined();
+				const typingPing = await fx.postActivityBody(
+					JSON.stringify({
+						type: "typing",
+						from: { id: "user-8" },
+						conversation: {
+							id: "19:meeting123@thread.tacv2",
+							conversation_type: "channel",
+						},
+					}),
+				);
+				expect(typingPing.status).toBe(200);
+				expect(fx.adapter.turnLog.length).toBe(turnsBeforePings);
+				expect(fx.adapter.counters.activitiesAccepted).toBe(
+					acceptedBeforePings,
+				);
+				expect(fx.adapter.counters.duplicatesSkipped).toBe(1);
 			},
 		),
 		mk(
@@ -330,7 +414,7 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 		),
 		mk(
 			"transport.teams.approval-card-lifecycle",
-			"teams: card actions DEFAULT-DENY (unconfigured denies w/ guidance; allowlist admits named clicker; '*' admits all); four choices resolve exactly-once through THE kit router; double-tap and stale ids answer the explicit expiry card",
+			"teams: card actions DEFAULT-DENY (unconfigured denies w/ guidance; allowlist admits named clicker; '*' admits all); card button data carries NO approval_id — clicks resolve by SESSION KEY through THE kit router; resolved taps echo the FULL confirmation card (title/cmd fence/Reason/bold label); double-tap answers the explicit expiry CARD; AdaptiveCard invoke activities route through handleActivityPost",
 			async (_fx) => {
 				const sessionKey = "sk-approval-1";
 
@@ -348,67 +432,140 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 				// Allowlisted clicker resolves ONCE; second tap expires.
 				const gated = makeTeamsFixture({ allowedUsers: ["clicker-B"] });
 				const sendResult = await gated.adapter.sendApprovalCard(
-					gated.adapter.convRefs.has("conv-x")
-						? "conv-x"
-						: "19:chat@thread.tacv2",
+					"19:chat@thread.tacv2",
 					"rm -rf /tmp/stale",
 					sessionKey,
 					"dangerous cleanup",
 				);
 				expect(sendResult.success).toBe(true);
 
-				// The registered pending id rides the card data — recover it from
-				// the adapter's approvals store size (one pending registered).
-				const pendingId = gated.adapter.pendingApprovalIds()[0];
-				expect(pendingId).toBeDefined();
+				// teams-1 btn_data_base parity (@1198-1210): button data carries NO
+				// approval_id — exactly {session_key, cmd, desc} + hermes_action.
+				// The sequential id bookkeeping stays ADAPTER-SIDE (one pending
+				// registered in the approvals store).
+				const postedCard = gated.bf.activities.at(-1);
+				const cardAttachment = (
+					(postedCard?.activity["attachments"] ?? []) as Array<
+						Record<string, unknown>
+					>
+				)[0];
+				const cardContent = cardAttachment?.["content"] as Record<
+					string,
+					unknown
+				>;
+				const cardActions = cardContent["actions"] as Array<
+					Record<string, unknown>
+				>;
+				expect(cardActions).toHaveLength(4); // smart_denied=false ⇒ 4 buttons
+				for (const action of cardActions) {
+					expect(
+						Object.keys(action["data"] as Record<string, unknown>).sort(),
+					).toEqual(["cmd", "desc", "hermes_action", "session_key"]);
+				}
+				expect(gated.adapter.pendingApprovalIds()).toHaveLength(1);
 
+				// HERMES-SHAPED click (approval_id absent-on-wire) resolves by
+				// session key through THE kit router.
 				const approved = await gated.adapter.handleCardAction(
 					{
 						hermes_action: "approve_once",
 						session_key: sessionKey,
 						cmd: "rm -rf /tmp/stale",
 						desc: "dangerous cleanup",
-						approval_id: pendingId,
 					},
 					{ aadObjectId: "clicker-B" },
 				);
-				expect(approved.value).toBe("✅ Allowed (once)");
+				// teams-4: the FULL confirmation card — title, fenced cmd, Reason
+				// line, bold label (@1160-1181), never a label-only string.
+				expect(approved.kind).toBe("card");
+				if (approved.kind === "card") {
+					expect(approved.value).toEqual({
+						type: "AdaptiveCard",
+						version: "1.4",
+						body: [
+							{
+								type: "TextBlock",
+								text: "⚠️ Command Approval Required",
+								wrap: true,
+								weight: "Bolder",
+							},
+							{
+								type: "TextBlock",
+								text: "```\nrm -rf /tmp/stale\n```",
+								wrap: true,
+							},
+							{
+								type: "TextBlock",
+								text: "Reason: dangerous cleanup",
+								wrap: true,
+								isSubtle: true,
+							},
+							{
+								type: "TextBlock",
+								text: "✅ Allowed (once)",
+								wrap: true,
+								weight: "Bolder",
+							},
+						],
+					});
+				}
 				expect(gated.adapter.counters.cardActionsResolved).toBe(1);
 
-				// Double-tap: consumed pending ⇒ explicit expiry answer.
+				// Double-tap: consumed pending ⇒ explicit expiry CARD.
 				const replay = await gated.adapter.handleCardAction(
-					{
-						hermes_action: "deny",
-						session_key: sessionKey,
-						approval_id: pendingId,
-					},
+					{ hermes_action: "deny", session_key: sessionKey },
 					{ aadObjectId: "clicker-B" },
 				);
-				expect(replay.value).toBe("⚠️ Approval already resolved or expired.");
+				expect(replay).toEqual({
+					statusCode: 200,
+					kind: "card",
+					value: {
+						type: "AdaptiveCard",
+						version: "1.4",
+						body: [
+							{
+								type: "TextBlock",
+								text: "⚠️ Approval already resolved or expired.",
+								wrap: true,
+							},
+						],
+					},
+				});
+
+				// Never-registered session key answers the SAME expiry card
+				// (has_blocking_approval parity).
+				const stale = await gated.adapter.handleCardAction(
+					{ hermes_action: "deny", session_key: "sk-never-registered" },
+					{ aadObjectId: "clicker-B" },
+				);
+				expect(stale.kind).toBe("card");
 
 				// Unauthorized clicker (not on the list): ⛔ Not authorized.
 				const stranger = await gated.adapter.handleCardAction(
-					{
-						hermes_action: "deny",
-						session_key: sessionKey,
-						approval_id: 999_001,
-					},
+					{ hermes_action: "deny", session_key: sessionKey },
 					{ aadObjectId: "clicker-EVIL" },
 				);
 				expect(stranger.value).toBe("⛔ Not authorized.");
 
-				// Wildcard allowlist admits everyone.
+				// Wildcard allowlist admits everyone; deny with no cmd/desc on the
+				// click data renders the bold label ONLY (Hermes body build parity).
 				const wildcard = makeTeamsFixture({ allowedUsers: ["*"] });
 				wildcard.adapter.approvals.register(424242, "sk-any");
 				const anyClicker = await wildcard.adapter.handleCardAction(
-					{
-						hermes_action: "deny",
-						session_key: "sk-any",
-						approval_id: 424242,
-					},
+					{ hermes_action: "deny", session_key: "sk-any" },
 					{ aadObjectId: "whoever" },
 				);
-				expect(anyClicker.value).toBe("❌ Denied");
+				expect(anyClicker.kind).toBe("card");
+				if (anyClicker.kind === "card") {
+					expect(anyClicker.value.body).toEqual([
+						{
+							type: "TextBlock",
+							text: "❌ Denied",
+							wrap: true,
+							weight: "Bolder",
+						},
+					]);
+				}
 				wildcard.dispose();
 
 				// Unknown hermes_action answers "Unknown action." (both shapes).
@@ -421,11 +578,88 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 				const missingFields = await gated2.adapter.handleCardAction({}, {});
 				expect(missingFields.value).toBe("Unknown action.");
 				gated2.dispose();
+
+				// teams-3: AdaptiveCard invoke activities route THROUGH
+				// handleActivityPost to the card-action handler (SDK on_card_action
+				// registration parity) — HTTP 200 WITH the modeled InvokeResponse
+				// body, resolution observed, NEVER dispatched as a turn.
+				const invoked = makeTeamsFixture({ allowedUsers: ["clicker-C"] });
+				const cardSend = await invoked.adapter.sendApprovalCard(
+					"19:chat@thread.tacv2",
+					"systemctl restart gateway",
+					"sk-invoke-1",
+					"restart service",
+				);
+				expect(cardSend.success).toBe(true);
+				const turnsBeforeInvoke = invoked.adapter.turnLog.length;
+				const acceptedBeforeInvoke =
+					invoked.adapter.counters.activitiesAccepted;
+				const invokeResp = await invoked.postActivityBody(
+					JSON.stringify({
+						type: "invoke",
+						name: "adaptiveCard/action",
+						from: { id: "clicker-C" },
+						conversation: {
+							id: "19:chat@thread.tacv2",
+							conversation_type: "personal",
+						},
+						value: {
+							action: {
+								type: "Action.Execute",
+								verb: "hermes_approve",
+								data: {
+									hermes_action: "approve_once",
+									session_key: "sk-invoke-1",
+									cmd: "systemctl restart gateway",
+									desc: "restart service",
+								},
+							},
+						},
+					}),
+				);
+				expect(invokeResp.status).toBe(200);
+				expect(invokeResp.json).toEqual({
+					value: {
+						type: "AdaptiveCard",
+						version: "1.4",
+						body: [
+							{
+								type: "TextBlock",
+								text: "⚠️ Command Approval Required",
+								wrap: true,
+								weight: "Bolder",
+							},
+							{
+								type: "TextBlock",
+								text: "```\nsystemctl restart gateway\n```",
+								wrap: true,
+							},
+							{
+								type: "TextBlock",
+								text: "Reason: restart service",
+								wrap: true,
+								isSubtle: true,
+							},
+							{
+								type: "TextBlock",
+								text: "✅ Allowed (once)",
+								wrap: true,
+								weight: "Bolder",
+							},
+						],
+					},
+				});
+				expect(invoked.adapter.counters.cardActionsResolved).toBe(1);
+				expect(invoked.adapter.turnLog.length).toBe(turnsBeforeInvoke);
+				expect(invoked.adapter.counters.activitiesAccepted).toBe(
+					acceptedBeforeInvoke,
+				);
+				invoked.dispose();
 			},
 		),
 		mk(
 			"transport.teams.outbound-rest-shapes",
-			"teams: token dance precedes every activity POST; activities ship RAW markdown (textFormat) byte-exact; threaded replies ONLY for digit reply_to≠0 with FLAT fallback on scripted 400; typing swallowed; service-host allowlist + conv-id charset refuse pre-wire",
+			'teams: token dance precedes every activity POST; activities ship RAW markdown (textFormat) byte-exact; threaded replies ONLY for digit reply_to≠0 with FLAT fallback on scripted 400 AND on THROWN transport errors; typing ships a REAL {type:"typing"} activity POST (errors swallowed); per-kind default media contentTypes (image/png, video/mp4, audio/mpeg, application/octet-stream); service-host allowlist + conv-id charset refuse pre-wire',
 			async (fx) => {
 				// Flat send shape: token first, then {"type":"message","text":…,
 				// "textFormat":"markdown"}.
@@ -470,6 +704,35 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 				expect(lastTwo[1]?.kind).toBe("send"); // flat fallback delivered
 				expect(lastTwo[1]?.activity["text"]).toBe("fallback please");
 
+				// webhook-40: a THROWN transport error on the threaded lane takes
+				// the SAME flat fallback — the chunk is never skipped just because
+				// postReply raised instead of answering non-200.
+				fx.bf.scriptReplyThrow(new Error("socket hang up"));
+				const threwThenFellBack = await fx.adapter.send(
+					"19:chat@thread.tacv2",
+					"throw fallback please",
+					undefined,
+					{ reply_to_message_id: "1999" } as never,
+				);
+				expect(threwThenFellBack.success).toBe(true);
+				expect(fx.bf.activities.at(-1)?.kind).toBe("send");
+				expect(fx.bf.activities.at(-1)?.activity["text"]).toBe(
+					"throw fallback please",
+				);
+
+				// Both lanes down ⇒ genuine failure surfaces (outer-catch parity:
+				// Hermes returns SendResult(success=false) only when flat ALSO fails).
+				fx.bf.scriptReplyThrow(new Error("threaded lane down"));
+				fx.bf.scriptActivityThrow(new Error("flat lane down"));
+				const bothDown = await fx.adapter.send(
+					"19:chat@thread.tacv2",
+					"doomed chunk",
+					undefined,
+					{ reply_to_message_id: "2001" } as never,
+				);
+				expect(bothDown.success).toBe(false);
+				expect(bothDown.retryable).toBe(true);
+
 				// Token failure surfaces the source's error shape, retryable.
 				fx.bf.scriptToken({ status: 401, json: { error: "invalid_client" } });
 				const tokenFail = await fx.adapter.send("19:chat@thread.tacv2", "nope");
@@ -479,9 +742,16 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 					true,
 				);
 
-				// Typing is best-effort polish (recorded, errors swallowed).
+				// Typing is best-effort polish: a REAL Typing activity POST — the
+				// {type:"typing"} body rides the wire (@1277-1283); errors swallowed.
 				await fx.adapter.sendTyping("19:chat@thread.tacv2");
 				expect(fx.bf.typingActivities).toHaveLength(1);
+				expect(fx.bf.typingActivities[0]?.conversationId).toBe(
+					"19:chat@thread.tacv2",
+				);
+				expect(fx.bf.typingActivities[0]?.activity).toEqual({
+					type: "typing",
+				});
 
 				// Service-host allowlist refuses pre-wire (SSRF posture).
 				const offAllowlist = makeTeamsFixture({
@@ -504,6 +774,63 @@ function teamsDeltaRows(newFixture: () => TeamsFixture): ConformanceRow[] {
 						"outside the Bot Framework conversation ID set",
 					),
 				).toBe(true);
+
+				// teams-6 per-kind default contentTypes (@1335/@1366/@1383/@1400):
+				// extension-less sources fall through guessMime to the KIND default.
+				await fx.adapter.sendImage("19:chat@thread.tacv2", {
+					url: "https://cdn.example/pic",
+				});
+				await fx.adapter.sendVideo("19:chat@thread.tacv2", {
+					url: "https://cdn.example/clip",
+				});
+				await fx.adapter.sendVoice("19:chat@thread.tacv2", {
+					url: "https://cdn.example/note",
+				});
+				await fx.adapter.sendDocument("19:chat@thread.tacv2", {
+					url: "https://cdn.example/blob",
+				});
+				const mediaPosts = fx.bf.activities.slice(-4);
+				expect(
+					mediaPosts.map(
+						(p) =>
+							((
+								p.activity["attachments"] as Array<Record<string, unknown>>
+							)[0] ?? {})["contentType"],
+					),
+				).toEqual([
+					"image/png",
+					"video/mp4",
+					"audio/mpeg",
+					"application/octet-stream",
+				]);
+
+				// Extension-derived mime still WINS over the per-kind default.
+				await fx.adapter.sendVideo("19:chat@thread.tacv2", {
+					url: "https://cdn.example/movie.mov",
+				});
+				const movPost = fx.bf.activities.at(-1);
+				expect(
+					((
+						movPost?.activity["attachments"] as Array<Record<string, unknown>>
+					)[0] ?? {})["contentType"],
+				).toBe("video/quicktime");
+
+				// Local-path variant rides the SAME default (data URI carries it).
+				writeFileSync(join(fx.mediaDir, "voice-note"), Buffer.from("abc"));
+				const voiceLocal = await fx.adapter.sendVoice("19:chat@thread.tacv2", {
+					path: join(fx.mediaDir, "voice-note"),
+				});
+				expect(voiceLocal.success).toBe(true);
+				const voiceAttachment =
+					(
+						fx.bf.activities.at(-1)?.activity["attachments"] as Array<
+							Record<string, unknown>
+						>
+					)[0] ?? {};
+				expect(voiceAttachment["contentType"]).toBe("audio/mpeg");
+				expect(String(voiceAttachment["contentUrl"])).toMatch(
+					/^data:audio\/mpeg;base64,/,
+				);
 
 				// Chunking at the native budget: 28 KB budget splits long content
 				// into multiple activity POSTs, each markdown-shaped.

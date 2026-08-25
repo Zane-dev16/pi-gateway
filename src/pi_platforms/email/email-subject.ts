@@ -41,7 +41,12 @@ export interface EmailSubjectOptions {
 	scalarMaxUnits?: number | undefined;
 	withSecret?: boolean | undefined;
 	requireAuthenticatedSender?: boolean | undefined;
+	/** EMAIL_ALLOW_ALL_USERS opt-in (allowed-users unset alongside). */
 	allowAllUsers?: boolean | undefined;
+	/** GATEWAY_ALLOW_ALL_USERS opt-in (allowed-users unset alongside). */
+	gatewayAllowAllUsers?: boolean | undefined;
+	/** Allowed-users unset WITHOUT any opt-in — default-deny leg. */
+	unsetAllowedUsers?: boolean | undefined;
 	declaredDraftStreaming?: boolean | undefined;
 }
 
@@ -86,10 +91,20 @@ export class EmailSubject implements ConformanceSubject {
 				if (key === "EMAIL_PASSWORD") return "fake-app-password";
 				if (key === "EMAIL_IMAP_HOST") return opts.imap.host;
 				if (key === "EMAIL_SMTP_HOST") return opts.smtp.host;
-				if (key === "EMAIL_ALLOWED_USERS" && opts.allowAllUsers !== true) {
+				const openAccess =
+					opts.allowAllUsers === true ||
+					opts.gatewayAllowAllUsers === true ||
+					opts.unsetAllowedUsers === true;
+				if (key === "EMAIL_ALLOWED_USERS" && !openAccess) {
 					return "alice@example.com, bob@example.com";
 				}
 				if (key === "EMAIL_ALLOW_ALL_USERS" && opts.allowAllUsers === true) {
+					return "true";
+				}
+				if (
+					key === "GATEWAY_ALLOW_ALL_USERS" &&
+					opts.gatewayAllowAllUsers === true
+				) {
 					return "true";
 				}
 				return undefined;

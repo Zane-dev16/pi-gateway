@@ -4,7 +4,8 @@
 // DEC-033 log-redaction row) run against the TELEGRAM subject, the FOUR
 // inherited §3.1 polling transport rows run against the REAL telegram engine
 // fixture (makeRealTelegramPollingFixture) — no stubbed return values — and
-// the EIGHT telegram-shape rows close the shape deltas.
+// the EIGHTEEN telegram-shape rows close the shape deltas
+// (round-2 cluster telegram-wire-r2 added seven).
 
 import { describe, expect, it } from "vitest";
 
@@ -82,10 +83,11 @@ describe("conformance suite — telegram census port (Phase 6, DEC-024)", () => 
 		expect(report.deferred).toEqual([]);
 	});
 
-	it("passes ALL EIGHT telegram-shape rows (shape deltas over the family)", async () => {
+	it("passes ALL EIGHTEEN telegram-shape rows (shape deltas over the family)", async () => {
 		const rows = makeTelegramShapeRows();
 		expect(rows.map((r) => r.id)).toEqual([
 			"tg.update-parsing-deltas",
+			"tg.send-wire-parity",
 			"tg.edit-send-reconciliation",
 			"tg.callback-roundtrip-64b",
 			"tg.reaction-ack-lifecycle",
@@ -93,6 +95,15 @@ describe("conformance suite — telegram census port (Phase 6, DEC-024)", () => 
 			"tg.typing-variant-matrix",
 			"tg.sticker-cache-hit-miss-expiry",
 			"tg.floodwait-method-classes",
+			"tg.connect-webhook-clear",
+			"tg.media-send-family",
+			"tg.edit-not-modified-noop",
+			"tg.post-connect-housekeeping",
+			"tg.dm-topic-send-routing",
+			"tg.wire-arg-whitelist",
+			"tg.rich-extras-lane",
+			"tg.media-dm-topic-retry",
+			"tg.long-poll-timeout-default",
 		]);
 		const report = await runConformanceSuite({
 			subjectName: "telegram-shape",

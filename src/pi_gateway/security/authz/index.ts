@@ -30,6 +30,7 @@ export {
 	type AdapterAuthzView,
 	type AuthzDecisionRecord,
 	type AuthzDeps,
+	type AuthzOptions,
 	type AuthzSource,
 	type DenialSink,
 	type PairingStoreLike,

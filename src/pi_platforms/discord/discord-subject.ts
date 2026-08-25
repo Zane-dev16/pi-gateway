@@ -68,6 +68,14 @@ interface AckAuditOp {
 	kind: string;
 }
 
+/** Reaction audit op (👀/✅/❌ lifecycle capture). */
+interface ReactionAuditOp {
+	channelId: string;
+	messageId: string;
+	emoji: string;
+	action: "add" | "remove";
+}
+
 /**
  * Subject-level REST plane: models the markdown-RENDERING rejection script
  * (`forceFormattingError`) exactly like the reference subjects — the §6.1
@@ -77,7 +85,11 @@ interface AckAuditOp {
  */
 function wrapWire(
 	raw: FakePlatformWire,
-	audit: { typing: TypingAuditOp[]; acks: AckAuditOp[] },
+	audit: {
+		typing: TypingAuditOp[];
+		acks: AckAuditOp[];
+		reactions: ReactionAuditOp[];
+	},
 ): DiscordRestPlane {
 	return {
 		transmitSend: async (
@@ -117,11 +129,16 @@ function wrapWire(
 			metadata: Metadata,
 		): Promise<SendResult> => raw.transmitRich("__embed__", content, metadata),
 		transmitThreadCreate: async (
-			chatId: string,
+			starterMessageId: string,
 			name: string,
 			metadata: Metadata,
 		): Promise<SendResult> =>
-			raw.transmitSend(chatId, name, { ...metadata, thread_create: true }),
+			// Vendor path: POST /channels/{starter_id}/threads — the starter id IS
+			// the path parameter; the body carries name + auto_archive_duration.
+			raw.transmitSend(starterMessageId, name, {
+				...metadata,
+				thread_create: true,
+			}),
 		transmitTyping: async (
 			chatId: string,
 			metadata: Metadata,
@@ -142,6 +159,15 @@ function wrapWire(
 			audit.acks.push({ interactionId, kind });
 			return { success: true };
 		},
+		transmitReaction: async (
+			channelId: string,
+			messageId: string,
+			emoji: string,
+			action: "add" | "remove",
+		): Promise<SendResult> => {
+			audit.reactions.push({ channelId, messageId, emoji, action });
+			return { success: true, messageId };
+		},
 		hasScript: (opKind) => raw.hasScript(opKind),
 	};
 }
@@ -155,6 +181,7 @@ export class DiscordSubject implements ConformanceSubject {
 	readonly clock: ManualClock;
 	readonly typingOps: TypingAuditOp[] = [];
 	readonly interactionAcks: AckAuditOp[] = [];
+	readonly reactionOps: ReactionAuditOp[] = [];
 
 	private readonly lockManager = new TokenLockManagerSeam({
 		nowMs: () => 1_000,
@@ -174,6 +201,7 @@ export class DiscordSubject implements ConformanceSubject {
 			rest: wrapWire(opts.wire, {
 				typing: this.typingOps,
 				acks: this.interactionAcks,
+				reactions: this.reactionOps,
 			}),
 			clock: this.clock as AdapterClock,
 			botUserId: this.gateway.botUserId,

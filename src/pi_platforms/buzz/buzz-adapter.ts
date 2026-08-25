@@ -24,6 +24,8 @@
 //   _parse_json_list          → parseJsonList (tolerant)
 //   connect (@~470)           → connect ladder with _set_fatal_error parity
 //   send (@~660)              → wireSend (messages send --channel C --content -)
+//   send_image (@~667)        → sendImage (--file lane for local files with
+//                               caption on stdin; URL/link-text fallback)
 //   _poll_loop/_poll_channel  → pollSweep/pollChannel (manual sweeps; injected clock)
 //   _seed_channel             → seedChannel (watermark + seen seeding)
 //   _discover_dms (#68871)    → discoverDms (dms list + channels-list fallback)
@@ -42,6 +44,8 @@ import {
 	OneShotPendingStore,
 	ActionHandlerRegistry,
 } from "../kit/index.js";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import type { ScopedSecretReader } from "../kit/registration.js";
 import type { DisableReason } from "../kit/lifecycle-state.js";
 import {
@@ -112,6 +116,8 @@ export interface BuzzAdapterOptions {
 				fileExists?: ((path: string) => boolean) | undefined;
 		  }
 		| undefined;
+	/** Local-image existence probe behind sendImage (no real fs in fixtures). */
+	imageFileProbe?: ((path: string) => boolean) | undefined;
 	/**
 	 * WebSocket establishment seam (probe-computed exclusion of the live loop).
 	 * Undefined ⇒ unavailable ⇒ auto falls back to poll; transport=websocket
@@ -143,6 +149,18 @@ export interface BuzzHooks {
 
 function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** http(s) refs ride as link text; everything else is a local-path candidate. */
+function isHttpUrl(ref: string): boolean {
+	return /^https?:\/\//i.test(ref);
+}
+
+/** Path.expanduser parity for local media sources. */
+function expandUserPath(ref: string): string {
+	if (ref === "~") return homedir();
+	if (ref.startsWith("~/")) return `${homedir()}/${ref.slice(2)}`;
+	return ref;
 }
 
 /**
@@ -247,6 +265,7 @@ export class BuzzAdapter extends BasePlatformAdapter {
 		which?: ((bin: string) => string | undefined) | undefined;
 		fileExists?: ((path: string) => boolean) | undefined;
 	};
+	private readonly imageFileExists: (path: string) => boolean;
 	/**
 	 * WebSocket establishment seam (probe-computed exclusion of the live loop).
 	 * MUTABLE so mode-resolution fixtures can flip availability per connect.
@@ -312,6 +331,8 @@ export class BuzzAdapter extends BasePlatformAdapter {
 		this.credentialsReader = opts.credentialsReader;
 		this.credentialsLister = opts.credentialsLister;
 		this.pathProbes = opts.pathProbes ?? {};
+		this.imageFileExists =
+			opts.imageFileProbe ?? ((p) => existsSync(expandUserPath(p)));
 		this.wsStarter = opts.wsStarter;
 		this.nowFn = opts.nowMs ?? (() => Date.now());
 		this.lockManager = opts.lockManager;
@@ -669,16 +690,21 @@ export class BuzzAdapter extends BasePlatformAdapter {
 	 * adapter.py:send — ONE command shape for channels AND DMs (a DM target is
 	 * just its conversation ref): ["messages","send","--channel",<target>,
 	 * "--content","-", …("--reply-to",<target>)]. Content rides stdin.
+	 *
+	 * adapter.py:send_image --file lane: a local filePath inserts
+	 * "--file",<path> BEFORE "--content -" (argv order is the vendor CLI's
+	 * contract) while the caption still rides stdin.
 	 */
-	buildSendArgs(chatId: string, replyTarget?: string | undefined): string[] {
-		const args = [
-			"messages",
-			"send",
-			"--channel",
-			String(chatId),
-			"--content",
-			"-",
-		];
+	buildSendArgs(
+		chatId: string,
+		replyTarget?: string | undefined,
+		filePath?: string | undefined,
+	): string[] {
+		const args = ["messages", "send", "--channel", String(chatId)];
+		if (filePath !== undefined && filePath.length > 0) {
+			args.push("--file", String(filePath));
+		}
+		args.push("--content", "-");
 		if (replyTarget !== undefined && replyTarget.length > 0) {
 			args.push("--reply-to", String(replyTarget));
 		}
@@ -740,6 +766,71 @@ export class BuzzAdapter extends BasePlatformAdapter {
 			success: data["accepted"] !== false,
 			...(eventId !== undefined ? { messageId: eventId } : {}),
 		};
+	}
+
+	// ── image sending (adapter.py:send_image parity) ──────────────────────────
+
+	/** adapter.py:send_image — local files upload via `--file` with the caption
+	 * piped on stdin; URLs (and MISSING local files, which fail is_file()) go
+	 * as link text because Buzz markdown renders clickable image links.
+	 */
+	async sendImage(
+		chatId: string,
+		imageRef: string,
+		caption?: string | undefined,
+		replyTo?: string | undefined,
+	): Promise<SendResult> {
+		const local = isHttpUrl(imageRef) ? null : expandUserPath(imageRef);
+		if (local !== null && this.imageFileExists(local)) {
+			const res = await this.runCli(
+				this.buildSendArgs(chatId, replyTo, local),
+				caption ?? "",
+			);
+			if (res.code !== 0) {
+				return {
+					success: false,
+					error: cliErrorMessage(res.stderr, res.code),
+					retryable: res.code === 2,
+				};
+			}
+			let data: Record<string, unknown> = {};
+			try {
+				const parsed: unknown = JSON.parse(
+					res.stdout.length > 0 ? res.stdout : "{}",
+				);
+				if (
+					parsed !== null &&
+					typeof parsed === "object" &&
+					!Array.isArray(parsed)
+				) {
+					data = parsed as Record<string, unknown>;
+				}
+			} catch {
+				data = {};
+			}
+			const eventId =
+				typeof data["event_id"] === "string" ? data["event_id"] : undefined;
+			if (eventId !== undefined) this.markSeen(chatId, eventId);
+			return {
+				success: data["accepted"] !== false,
+				...(eventId !== undefined ? { messageId: eventId } : {}),
+			};
+		}
+		// Link-text fallback: caption ABOVE the URL on its own line.
+		const text = caption ? `${caption}\n${imageRef}` : imageRef;
+		return this.wireSend(chatId, text, {});
+	}
+
+	/** Post-stream image-batch hook (DEC-019 explicit-tag delivery path). */
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		const results: SendResult[] = [];
+		for (const image of images) {
+			results.push(await this.sendImage(chatId, image));
+		}
+		return results;
 	}
 
 	// ── inbound polling ───────────────────────────────────────────────────────────

@@ -67,6 +67,12 @@ export interface GetUpdatesOptions {
 	timeoutMs: number;
 	/** Cold-boot / conflict-recovery parity: evict rival sessions. */
 	dropPendingUpdates?: boolean | undefined;
+	/**
+	 * allowed_updates wire parity (tg-1): the update kinds this poll requests.
+	 * The reference family fake ignores it; the telegram fake models real
+	 * filtering semantics (unlisted kinds are never delivered).
+	 */
+	allowedUpdates?: readonly string[] | undefined;
 }
 
 let serverSeq = 0;

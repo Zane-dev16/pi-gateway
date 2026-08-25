@@ -37,9 +37,14 @@
 // (production wires HTTP; conformance supplies FakeBlueBubblesServer), and the
 // egress door mirrors every user-visible chunk onto the subject-supplied
 // CAPTURE wire (FakePlatformWire) so shared rows observe bubbles with zero
-// sockets. The inbound attachment downloader (_download_attachment @~610) is
-// NOT ported — it shells to local-FS media caches; the closed historical
-// mime→ext override maps ride as manifest data instead (proposed DEC).
+// sockets. The attachment TRANSPORT legs ARE ported (_send_attachment @~470
+// multipart upload + _download_attachment @~610 byte fetch); only the local-FS
+// media-cache PERSISTENCE stays upstream — mime→ext classification rides the
+// closed historical override maps kept as manifest data (BB_*_EXT_OVERRIDES).
+
+import { randomUUID } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { basename } from "node:path";
 
 import {
 	BasePlatformAdapter,
@@ -48,21 +53,21 @@ import {
 	ClarifyPendingStore,
 	OneShotPendingStore,
 	secureCompare,
-} from '../kit/index.js';
+} from "../kit/index.js";
 import type {
 	Metadata,
 	SendResult,
 	StreamLogger,
-} from '../../pi_gateway/streaming/adapter-seam.js';
-import { REPLY_TO_METADATA_KEY } from '../../pi_gateway/streaming/adapter-seam.js';
-import { EgressChokepoint } from '../../pi_gateway/streaming/egress-door.js';
+} from "../../pi_gateway/streaming/adapter-seam.js";
+import { REPLY_TO_METADATA_KEY } from "../../pi_gateway/streaming/adapter-seam.js";
+import { EgressChokepoint } from "../../pi_gateway/streaming/egress-door.js";
 import type {
 	IncomingEvent,
 	TaskSpawner,
-} from '../../pi_gateway/guards/index.js';
-import type { CommandRegistry } from '../../pi_gateway/guards/index.js';
-import type { ScopedSecretReader } from '../kit/registration.js';
-import type { DisableReason } from '../kit/lifecycle-state.js';
+} from "../../pi_gateway/guards/index.js";
+import type { CommandRegistry } from "../../pi_gateway/guards/index.js";
+import type { ScopedSecretReader } from "../kit/registration.js";
+import type { DisableReason } from "../kit/lifecycle-state.js";
 import {
 	chunkWithFenceCarry,
 	codePointLen,
@@ -73,7 +78,7 @@ import {
 	sendWithRetry,
 	plainTextFallbackBody,
 	type ChatLengthPolicy,
-} from '../kit/index.js';
+} from "../kit/index.js";
 import {
 	BB_DEFAULT_MENTION_PATTERNS,
 	BB_DEFAULT_WEBHOOK_HOST,
@@ -89,25 +94,25 @@ import {
 	BLUEBUBBLES_PLUGIN_MANIFEST,
 	declareBlueBubblesTrustBoundary,
 	validateBlueBubblesTrustBoundary,
-} from './manifest.js';
-import { stripMarkdown } from './strip-markdown.js';
+} from "./manifest.js";
+import { stripMarkdown } from "./strip-markdown.js";
 
 /** The one command registry (07 §1 derivation — mirrors the reference set). */
 export const BLUEBUBBLES_REGISTRY: CommandRegistry = [
 	{
-		name: 'new',
-		aliases: ['reset'],
-		busyPolicy: 'interrupt_then_dispatch' as const,
-		busyHandler: 'new',
+		name: "new",
+		aliases: ["reset"],
+		busyPolicy: "interrupt_then_dispatch" as const,
+		busyHandler: "new",
 	},
 	{
-		name: 'stop',
-		busyPolicy: 'interrupt_then_dispatch' as const,
-		busyHandler: 'stop',
+		name: "stop",
+		busyPolicy: "interrupt_then_dispatch" as const,
+		busyHandler: "stop",
 	},
-	{ name: 'model', busyPolicy: 'reject' as const, busyHandler: 'model' },
-	{ name: 'approve', busyPolicy: 'dispatch' as const },
-	{ name: 'status', busyPolicy: 'dispatch' as const },
+	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
+	{ name: "approve", busyPolicy: "dispatch" as const },
+	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 /**
@@ -131,6 +136,26 @@ export interface BlueBubblesConfig {
 	guid_cache_size?: number | undefined;
 }
 
+/** One multipart upload part (_send_attachment `files=` shape). */
+export interface BlueBubblesMultipartFile {
+	/** Form field carrying the bytes ('attachment' in the vendor request). */
+	field: string;
+	/** Filename written into the part's Content-Disposition. */
+	name: string;
+	bytes: Uint8Array;
+	contentType?: string | undefined;
+}
+
+/** ONE multipart upload result: HTTP status + the FULL vendor JSON envelope. */
+export interface BlueBubblesMultipartResponse {
+	status: number;
+	/**
+	 * Parsed vendor envelope body ({status,message,data}) when present —
+	 * BlueBubbles reports upload success through the BODY-level status field.
+	 */
+	body?: Record<string, unknown> | undefined;
+}
+
 /** REST seam the adapter drives (path-shaped like the httpx calls). */
 export interface BlueBubblesRestClient {
 	get(path: string): Promise<{ status: number; data?: unknown }>;
@@ -139,6 +164,17 @@ export interface BlueBubblesRestClient {
 		payload: Record<string, unknown>,
 	): Promise<{ status: number; data?: unknown }>;
 	del(path: string): Promise<{ status: number; data?: unknown }>;
+	/**
+	 * multipart/form-data POST (_send_attachment @~470): flat string fields
+	 * ({chatGuid,name,tempGuid[,isAudioMessage]}) plus ONE file part.
+	 */
+	postMultipart(
+		path: string,
+		fields: Record<string, string>,
+		file: BlueBubblesMultipartFile,
+	): Promise<BlueBubblesMultipartResponse>;
+	/** Raw-bytes GET (_download_attachment @~610: attachment/{guid}/download). */
+	getBinary(path: string): Promise<{ status: number; bytes: Uint8Array }>;
 }
 
 export interface BlueBubblesAdapterOptions {
@@ -180,7 +216,7 @@ export type WebhookRecord = Record<string, unknown>;
 
 export interface HandlerResponse {
 	status: number;
-	contentType?: 'application/json' | 'text/plain' | undefined;
+	contentType?: "application/json" | "text/plain" | undefined;
 	body?: string | Record<string, never> | undefined;
 }
 
@@ -233,7 +269,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	readonly dispatchedEvents: Array<{
 		messageId: string;
 		text: string;
-		source: IncomingEvent['source'];
+		source: IncomingEvent["source"];
 	}> = [];
 	readonly turnLog: string[] = [];
 	readonly replyLog: string[] = [];
@@ -253,7 +289,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	private readonly declaredMessageEditing: boolean;
 	/** Session-scoped ladder — the rich latch persists across chunks (§10.1). */
 	private restLadder: FormattingLadder | null = null;
-	private restLadderChatId = '';
+	private restLadderChatId = "";
 	private allowAllClickers = true;
 	private readonly clarifyArmedSet = new Set<string>();
 	private holding = false;
@@ -278,31 +314,31 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		// _normalize_server_url (trim, http:// prefix when scheme missing,
 		// rstrip ALL trailing slashes).
 		this.serverUrl = normalizeServerUrl(
-			config.server_url ?? process.env['BLUEBUBBLES_SERVER_URL'] ?? '',
+			config.server_url ?? process.env["BLUEBUBBLES_SERVER_URL"] ?? "",
 		);
 		// password: falsy extra falls through to the scoped secret (source
 		// `extra.get('password') or _get_scoped_secret(...)`), default ''.
 		this.password =
 			stringOrEmpty(config.password) ||
-			this.secretReader('BLUEBUBBLES_PASSWORD') ||
-			'';
+			this.secretReader("BLUEBUBBLES_PASSWORD") ||
+			"";
 		this.webhookHost =
 			firstTruthy(
 				config.webhook_host,
-				process.env['BLUEBUBBLES_WEBHOOK_HOST'],
+				process.env["BLUEBUBBLES_WEBHOOK_HOST"],
 				BB_DEFAULT_WEBHOOK_HOST,
 			) ?? BB_DEFAULT_WEBHOOK_HOST;
 		this.webhookPort = Number(
 			firstTruthy(
 				config.webhook_port,
-				parseEnvNumber(process.env['BLUEBUBBLES_WEBHOOK_PORT']),
+				parseEnvNumber(process.env["BLUEBUBBLES_WEBHOOK_PORT"]),
 				BB_DEFAULT_WEBHOOK_PORT,
 			),
 		);
 		this.webhookPath = normalizeWebhookPath(
 			firstTruthy(
 				config.webhook_path,
-				process.env['BLUEBUBBLES_WEBHOOK_PATH'],
+				process.env["BLUEBUBBLES_WEBHOOK_PATH"],
 				BB_DEFAULT_WEBHOOK_PATH,
 			) ?? BB_DEFAULT_WEBHOOK_PATH,
 		);
@@ -312,19 +348,19 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 				: true;
 		const requireMentionRaw = firstTruthy(
 			config.require_mention,
-			process.env['BLUEBUBBLES_REQUIRE_MENTION'],
+			process.env["BLUEBUBBLES_REQUIRE_MENTION"],
 		);
 		// str(_require_mention).strip().lower() in {'true','1','yes','on'} parity.
-		const requireMentionNormalized = String(requireMentionRaw ?? '')
+		const requireMentionNormalized = String(requireMentionRaw ?? "")
 			.trim()
 			.toLowerCase();
 		this.requireMention = REQUIRE_MENTION_TRUTHY.has(requireMentionNormalized);
 		// Key-PRESENCE semantics (`'mention_patterns' in extra`): an explicit
 		// null/undefined entry wins over env and compiles the DEFAULTS, exactly
 		// like the source's in-test.
-		const rawPatterns = Object.hasOwn(config, 'mention_patterns')
+		const rawPatterns = Object.hasOwn(config, "mention_patterns")
 			? config.mention_patterns
-			: process.env['BLUEBUBBLES_MENTION_PATTERNS'];
+			: process.env["BLUEBUBBLES_MENTION_PATTERNS"];
 		this.mentionPatterns = compileMentionPatterns(
 			rawPatterns,
 			BB_DEFAULT_MENTION_PATTERN_SOURCES,
@@ -340,8 +376,8 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		const boundaryErrors = validateBlueBubblesTrustBoundary(this.trustBoundary);
 		if (boundaryErrors.length > 0) {
 			const reason: DisableReason = {
-				kind: 'config_invalid',
-				detail: boundaryErrors.join('; '),
+				kind: "config_invalid",
+				detail: boundaryErrors.join("; "),
 			};
 			this.lifecycle.disable(reason);
 		}
@@ -353,7 +389,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		for (const spec of BLUEBUBBLES_PLUGIN_MANIFEST.requiresEnv) {
 			if (this.secretReader(spec.name) === undefined) {
 				this.lifecycle.disable({
-					kind: 'secret_missing',
+					kind: "secret_missing",
 					secretKey: spec.name,
 					manifestName: BLUEBUBBLES_PLUGIN_MANIFEST.name,
 				});
@@ -368,8 +404,8 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			streamIsMessageForChat: () => this.declaredMessageEditing,
 			transmitSend: async (chatId, content, metadata) =>
 				this.wireSend(chatId, content, metadata),
-			transmitEdit: async () => ({ success: false, error: 'Not supported' }),
-			transmitSeal: async () => ({ success: false, error: 'Not supported' }),
+			transmitEdit: async () => ({ success: false, error: "Not supported" }),
+			transmitSeal: async () => ({ success: false, error: "Not supported" }),
 		});
 
 		this.router = new CallbackQueryRouter({
@@ -381,20 +417,20 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			},
 			authorizer: () => this.allowAllClickers,
 			onExecApproval: async () => {
-				this.resolvedFamilies.push('ea');
-				return 'ok';
+				this.resolvedFamilies.push("ea");
+				return "ok";
 			},
 			onSlashConfirm: async () => {
-				this.resolvedFamilies.push('sc');
-				return 'ok';
+				this.resolvedFamilies.push("sc");
+				return "ok";
 			},
 			onClarifyChoice: async (_k, _id, idx) => {
-				this.resolvedFamilies.push('cl');
+				this.resolvedFamilies.push("cl");
 				return `answer-${idx}`;
 			},
 			onWhatsappApproval: async () => {
-				this.resolvedFamilies.push('appr');
-				return 'ok';
+				this.resolvedFamilies.push("appr");
+				return "ok";
 			},
 			onPickerNav: async (parsed) => ({ answerText: `nav:${parsed.family}` }),
 		});
@@ -408,11 +444,11 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	protected override chatDescriptorFor(chatId: string):
 		| {
 				maxMessageLength?: number | undefined;
-				lenUnit?: import('../kit/length-policy.js').LengthUnit | undefined;
+				lenUnit?: import("../kit/length-policy.js").LengthUnit | undefined;
 		  }
 		| undefined {
-		if (chatId.includes('utf16')) {
-			return { maxMessageLength: 30, lenUnit: 'utf16' };
+		if (chatId.includes("utf16")) {
+			return { maxMessageLength: 30, lenUnit: "utf16" };
 		}
 		return undefined;
 	}
@@ -427,7 +463,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 
 	/** _api_url: password rides EVERY call as ?password=<quoted> (or &). */
 	apiUrl(path: string): string {
-		const sep = path.includes('?') ? '&' : '?';
+		const sep = path.includes("?") ? "&" : "?";
 		return `${this.serverUrl}${path}${sep}password=${pyQuote(this.password)}`;
 	}
 
@@ -459,16 +495,16 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		this.throwIfDisabled();
 		if (!this.serverUrl || !this.password) {
 			this.logger?.error?.(
-				'[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required',
+				"[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required",
 			);
 			return false;
 		}
 		try {
-			await this.apiGet('/api/v1/ping');
-			const info = await this.apiGet('/api/v1/server/info');
+			await this.apiGet("/api/v1/ping");
+			const info = await this.apiGet("/api/v1/server/info");
 			const serverData = asRecord(info.data);
-			this.privateApiEnabled = Boolean(serverData['private_api']);
-			this.helperConnected = Boolean(serverData['helper_connected']);
+			this.privateApiEnabled = Boolean(serverData["private_api"]);
+			this.helperConnected = Boolean(serverData["helper_connected"]);
 			this.logger?.info?.(
 				`[bluebubbles] connected to ${this.serverUrl} (private_api=${String(this.privateApiEnabled)}, helper=${String(this.helperConnected)})`,
 			);
@@ -509,12 +545,12 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	get webhookUrl(): string {
 		let host = this.webhookHost;
 		if (
-			host === '0.0.0.0' ||
-			host === '127.0.0.1' ||
-			host === 'localhost' ||
-			host === '::'
+			host === "0.0.0.0" ||
+			host === "127.0.0.1" ||
+			host === "localhost" ||
+			host === "::"
 		) {
-			host = 'localhost';
+			host = "localhost";
 		}
 		return `http://${host}:${this.webhookPort}${this.webhookPath}`;
 	}
@@ -542,11 +578,11 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		url: string,
 	): Promise<Array<Record<string, unknown>>> {
 		try {
-			const res = await this.apiGet('/api/v1/webhook');
+			const res = await this.apiGet("/api/v1/webhook");
 			const data = res.data;
 			if (Array.isArray(data)) {
 				return data.filter(
-					(wh): wh is Record<string, unknown> => asRecord(wh)['url'] === url,
+					(wh): wh is Record<string, unknown> => asRecord(wh)["url"] === url,
 				);
 			}
 		} catch {
@@ -573,7 +609,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			events: [...REGISTER_WEBHOOK_EVENTS],
 		};
 		try {
-			const res = await this.apiPost('/api/v1/webhook', payload);
+			const res = await this.apiPost("/api/v1/webhook", payload);
 			if (res.status >= 200 && res.status < 300) {
 				this.logger?.info?.(
 					`[bluebubbles] webhook registered with server: ${this.webhookRegisterUrlForLog}`,
@@ -598,8 +634,8 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		let removed = false;
 		try {
 			for (const wh of await this.findRegisteredWebhooks(webhookUrl)) {
-				const whId = wh['id'];
-				if (whId === undefined || whId === null || whId === '') continue;
+				const whId = wh["id"];
+				if (whId === undefined || whId === null || whId === "") continue;
 				await this.restClient.del(
 					`/api/v1/webhook/${encodeURIComponent(String(whId))}`,
 				);
@@ -629,10 +665,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	 * attempt after chat creation must not read a stale miss).
 	 */
 	async resolveChatGuid(target: string): Promise<string | null> {
-		const t = (target ?? '').trim();
+		const t = (target ?? "").trim();
 		if (!t) return null;
 		// Already a raw GUID.
-		if (t.includes(';')) return t;
+		if (t.includes(";")) return t;
 		const cached = this.guidCache.get(t);
 		if (cached !== undefined) {
 			// move_to_end parity.
@@ -641,7 +677,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			return cached;
 		}
 		try {
-			const payload = await this.apiPost('/api/v1/chat/query', {
+			const payload = await this.apiPost("/api/v1/chat/query", {
 				limit: 100,
 				offset: 0,
 			});
@@ -649,10 +685,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			for (const raw of chats) {
 				const chat = asRecord(raw);
 				const guid =
-					stringOrNull(chat['guid']) ?? stringOrNull(chat['chatGuid']);
+					stringOrNull(chat["guid"]) ?? stringOrNull(chat["chatGuid"]);
 				const identifier =
-					stringOrNull(chat['chatIdentifier']) ??
-					stringOrNull(chat['identifier']);
+					stringOrNull(chat["chatIdentifier"]) ??
+					stringOrNull(chat["identifier"]);
 				// STRICT identity equality only — participants never consulted.
 				if (identifier === t) {
 					if (guid !== null) {
@@ -688,10 +724,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			tempGuid: this.nextTempGuid(),
 		};
 		try {
-			const res = await this.apiPost('/api/v1/chat/new', payload);
+			const res = await this.apiPost("/api/v1/chat/new", payload);
 			const data = asRecord(res.data);
 			const msgId =
-				stringOrNull(data['guid']) ?? stringOrNull(data['messageGuid']) ?? 'ok';
+				stringOrNull(data["guid"]) ?? stringOrNull(data["messageGuid"]) ?? "ok";
 			return { success: true, messageId: String(msgId) };
 		} catch (exc) {
 			return { success: false, error: errorMessage(exc) };
@@ -710,7 +746,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		maxLength: number = BB_MAX_TEXT_LENGTH,
 	): string[] {
 		const plan = chunkWithFenceCarry(content, truncatePolicy(maxLength));
-		return plan.chunks.map((c) => c.replace(/\s*\(\d+\/\d+\)$/, ''));
+		return plan.chunks.map((c) => c.replace(/\s*\(\d+\/\d+\)$/, ""));
 	}
 
 	/**
@@ -728,7 +764,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	): Promise<SendResult> {
 		const text = stripMarkdown(content);
 		if (!text) {
-			return { success: false, error: 'BlueBubbles send requires text' };
+			return { success: false, error: "BlueBubbles send requires text" };
 		}
 		// Split on paragraph breaks (double newlines); blanks dropped, trimmed.
 		const paragraphs = text
@@ -769,7 +805,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		if (!guid) {
 			if (
 				this.privateApiEnabled &&
-				(chatId.includes('@') || /^\+\d/.test(chatId))
+				(chatId.includes("@") || /^\+\d/.test(chatId))
 			) {
 				return await this.createChatForHandle(chatId, message);
 			}
@@ -788,15 +824,15 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			this.privateApiEnabled &&
 			this.helperConnected
 		) {
-			payload['method'] = 'private-api';
-			payload['selectedMessageGuid'] = replyTo;
-			payload['partIndex'] = 0;
+			payload["method"] = "private-api";
+			payload["selectedMessageGuid"] = replyTo;
+			payload["partIndex"] = 0;
 		}
 		try {
-			const res = await this.apiPost('/api/v1/message/text', payload);
+			const res = await this.apiPost("/api/v1/message/text", payload);
 			const data = asRecord(res.data);
 			const msgId =
-				stringOrNull(data['guid']) ?? stringOrNull(data['messageGuid']) ?? 'ok';
+				stringOrNull(data["guid"]) ?? stringOrNull(data["messageGuid"]) ?? "ok";
 			return { success: true, messageId: String(msgId) };
 		} catch (exc) {
 			return { success: false, error: errorMessage(exc) };
@@ -806,6 +842,156 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	private nextTempGuid(): string {
 		// datetime.utcnow().timestamp() parity — float seconds.
 		return `temp-${this.nowFn() / 1000}`;
+	}
+
+	// ── media attachments (_send_attachment/_download_attachment parity) ───
+
+	/**
+	 * THE Hermes _send_attachment engine (@~470): existence-gate the file,
+	 * resolve the chat GUID (NO create-chat fallback here — source parity),
+	 * then multipart POST /api/v1/message/attachment with flat fields
+	 * {chatGuid,name,tempGuid[,isAudioMessage:"true"]} and ONE "attachment"
+	 * part (application/octet-stream). HTTP-level failures throw into the same
+	 * catch; the vendor envelope's OWN status field decides success (200 ⇒
+	 * data.guid). A caption rides as a SEPARATE text bubble AFTER the upload
+	 * resolves — vendor ordering fires it whenever the HTTP call succeeded,
+	 * even before the body-status verdict is read.
+	 */
+	async sendAttachmentFile(
+		chatId: string,
+		filePath: string,
+		opts: {
+			filename?: string | undefined;
+			caption?: string | undefined;
+			isAudioMessage?: boolean | undefined;
+		} = {},
+	): Promise<SendResult> {
+		// os.path.isfile gate precedes EVERYTHING else in the source.
+		try {
+			await stat(filePath);
+		} catch {
+			return { success: false, error: `File not found: ${filePath}` };
+		}
+		const guid = await this.resolveChatGuid(chatId);
+		if (!guid) {
+			return { success: false, error: `Chat not found: ${chatId}` };
+		}
+		const fname = opts.filename ?? basename(filePath);
+		try {
+			// httpx's async multipart iterator reads file-like objects through a
+			// synchronous chunk generator upstream — read off the loop thread;
+			// here a plain awaited read plays that role.
+			const bytes = await readFile(filePath);
+			const fields: Record<string, string> = {
+				chatGuid: guid,
+				name: fname,
+				tempGuid: randomUUID().replaceAll("-", ""), // uuid4().hex
+			};
+			if (opts.isAudioMessage === true) fields["isAudioMessage"] = "true";
+			const res = await this.restClient.postMultipart(
+				"/api/v1/message/attachment",
+				fields,
+				{
+					field: "attachment",
+					name: fname,
+					bytes,
+					contentType: "application/octet-stream",
+				},
+			);
+			if (res.status < 200 || res.status >= 300) {
+				throw new Error(
+					`POST /api/v1/message/attachment failed with status ${res.status}`,
+				);
+			}
+			if (opts.caption !== undefined && opts.caption.length > 0) {
+				await this.sendText(chatId, opts.caption);
+			}
+			const envelope = res.body ?? {};
+			if (envelope["status"] === 200) {
+				const data = asRecord(envelope["data"]);
+				const msgId = stringOrNull(data["guid"]);
+				return {
+					success: true,
+					...(msgId !== null ? { messageId: msgId } : {}),
+				};
+			}
+			return {
+				success: false,
+				error: stringOrNull(envelope["message"]) ?? "Attachment upload failed",
+			};
+		} catch (exc) {
+			return { success: false, error: errorMessage(exc) };
+		}
+	}
+
+	/**
+	 * _download_attachment TRANSPORT leg (@~610): GET /api/v1/attachment/
+	 * {quoted-guid}/download and hand back the raw bytes, or null on ANY
+	 * failure (source logs a warning and returns None). Mime→ext classification
+	 * and local media-cache persistence stay upstream — the closed historical
+	 * override tables ride as BB_*_EXT_OVERRIDES manifest data.
+	 */
+	async downloadAttachment(attGuid: string): Promise<Uint8Array | null> {
+		try {
+			const encoded = pyQuote(attGuid); // quote(att_guid, safe='') parity
+			const res = await this.restClient.getBinary(
+				`/api/v1/attachment/${encoded}/download`,
+			);
+			if (res.status < 200 || res.status >= 300) {
+				throw new Error(
+					`GET /api/v1/attachment/${encoded}/download failed with status ${res.status}`,
+				);
+			}
+			return res.bytes;
+		} catch (exc) {
+			this.logger?.warn?.(
+				`[bluebubbles] failed to download attachment ${attGuid}: ${errorMessage(exc)}`,
+			);
+			return null;
+		}
+	}
+
+	// ── post-stream media lanes (DEC-019 explicit-tag delivery surface) ─────
+
+	/**
+	 * run.py:_deliver_media_from_response surface. WITHOUT these bindings the
+	 * post-stream rescan pass optional-chains every MEDIA-tagged file into a
+	 * silent no-op. Vendor mapping (bluebubbles.py @~490-540): each image goes
+	 * out as its OWN attachment bubble, voice flags isAudioMessage=true, and
+	 * video/document ride the plain multipart lane.
+	 */
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		const results: SendResult[] = [];
+		for (const image of images) {
+			results.push(await this.sendAttachmentFile(chatId, image));
+		}
+		return results;
+	}
+
+	/** send_voice @~514: audio uploads carry isAudioMessage="true". */
+	sendVoice(chatId: string, audioPath: string): Promise<SendResult> {
+		return this.sendAttachmentFile(chatId, audioPath, {
+			isAudioMessage: true,
+		});
+	}
+
+	/** send_video @~524: plain multipart lane. */
+	sendVideo(chatId: string, videoPath: string): Promise<SendResult> {
+		return this.sendAttachmentFile(chatId, videoPath);
+	}
+
+	/** send_document @~531: filename passthrough supported. */
+	sendDocument(
+		chatId: string,
+		filePath: string,
+		filename?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendAttachmentFile(chatId, filePath, {
+			...(filename !== undefined ? { filename } : {}),
+		});
 	}
 
 	// ── typing indicators / read receipts (@~540-590 parity) ────────────────
@@ -884,7 +1070,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		for (const pattern of this.mentionPatterns) {
 			const m = pattern.exec(stripped);
 			if (m !== null && m.index === 0) {
-				const cleaned = stripped.slice(m[0].length).replace(/^[ ,:-]+/, '');
+				const cleaned = stripped.slice(m[0].length).replace(/^[ ,:-]+/, "");
 				return cleaned.length > 0 ? cleaned : text;
 			}
 		}
@@ -912,17 +1098,17 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		const query = input.query ?? {};
 		const headers = normalizeHeaders(input.headers);
 		const token = firstTruthy(
-			query['password'],
-			query['guid'],
-			headers['x-password'],
-			headers['x-guid'],
-			headers['x-bluebubbles-guid'],
+			query["password"],
+			query["guid"],
+			headers["x-password"],
+			headers["x-guid"],
+			headers["x-bluebubbles-guid"],
 		);
 		// DEC-017: constant-time compare against the configured password
 		// (bbPasswordTokenCompare IS this wire's authenticity mechanism).
 		if (token === undefined || !secureCompare(token, this.password)) {
 			this.counters.unauthorized += 1;
-			return jsonResponse({ error: 'unauthorized' }, 401);
+			return jsonResponse({ error: "unauthorized" }, 401);
 		}
 
 		// Body cap (declared client_max_size parity): aiohttp raises during
@@ -930,7 +1116,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		// SAME 400 invalid-payload verdict — enforced here BEFORE decode.
 		if (input.rawBody.length > BB_WEBHOOK_MAX_BODY_BYTES) {
 			this.counters.invalidPayload += 1;
-			return jsonResponse({ error: 'invalid payload' }, 400);
+			return jsonResponse({ error: "invalid payload" }, 400);
 		}
 
 		// 2. THE parse seam — the ONLY place a request body is decoded. JSON
@@ -939,16 +1125,16 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		this.counters.parseInvocations += 1;
 		let payload: unknown;
 		try {
-			const body = input.rawBody.toString('utf8'); // errors='replace' parity
+			const body = input.rawBody.toString("utf8"); // errors='replace' parity
 			try {
 				payload = JSON.parse(body);
 			} catch {
 				const form = new URLSearchParams(body);
 				const payloadStr = firstTruthy(
-					form.get('payload'),
-					form.get('data'),
-					form.get('message'),
-					'',
+					form.get("payload"),
+					form.get("data"),
+					form.get("message"),
+					"",
 				);
 				payload = payloadStr ? JSON.parse(payloadStr) : {};
 			}
@@ -957,7 +1143,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			this.logger?.error?.(
 				`[bluebubbles] webhook parse error: ${errorMessage(exc)}`,
 			);
-			return jsonResponse({ error: 'invalid payload' }, 400);
+			return jsonResponse({ error: "invalid payload" }, 400);
 		}
 
 		// 3. Event-type filter: only message events carry users; everything else
@@ -966,9 +1152,9 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		const payloadRecord = asRecord(payload);
 		const eventType =
 			firstTruthy(
-				stringOrNull(payloadRecord['type']),
-				stringOrNull(payloadRecord['event']),
-			) ?? '';
+				stringOrNull(payloadRecord["type"]),
+				stringOrNull(payloadRecord["event"]),
+			) ?? "";
 		if (eventType && !BB_MESSAGE_EVENTS.has(eventType)) {
 			this.counters.eventFiltered += 1;
 			return okText();
@@ -979,15 +1165,15 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		const record = extractPayloadRecord(payloadRecord);
 
 		// 5. Self-authored echo drop.
-		if (record['isFromMe'] || record['fromMe'] || record['is_from_me']) {
+		if (record["isFromMe"] || record["fromMe"] || record["is_from_me"]) {
 			this.counters.fromMeDropped += 1;
 			return okText();
 		}
 
 		// 6. Tapback reactions delivered as messages are dropped.
-		const assocType = record['associatedMessageType'];
+		const assocType = record["associatedMessageType"];
 		if (
-			typeof assocType === 'number' &&
+			typeof assocType === "number" &&
 			(assocType in BB_TAPBACK_ADDED || assocType in BB_TAPBACK_REMOVED)
 		) {
 			this.counters.tapbackDropped += 1;
@@ -997,47 +1183,47 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		// 7. Text extraction chain.
 		const text =
 			firstTruthy(
-				stringOrNull(record['text']),
-				stringOrNull(record['message']),
-				stringOrNull(record['body']),
-			) ?? '';
+				stringOrNull(record["text"]),
+				stringOrNull(record["message"]),
+				stringOrNull(record["body"]),
+			) ?? "";
 
 		// 8. Chat-GUID chain — v1.9+ payloads omit top-level chatGuid; the chat
 		// GUID hides under data.chats[0].guid instead.
 		let chatGuid =
 			firstTruthy(
-				stringOrNull(record['chatGuid']),
-				stringOrNull(payloadRecord['chatGuid']),
-				stringOrNull(record['chat_guid']),
-				stringOrNull(payloadRecord['chat_guid']),
-				stringOrNull(payloadRecord['guid']),
-			) ?? '';
+				stringOrNull(record["chatGuid"]),
+				stringOrNull(payloadRecord["chatGuid"]),
+				stringOrNull(record["chat_guid"]),
+				stringOrNull(payloadRecord["chat_guid"]),
+				stringOrNull(payloadRecord["guid"]),
+			) ?? "";
 		if (!chatGuid) {
-			const chats = record['chats'];
+			const chats = record["chats"];
 			const firstChat = Array.isArray(chats) ? asRecord(chats[0]) : {};
 			chatGuid =
-				stringOrNull(firstChat['guid']) ??
-				stringOrNull(firstChat['chatGuid']) ??
-				'';
+				stringOrNull(firstChat["guid"]) ??
+				stringOrNull(firstChat["chatGuid"]) ??
+				"";
 		}
 		const chatIdentifier =
 			firstTruthy(
-				stringOrNull(record['chatIdentifier']),
-				stringOrNull(record['identifier']),
-				stringOrNull(payloadRecord['chatIdentifier']),
-				stringOrNull(payloadRecord['identifier']),
-			) ?? '';
+				stringOrNull(record["chatIdentifier"]),
+				stringOrNull(record["identifier"]),
+				stringOrNull(payloadRecord["chatIdentifier"]),
+				stringOrNull(payloadRecord["identifier"]),
+			) ?? "";
 
 		// 9. Sender chain: handle.address dict → sender → from → address,
 		// falling to the identifiers. A sender-only payload backfills
 		// chat_identifier so the session still has a surface id.
-		const handle = asRecord(record['handle']);
+		const handle = asRecord(record["handle"]);
 		const sender =
 			firstTruthy(
-				stringOrNull(handle['address']),
-				stringOrNull(record['sender']),
-				stringOrNull(record['from']),
-				stringOrNull(record['address']),
+				stringOrNull(handle["address"]),
+				stringOrNull(record["sender"]),
+				stringOrNull(record["from"]),
+				stringOrNull(record["address"]),
 			) ??
 			chatIdentifier ??
 			chatGuid;
@@ -1049,13 +1235,13 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		}
 
 		const sessionChatId = chatGuid || effectiveChatIdentifier;
-		const isGroup = Boolean(record['isGroup']) || chatGuid.includes(';+;');
+		const isGroup = Boolean(record["isGroup"]) || chatGuid.includes(";+;");
 
 		// Missing-field verdict BEFORE mention gating (source ordering): no
 		// sender OR no chat surface OR no text ⇒ 400.
 		if (!sender || !(chatGuid || effectiveChatIdentifier) || !text) {
 			this.counters.missingFields += 1;
-			return jsonResponse({ error: 'missing message fields' }, 400);
+			return jsonResponse({ error: "missing message fields" }, 400);
 		}
 
 		// Group mention gating: require_mention + no wake word ⇒ silently
@@ -1065,7 +1251,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			if (!this.messageMatchesMentionPatterns(text)) {
 				this.counters.mentionDropped += 1;
 				this.logger?.debug?.(
-					'[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)',
+					"[bluebubbles] ignoring group message (require_mention=true, no mention pattern matched)",
 				);
 				return okText();
 			}
@@ -1074,19 +1260,19 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 
 		// 11. Dispatch the incoming event (build_source parity).
 		const messageId = firstTruthy(
-			stringOrNull(record['guid']),
-			stringOrNull(record['messageGuid']),
-			stringOrNull(record['id']),
+			stringOrNull(record["guid"]),
+			stringOrNull(record["messageGuid"]),
+			stringOrNull(record["id"]),
 		);
 		const replyToMessageId = firstTruthy(
-			stringOrNull(record['threadOriginatorGuid']),
-			stringOrNull(record['associatedMessageGuid']),
+			stringOrNull(record["threadOriginatorGuid"]),
+			stringOrNull(record["associatedMessageGuid"]),
 		);
 		// Built as a variable so adapter-extended slots (chat_id_alt) ride
 		// structurally without tripping fresh-literal excess checks.
 		const source = {
 			platform: BLUEBUBBLES_PLUGIN_MANIFEST.name,
-			chatType: isGroup ? 'group' : 'dm',
+			chatType: isGroup ? "group" : "dm",
 			userId: sender,
 			chatId: sessionChatId,
 			chatName: effectiveChatIdentifier || sender,
@@ -1099,14 +1285,14 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 				: {}),
 		};
 		const event: IncomingEvent = {
-			messageType: 'text',
+			messageType: "text",
 			text: dispatchText,
 			...(messageId !== undefined ? { messageId } : {}),
 			...(replyToMessageId !== undefined ? { replyToMessageId } : {}),
 			source,
 		};
 		this.dispatchedEvents.push({
-			messageId: event.messageId ?? '',
+			messageId: event.messageId ?? "",
 			text: dispatchText,
 			source: event.source,
 		});
@@ -1140,15 +1326,15 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 				messageHandler: async (event, ctx) => {
 					const text = event.text ?? `[${String(event.messageType)}]`;
 					const sessionKey = String(
-						event.metadata?.['gateway_session_key'] ?? '',
+						event.metadata?.["gateway_session_key"] ?? "",
 					);
-					if (this.clarifyArmedSet.has(sessionKey) && !text.startsWith('/')) {
+					if (this.clarifyArmedSet.has(sessionKey) && !text.startsWith("/")) {
 						this.clarifyCaptures.push(text);
 						return null;
 					}
 					this.turnLog.push(text);
 					const isInlineDispatch =
-						text.startsWith('/') ||
+						text.startsWith("/") ||
 						(ctx.task.cancelRequested() === false && ctx.task.isDone());
 					if (!isInlineDispatch) {
 						while (this.holding && !ctx.task.cancelRequested()) {
@@ -1199,7 +1385,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	): Promise<void> {
 		// Self/echo filter parity (shared row contract): bot-authored echoes
 		// never become turns.
-		if (String(event.source?.userId ?? '') === 'bot-self') return;
+		if (String(event.source?.userId ?? "") === "bot-self") return;
 		event.metadata = {
 			...(event.metadata ?? {}),
 			gateway_session_key: sessionKey,
@@ -1283,14 +1469,14 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		);
 		if (outcome.success) return outcome;
 		// Transient RICH failures are NEVER legacy-resent (§10.1 duplicate risk).
-		if (outcome.tier === 'rich') return outcome;
+		if (outcome.tier === "rich") return outcome;
 
-		const failureClass = classifySendError(new Error(outcome.error ?? ''));
+		const failureClass = classifySendError(new Error(outcome.error ?? ""));
 		const networkClassified =
 			outcome.retryable === true ||
-			failureClass === 'connect-timeout' ||
-			failureClass === 'network' ||
-			failureClass === 'flood';
+			failureClass === "connect-timeout" ||
+			failureClass === "network" ||
+			failureClass === "flood";
 		if (networkClassified) {
 			// §6.1 ladder — timeouts NOT retried inside, retry_after honored.
 			const retried = await sendWithRetry(
@@ -1302,7 +1488,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			if (retried.success) return retried;
 			return this.wireSend(chatId, DELIVERY_FAILED_NOTICE, metadata);
 		}
-		if (failureClass === 'formatting') {
+		if (failureClass === "formatting") {
 			return this.wireSend(chatId, plainTextFallbackBody(chunk), metadata);
 		}
 		return outcome;
@@ -1335,7 +1521,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	): Promise<SendResult> {
 		void this.restLadderChatId;
 		const replyToRaw = metadata[REPLY_TO_METADATA_KEY];
-		const replyTo = typeof replyToRaw === 'string' ? replyToRaw : undefined;
+		const replyTo = typeof replyToRaw === "string" ? replyToRaw : undefined;
 		const rest = content.startsWith(PLAIN_TEXT_FALLBACK_PREFIX)
 			? await this.postBubble(chatId, content, undefined)
 			: await this.postStrippedBubble(chatId, content, replyTo);
@@ -1360,7 +1546,7 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	): Promise<SendResult> {
 		const text = stripMarkdown(content);
 		if (!text) {
-			return { success: false, error: 'BlueBubbles send requires text' };
+			return { success: false, error: "BlueBubbles send requires text" };
 		}
 		return this.postResolvedBubble(chatId, text, replyTo);
 	}
@@ -1378,18 +1564,18 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		void _metadata;
 		if (
 			this.captureWire === undefined ||
-			!this.captureWire.hasRichScript('rich')
+			!this.captureWire.hasRichScript("rich")
 		) {
-			return { success: false, error: 'sendRichMessage: method not found' };
+			return { success: false, error: "sendRichMessage: method not found" };
 		}
-		return this.captureWire.transmitRich('__rich__', content);
+		return this.captureWire.transmitRich("__rich__", content);
 	}
 }
 
 async function drainBackgroundTasks(
 	adapter: BlueBubblesAdapter,
 ): Promise<void> {
-	await Promise.allSettled([...adapter['backgroundTasks']]);
+	await Promise.allSettled([...adapter["backgroundTasks"]]);
 }
 
 /** Exposed for fixture teardown determinism (read receipts settle). */
@@ -1406,22 +1592,22 @@ const BB_DEFAULT_MENTION_PATTERN_SOURCES: readonly string[] =
 	BB_DEFAULT_MENTION_PATTERNS;
 
 const REGISTER_WEBHOOK_EVENTS: readonly string[] = [
-	'new-message',
-	'updated-message',
+	"new-message",
+	"updated-message",
 ];
 
 const REQUIRE_MENTION_TRUTHY: ReadonlySet<string> = new Set([
-	'true',
-	'1',
-	'yes',
-	'on',
+	"true",
+	"1",
+	"yes",
+	"on",
 ]);
 
 /** Synthetic policy for the truncate engine (codepoints ≙ Python len). */
 function truncatePolicy(maxUnits: number): ChatLengthPolicy {
 	return {
-		chatId: '__truncate__',
-		unit: 'chars',
+		chatId: "__truncate__",
+		unit: "chars",
 		lenFn: codePointLen,
 		maxUnits,
 	};
@@ -1429,17 +1615,17 @@ function truncatePolicy(maxUnits: number): ChatLengthPolicy {
 
 /** _normalize_server_url: trim, http:// prefix when scheme missing, rstrip /. */
 export function normalizeServerUrl(raw: string): string {
-	const value = (raw ?? '').trim();
-	if (!value) return '';
+	const value = (raw ?? "").trim();
+	if (!value) return "";
 	if (!/^https?:\/\//i.test(value))
-		return `http://${value}`.replace(/\/+$/, '');
-	return value.replace(/\/+$/, '');
+		return `http://${value}`.replace(/\/+$/, "");
+	return value.replace(/\/+$/, "");
 }
 
 /** Leading-slash normalization (__init__ webhook_path parity). */
 export function normalizeWebhookPath(path: string): string {
-	const raw = String(path ?? '').trim();
-	return raw.startsWith('/') ? raw : `/${raw}`;
+	const raw = String(path ?? "").trim();
+	return raw.startsWith("/") ? raw : `/${raw}`;
 }
 
 /**
@@ -1468,7 +1654,7 @@ export function compileMentionPatterns(
 	let patterns: readonly unknown[];
 	if (raw === null || raw === undefined) {
 		patterns = defaults;
-	} else if (typeof raw === 'string') {
+	} else if (typeof raw === "string") {
 		const text = raw.trim();
 		let loaded: unknown;
 		try {
@@ -1480,7 +1666,7 @@ export function compileMentionPatterns(
 			? loaded
 			: text
 					.split("\n")
-					.flatMap((line) => line.split(','))
+					.flatMap((line) => line.split(","))
 					.map((part) => part.trim());
 	} else if (Array.isArray(raw)) {
 		patterns = raw;
@@ -1492,7 +1678,7 @@ export function compileMentionPatterns(
 		const text = String(entry).trim();
 		if (!text) continue;
 		try {
-			compiled.push(new RegExp(text, 'i'));
+			compiled.push(new RegExp(text, "i"));
 		} catch (exc) {
 			logger?.warn?.(
 				`[bluebubbles] Invalid mention pattern ${JSON.stringify(text)}: ${errorMessage(exc)}`,
@@ -1508,13 +1694,13 @@ function jsonResponse(
 ): HandlerResponse {
 	return {
 		status,
-		contentType: 'application/json',
+		contentType: "application/json",
 		body: body as Record<string, never>,
 	};
 }
 
 function okText(): HandlerResponse {
-	return { status: 200, contentType: 'text/plain', body: 'ok' };
+	return { status: 200, contentType: "text/plain", body: "ok" };
 }
 
 function normalizeHeaders(
@@ -1529,7 +1715,7 @@ function normalizeHeaders(
 export function extractPayloadRecord(
 	payload: Record<string, unknown>,
 ): Record<string, unknown> {
-	const data = payload['data'];
+	const data = payload["data"];
 	if (asRecordOrNil(data) !== null)
 		return asRecordOrNil(data) as Record<string, unknown>;
 	if (Array.isArray(data)) {
@@ -1538,13 +1724,13 @@ export function extractPayloadRecord(
 			if (rec !== null) return rec;
 		}
 	}
-	const message = asRecordOrNil(payload['message']);
+	const message = asRecordOrNil(payload["message"]);
 	if (message !== null) return message;
 	return payload;
 }
 
 function asRecordOrNil(v: unknown): Record<string, unknown> | null {
-	return v !== null && typeof v === 'object' && !Array.isArray(v)
+	return v !== null && typeof v === "object" && !Array.isArray(v)
 		? (v as Record<string, unknown>)
 		: null;
 }
@@ -1554,12 +1740,12 @@ function asRecord(v: unknown): Record<string, unknown> {
 }
 
 function stringOrEmpty(v: unknown): string {
-	return typeof v === 'string' ? v : '';
+	return typeof v === "string" ? v : "";
 }
 
 function stringOrNull(v: unknown): string | null {
 	if (v === null || v === undefined) return null;
-	if (typeof v !== 'string') return null;
+	if (typeof v !== "string") return null;
 	const text = v.trim();
 	return text.length > 0 ? text : null;
 }
@@ -1569,7 +1755,7 @@ function firstTruthy<T>(
 	...candidates: Array<T | null | undefined>
 ): T | undefined {
 	for (const c of candidates) {
-		if (c !== undefined && c !== null && c !== '' && c !== 0 && c !== false) {
+		if (c !== undefined && c !== null && c !== "" && c !== 0 && c !== false) {
 			return c;
 		}
 	}
@@ -1577,7 +1763,7 @@ function firstTruthy<T>(
 }
 
 function parseEnvNumber(raw: string | undefined): number | undefined {
-	if (raw === undefined || raw.trim() === '') return undefined;
+	if (raw === undefined || raw.trim() === "") return undefined;
 	const n = Number(raw);
 	return Number.isFinite(n) ? n : undefined;
 }
@@ -1588,5 +1774,5 @@ function errorMessage(exc: unknown): string {
 
 /** Python str.lstrip() (whitespace) parity — used by _clean_mention_text. */
 function pythonLstrip(text: string): string {
-	return text.replace(/^\s+/, '');
+	return text.replace(/^\s+/, "");
 }

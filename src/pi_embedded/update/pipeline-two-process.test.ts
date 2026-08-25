@@ -334,8 +334,9 @@ describe("two-profile update drill (roadmap exit criteria c+f)", () => {
 			treeRoot: tree.checkout,
 			homes: [{ profile: "default", home }],
 		});
-		expect(result.outcome).toBe("failed");
-		expect(result.exitCode).toBe(1);
+		// Exit-2 preflight-refusal convention: a DECLINED run is not a failed one.
+		expect(result.outcome).toBe("refused");
+		expect(result.exitCode).toBe(2);
 		expect(result.error ?? "").toMatch(/not updatable in place/);
 		// Nothing mutated BEFORE the gate: no snapshots anywhere.
 		expect(existsSync(join(home, SNAPSHOTS_DIRNAME))).toBe(false);
@@ -343,7 +344,7 @@ describe("two-profile update drill (roadmap exit criteria c+f)", () => {
 		expect(result.receiptPath).not.toBeNull();
 		expect(
 			readLatestPointer(join(home, UPDATE_RECEIPTS_DIRNAME))?.outcome,
-		).toBe("failed");
+		).toBe("refused");
 	}, 60_000);
 
 	it("a dirty-tree ZIP-overlay refusal is receipted at the pipeline boundary", async () => {
@@ -361,7 +362,8 @@ describe("two-profile update drill (roadmap exit criteria c+f)", () => {
 			zipSourceDir: source,
 			platform: "win32",
 		});
-		expect(result.outcome).toBe("failed");
+		expect(result.outcome).toBe("refused");
+		expect(result.exitCode).toBe(2);
 		expect(result.error ?? "").toMatch(/refused at up-front/);
 		expect(existsSync(join(tree.checkout, "uncommitted.txt"))).toBe(true); // no clobber
 		const receiptDirs = join(home, UPDATE_RECEIPTS_DIRNAME);

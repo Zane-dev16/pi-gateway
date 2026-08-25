@@ -16,8 +16,10 @@
 //   - ingress pipeline ports _handle_notification exactly: CIDR gate →
 //     defensive in-band handshake echo → body cap (declared-length then
 //     actual-bytes, both pre-parse) → JSON shape → per-notification walk
-//     (resource filter → clientState → receipt dedupe) → verdict ladder
-//     (202 accepted/deduped · 403 all-auth-rejected · 400 otherwise)
+//     (resource filter → clientState → receipt dedupe) → FIRE-AND-FORGET
+//     dispatch (_schedule_notification @437 create_task parity) →
+//     byte-level verdict ladder (empty-body 202 accepted/deduped ·
+//     403 all-auth-rejected · 400 otherwise)
 //   - subscription lifecycle stays with Graph/operator (06 §8.3): the adapter
 //     NEVER creates or renews subscriptions — connect refusal ladder +
 //     zero-outbound-call posture are pinned by conformance rows
@@ -190,6 +192,8 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 		text: string;
 		internal: true;
 	}> = [];
+	/** In-flight DETACHED dispatch tasks (webhook-43 quiescence seam). */
+	private readonly inFlightDispatches = new Set<Promise<void>>();
 	readonly turnLog: string[] = [];
 	readonly replyLog: string[] = [];
 	readonly clarifyCaptures: string[] = [];
@@ -433,7 +437,10 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 			contentType: "application/json",
 			body: JSON.stringify({
 				status: "ok",
-				platform: MSGRAPH_WEBHOOK_PLUGIN_MANIFEST.name,
+				// _handle_health:246 emits `self.platform.value` — the Platform
+				// ENUM VALUE "msgraph_webhook" (config.py:348), not the hyphenated
+				// plugin manifest name.
+				platform: "msgraph_webhook",
 				webhook_path: this.webhookPath,
 				accepted: this.counters.accepted,
 				duplicates: this.counters.duplicates,
@@ -507,16 +514,29 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 		this.counters.authRejected += verdict.authRejected;
 		this.counters.otherRejected += verdict.otherRejected;
 
-		// Verdict ladder (@~270): if anything ingested OR deduped, 202 with an
-		// empty body so Graph acks and we don't leak internal counters. If every
-		// item failed auth, 403 so an attacker POSTing fake notifications gets a
-		// clear reject. Other failures are the sender's configuration problem ⇒
-		// 400.
+		// webhook-43 (msgraph_webhook.py:_handle_notification @296→311 +
+		// _schedule_notification @437): each accepted notification dispatches
+		// FIRE-AND-FORGET (asyncio.create_task + done-callback discard) and the
+		// verdict resolves IMMEDIATELY after the walk/counters — the HTTP path
+		// never awaits a turn (Graph's ack has a hard retry budget).
+		// drainDispatches() below is the TEST-observability quiescence seam;
+		// production callers never see it on this path.
 		for (const notification of verdict.accepted) {
-			await this.dispatchNotification(notification);
+			const task = this.dispatchNotification(notification);
+			this.inFlightDispatches.add(task);
+			void task.then(
+				() => this.inFlightDispatches.delete(task),
+				() => this.inFlightDispatches.delete(task),
+			);
 		}
+		// Verdict ladder (@~270/@311): if anything ingested OR deduped, 202 —
+		// BYTE-LEVEL web.Response(status=202): no body, NO content-type
+		// (webhook-42), so Graph acks successfully and internal counters never
+		// leak. If every item failed auth, 403 so an attacker POSTing fake
+		// notifications gets a clear reject. Other failures are the sender's
+		// configuration problem ⇒ 400.
 		if (verdict.accepted.length > 0 || verdict.duplicates > 0) {
-			return { status: 202, contentType: "application/json", body: {} };
+			return { status: 202 };
 		}
 		if (verdict.authRejected > 0 && verdict.otherRejected === 0) {
 			return { status: 403 };
@@ -618,8 +638,11 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 	buildMessageId(notification: NotificationRecord): string {
 		const explicit = buildReceiptKey(notification);
 		if (explicit !== null) return explicit;
+		// _build_message_event:390 byte-parity fallback — hash the SAME canonical
+		// bytes the Python baseline hashes (json.dumps(notification,
+		// sort_keys=True).encode('utf-8')).
 		return `sha1:${createHash("sha1")
-			.update(canonicalJson(notification))
+			.update(canonicalJson(notification), "utf8")
 			.digest("hex")}`;
 	}
 
@@ -816,6 +839,16 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 		}
 	}
 
+	/**
+	 * TEST-OBSERVABILITY QUIESCENCE SEAM (webhook-43): resolves once every
+	 * detached dispatch has settled. Conformance rows await this AFTER a POST
+	 * and BEFORE asserting dispatchedEvents/turns — the HTTP verdict itself
+	 * NEVER awaits it (fire-and-forget asyncio.create_task parity).
+	 */
+	async drainDispatches(): Promise<void> {
+		await Promise.allSettled([...this.inFlightDispatches]);
+	}
+
 	/** Receipt-set observability (dedupe rows probe the live bound). */
 	seenReceiptCount(): number {
 		return this.seenReceipts.size();
@@ -887,13 +920,95 @@ function timingSafeEqual(a: Buffer, b: Buffer): boolean {
 }
 
 /**
- * Canonical JSON for the sha1 fallback id. Python anchor:
- * sha1(json.dumps(notification, sort_keys=True)). The port canonicalizes with
- * sorted keys and compact separators — deterministic within the port (ids
- * never cross the language boundary), which is the property the dedupe needs.
+ * Canonical JSON for the sha1 fallback id — BYTE-PARITY with the Python
+ * baseline bytes (msgraph_webhook.py:_build_message_event:390):
+ *
+ *   sha1(json.dumps(notification, sort_keys=True).encode('utf-8')).hexdigest()
+ *
+ * json.dumps defaults when indent is None: separators (', ', ': ') and
+ * ensure_ascii=True (all non-ASCII + control chars as \\uXXXX escapes,
+ * lowercase hex; astral chars as explicit surrogate-pair escapes). Sorting
+ * keys recursively mirrors sort_keys=True. Id-less notifications therefore
+ * mint the SAME ids as the Python gateway. Known residual: float scalars
+ * render via JS number formatting (Python repr would print 1.0 / 1e+21);
+ * Graph notification payloads carry ints/strings/bools/nulls only, and
+ * NaN/Infinity cannot arise from JSON.parse.
  */
 function canonicalJson(value: unknown): string {
-	return JSON.stringify(sortKeysDeep(value));
+	return dumpsValue(sortKeysDeep(value));
+}
+
+/** Serializer over PRE-SORTED structures (see canonicalJson). */
+function dumpsValue(value: unknown): string {
+	if (value === null) return "null";
+	switch (typeof value) {
+		case "boolean":
+			return value ? "true" : "false";
+		case "number":
+			return JSON.stringify(value);
+		case "string":
+			return escapePythonString(value);
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map(dumpsValue).join(", ")}]`;
+	}
+	if (typeof value === "object") {
+		const rec = value as Record<string, unknown>;
+		const entries = Object.keys(rec).map(
+			(k) => `${escapePythonString(k)}: ${dumpsValue(rec[k])}`,
+		);
+		return `{${entries.join(", ")}}`;
+	}
+	// undefined has no JSON wire shape (JSON.stringify would drop/skip it);
+	// coerce deterministically like the null it round-trips to.
+	return "null";
+}
+
+const PYTHON_ESCAPES: Record<string, string> = {
+	'"': '\\"',
+	"\\": "\\\\",
+	"\b": "\\b",
+	"\f": "\\f",
+	"\n": "\\n",
+	"\r": "\\r",
+	"\t": "\\t",
+};
+
+/**
+ * json.dumps ensure_ascii=True string encoding: printable ASCII (0x20–0x7e)
+ * passes through verbatim (with quote/backslash escapes); EVERYTHING else —
+ * control chars, DEL 0x7f included, and all non-ASCII — becomes a lowercase
+ * \\uXXXX escape, astral code points as explicit surrogate-pair escapes.
+ */
+function escapePythonString(s: string): string {
+	let out = '"';
+	for (let i = 0; i < s.length; i++) {
+		const ch = s[i] as string;
+		const known = PYTHON_ESCAPES[ch];
+		if (known !== undefined) {
+			out += known;
+			continue;
+		}
+		const code = ch.charCodeAt(0);
+		if (code >= 0x20 && code <= 0x7e) {
+			out += ch;
+		} else if (code < 0xd800 || code > 0xdfff) {
+			out += `\\u${code.toString(16).padStart(4, "0")}`;
+		} else if (code >= 0xdc00) {
+			// lone low surrogate: escape as-is
+			out += `\\u${code.toString(16).padStart(4, "0")}`;
+		} else {
+			const next = s.charCodeAt(i + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				// astral pair → two surrogate escapes (ensure_ascii parity)
+				out += `\\u${code.toString(16).padStart(4, "0")}\\u${next.toString(16).padStart(4, "0")}`;
+				i++; // consume the low surrogate
+			} else {
+				out += `\\u${code.toString(16).padStart(4, "0")}`;
+			}
+		}
+	}
+	return `${out}"`;
 }
 
 function sortKeysDeep(value: unknown): unknown {
@@ -933,10 +1048,15 @@ function stablePrettyJson(value: unknown): string {
 }
 
 /**
- * Template interpolation (_render_template parity): `{a.b.c}` placeholders
- * resolve against the payload dict-path-wise; dict/list values render as
- * stable JSON capped at 2000 chars; unresolved keys keep the literal
- * `{a.b.c}` text.
+ * Template interpolation (_render_template:420 parity): `{a.b.c}` placeholders
+ * resolve against the payload dict-path-wise. Per-segment semantics mirror
+ * `value.get(part, f"{{{key}}}")`: a MISSING segment (own-property miss,
+ * prototype names never resolve) installs the literal `{key}` sentinel which
+ * short-circuits to that literal text — including at the FINAL segment.
+ * Explicit null renders str(None) ⇒ "None"; mid-path null/leaf non-dicts keep
+ * the literal; dict/list values render as json.dumps(sort_keys=True) bytes
+ * (', '/': ' separators + ensure_ascii escaping, canonicalJson) capped at
+ * 2000 chars.
  */
 function renderTemplate(
 	template: string,
@@ -950,17 +1070,20 @@ function renderTemplate(
 				typeof value === "object" &&
 				!Array.isArray(value)
 			) {
-				value = (value as Record<string, unknown>)[part];
+				const rec = value as Record<string, unknown>;
+				// dict.get(part, sentinel): absent own key → literal {key}.
+				if (!Object.hasOwn(rec, part)) return `{${key}}`;
+				value = rec[part];
 			} else {
 				return `{${key}}`;
 			}
 		}
 		if (value !== null && typeof value === "object") {
-			return JSON.stringify(sortKeysDeep(value)).slice(
-				0,
-				MSGRAPH_TEMPLATE_VALUE_CAP_CHARS,
-			);
+			return canonicalJson(value).slice(0, MSGRAPH_TEMPLATE_VALUE_CAP_CHARS);
 		}
+		// str(None) parity: an explicitly-null leaf renders "None", never "null"
+		// (undefined is unreachable on the JSON wire but coerces identically).
+		if (value === null || value === undefined) return "None";
 		return String(value);
 	});
 }

@@ -24,6 +24,14 @@
 // that precede a user message — that pattern IS valid when the previous turn
 // completed normally and the user redirected before the continuation turn.
 //
+// Companion sanitation step (same pre-request family, DEC-015):
+//   sanitizeToolCallArguments      ← agent/agent_runtime_helpers.py:
+//     sanitize_tool_call_arguments (repair corrupted tool_call argument JSON
+//     in-place on live history) + agent/message_sanitization.py:
+//     _repair_tool_call_arguments / _escape_invalid_chars_in_json_strings
+//     (the repair pipeline itself: trailing commas, unclosed structures,
+//     excess closers bounded 50, control-char lacing, "{}" last resort).
+//
 // TS mapping notes vs the Python source:
 //   - tool calls live INSIDE assistant.content as ToolCall blocks (pi shape),
 //     not a separate `tool_calls` key → union = appending later blocks.
@@ -179,6 +187,165 @@ export interface RepairWithCursorResult {
 	repairs: number;
 	/** Recomputed flush cursor (see below). */
 	cursor: number;
+}
+
+/**
+ * Escape unescaped control characters inside JSON string values
+ * (message_sanitization.py:_escape_invalid_chars_in_json_strings): walk the
+ * raw JSON tracking double-quoted strings; inside strings, literal control
+ * chars (< 0x20, not already part of an escape pair) become \uXXXX. Passes
+ * everything else through untouched.
+ */
+function escapeInvalidCharsInJsonStrings(raw: string): string {
+	const out: string[] = [];
+	let inString = false;
+	let i = 0;
+	const n = raw.length;
+	while (i < n) {
+		const ch = raw[i]!;
+		if (inString) {
+			if (ch === "\\" && i + 1 < n) {
+				// Already-escaped char — pass through as-is.
+				out.push(ch, raw[i + 1]!);
+				i += 2;
+				continue;
+			}
+			if (ch === '"') {
+				inString = false;
+				out.push(ch);
+			} else if (ch.charCodeAt(0) < 0x20) {
+				out.push(`\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+			} else {
+				out.push(ch);
+			}
+		} else {
+			if (ch === '"') inString = true;
+			out.push(ch);
+		}
+		i += 1;
+	}
+	return out.join("");
+}
+
+/**
+ * message_sanitization.py:_repair_tool_call_arguments — attempt to repair
+ * malformed tool-call argument JSON; when every repair fails return "{}" so
+ * the request succeeds instead of crashing the session on an HTTP 400.
+ * Repair ladder (order is load-bearing):
+ *   fast-path empty/whitespace → "{}"; Python-literal None → "{}"; direct
+ *   parse+reserialize; strip trailing commas before }/] ; close unclosed {/[ ;
+ *   remove excess closers (bounded 50); control-char escape retry; "{}".
+ */
+export function repairToolCallArgumentsJson(
+	rawArgs: string,
+	toolName = "?",
+): string {
+	const rawStripped = typeof rawArgs === "string" ? rawArgs.trim() : "";
+	void toolName; // parity parameter — Hermes logs per-tool WARNINGs here
+
+	// Fast-path: empty / whitespace-only → empty object.
+	if (!rawStripped) return "{}";
+	// Python-literal None (and its JSON spelling) → normalize to {}.
+	if (rawStripped === "None" || rawStripped === "null") return "{}";
+
+	const tryParse = (s: string): unknown => {
+		try {
+			return JSON.parse(s);
+		} catch {
+			return undefined;
+		}
+	};
+
+	// Pass 0: direct parse + compact reserialize (normalizes formatting).
+	let parsed = tryParse(rawStripped);
+	if (parsed !== undefined) return JSON.stringify(parsed);
+
+	// Common repairs.
+	let fixed = rawStripped.replace(/,\s*([}\]])/g, "$1"); // 1. trailing commas
+	const openCurly =
+		(fixed.match(/\{/g)?.length ?? 0) - (fixed.match(/\}/g)?.length ?? 0);
+	const openBracket =
+		(fixed.match(/\[/g)?.length ?? 0) - (fixed.match(/\]/g)?.length ?? 0);
+	if (openCurly > 0) fixed += "}".repeat(openCurly); // 2. close unclosed
+	if (openBracket > 0) fixed += "]".repeat(openBracket);
+	// 3. Remove excess closers (bounded to 50 iterations).
+	for (let i = 0; i < 50; i++) {
+		if (tryParse(fixed) !== undefined) break;
+		if (
+			fixed.endsWith("}") &&
+			(fixed.match(/\}/g)?.length ?? 0) > (fixed.match(/\{/g)?.length ?? 0)
+		) {
+			fixed = fixed.slice(0, -1);
+		} else if (
+			fixed.endsWith("]") &&
+			(fixed.match(/\]/g)?.length ?? 0) > (fixed.match(/\[/g)?.length ?? 0)
+		) {
+			fixed = fixed.slice(0, -1);
+		} else {
+			break;
+		}
+	}
+	parsed = tryParse(fixed);
+	if (parsed !== undefined) return JSON.stringify(parsed);
+
+	// Pass 4: escape control chars inside strings, then retry.
+	const escaped = escapeInvalidCharsInJsonStrings(fixed);
+	if (escaped !== fixed) {
+		parsed = tryParse(escaped);
+		if (parsed !== undefined) return JSON.stringify(parsed);
+	}
+
+	// Last resort: empty object so the request still succeeds.
+	return "{}";
+}
+
+/** Parse repaired argument JSON; always yields a record ({} fallback). */
+function argumentsRecord(repairedJson: string): Record<string, unknown> {
+	try {
+		const parsed: unknown = JSON.parse(repairedJson);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed)
+		) {
+			return parsed as Record<string, unknown>;
+		}
+	} catch {
+		/* fall through */
+	}
+	return {};
+}
+
+/**
+ * agent_runtime_helpers.py:sanitize_tool_call_arguments companion pass over
+ * LIVE history (DEC-015 family): every assistant ToolCall block must carry a
+ * well-formed arguments OBJECT before the request goes out. String arguments
+ * are parsed (through the _repair_tool_call_arguments ladder when malformed);
+ * null/empty arguments become {}; unshapeable values degrade to {}. Returns
+ * the number of repairs made. Runs AFTER the sequence passes so merged
+ * survivors are sanitized exactly once.
+ */
+export function sanitizeToolCallArguments(messages: Message[]): number {
+	let repairs = 0;
+	for (const msg of messages) {
+		if (!isAssistant(msg)) continue;
+		for (let i = 0; i < msg.content.length; i++) {
+			const block = msg.content[i]!;
+			if (block.type !== "toolCall") continue;
+			const call = block as ToolCall;
+			const args: unknown = call.arguments;
+			if (typeof args === "string") {
+				call.arguments = argumentsRecord(
+					repairToolCallArgumentsJson(args, call.name),
+				);
+				repairs += 1;
+			} else if (args === undefined || args === null) {
+				call.arguments = {};
+				repairs += 1;
+			}
+		}
+	}
+	return repairs;
 }
 
 /**

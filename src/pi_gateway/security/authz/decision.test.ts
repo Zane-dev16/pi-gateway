@@ -767,3 +767,131 @@ describe("unauthorizedDmBehavior resolution order", () => {
 		expect(unauthorizedDmBehavior("telegram")).toBe("pair");
 	});
 });
+
+// ── allowAdapterDelegation (secops-10 parity run.py:18981) ─────────────────
+// The plugin message-injection re-auth caller passes False, disabling the
+// three DELEGATION gates: upstream-relay admission (1), adapter-verified
+// role auth (6), and adapter own-policy trust (8 own-policy branch only).
+describe("allowAdapterDelegation:false — plugin re-auth re-authorizes locally", () => {
+	it("relay-delivered event with delegation OFF falls through to local allowlists", () => {
+		withEnv({ DISCORD_ALLOWED_USERS: "42" }, () => {
+			const record = isUserAuthorized(
+				{
+					platform: "discord",
+					userId: "42",
+					deliveredViaUpstreamRelay: true,
+				},
+				{},
+				{ allowAdapterDelegation: false },
+			);
+			expect(record).toMatchObject({
+				allowed: true,
+				gate: 9,
+				reasonCode: "allowlist_union",
+			});
+		});
+	});
+
+	it("relay-delivered event with delegation OFF and no local grant DEFAULT-DENIES", () => {
+		withEnv({}, () => {
+			const record = isUserAuthorized(
+				{
+					platform: "discord",
+					userId: "42",
+					deliveredViaUpstreamRelay: true,
+				},
+				{},
+				{ allowAdapterDelegation: false },
+			);
+			// The same source admits at gate 1 when delegation is on (matrix row
+			// above); off, nothing local authorizes it — fail CLOSED.
+			expect(record).toMatchObject({
+				allowed: false,
+				gate: 10,
+				reasonCode: "default_deny",
+			});
+		});
+	});
+
+	it("adapter authorization_is_upstream with delegation OFF never admits", () => {
+		withEnv({ TELEGRAM_ALLOWED_USERS: "" }, () => {
+			const record = isUserAuthorized(
+				{ platform: "relay", userId: "42" },
+				{
+					adapterView: (): AdapterAuthzView => ({
+						authorizationIsUpstream: true,
+					}),
+				},
+				{ allowAdapterDelegation: false },
+			);
+			expect(record).toMatchObject({ allowed: false, gate: 10 });
+		});
+	});
+
+	it("role_authorized:true with delegation OFF is skipped (falls to default deny)", () => {
+		withEnv({}, () => {
+			const record = isUserAuthorized(
+				{ platform: "discord", userId: "42", roleAuthorized: true },
+				{},
+				{ allowAdapterDelegation: false },
+			);
+			expect(record).toMatchObject({
+				allowed: false,
+				gate: 10,
+				reasonCode: "default_deny",
+			});
+		});
+	});
+
+	it("own-policy adapter trust with delegation OFF is skipped; config.allow_from STILL admits", () => {
+		withEnv({}, () => {
+			// Own-policy intake trust disabled: dm_policy=allowlist alone must NOT
+			// admit a plugin re-auth pass…
+			const ownPolicy = isUserAuthorized(
+				{ platform: "wecom", userId: "777" },
+				{
+					adapterView: (): AdapterAuthzView => ({
+						enforcesOwnAccessPolicy: true,
+						dmPolicy: "allowlist",
+					}),
+				},
+				{ allowAdapterDelegation: false },
+			);
+			expect(ownPolicy).toMatchObject({
+				allowed: false,
+				gate: 10,
+				reasonCode: "default_deny",
+			});
+			// …but an explicitly configured allow_from remains operator policy,
+			// NOT delegation, so it still admits at gate 8.
+			const fromConfig = isUserAuthorized(
+				{ platform: "wecom", userId: "777" },
+				{
+					adapterView: (): AdapterAuthzView => ({
+						enforcesOwnAccessPolicy: false,
+						extra: { allow_from: ["777"] },
+					}),
+				},
+				{ allowAdapterDelegation: false },
+			);
+			expect(fromConfig).toMatchObject({
+				allowed: true,
+				gate: 8,
+				reasonCode: "config_allow_from",
+			});
+		});
+	});
+
+	it("delegation stays ON by default — omitted option never narrows policy", () => {
+		const record = isUserAuthorized({
+			platform: "discord",
+			userId: "999",
+			deliveredViaUpstreamRelay: true,
+		});
+		expect(record).toMatchObject({
+			allowed: true,
+			gate: 1,
+			reasonCode: "upstream_auth_delegation",
+		});
+	});
+});

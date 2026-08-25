@@ -81,6 +81,7 @@ function makeCaptureTransport(raw: FakePlatformWire): GchatTransport {
 			messageName,
 			body,
 			metadata = {},
+			_updateMask?: string,
 		): Promise<GchatApiResponse> => {
 			if (
 				metadata["forceFormattingError"] === true &&

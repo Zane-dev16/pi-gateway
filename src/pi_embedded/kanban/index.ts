@@ -54,3 +54,42 @@ export {
 	kanbanDispatcherServiceEntry,
 	type KanbanDispatcherEntryDeps,
 } from "./stage-entry.js";
+export {
+	MAX_SEND_FAILURES,
+	NOTIFY_TERMINAL_KINDS,
+	NOTIFIER_GC_INTERVAL_SECONDS,
+	SILENT_EVENT_KINDS,
+	renderNotifyMessage,
+	resolveNotifierServiceConfig,
+	runNotifierTick,
+	startKanbanNotifier,
+	KANBAN_NOTIFY_IN_GATEWAY_ENV,
+} from "./notifier.js";
+export type {
+	NotifyTerminalKind,
+	NotifyTickOptions,
+	NotifyTickResult,
+	NotifierStartResult,
+	RunningKanbanNotifier,
+	StartKanbanNotifierOptions,
+	NotifyDeliverFn,
+	KanbanNotifierConfig,
+} from "./notifier.js";
+export {
+	SqliteKanbanNotifyStore,
+	subKeyOf,
+	DEFAULT_DONE_SUB_RETENTION_DAYS,
+} from "./notify-store.js";
+export {
+	KANBAN_NOTIFIER_SERVICE_NAME,
+	kanbanNotifierServiceEntry,
+	type KanbanNotifierEntryDeps,
+} from "./notifier-stage-entry.js";
+export type {
+	ClaimedEvents,
+	NotifyEvent,
+	NotifySubStore,
+	NotifySubscription,
+	NotifyTaskView,
+	SubKey,
+} from "./notify-store.js";

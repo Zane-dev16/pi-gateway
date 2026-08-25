@@ -9,6 +9,8 @@ import type { AssistantMessage, Message, ToolResultMessage } from "./host.js";
 import {
 	repairMessageSequence,
 	repairMessageSequenceWithCursor,
+	repairToolCallArgumentsJson,
+	sanitizeToolCallArguments,
 } from "./alternation-repair.js";
 import {
 	fauxAssistantMessage,
@@ -206,5 +208,103 @@ describe("alternation repair (DEC-015)", () => {
 		const sameRef = messages;
 		repairMessageSequence(messages);
 		expect(sameRef).toHaveLength(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// DEC-015 companion sanitation family (agent_runtime_helpers.py:
+// sanitize_tool_call_arguments ← message_sanitization.py:
+// _repair_tool_call_arguments / _escape_invalid_chars_in_json_strings).
+
+describe("tool-call argument repair ladder (_repair_tool_call_arguments)", () => {
+	it("empty / whitespace / Python-None / JSON-null arguments normalize to {}", () => {
+		expect(repairToolCallArgumentsJson("")).toBe("{}");
+		expect(repairToolCallArgumentsJson("   ")).toBe("{}");
+		expect(repairToolCallArgumentsJson("None")).toBe("{}");
+		expect(repairToolCallArgumentsJson("null")).toBe("{}");
+	});
+
+	it("well-formed JSON passes through compactly reserialized", () => {
+		expect(repairToolCallArgumentsJson('{"a": 1}')).toBe('{"a":1}');
+		expect(repairToolCallArgumentsJson("[1,2]")).toBe("[1,2]");
+	});
+
+	it("trailing commas before closing braces/brackets are stripped", () => {
+		expect(repairToolCallArgumentsJson('{"a": [1, 2,]}')).toBe('{"a":[1,2]}');
+		expect(repairToolCallArgumentsJson('{"a": 1,}')).toBe('{"a":1}');
+	});
+
+	it("truncated structures are closed; hopeless truncation degrades to {}", () => {
+		expect(repairToolCallArgumentsJson("[1, 2")).toBe("[1,2]");
+		expect(repairToolCallArgumentsJson('{"a": {"b": 1')).toBe('{"a":{"b":1}}');
+		// Unterminated STRING can't be repaired by brace-closing → {} parity.
+		expect(repairToolCallArgumentsJson('{"truncated": "val')).toBe("{}");
+	});
+
+	it("excess closers are removed (bounded loop)", () => {
+		expect(repairToolCallArgumentsJson('{"a": 1}}}')).toBe('{"a":1}');
+	});
+
+	it("literal control characters inside strings are escaped and retried", () => {
+		// llama.cpp-style raw tab inside a string value (#12068 family): JS
+		// JSON.parse rejects it outright.
+		const laced = '{"cmd": "a\tb"}'; // literal TAB byte inside the value
+		expect(() => JSON.parse(laced)).toThrow();
+		expect(repairToolCallArgumentsJson(laced)).toBe('{"cmd":"a\\tb"}');
+	});
+});
+
+describe("sanitizeToolCallArguments (pre-request companion pass)", () => {
+	function assistantWithArgs(args: unknown): AssistantMessage {
+		return assistant([
+			fauxToolCall("echo", args as Record<string, unknown>, { id: "c1" }),
+		]);
+	}
+
+	it("string arguments parse into objects; corrupt ones go through the ladder", () => {
+		const messages: Message[] = [assistantWithArgs('{"x": 1,}')];
+		expect(sanitizeToolCallArguments(messages)).toBe(1);
+		const call = (
+			(messages[0] as AssistantMessage).content as Array<{
+				type: string;
+				arguments?: unknown;
+			}>
+		).find((b) => b.type === "toolCall");
+		expect(call?.arguments).toEqual({ x: 1 });
+	});
+
+	it("null/undefined arguments become {}; object arguments are untouched", () => {
+		const untouched = fauxAssistantMessage([
+			fauxToolCall("ok", { keep: true }, { id: "c0" }),
+		]);
+		const nulled = fauxAssistantMessage([
+			fauxToolCall("n", undefined as unknown as Record<string, unknown>, {
+				id: "c1",
+			}),
+		]);
+		const messages: Message[] = [
+			user("q"),
+			untouched,
+			nulled,
+			assistant([fauxText("done")]),
+		];
+		expect(sanitizeToolCallArguments(messages)).toBe(1); // only the null one
+		const calls = (
+			nulled.content as Array<{ type: string; arguments?: unknown }>
+		).filter((b) => b.type === "toolCall");
+		expect(calls[0]?.arguments).toEqual({});
+		const kept = (
+			untouched.content as Array<{ type: string; arguments?: unknown }>
+		).find((b) => b.type === "toolCall");
+		expect(kept?.arguments).toEqual({ keep: true });
+	});
+
+	it("counts zero repairs on already-clean history", () => {
+		const messages: Message[] = [
+			user("q"),
+			assistant([fauxText("hi")]),
+			assistantWithArgs({ fine: 1 }),
+		];
+		expect(sanitizeToolCallArguments(messages)).toBe(0);
 	});
 });

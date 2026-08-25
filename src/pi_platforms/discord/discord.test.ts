@@ -12,7 +12,10 @@
 //   - components round-trip through kit machinery (DEC-016)
 //   - auto-thread continuity: DEC-028 effective-thread-slot predicate at the
 //     wire level (+ #51057 starter dedup, #20243 abort-on-failure)
-//   - typing refresh-loop variants (A11): cadence/duplicate/429/stop
+//   - typing refresh-loop variants (A11): immediate entry fire, cadence,
+//     duplicate suppression, 429 survival, stop + turn-admission wiring
+//   - stability round r2: READY d.user.id identity grounding (ws-1),
+//     forum-parent type-15 post lane (ws-9)
 //   - manifest data transcription (limits/caps with Hermes anchors)
 
 import { describe, expect, it } from "vitest";
@@ -33,7 +36,11 @@ import {
 import {
 	ALLOWED_MENTIONS_DEFAULTS,
 	BUTTON_LABEL_LIMIT,
+	CHANNEL_TYPE_FORUM,
 	CLARIFY_CHOICES_MAX,
+	DISCORD_IDENTIFY_INTENTS,
+	DISCORD_INTENT_GUILD_MESSAGES,
+	DISCORD_INTENT_MESSAGE_CONTENT,
 	GATEWAY_OPCODES as OP,
 	MAX_SPLIT_MESSAGES,
 	MESSAGE_LENGTH_MAX,
@@ -46,9 +53,11 @@ import {
 	DiscordAdapter,
 	buildComponentRows,
 	buildSelectOptions,
+	deriveForumThreadName,
 	deriveThreadName,
 	truncateToMessageCap,
 	convertGfmToDiscordMarkdown,
+	type DiscordRestPlane,
 } from "./discord-adapter.js";
 import { ManualClock } from "./clock.js";
 import { FakePlatformWire } from "../conformance/wire.js";
@@ -85,7 +94,7 @@ function push(
 }
 
 describe("gateway protocol contracts", () => {
-	it("IDENTIFY carries token+intents; READY captures session_id; heartbeats fire on HELLO cadence carrying last seq", async () => {
+	it("IDENTIFY carries token + INTEGER intents bitmask incl MESSAGE_CONTENT; READY captures session_id; heartbeats fire on HELLO cadence carrying last seq", async () => {
 		const world = makeDiscordWorld({
 			name: "proto",
 			heartbeatIntervalMs: 1_000,
@@ -96,9 +105,14 @@ describe("gateway protocol contracts", () => {
 
 		const identify = gateway.receivedFrames.find(
 			(f) => f.frame.op === OP.IDENTIFY,
-		)?.frame.d as { token?: string; intents?: string[] };
+		)?.frame.d as { token?: string; intents?: number };
 		expect(identify.token).toBe("discord-fake-token");
-		expect(identify.intents).toContain("GUILD_MESSAGES");
+		// VENDOR WIRE FORM: an integer bitmask — string arrays never come online
+		// and MESSAGE_CONTENT is required or inbound content arrives empty.
+		expect(typeof identify.intents).toBe("number");
+		expect(identify.intents).toBe(DISCORD_IDENTIFY_INTENTS);
+		expect(identify.intents! & DISCORD_INTENT_MESSAGE_CONTENT).toBeTruthy();
+		expect(identify.intents! & DISCORD_INTENT_GUILD_MESSAGES).toBeTruthy();
 		expect(engine.sessionId).toMatch(/^sess-/);
 
 		await clock.advance(2_500); // two heartbeat intervals
@@ -642,7 +656,7 @@ describe("auto-thread continuity — DEC-028 effective-thread-slot predicate at 
 			{ kind: "fail", error: "Missing Permissions (50013)" },
 			{ kind: "fail", error: "Missing Permissions (50013)" },
 		);
-		const { engine, subject, clock } = world;
+		const { engine, subject, clock, wire } = world;
 		await world.connectAndAwaitLive();
 
 		push(world, {
@@ -660,33 +674,115 @@ describe("auto-thread continuity — DEC-028 effective-thread-slot predicate at 
 		expect(engine.threadCreations).toHaveLength(0); // retried once, gave up
 		expect(subject.turns()).toHaveLength(0); // message ABORTED, not inlined
 		expect(engine.ledger.get("init-fail")?.status).toBe("failed");
+		// The abort pairs a VISIBLE channel notice so users know to retry
+		// (adapter.py :8196-8206) — delivered AFTER both create attempts failed.
+		const ops = wire.ops.filter((o) => o.op === "send");
+		const notice = ops[ops.length - 1];
+		expect(notice?.content).toContain("could not create");
+		expect(notice?.content).toContain("Please retry");
+	});
+
+	it("per-turn emoji acks: eyes on dispatch, remove-then-add success/failure on completion; ledger fed", async () => {
+		const world = makeDiscordWorld({ name: "emoji-acks" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		push(world, {
+			id: "emo-1",
+			channelId: "chan-e",
+			guildId: "g1",
+			authorId: "user-2",
+			content: "<@bot-self> react to me",
+		});
+		await eventually(() => subject.turns().length >= 1);
+		await eventually(() => engine.ledger.get("emo-1")?.emojiAck === true);
+
+		const EYES = "\u{1F440}";
+		const CHECK = "\u2705";
+		const reactions = subject.reactionOps.filter(
+			(r) => r.messageId === "emo-1",
+		);
+		// First op: eyes ADDED on dispatch.
+		expect(reactions[0]).toMatchObject({
+			channelId: "chan-e",
+			messageId: "emo-1",
+			emoji: EYES,
+			action: "add",
+		});
+		// Completion swap: eyes REMOVED then check ADDED.
+		expect(
+			reactions.some((r) => r.action === "remove" && r.emoji === EYES),
+		).toBe(true);
+		expect(reactions.at(-1)).toMatchObject({
+			emoji: CHECK,
+			action: "add",
+		});
+	});
+
+	it("split continuations + replies build message_reference (grouping parity)", async () => {
+		const world = makeDiscordWorld({ name: "references" });
+		const { subject, wire } = world;
+		// Oversized content splits at the harness budget (64 units).
+		const results = await subject.adapter.deliverText(
+			"ref-chat",
+			"x".repeat(150),
+		);
+		const sends = wire.sendsOf("ref-chat");
+		expect(sends.length).toBeGreaterThanOrEqual(2);
+		const firstId = results[0]?.messageId;
+		expect(sends[1]?.metadata["message_reference"]).toEqual({
+			message_id: firstId,
+			fail_if_not_exists: false,
+		});
+		expect(sends[0]?.metadata["message_reference"]).toBeUndefined();
+		// Continuations chain: chunk 3 references chunk 2.
+		if (sends.length >= 3) {
+			expect(sends[2]?.metadata["message_reference"]).toEqual({
+				message_id: results[1]?.messageId,
+				fail_if_not_exists: false,
+			});
+		}
+
+		// Reply lane: reply_to_message_id converts into the vendor body key.
+		await subject.sendThroughDoor1("ref-reply", "a reply body", {
+			reply_to_message_id: "parent-9",
+		});
+		const replySend = wire.sendsOf("ref-reply")[0];
+		expect(replySend?.metadata["message_reference"]).toMatchObject({
+			message_id: "parent-9",
+		});
+		expect(replySend?.metadata["reply_to_message_id"]).toBeUndefined();
 	});
 });
 
 describe("typing refresh-loop variants (A11)", () => {
-	it("cadence 12s, duplicate suppression, stop cancels — injected clock only", async () => {
+	it("IMMEDIATE first fire on entry, 12s refresh cadence, duplicate suppression, stop cancels — injected clock only", async () => {
 		const world = makeDiscordWorld({ name: "typing" });
 		const { engine, clock, subject } = world;
 		await world.connectAndAwaitLive();
 
 		engine.startTyping("chat-typing");
-		engine.startTyping("chat-typing"); // duplicate suppressed
-		await clock.advance(TYPING_INTERVAL_SECONDS * 1000 * 3);
-		expect(subject.typingOps).toHaveLength(3); // one loop, 12s cadence
+		await clock.advance(0); // the entry post lands at t+0 — no interval elapses
+		// Fires ON ENTRY (request-first loop, :5605-5637) — a sub-interval
+		// turn still shows the indicator.
+		expect(subject.typingOps).toHaveLength(1);
+		engine.startTyping("chat-typing"); // duplicate suppressed — still ONE loop
+		await clock.advance(TYPING_INTERVAL_SECONDS * 1000);
+		expect(subject.typingOps).toHaveLength(2); // entry + t=12 refresh
 		expect(engine.typingActive("chat-typing")).toBe(true);
 
 		engine.stopTyping("chat-typing");
 		await clock.advance(TYPING_INTERVAL_SECONDS * 1000 * 2);
-		expect(subject.typingOps).toHaveLength(3);
+		expect(subject.typingOps).toHaveLength(2);
 		expect(engine.typingActive("chat-typing")).toBe(false);
 	});
 
-	it("429 survival: authoritative sleep then KEEP looping; non-retryable ends the loop", async () => {
+	it("429 survival: authoritative delay alone leads to the next post, KEEP looping; non-retryable ends the loop", async () => {
 		const world = makeDiscordWorld({ name: "typing-429" });
 		const { engine, clock, subject } = world;
 		await world.connectAndAwaitLive();
 
-		// First refresh draws a scripted 429 (retryable + retry_after).
+		// The IMMEDIATE entry fire draws a scripted 429 (retryable + retry_after).
 		world.wire.script("send", {
 			kind: "fail",
 			error: "429 rate limited",
@@ -694,21 +790,357 @@ describe("typing refresh-loop variants (A11)", () => {
 			retryAfter: 2,
 		});
 		engine.startTyping("chat-tp");
-		await clock.advance(TYPING_INTERVAL_SECONDS * 1000);
+		await clock.advance(0);
 		expect(subject.typingOps).toHaveLength(1); // fired, got 429
 
-		// Loop survived: slept the authoritative 2s, next refresh succeeds.
-		// (12s cadence + 2s penalty ⇒ second refresh lands at t≈26s.)
-		await clock.advance(TYPING_INTERVAL_SECONDS * 1000 + 3_000);
-		expect(subject.typingOps.length).toBeGreaterThanOrEqual(2);
+		// Loop survived: slept ONLY the authoritative 2s, next refresh succeeds
+		// (:5626 sleep(retry_after) → straight back to request).
+		await clock.advance(3_000);
+		expect(subject.typingOps).toHaveLength(2);
+		// Back on the plain 12s cadence from the last fire.
+		await clock.advance(TYPING_INTERVAL_SECONDS * 1000);
+		expect(subject.typingOps).toHaveLength(3);
 
 		// A NON-retryable failure ENDS the loop.
 		world.wire.script("send", { kind: "timeout" });
-		await clock.advance(TYPING_INTERVAL_SECONDS * 1000);
+		await clock.advance(TYPING_INTERVAL_SECONDS * 1000 + 1_000);
 		const countAfterTimeout = subject.typingOps.length;
 		await clock.advance(TYPING_INTERVAL_SECONDS * 1000 * 2);
 		expect(subject.typingOps.length).toBe(countAfterTimeout);
 		expect(engine.typingActive("chat-tp")).toBe(false);
+	});
+});
+
+describe("stability round r2 — identity grounding, turn-admission typing, forum-post lane", () => {
+	/** Direct engine with a forum-capable REST plane (subject wire lacks the
+	 * vendor channel-type probe; conformance rows cover the legacy lane). */
+	function makeForumEngine(opts: {
+		clock: ManualClock;
+		wire: FakePlatformWire;
+		gateway?: DiscordGatewayFake | undefined;
+		forumTypes?: ReadonlySet<string> | undefined;
+		posts?: Array<{ forumId: string; name: string; starter: string }>;
+		failFirstPost?: boolean | undefined;
+	}): DiscordAdapter {
+		const posts = opts.posts ?? [];
+		let postAttempts = 0;
+		const rest: DiscordRestPlane = {
+			transmitSend: (c, content, m) => opts.wire.transmitSend(c, content, m),
+			transmitEdit: (c, mid, content, m) =>
+				opts.wire.transmitEdit(c, mid, content, m),
+			transmitDraft: (c, d, content, final, m) =>
+				opts.wire.transmitDraft(c, d, content, final, m),
+			transmitRich: (c, content, m) => opts.wire.transmitRich(c, content, m),
+			transmitThreadCreate: (c, name, m) =>
+				opts.wire.transmitSend(c, name, { ...m, thread_create: true }),
+			transmitTyping: async () => ({ success: true }),
+			transmitInteractionAck: async () => ({ success: true }),
+			hasScript: (k) => opts.wire.hasScript(k),
+		};
+		if (opts.forumTypes !== undefined) {
+			rest.resolveChannelType = async (chatId) =>
+				opts.forumTypes?.has(chatId) === true ? CHANNEL_TYPE_FORUM : 0;
+			rest.transmitForumThreadCreate = async (forumId, name, starter) => {
+				postAttempts += 1;
+				if (opts.failFirstPost === true && postAttempts === 1) {
+					return { success: false, error: "forced forum-post failure" };
+				}
+				posts.push({ forumId, name, starter });
+				return {
+					success: true,
+					messageId: `starter-${posts.length}`,
+					threadId: `thread-${posts.length}`,
+				};
+			};
+		}
+		const gateway =
+			opts.gateway ?? new DiscordGatewayFake({ nowMs: opts.clock.nowMs });
+		return new DiscordAdapter({
+			transport: gateway,
+			rest,
+			clock: { nowMs: opts.clock.nowMs, sleepMs: opts.clock.sleepMs },
+			scalarMaxUnits: MESSAGE_LENGTH_MAX,
+		});
+	}
+
+	it("ws-1: READY d.user.id grounds the bot identity — require_mention matches the REAL id and self-echo filters on it", async () => {
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		// The gateway fake echoes a DIFFERENT id than the 'bot-self' fallback.
+		const gateway = new DiscordGatewayFake({
+			nowMs: clock.nowMs,
+			botUserId: "gateway-bot-42",
+		});
+		const engine = makeForumEngine({ clock, wire, gateway });
+		engine.attachStandardGuard();
+		await engine.connect({ isReconnect: false });
+		await eventually(() => engine.isLive);
+
+		// Identity ADOPTED from READY d.user.id (adapter.py:on_ready :1391 —
+		// Hermes grounds everything in client.user).
+		expect(engine.resolvedBotUserId).toBe("gateway-bot-42");
+
+		// A guild message mentioning <@gateway-bot-42> DISPATCHES — with the
+		// unfixed fallback ('bot-self') require_mention would silently drop it.
+		gateway.pushMessage({
+			id: "rm-1",
+			channelId: "guild-chan",
+			guildId: "g1",
+			authorId: "user-7",
+			content: "<@gateway-bot-42> status please",
+		});
+		await eventually(() => engine.turnLog.length >= 1);
+		expect(engine.turnLog[0]).toBe("status please"); // stripSelfMention consumed the mention
+
+		// Unmentioned guild messages stay gated (require_mention default holds).
+		gateway.pushMessage({
+			id: "rm-2",
+			channelId: "guild-chan",
+			guildId: "g1",
+			authorId: "user-8",
+			content: "no mention here",
+		});
+		await new Promise((r) => setTimeout(r, 10));
+		expect(engine.turnLog).toHaveLength(1);
+
+		// Self-echo filter grounds in the adopted id too.
+		gateway.pushMessage({
+			id: "rm-3",
+			channelId: "guild-chan",
+			guildId: "g1",
+			authorId: "gateway-bot-42",
+			content: "<@gateway-bot-42> echo of myself",
+		});
+		await new Promise((r) => setTimeout(r, 10));
+		expect(engine.turnLog).toHaveLength(1);
+	});
+
+	it("ws-1: a payload-less READY never downgrades the grounded identity (injected value stays fallback)", async () => {
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		const gateway = new DiscordGatewayFake({
+			nowMs: clock.nowMs,
+			botUserId: "gateway-bot-42",
+		});
+		const engine = makeForumEngine({ clock, wire, gateway });
+		await engine.connect({ isReconnect: false });
+		await eventually(() => engine.isLive);
+
+		// Synthetic re-READY WITHOUT a user payload: identity must survive.
+		gateway.dispatch("READY", { session_id: "sess-anon" });
+		await new Promise((r) => setTimeout(r, 10));
+		expect(engine.resolvedBotUserId).toBe("gateway-bot-42");
+	});
+
+	it("ws-2: turn admission starts the indicator; failure stops it; finalize stops it", async () => {
+		// Direct engine, NO guard: handleIngress rejects after admission — a
+		// deterministic FAILURE window. A gated transmitReaction holds the
+		// adapter BETWEEN startTyping and the turn so the ACTIVE state (and
+		// the t+0 entry post) is observable.
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		let releaseReaction: () => void = () => {};
+		const reactionGate = new Promise<void>((r) => {
+			releaseReaction = r;
+		});
+		const typingPosts: string[] = [];
+		const gateway = new DiscordGatewayFake({ nowMs: clock.nowMs });
+		const engine = new DiscordAdapter({
+			transport: gateway,
+			rest: {
+				transmitSend: (c, content, m) => wire.transmitSend(c, content, m),
+				transmitEdit: (c, mid, content, m) =>
+					wire.transmitEdit(c, mid, content, m),
+				transmitDraft: (c, d, content, final, m) =>
+					wire.transmitDraft(c, d, content, final, m),
+				transmitRich: (c, content, m) => wire.transmitRich(c, content, m),
+				transmitThreadCreate: (c, name, m) =>
+					wire.transmitSend(c, name, { ...m, thread_create: true }),
+				transmitTyping: async (chatId) => {
+					typingPosts.push(chatId);
+					return { success: true };
+				},
+				transmitInteractionAck: async () => ({ success: true }),
+				async transmitReaction() {
+					await reactionGate;
+					return { success: true };
+				},
+				hasScript: (k) => wire.hasScript(k),
+			},
+			clock: { nowMs: clock.nowMs, sleepMs: clock.sleepMs },
+			scalarMaxUnits: MESSAGE_LENGTH_MAX,
+		});
+		await engine.connect({ isReconnect: false });
+		await eventually(() => engine.isLive);
+
+		gateway.pushMessage({
+			id: "tw-1",
+			channelId: "chan-tw",
+			guildId: "g1",
+			authorId: "user-2",
+			content: "<@bot-self> work on this",
+		});
+		// Admission STARTED the indicator (run.py:5000 parity)…
+		await eventually(() => engine.typingActive("chan-tw"));
+		await clock.advance(0); // …and the entry post fires at t+0 MID-TURN
+		expect(typingPosts).toEqual(["chan-tw"]);
+
+		releaseReaction();
+		// handleIngress now rejects (no guard) → ❌ failure path → STOPPED.
+		await eventually(
+			() =>
+				engine.ledger.get("tw-1")?.status === "failed" &&
+				!engine.typingActive("chan-tw"),
+		);
+
+		// Finalize side: a GUARDED engine completes dispatch — the indicator
+		// is stopped once handleIngress settles (✅ success branch).
+		const clock2 = new ManualClock();
+		const wire2 = new FakePlatformWire();
+		const gateway2 = new DiscordGatewayFake({ nowMs: clock2.nowMs });
+		const engine2 = new DiscordAdapter({
+			transport: gateway2,
+			rest: {
+				transmitSend: (c, content, m) => wire2.transmitSend(c, content, m),
+				transmitEdit: (c, mid, content, m) =>
+					wire2.transmitEdit(c, mid, content, m),
+				transmitDraft: (c, d, content, final, m) =>
+					wire2.transmitDraft(c, d, content, final, m),
+				transmitRich: (c, content, m) => wire2.transmitRich(c, content, m),
+				transmitThreadCreate: (c, name, m) =>
+					wire2.transmitSend(c, name, { ...m, thread_create: true }),
+				transmitTyping: async () => ({ success: true }),
+				transmitInteractionAck: async () => ({ success: true }),
+				hasScript: (k) => wire2.hasScript(k),
+			},
+			clock: { nowMs: clock2.nowMs, sleepMs: clock2.sleepMs },
+			scalarMaxUnits: MESSAGE_LENGTH_MAX,
+		});
+		engine2.attachStandardGuard();
+		await engine2.connect({ isReconnect: false });
+		await eventually(() => engine2.isLive);
+		gateway2.pushMessage({
+			id: "tw-2",
+			channelId: "chan-done",
+			guildId: "g1",
+			authorId: "user-3",
+			content: "<@bot-self> finish clean",
+		});
+		await eventually(() => engine2.inboundLog.includes("tw-2"));
+		expect(engine2.typingActive("chan-done")).toBe(false);
+	});
+
+	it("ws-9: type-15 targets route sends through thread-create starter + follow-ups INTO the new thread", async () => {
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		const posts: Array<{ forumId: string; name: string; starter: string }> = [];
+		const engine = makeForumEngine({
+			clock,
+			wire,
+			forumTypes: new Set(["forum-1"]),
+			posts,
+		});
+
+		// Oversized delivery ⇒ starter + follow-up chunks (_send_to_forum :3593:
+		// create_thread(name=derived, content=starter), then thread sends).
+		const body = Array.from(
+			{ length: 240 },
+			(_, i) => `line-${i} padding text`,
+		).join("\n");
+		const results = await engine.deliverText(
+			"forum-1",
+			`Forum report\n${body}`,
+		);
+
+		// EXACTLY ONE post op carrying the derived FIRST-LINE name + starter.
+		expect(posts).toHaveLength(1);
+		expect(posts[0]?.forumId).toBe("forum-1");
+		expect(posts[0]?.name).toBe("Forum report");
+		expect(posts[0]?.starter.startsWith("Forum report")).toBe(true);
+
+		// Follow-up chunks went INTO the created thread — never as plain sends
+		// to the forum parent (Discord rejects those).
+		const followUps = wire.sendsOf("thread-1");
+		expect(followUps.length).toBe(results.length - 1);
+		expect(wire.sendsOf("forum-1")).toHaveLength(0);
+		expect(results.every((r) => r.success)).toBe(true);
+		expect(results[0]?.messageId).toBe("starter-1");
+	});
+
+	it("ws-9: single door sends create the post; non-forum chats probe ONCE then ride the plain lane", async () => {
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		const posts: Array<{ forumId: string; name: string; starter: string }> = [];
+		let probes = 0;
+		const engine = makeForumEngine({
+			clock,
+			wire,
+			posts,
+			forumTypes: new Set(["forum-x"]),
+		});
+		// Wrap to count channel-type lookups (probe-cache evidence).
+		const rest = (engine as unknown as { rest: DiscordRestPlane }).rest;
+		const innerResolve = rest.resolveChannelType?.bind(rest);
+		if (innerResolve !== undefined) {
+			rest.resolveChannelType = async (chatId) => {
+				probes += 1;
+				return innerResolve(chatId);
+			};
+		}
+
+		const sent = await engine.send("forum-x", "Door body", undefined, {});
+		expect(sent.success).toBe(true);
+		expect(sent.messageId).toBe("starter-1"); // starter message id surfaces
+		expect(posts).toHaveLength(1);
+		expect(posts[0]?.name).toBe("Door body");
+
+		// Plain chats never create posts. (The SECOND bare send to the SAME
+		// chat reconciles by edit under §5 invariant 4 — chokepoint lane
+		// behavior, orthogonal to the forum routing.)
+		await engine.send("plain-chat", "normal", undefined, {});
+		await engine.send("plain-chat", "again", undefined, {});
+		const plainOps = wire.ops.filter((o) => o.chatId === "plain-chat");
+		expect(plainOps.some((o) => o.op === "send")).toBe(true);
+		expect(plainOps.every((o) => o.metadata["forum_post"] === undefined)).toBe(
+			true,
+		);
+		expect(posts).toHaveLength(1);
+		// Verdicts CACHE per chat: forum-x + plain-chat probed exactly once.
+		expect(probes).toBe(2);
+	});
+
+	it("ws-9: failed starter surfaces the error and a later chunk falls back to creating its own post", async () => {
+		const clock = new ManualClock();
+		const wire = new FakePlatformWire();
+		const posts: Array<{ forumId: string; name: string; starter: string }> = [];
+		const engine = makeForumEngine({
+			clock,
+			wire,
+			forumTypes: new Set(["forum-f"]),
+			posts,
+			failFirstPost: true,
+		});
+		const results = await engine.deliverText(
+			"forum-f",
+			`first line\n${"x".repeat(4600)}`,
+		);
+		// Post #1 failed; chunk 2 had no open thread so it created ITS OWN post;
+		// chunk 3 followed into that new thread. No doomed plain send ever hit
+		// the forum parent.
+		expect(results[0]?.success).toBe(false);
+		expect(results.slice(1).every((r) => r.success)).toBe(true);
+		expect(wire.sendsOf("forum-f")).toHaveLength(0);
+		expect(wire.sendsOf("thread-1").length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("ws-9: forum-thread names derive from the first line (heading strip, 100-char cap, New Post fallback)", () => {
+		expect(deriveForumThreadName("# Bug report\nbody below")).toBe(
+			"Bug report",
+		);
+		expect(deriveForumThreadName("### ### heading")).toBe("### heading");
+		expect(deriveForumThreadName("x".repeat(250))).toHaveLength(100);
+		expect(deriveForumThreadName("#\nreal title")).toBe("New Post");
+		expect(deriveForumThreadName("")).toBe("New Post");
 	});
 });
 
@@ -793,14 +1225,38 @@ describe("manifest data transcription (vendor ground truth)", () => {
 		expect(options?.options.every((o) => o.value.length <= 100)).toBe(true);
 	});
 
-	it("ping-safety allowed_mentions deny everyone/roles by default on EVERY text send", async () => {
+	it("ping-safety allowed_mentions ship VENDOR shape and ride EVERY lane (send/edit/draft)", async () => {
 		const world = makeDiscordWorld({ name: "ping-safety" });
 		const { subject, wire } = world;
 		await subject.sendThroughDoor1("ps-chat", "@everyone check this");
 		const op = wire.sendsOf("ps-chat")[0];
-		expect(op?.metadata["allowed_mentions"]).toEqual(ALLOWED_MENTIONS_DEFAULTS);
-		expect(ALLOWED_MENTIONS_DEFAULTS.everyone).toBe(false);
-		expect(ALLOWED_MENTIONS_DEFAULTS.roles).toBe(false);
+		// Vendor wire form (discord.py AllowedMentions.to_dict) — camelCase
+		// booleans would be DROPPED by the vendor ⇒ parse=[] ⇒ no pings at all.
+		expect(op?.metadata["allowed_mentions"]).toEqual({
+			parse: ["users"],
+			replied_user: true,
+		});
+		expect(ALLOWED_MENTIONS_DEFAULTS.parse).not.toContain("everyone");
+		expect(ALLOWED_MENTIONS_DEFAULTS.parse).not.toContain("roles");
+
+		// Edit + streaming-edit lanes PATCH with the same safe default
+		// (discord.py Message.edit fills the client-wide default :3798).
+		await subject.adapter.editMessage("ps-chat", "wire-1", "updated");
+		const editOp = wire.editsOf("ps-chat")[0];
+		expect(editOp?.metadata["allowed_mentions"]).toEqual({
+			parse: ["users"],
+			replied_user: true,
+		});
+		await subject.streamAdapter().sendDraft?.({
+			chatId: "ps-chat",
+			draftId: 3,
+			content: "stream",
+		});
+		const draftOp = wire.draftsOf("ps-chat")[0];
+		expect(draftOp?.metadata["allowed_mentions"]).toEqual({
+			parse: ["users"],
+			replied_user: true,
+		});
 	});
 
 	it("REST lane converts ONLY GFM tables; emphasis/link bytes stay native; fences survive byte-exact", () => {

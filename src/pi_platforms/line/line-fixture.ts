@@ -9,6 +9,9 @@
 // outcomes, never snapshotted strings.
 
 import { createHmac } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { LineWebhookAdapter } from "./line-webhook-adapter.js";
 import type {
@@ -16,6 +19,7 @@ import type {
 	LineApiTransport,
 	LineMessage,
 } from "./line-webhook-adapter.js";
+import { lineBubbleText } from "./line-webhook-adapter.js";
 import type { SendResult } from "../../pi_gateway/streaming/adapter-seam.js";
 import type { WireBehavior } from "../conformance/wire.js";
 import {
@@ -57,19 +61,36 @@ export interface LineFixtureOptions {
 	dedupCap?: number | undefined;
 }
 
+export interface LoadingCall {
+	chatId: string;
+	seconds: number;
+}
+
 /**
  * Instrumented Reply/Push endpoint. Enforces the VENDOR's single-use reply
  * token semantic server-side: a burned token presented twice is rejected
- * BEFORE any scripted behavior applies.
+ * BEFORE any scripted behavior applies. Also models the loading-indicator,
+ * bot-info, and content-download edges of _LineClient.
  */
 export class FakeLineApi implements LineApiTransport {
-	readonly replyCalls: Array<{ token: string; texts: string[] }> = [];
-	readonly pushCalls: Array<{ chatId: string; texts: string[] }> = [];
+	readonly replyCalls: Array<{
+		token: string;
+		texts: string[];
+		messages: LineMessage[];
+	}> = [];
+	readonly pushCalls: Array<{
+		chatId: string;
+		texts: string[];
+		messages: LineMessage[];
+	}> = [];
+	readonly loadingCalls: LoadingCall[] = [];
 	private readonly burnedReplyTokens = new Set<string>();
 	private readonly scripts: {
 		reply: WireBehavior[];
 		push: WireBehavior[];
 	} = { reply: [], push: [] };
+	/** Seeded inbound media binaries, keyed by message id. */
+	private readonly contentStore = new Map<string, Buffer>();
 
 	constructor(private readonly secret: string = FIXTURE_CHANNEL_SECRET) {}
 
@@ -87,7 +108,8 @@ export class FakeLineApi implements LineApiTransport {
 	}
 
 	private textsOf(messages: LineMessage[]): string[] {
-		return messages.map((m) => m.text);
+		// The user-visible bubble text (template bubbles render inner text).
+		return messages.map(lineBubbleText);
 	}
 
 	async reply(
@@ -95,7 +117,7 @@ export class FakeLineApi implements LineApiTransport {
 		messages: LineMessage[],
 		metadata?: Record<string, unknown>,
 	): Promise<SendResult> {
-		this.replyCalls.push({ token, texts: this.textsOf(messages) });
+		this.replyCalls.push({ token, texts: this.textsOf(messages), messages });
 		const rejected = this.rejectionScript(messages, metadata);
 		if (rejected !== null) return rejected;
 		if (this.burnedReplyTokens.has(token)) {
@@ -121,7 +143,7 @@ export class FakeLineApi implements LineApiTransport {
 		messages: LineMessage[],
 		metadata?: Record<string, unknown>,
 	): Promise<SendResult> {
-		this.pushCalls.push({ chatId, texts: this.textsOf(messages) });
+		this.pushCalls.push({ chatId, texts: this.textsOf(messages), messages });
 		const rejected = this.rejectionScript(messages, metadata);
 		if (rejected !== null) return rejected;
 		const behavior = this.take("push");
@@ -132,6 +154,26 @@ export class FakeLineApi implements LineApiTransport {
 			return { success: false, error: "request timed out" };
 		}
 		return { success: true, messageId: `push-${this.pushCalls.length}` };
+	}
+
+	async loading(chatId: string, seconds: number): Promise<SendResult> {
+		this.loadingCalls.push({ chatId, seconds });
+		return { success: true };
+	}
+
+	async botInfo(): Promise<{ userId?: string | undefined }> {
+		return { userId: this.botId };
+	}
+
+	async fetchContent(messageId: string): Promise<Buffer> {
+		const bytes = this.contentStore.get(messageId);
+		if (bytes === undefined) throw new Error(`LINE content 404: ${messageId}`);
+		return bytes;
+	}
+
+	/** Pre-seed downloadable inbound media (inbound media tests). */
+	seedContent(messageId: string, bytes: Buffer): void {
+		this.contentStore.set(messageId, bytes);
 	}
 
 	replyCount(): number {
@@ -145,7 +187,7 @@ export class FakeLineApi implements LineApiTransport {
 		metadata?: Record<string, unknown> | undefined,
 	): SendResult | null {
 		if ((metadata?.["forceFormattingError"] ?? null) !== true) return null;
-		const joined = messages.map((m) => m.text).join("\n");
+		const joined = messages.map(lineBubbleText).join("\n");
 		if (!joined.startsWith("(Response formatting failed, plain text:")) {
 			return { success: false, error: "Bad Request: can't parse entities" };
 		}
@@ -155,6 +197,9 @@ export class FakeLineApi implements LineApiTransport {
 	pushCount(): number {
 		return this.pushCalls.length;
 	}
+
+	/** This channel's own userId (botInfo edge). */
+	readonly botId = "U-line-bot-self";
 
 	get channelSecret(): string {
 		return this.secret;
@@ -172,6 +217,10 @@ export class LineFixture {
 	readonly adapter: LineWebhookAdapter;
 	readonly api: FakeLineApi;
 	readonly clock = new FixtureClock();
+	/** Isolated inbound-media cache root (fetchContent-seam rows). */
+	readonly mediaDir: string;
+
+	private readonly tempRoot: string;
 
 	constructor(opts: LineFixtureOptions = {}) {
 		const config: LineAdapterConfig = {
@@ -182,11 +231,15 @@ export class LineFixture {
 			opts.config?.channel_secret !== undefined
 				? new FakeLineApi(opts.config.channel_secret)
 				: new FakeLineApi();
+		this.tempRoot = mkdtempSync(join(tmpdir(), "line-fix-"));
+		this.mediaDir = join(this.tempRoot, "media");
+		mkdirSync(this.mediaDir, { recursive: true });
 		this.adapter = new LineWebhookAdapter({
 			config,
 			nowMs: () => this.clock.nowMs,
 			transport: this.api,
 			dedupCap: opts.dedupCap,
+			mediaCacheDir: this.mediaDir,
 			secretReader: (name) => {
 				if (opts.withSecret === false) return undefined;
 				if (name === "LINE_CHANNEL_ACCESS_TOKEN") {
@@ -204,7 +257,7 @@ export class LineFixture {
 	}
 
 	dispose(): void {
-		/* pure in-process fixture */
+		rmSync(this.tempRoot, { recursive: true, force: true });
 	}
 
 	// ── HTTP-level requests ──────────────────────────────────────────────────

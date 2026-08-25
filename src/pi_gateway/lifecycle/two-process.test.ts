@@ -166,6 +166,41 @@ describe("duplicate-instance takeover across OS processes (01 §3.2)", () => {
 		}
 	}, 30_000);
 
+	it("SIGUSR1 drain-first restart: real process drains, classifies service_restart, EXITS 75", async () => {
+		// The fleet updater (pi_embedded/update/restart.ts) signals SIGUSR1 and
+		// expects the gateway to disappear during the drain window. Against the
+		// REAL runtime this requires a live SIGUSR1 listener — without one Node
+		// opens the inspector and the survivor takes SIGTERM ⇒ exit 1.
+		const procA = spawnDriver({
+			scenario: "hold-running-sigusr1",
+			home,
+			coord,
+			"ready-marker": "ready-sigusr1",
+		});
+		const collectedA = collect(procA);
+		try {
+			await waitForMarker("ready-sigusr1");
+			const ready = JSON.parse(
+				readFileSync(join(coord, "ready-sigusr1"), "utf8"),
+			) as { pid: number; ok: boolean };
+			expect(ready.ok).toBe(true);
+
+			// The driver signals ITSELF with SIGUSR1 after READY; the graceful
+			// drain must complete and the PROCESS EXIT CODE must be 75.
+			const closeInfo = await collectedA;
+			expect(closeInfo.code).toBe(75);
+			const outcomeA = parseResult(closeInfo);
+			expect(outcomeA["klass"]).toBe("service_restart");
+			expect(outcomeA["exitCode"]).toBe(75);
+			expect(outcomeA["persistedStopped"]).toBe(true);
+
+			// Ownership released: the replacer/updater can claim immediately.
+			expect(getRunningPid(home)).toBeNull();
+		} finally {
+			if (!procA.killed && procA.exitCode === null) procA.kill("SIGKILL");
+		}
+	}, 30_000);
+
 	it("FOLLOWER: second instance WITHOUT --replace exits cleanly; original unaffected", async () => {
 		const procA = spawnDriver({
 			scenario: "hold-running",

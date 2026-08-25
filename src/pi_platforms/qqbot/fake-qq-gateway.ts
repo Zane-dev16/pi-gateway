@@ -6,9 +6,10 @@
 //     (op 10 Hello → Identify(2)/Resume(6); op 0 dispatch; op 11 heartbeat
 //     ACK; op 7 server-reconnect; op 9 invalid-session) with scripted closes;
 //   • the REST face (token, /gateway, v2 messages, interactions ACK, media +
-//     chunked-upload endpoints) with scriptable failures carrying vendor
-//     biz_codes in error MESSAGES (never snapshotted vendor strings — the
-//     uploader matches codes numerically, mirroring Hermes).
+//     chunked-upload endpoints, and the q.qq.com QR-onboard portal endpoints
+//     create_bind_task / poll_bind_result) with scriptable failures carrying
+//     vendor biz_codes in error MESSAGES (never snapshotted vendor strings —
+//     the uploader matches codes numerically, mirroring Hermes).
 //
 // Resume semantics mirror the QQ protocol as Hermes uses it
 // (adapter.py:_send_resume): on RESUME the server replays every dispatch with
@@ -148,6 +149,7 @@ export class FakeQQGateway {
 
 	private tokenCounter = 0;
 	private msgCounter = 0;
+	private bindTaskCounter = 0;
 	accessToken = "fake-access-token";
 	expiresInS = 7200;
 	gatewayUrl = "wss://fake-qq-gateway.invalid/gateway";
@@ -187,6 +189,14 @@ export class FakeQQGateway {
 			};
 		}
 		if (path.endsWith("/gateway")) {
+			// Recorded so rows can assert authenticated-leg headers (UA parity).
+			this.nextRest("gateway", {
+				key: "gateway",
+				method,
+				path,
+				body,
+				headers,
+			});
 			return { status: 200, body: { url: this.gatewayUrl } };
 		}
 		if (path.startsWith("/v2/users/") && path.endsWith("/messages")) {
@@ -266,6 +276,63 @@ export class FakeQQGateway {
 			if (b.kind === "fail")
 				return { status: 503, body: { message: b.message } };
 			return { status: 200, body: {} };
+		}
+		if (path.includes("/lite/create_bind_task")) {
+			const b = this.nextRest("onboard:create", {
+				key: "onboard:create",
+				method,
+				path,
+				body,
+				headers,
+			});
+			if (b.kind === "fail") {
+				return { status: 400, body: { retcode: -1, msg: b.message } };
+			}
+			// Vendor contract: a bind task REQUIRES the client-generated AES key.
+			if (typeof body["key"] !== "string" || body["key"] === "") {
+				return {
+					status: 200,
+					body: { retcode: 310010, msg: "missing bind key" },
+				};
+			}
+			this.bindTaskCounter += 1;
+			return {
+				status: 200,
+				body:
+					b.body && Object.keys(b.body).length > 0
+						? b.body
+						: {
+								retcode: 0,
+								data: { task_id: `bind-task-${this.bindTaskCounter}` },
+							},
+			};
+		}
+		if (path.includes("/lite/poll_bind_result")) {
+			const b = this.nextRest("onboard:poll", {
+				key: "onboard:poll",
+				method,
+				path,
+				body,
+				headers,
+			});
+			if (b.kind === "fail") {
+				return { status: 400, body: { retcode: -1, msg: b.message } };
+			}
+			// Vendor contract: polls carry the task_id from create_bind_task.
+			if (typeof body["task_id"] !== "string" || body["task_id"] === "") {
+				return {
+					status: 200,
+					body: { retcode: 310020, msg: "missing task_id" },
+				};
+			}
+			return {
+				status: 200,
+				// Default PENDING — completed/expired bodies are scripted per row.
+				body:
+					b.body && Object.keys(b.body).length > 0
+						? b.body
+						: { retcode: 0, data: { status: 1 } },
+			};
 		}
 		if (path.endsWith("/files")) {
 			const b = this.nextRest("files", {

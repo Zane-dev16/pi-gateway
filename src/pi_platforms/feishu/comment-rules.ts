@@ -125,6 +125,14 @@ export function resolveRule(
 }
 
 /**
+ * has_wiki_keys (:165): any document rule key starts with "wiki:" — gates
+ * the reverse-lookup re-resolution in comment ingress.
+ */
+export function hasWikiKeys(cfg: CommentsConfigFile): boolean {
+	return Object.keys(cfg.documents ?? {}).some((k) => k.startsWith("wiki:"));
+}
+
+/**
  * The gate (:285 is_user_allowed): allowlist membership ALWAYS passes;
  * pairing policy consults the approved store; allowlist without membership
  * DENIES.

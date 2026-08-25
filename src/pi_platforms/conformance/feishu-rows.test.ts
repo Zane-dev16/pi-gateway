@@ -273,14 +273,20 @@ function feishuDeltaRows(
 					})["event"] as Record<string, unknown>,
 				);
 				const card = ack["card"] as
-					| { header?: { template?: string; title?: { content?: string } } }
+					| {
+							header?: { template?: string; title?: { content?: string } };
+							elements?: Array<{ tag: string; content?: string }>;
+					  }
 					| undefined;
 				expect(card?.header?.template).toBe("green");
+				// Attribution line: "{icon} **{label}** by {user_name}" (:2199).
+				expect(card?.elements?.[0]?.content).toContain("by ou_user1");
 				expect(
 					fx.engine.resolvedFamilies.some((f) => f.startsWith("ea:")),
 				).toBe(true);
 
-				// Double-tap resolves exactly once — corrective card, no re-resolve.
+				// Double-tap resolves exactly once — BARE stale response (no card,
+				// no invented payload), no re-resolve (:2894 parity).
 				const second = await fx.engine.handleCardActionTrigger(
 					`tok-${approvalId}-b`,
 					cardActionEnvelope({
@@ -293,7 +299,7 @@ function feishuDeltaRows(
 						operatorOpenId: "ou_user1",
 					})["event"] as Record<string, unknown>,
 				);
-				expect(second["card"]).toBeDefined();
+				expect(Object.keys(second)).toHaveLength(0);
 				expect(fx.engine.resolvedApprovalCards).toHaveLength(1);
 
 				// Update-prompt family through the SAME handler.
@@ -425,45 +431,59 @@ function feishuDeltaRows(
 								url: "https://feishu.cn/docx/x",
 							}),
 							batchQueryComment: () => ({
-								isWhole: false,
-								quote: "",
-								replies: [
+								items: [
+									{
+										isWhole: false,
+										quote: "",
+										replies: [
+											{
+												openId: "ou_author",
+												text: "please summarize",
+												replyId: "r0",
+											},
+										],
+									},
+								],
+							}),
+							listWholeCommentsPage: () => ({
+								items: [],
+								hasMore: false,
+								pageToken: "",
+							}),
+							listRepliesPage: () => ({
+								items: [
 									{
 										openId: "ou_author",
 										text: "please summarize",
 										replyId: "r0",
 									},
 								],
+								hasMore: false,
+								pageToken: "",
 							}),
-							listWholeComments: () => [],
-							listCommentReplies: () => [
-								{
-									openId: "ou_author",
-									text: "please summarize",
-									replyId: "r0",
-								},
-							],
 							addReaction: () => true,
 							deleteReaction: () => true,
-							postThreadReply: (_ft, _ty, _cid, text) => {
-								posted.push({ kind: "thread", text });
+							postThreadReply: (req) => {
+								posted.push({ kind: "thread", text: req.textRunText });
 								return { ok: true } as const;
 							},
-							postNewComment: (_ft, _ty, text) => {
-								posted.push({ kind: "whole", text });
+							postNewComment: (req) => {
+								posted.push({ kind: "whole", text: req.replyElementsText });
 								return { ok: true } as const;
 							},
+							reverseLookupWikiNode: () => null,
+							getWikiNode: () => null,
 						},
 						// The agent leg rides the GUARD PIPELINE (PROPOSED DEC-046):
 						// the prompt traverses both guards as a DM turn and the
 						// scripted model's answer comes back via the reply log.
-							runTurn: async (prompt) => {
-								// The PROMPT itself traverses both guards as a DM turn;
-								// the scripted model's ANSWER is fixed text.
-								answers.push(prompt);
-								await deliverText(fx, `cmt-turn-${answers.length}`, prompt);
-								return "Here is the summary you asked for.";
-							},
+						runTurn: async (prompt) => {
+							// The PROMPT itself traverses both guards as a DM turn;
+							// the scripted model's ANSWER is fixed text.
+							answers.push(prompt);
+							await deliverText(fx, `cmt-turn-${answers.length}`, prompt);
+							return "Here is the summary you asked for.";
+						},
 					});
 				};
 

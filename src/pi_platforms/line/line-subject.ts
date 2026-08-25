@@ -25,6 +25,7 @@ import {
 
 import { LineWebhookAdapter } from "./line-webhook-adapter.js";
 import type { LineApiTransport, LineMessage } from "./line-webhook-adapter.js";
+import { lineBubbleText } from "./line-webhook-adapter.js";
 import {
 	FIXTURE_CHANNEL_ACCESS_TOKEN,
 	FIXTURE_CHANNEL_SECRET,
@@ -53,7 +54,7 @@ function makeCaptureTransport(raw: FakePlatformWire): LineApiTransport {
 		messages: LineMessage[],
 		metadata: Record<string, unknown> = {},
 	): Promise<SendResult> => {
-		const content = messages.map((m) => m.text).join("\n");
+		const content = messages.map(lineBubbleText).join("\n");
 		// Markdown-rendering rejection script — EXACTLY like the reference
 		// fixtures: a forced formatting error fails unless this IS already the
 		// plain-text fallback body (§6.1 lane succeeds on the wire).

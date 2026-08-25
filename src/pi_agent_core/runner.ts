@@ -14,6 +14,14 @@
 //   - budget/grace iteration semantics + recorded exit reasons (05 §4.1),
 //     enforced over the host loop's turn_end event stream — the narrowest real
 //     SDK seam for "iterations" (each turn_end = one completed model call);
+//     the default cap is the UNLIMITED sentinel (config.py:TURN_LIMIT_UNLIMITED
+//     parity — a finite cap exists only when agent.max_turns is configured);
+//   - two-layer turn-lease prologue (02 §5, DEC-004): L1 in-process registry
+//     acquire/release keyed on the resolved session id + durable DB lease via
+//     StateStore.leases (run_agent.py:run_conversation turn prologue parity:
+//     structured holder pid/turn/platform, ttl 300 / wait 1800 / on_wait /
+//     should_abort, waited ⇒ resume-tip re-resolve + transcript reload,
+//     60s holder-scoped refresh daemon, fail-closed timeout ⇒ resend notice);
 //   - interrupt at boundaries via session.abort() (/stop analogue);
 //   - steer drain placement delegated to the host queue (delivered after the
 //     current assistant turn finishes its tool calls, before the next model
@@ -23,12 +31,16 @@
 //     loop; interrupted turns skip BOTH sync and warming (#15218).
 //
 // Hermes anchors: run_agent.py:AIAgent.run_conversation →
-// agent/conversation_loop.py::run_conversation; gateway/run.py::_agent_cache.
-
+// agent/conversation_loop.py::run_conversation; gateway/run.py::_agent_cache;
+// gateway/run.py::_session_expiry_watcher (300s idle sweep of the agent cache).
 import type DatabaseType from "better-sqlite3";
 
 import { AgentInstanceCache, type AgentCacheOptions } from "./agent-cache.js";
-import { repairMessageSequence } from "./alternation-repair.js";
+import {
+	repairMessageSequence,
+	sanitizeToolCallArguments,
+	repairToolCallArgumentsJson,
+} from "./alternation-repair.js";
 import {
 	ConversationState,
 	runWithConversation,
@@ -51,6 +63,12 @@ import {
 	type ToolDefinition,
 	type AgentSession,
 } from "./host.js";
+import {
+	DEFAULT_TTL_SECONDS,
+	DEFAULT_WAIT_SECONDS,
+	isExplicitForkChildRow,
+	structuredHolder,
+} from "../pi_state/index.js";
 import {
 	readReplayMessages,
 	substituteApiContent,
@@ -88,6 +106,56 @@ export interface RunnerStore {
 	db: DatabaseType.Database;
 	appendMessage(message: NewMessage): number | Promise<number>;
 	queueTokenCounts(sessionId: string, delta: TokenDelta): unknown;
+	/**
+	 * Cross-process turn-lease layer (02 §5). Optional so minimal test stores
+	 * can omit it; StateStore satisfies this structurally via its `leases`.
+	 */
+	leases?: RunnerStoreLeases;
+}
+
+/** Structural subset of pi_state's DbTurnLeaseStore the runner drives. */
+export interface RunnerStoreLeases {
+	acquireWait(
+		sessionId: string,
+		holder: string,
+		options?: {
+			ttlSeconds?: number;
+			waitSeconds?: number;
+			pollIntervalSeconds?: number;
+			onWait?: (elapsedSeconds: number) => void;
+			shouldAbort?: () => boolean;
+		},
+	): Promise<boolean>;
+	refresh(sessionId: string, holder: string, ttlSeconds?: number): boolean;
+	releaseHolder(sessionId: string, holder: string): void;
+}
+
+/**
+ * L1 in-process turn-lease registry seam (02 §5 / DEC-004). Declared
+ * structurally so pi_agent_core never imports upward into pi_gateway: the
+ * composition layer passes the real SessionTurnLeaseRegistry, whose
+ * acquire()/release() signatures satisfy this shape. Acquire rejections (the
+ * registry's TurnLeaseTimeoutError) propagate untouched to the caller — the
+ * routing layer converts them into a resend notice.
+ */
+export interface RunnerTurnLeaseRegistry {
+	acquire(
+		sessionId: string,
+		options: { ownerKey: string; generation: number; timeoutMs?: number },
+	): Promise<unknown>;
+	release(token: unknown): boolean;
+}
+
+/** Cancellable interval handle (injected-timer seam for deterministic tests). */
+export interface IntervalHandle {
+	cancel(): void;
+}
+
+/** Default unref'd setInterval — a background sweep must never pin exit. */
+function defaultStartInterval(fn: () => void, ms: number): IntervalHandle {
+	const timer = setInterval(fn, ms);
+	timer.unref?.();
+	return { cancel: () => clearInterval(timer) };
 }
 
 export interface GatewayAgentRunnerOptions {
@@ -97,9 +165,12 @@ export interface GatewayAgentRunnerOptions {
 	modelRuntime: import("./host.js").ModelRuntime;
 	customTools?: ToolDefinition[];
 	/**
-	 * Per-turn model-call budget (Hermes max_iterations). Default 32. When the
-	 * host loop would exceed it, exactly ONE grace call is allowed, then the
-	 * turn ends with exitReason "budget_exhausted".
+	 * Per-turn model-call budget (Hermes agent.max_turns). UNSET means
+	 * UNLIMITED — the Hermes default (hermes_cli/config.py:
+	 * TURN_LIMIT_UNLIMITED / resolve_turn_limit); only a configured finite cap
+	 * ever bounds a turn. When a finite cap is set and the host loop would
+	 * exceed it, exactly ONE grace call is allowed, then the turn ends with
+	 * exitReason "budget_exhausted".
 	 */
 	maxIterations?: number;
 	memoryHooks?: MemoryTurnHooks;
@@ -107,6 +178,22 @@ export interface GatewayAgentRunnerOptions {
 	poolMaxWorkers?: number;
 	/** Injected clock (ms) for cache recency + turn timestamps. */
 	now?: () => number;
+	/** L1 in-process turn-lease registry (02 §5). Absent ⇒ prologue skips L1. */
+	turnLeaseRegistry?: RunnerTurnLeaseRegistry;
+	/** Durable-lease TTL seconds (default 300, 02 §5). */
+	leaseTtlSeconds?: number;
+	/** Durable-lease bounded-wait budget seconds (default 1800, 02 §5). */
+	leaseWaitSeconds?: number;
+	/** Durable-lease poll cadence seconds (test hook; default 1.0). */
+	leasePollIntervalSeconds?: number;
+	/** Holder-refresh daemon cadence ms (run_agent.py parity default 60_000). */
+	leaseRefreshIntervalMs?: number;
+	/** Abort probe polled while waiting on the durable lease (default never). */
+	shouldAbortLeaseWait?: () => boolean;
+	/** Cached-agent idle-sweep cadence ms (_session_expiry_watcher: 300_000). */
+	cacheSweepIntervalMs?: number;
+	/** Interval-timer seam (tests drive ticks deterministically). */
+	startInterval?: (fn: () => void, ms: number) => IntervalHandle;
 }
 
 interface CachedHostSession {
@@ -119,7 +206,36 @@ interface InflightTurn {
 	budgetAborted: boolean;
 }
 
-const DEFAULT_MAX_ITERATIONS = 32;
+/**
+ * Hermes turn-limit sentinel parity (hermes_cli/config.py:TURN_LIMIT_UNLIMITED
+ * = sys.maxsize): turns are UNLIMITED unless a finite agent.max_turns cap is
+ * configured. Number.MAX_SAFE_INTEGER is the JS parity — far beyond any real
+ * conversation, and safe in the `startedCalls > max + 1` comparisons below.
+ */
+export const TURN_LIMIT_UNLIMITED = Number.MAX_SAFE_INTEGER;
+
+/** run_agent.py turn prologue: holder-scoped refresh daemon cadence. */
+export const LEASE_REFRESH_INTERVAL_MS = 60_000;
+
+/** gateway/run.py:_session_expiry_watcher cadence (5-minute idle sweep). */
+export const SESSION_EXPIRY_SWEEP_INTERVAL_MS = 300_000;
+
+const DEFAULT_MAX_ITERATIONS = TURN_LIMIT_UNLIMITED;
+
+/**
+ * Fail-closed DB-layer lease timeout (run_agent.py prologue parity: "Fail
+ * closed like gateway TurnLeaseTimeoutError … surface a resend notice instead
+ * of a bare TimeoutError that looks like a hang"). Callers catch BOTH this
+ * and the L1 registry's TurnLeaseTimeoutError and send the same resend notice.
+ */
+export class SessionTurnLeaseTimeoutError extends Error {
+	readonly sessionId: string;
+	constructor(sessionId: string) {
+		super(`session_turn_lease_timeout:${sessionId}`);
+		this.name = "SessionTurnLeaseTimeoutError";
+		this.sessionId = sessionId;
+	}
+}
 
 export class GatewayAgentRunner {
 	private readonly store: RunnerStore;
@@ -134,6 +250,17 @@ export class GatewayAgentRunner {
 	private readonly pool: TurnWorkerPool;
 	private readonly inflight = new Map<string, InflightTurn>();
 	private readonly generations = new Map<string, number>();
+	private readonly turnLeaseRegistry: RunnerTurnLeaseRegistry | null;
+	private readonly leaseTtlSeconds: number;
+	private readonly leaseWaitSeconds: number;
+	private readonly leasePollIntervalSeconds: number;
+	private readonly leaseRefreshIntervalMs: number;
+	private readonly shouldAbortLeaseWait: (() => boolean) | null;
+	private readonly startInterval: (
+		fn: () => void,
+		ms: number,
+	) => IntervalHandle;
+	private sweepTimer: IntervalHandle | null;
 	private closed = false;
 
 	constructor(options: GatewayAgentRunnerOptions) {
@@ -151,6 +278,20 @@ export class GatewayAgentRunner {
 		this.pool = new TurnWorkerPool({
 			maxWorkers: options.poolMaxWorkers ?? 10,
 		});
+		this.turnLeaseRegistry = options.turnLeaseRegistry ?? null;
+		this.leaseTtlSeconds = options.leaseTtlSeconds ?? DEFAULT_TTL_SECONDS;
+		this.leaseWaitSeconds = options.leaseWaitSeconds ?? DEFAULT_WAIT_SECONDS;
+		this.leasePollIntervalSeconds = options.leasePollIntervalSeconds ?? 1.0;
+		this.leaseRefreshIntervalMs =
+			options.leaseRefreshIntervalMs ?? LEASE_REFRESH_INTERVAL_MS;
+		this.shouldAbortLeaseWait = options.shouldAbortLeaseWait ?? null;
+		this.startInterval = options.startInterval ?? defaultStartInterval;
+		// gateway/run.py:_session_expiry_watcher parity: periodic unref'd idle
+		// sweep of the cached-agent instance cache; timer injectable so tests drive
+		// ticks without real 300s waits.
+		this.sweepTimer = this.startInterval(() => {
+			this.cache.sweepIdle();
+		}, options.cacheSweepIntervalMs ?? SESSION_EXPIRY_SWEEP_INTERVAL_MS);
 	}
 
 	get poolStats(): { active: number; pending: number; max: number } {
@@ -225,6 +366,8 @@ export class GatewayAgentRunner {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		this.sweepTimer?.cancel();
+		this.sweepTimer = null;
 		for (const key of this.cache.keys()) this.dropCachedSession(key);
 	}
 
@@ -239,8 +382,218 @@ export class GatewayAgentRunner {
 		state.iterations = 0;
 		state.exitReason = null;
 
-		const host = await this.acquireHostSession(request.sessionId);
+		// ---- Turn-lease prologue (02 §5 two-layer serialization, DEC-004) ---
+		// L1 first (in-process registry keyed on the RESOLVED session id,
+		// gateway/turn_lease.py:SessionTurnLeaseRegistry.acquire parity), then
+		// the durable DB lease via StateStore.leases keyed on the
+		// compression-lineage root (run_agent.py:run_conversation turn
+		// prologue: structured pid/turn/platform holder, ttl 300 / wait 1800 /
+		// on_wait / should_abort). A fresh session id skips the durable layer —
+		// process-unique, nothing to race over (#84234 probe-failure parity:
+		// hasDurableSessionRow fails CLOSED).
+		const generation = state.generation;
+		let l1Token: unknown = null;
+		if (this.turnLeaseRegistry !== null) {
+			l1Token = await this.turnLeaseRegistry.acquire(request.sessionId, {
+				ownerKey: request.routingKey,
+				generation,
+			});
+		}
+		let dbHolder: string | null = null;
+		let waited = false;
+		if (
+			this.store.leases !== undefined &&
+			this.hasDurableSessionRow(request.sessionId)
+		) {
+			dbHolder = structuredHolder(
+				`turn=g${generation}:platform=${platformFromRoutingKey(request.routingKey)}`,
+				process.pid,
+			);
+			const acquired = await this.store.leases.acquireWait(
+				request.sessionId,
+				dbHolder,
+				{
+					ttlSeconds: this.leaseTtlSeconds,
+					waitSeconds: this.leaseWaitSeconds,
+					pollIntervalSeconds: this.leasePollIntervalSeconds,
+					onWait: () => {
+						waited = true;
+					},
+					shouldAbort: () => this.shouldAbortLeaseWait?.() ?? false,
+				},
+			);
+			if (!acquired) {
+				// Fail closed like gateway TurnLeaseTimeoutError: do not enter
+				// load/run/flush; the caller surfaces a resend notice.
+				throw new SessionTurnLeaseTimeoutError(request.sessionId);
+			}
+		}
+
+		// Waited ⇒ another process may have compressed/rotated the session while
+		// we queued: re-resolve the resume tip BEFORE loading history and reload
+		// the latest transcript below (run_agent.py `_lease_waited` ⇒
+		// resolve_resume_session_id + get_messages_as_conversation reload).
+		let effectiveSessionId = request.sessionId;
+		if (waited) {
+			effectiveSessionId = this.resolveResumeSessionId(request.sessionId);
+			if (effectiveSessionId !== request.sessionId) {
+				this.dropCachedSession(request.sessionId);
+			}
+		}
+
+		try {
+			return await this.driveTurn(
+				request,
+				state,
+				effectiveSessionId,
+				waited,
+				dbHolder,
+			);
+		} finally {
+			if (dbHolder !== null) {
+				try {
+					// Holder-scoped delete: idempotent, and a stale unwind can
+					// never free a successor's row (release_session_turn_lease).
+					this.store.leases?.releaseHolder(request.sessionId, dbHolder);
+				} catch {
+					/* release failure must never mask the turn result */
+				}
+			}
+			// L1 released last — symmetric with acquire-first nesting.
+			if (l1Token !== null) this.turnLeaseRegistry?.release(l1Token);
+		}
+	}
+
+	/** True when the sessions table holds a durable row for this id. */
+	private hasDurableSessionRow(sessionId: string): boolean {
+		try {
+			const row = this.store.db
+				.prepare("SELECT id FROM sessions WHERE id = ? LIMIT 1")
+				.get(sessionId);
+			return row !== undefined;
+		} catch {
+			return true; // #84234: probe failure ⇒ acquire rather than run unsynchronized
+		}
+	}
+
+	/**
+	 * hermes_state.py:resolve_resume_session_id parity (read-only): walk
+	 * forward to the compression tip (get_compression_tip semantics — children
+	 * of compression-ended parents only, explicit fork/tool children excluded),
+	 * then follow most-recently-started eligible children to the deepest node
+	 * holding messages. Depth-capped; returns the input id unchanged when no
+	 * descendant holds messages.
+	 */
+	private resolveResumeSessionId(sessionId: string): string {
+		if (!sessionId) return sessionId;
+		const db = this.store.db;
+		const compressionChildren = db.prepare(`
+			SELECT child.id, child.source, child.model_config, child.parent_session_id
+			FROM sessions parent JOIN sessions child ON child.parent_session_id = parent.id
+			WHERE parent.id = ? AND parent.end_reason = 'compression'
+			ORDER BY child.started_at DESC, child.id DESC
+		`);
+		const anyChildren = db.prepare(`
+			SELECT id, source, model_config, parent_session_id FROM sessions
+			WHERE parent_session_id = ?
+			ORDER BY started_at DESC, id DESC
+		`);
+		const hasMessages = db.prepare(
+			"SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+		);
+		interface ChildRow {
+			id: string;
+			source: string | null;
+			model_config: string | null;
+			parent_session_id: string | null;
+		}
+		const eligible = (rows: ChildRow[]): string | undefined => {
+			for (const row of rows) {
+				if (
+					isExplicitForkChildRow({
+						source: row.source,
+						model_config: row.model_config,
+						parent_session_id: row.parent_session_id,
+					})
+				) {
+					continue;
+				}
+				return String(row.id);
+			}
+			return undefined;
+		};
+
+		try {
+			// Step 1: compression-tip walk (bounded 100, cycle-safe).
+			let tip = sessionId;
+			const seenTip = new Set<string>([tip]);
+			for (let hop = 0; hop < 100; hop++) {
+				const next = eligible(compressionChildren.all(tip) as ChildRow[]);
+				if (next === undefined || seenTip.has(next)) break;
+				seenTip.add(next);
+				tip = next;
+			}
+
+			// Step 2: empty-head walk to the deepest descendant WITH messages.
+			let best: string | null = null;
+			let current: string | undefined = tip;
+			const seen = new Set<string>([current]);
+			for (let depth = 0; depth < 32 && current !== undefined; depth++) {
+				if (hasMessages.get(current) !== undefined) best = current;
+				const next = eligible(anyChildren.all(current) as ChildRow[]);
+				if (next === undefined || seen.has(next)) break;
+				seen.add(next);
+				current = next;
+			}
+			return best ?? sessionId;
+		} catch {
+			return sessionId; // resolution failure never blocks the waited turn
+		}
+	}
+
+	// ------------------------------------------------------------------
+
+	/**
+	 * Drive ONE admitted turn end-to-end on the bounded worker pool (runs
+	 * inside runTurn's lease-scoped try — every resource this method touches is
+	 * released by runTurn's finally or here).
+	 */
+	private async driveTurn(
+		request: { sessionId: string; routingKey: string; text: string },
+		state: ConversationState,
+		sessionId: string,
+		waited: boolean,
+		dbHolder: string | null,
+	): Promise<TurnOutcome> {
+		const host = await this.acquireHostSession(sessionId);
 		const session = host.session;
+		if (waited) {
+			// "Session is free; loading the latest transcript..." parity: the
+			// cached history may predate the wait — reload from durable rows.
+			await this.seedReplay(session, sessionId);
+		}
+
+		// Holder-scoped refresh daemon: long model/tool turns outlive a fixed
+		// TTL; refresh() losing means another process reclaimed the lineage slot
+		// ⇒ abort to protect the transcript (run_agent.py:
+		// _refresh_durable_turn_lease hard-interrupt parity).
+		let refresher: IntervalHandle | null = null;
+		let leaseLost = false;
+		if (dbHolder !== null && this.store.leases !== undefined) {
+			const leases = this.store.leases;
+			refresher = this.startInterval(() => {
+				let ok = false;
+				try {
+					ok = leases.refresh(sessionId, dbHolder, this.leaseTtlSeconds);
+				} catch {
+					ok = false;
+				}
+				if (!ok && !leaseLost) {
+					leaseLost = true;
+					void session.abort().catch(() => {});
+				}
+			}, this.leaseRefreshIntervalMs);
+		}
 
 		// ---- PRE-REQUEST alternation repair on LIVE history (DEC-015) --------
 		// The host loop derives the wire copy from state.messages at request
@@ -249,6 +602,10 @@ export class GatewayAgentRunner {
 		let repairs = 0;
 		const live = session.agent.state.messages as unknown as Message[];
 		repairs = repairMessageSequence(live);
+		// Companion pre-request sanitation (DEC-015 repair family):
+		// corrupted tool_call arguments JSON is repaired before the request
+		// goes out instead of silently degrading (sanitize_tool_call_arguments).
+		repairs += sanitizeToolCallArguments(live);
 		if (repairs > 0) {
 			session.agent.state.messages =
 				live as unknown as typeof session.agent.state.messages;
@@ -257,7 +614,7 @@ export class GatewayAgentRunner {
 
 		// ---- Persist user row BEFORE prompting (crash-safe ordering) --------
 		const userRowId = await this.store.appendMessage({
-			sessionId: request.sessionId,
+			sessionId,
 			role: "user",
 			content: request.text,
 			apiContent: request.text,
@@ -359,12 +716,17 @@ export class GatewayAgentRunner {
 		// Precedence mirrors Hermes: an EXTERNAL interrupt wins; a budget abort
 		// counts as budget_exhausted UNLESS the grace call delivered the final
 		// payload (stopReason "stop" ⇒ the loop would have finalized anyway);
-		// provider errors surface as "error".
+		// provider errors surface as "error". A LOST durable lease overrides all
+		// of these — the turn was aborted to protect the transcript, not by the
+		// user or the budget.
 		const interrupted =
 			inflight.interruptRequested || lastStopReason === "aborted";
 		let exitReason: TurnExitReason;
-		if (inflight.interruptRequested) exitReason = "interrupted_by_user";
-		else if (
+		if (leaseLost) {
+			exitReason = "error";
+		} else if (inflight.interruptRequested) {
+			exitReason = "interrupted_by_user";
+		} else if (
 			inflight.budgetAborted &&
 			lastStopReason !== "stop" &&
 			lastStopReason !== "error"
@@ -381,8 +743,9 @@ export class GatewayAgentRunner {
 		const assistantMsg: AssistantMessage | null = observed.final;
 		const finalText = assistantText(assistantMsg);
 
-		// ---- Memory sync leg (interrupted turns SKIP BOTH legs, #15218) ------
-		if (exitReason !== "interrupted_by_user") {
+		// ---- Memory sync leg (interrupted turns SKIP BOTH legs, #15218; a
+		// lost-lease abort protects the transcript and stays equally silent) --
+		if (exitReason !== "interrupted_by_user" && !leaseLost) {
 			if (request.text.length > 0 && finalText.length > 0) {
 				try {
 					await this.memoryHooks?.syncAll?.({
@@ -425,7 +788,7 @@ export class GatewayAgentRunner {
 				content: assistantMsg.content,
 			});
 			assistantRowId = await this.store.appendMessage({
-				sessionId: request.sessionId,
+				sessionId,
 				role: "assistant",
 				content: finalText,
 				apiContent: wireBytes,
@@ -433,7 +796,7 @@ export class GatewayAgentRunner {
 				...(usageSnapshot ? { tokenCount: usageSnapshot.outputTokens } : {}),
 			});
 			if (usageSnapshot) {
-				this.store.queueTokenCounts(request.sessionId, {
+				this.store.queueTokenCounts(sessionId, {
 					inputTokens: usageSnapshot.inputTokens,
 					outputTokens: usageSnapshot.outputTokens,
 					cacheReadTokens: usageSnapshot.cacheReadTokens,
@@ -453,7 +816,12 @@ export class GatewayAgentRunner {
 			assistantRowId,
 			usage: usageSnapshot,
 		};
-		if (lastAssistantError !== undefined) {
+		if (leaseLost) {
+			// The abort's generic "Request was aborted" must not mask the root
+			// cause: the transcript-protecting lease-loss abort.
+			outcome.errorMessage =
+				"session turn lease lost; turn aborted to protect the transcript";
+		} else if (lastAssistantError !== undefined) {
 			outcome.errorMessage = lastAssistantError;
 		}
 		return outcome;
@@ -533,6 +901,15 @@ export class GatewayAgentRunner {
 
 // ----------------------------------------------------------------------
 
+/**
+ * run_agent.py durable-holder parity: platform is routing-key field [2]
+ * ("agent:<ns>:<platform>:…", gateway/run.py key shape); unknown when absent.
+ */
+function platformFromRoutingKey(routingKey: string): string {
+	const parts = routingKey.split(":");
+	return parts[2] && parts[2].length > 0 ? parts[2] : "unknown";
+}
+
 /** Map one persisted row onto the host loop's message vocabulary. */
 export function rowToLoopMessage(row: MessageRow, model: Model<Api>): Message {
 	const tsMs = Math.round(row.timestamp * 1000);
@@ -580,30 +957,69 @@ function zeroUsage(): Usage {
 	};
 }
 
-function parseToolCalls(raw: string | null): ToolCall[] {
-	if (!raw) return [];
+/**
+ * Decode a stored tool_calls sidecar into host ToolCall blocks. Corrupt JSON
+ * goes through the DEC-015 repair ladder (_repair_tool_call_arguments parity)
+ * instead of silently mapping to [] — dropping calls here orphaned their
+ * results downstream; per-call arguments strings repair to objects, empty or
+ * unshapeable arguments degrade to {}.
+ */
+export function parseToolCalls(raw: string | null): ToolCall[] {
+	if (!raw || raw.trim() === "") return []; // empty tool_calls array → no blocks
+	let parsed: unknown;
 	try {
-		const parsed = JSON.parse(raw) as Array<{
-			id?: string;
-			name?: string;
-			arguments?: Record<string, unknown>;
-		}>;
-		if (!Array.isArray(parsed)) return [];
-		return parsed.flatMap((c) =>
-			c && c.id && c.name
-				? [
-						{
-							type: "toolCall" as const,
-							id: c.id,
-							name: c.name,
-							arguments: c.arguments ?? {},
-						},
-					]
-				: [],
-		);
+		parsed = JSON.parse(raw);
 	} catch {
-		return [];
+		parsed = tryParseJson(repairToolCallArgumentsJson(raw));
 	}
+	if (!Array.isArray(parsed)) return [];
+	return parsed.flatMap((c) => {
+		if (typeof c !== "object" || c === null) return [];
+		const record = c as { id?: unknown; name?: unknown; arguments?: unknown };
+		if (
+			typeof record.id !== "string" ||
+			record.id === "" ||
+			typeof record.name !== "string" ||
+			record.name === ""
+		) {
+			return []; // identity cannot be repaired — drop this call only
+		}
+		return [
+			{
+				type: "toolCall" as const,
+				id: record.id,
+				name: record.name,
+				arguments: decodeToolArguments(record.arguments),
+			},
+		];
+	});
+}
+
+function tryParseJson(text: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
+
+function decodeToolArguments(args: unknown): Record<string, unknown> {
+	if (typeof args === "string") {
+		const parsed = tryParseJson(repairToolCallArgumentsJson(args));
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed)
+		) {
+			return parsed as Record<string, unknown>;
+		}
+		return {};
+	}
+	if (args === undefined || args === null || args === "") return {};
+	if (typeof args === "object" && !Array.isArray(args)) {
+		return args as Record<string, unknown>;
+	}
+	return {};
 }
 
 function assistantText(msg: AssistantMessage | null): string {

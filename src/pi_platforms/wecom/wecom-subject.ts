@@ -55,6 +55,7 @@ function makeCaptureTransport(raw: FakePlatformWire) {
 			_app: unknown,
 			_token: string,
 			payload: Record<string, unknown>,
+			metadata: Record<string, unknown> = {},
 		): Promise<{
 			success: boolean;
 			messageId?: string;
@@ -66,15 +67,16 @@ function makeCaptureTransport(raw: FakePlatformWire) {
 			];
 			const content = String(text ?? "");
 			if (
-				payload["forceFormattingError"] === true &&
+				metadata["forceFormattingError"] === true &&
 				!content.startsWith("(Response formatting failed, plain text:")
 			) {
 				return { success: false, errcode: 400, error: "can't parse entities" };
 			}
+			// Vendor body only — metadata is NOT spread into the transmission.
 			const result = await raw.transmitSend(
 				String(payload["touser"] ?? ""),
 				content,
-				payload,
+				metadata,
 			);
 			if (result.success) {
 				return { success: true, messageId: result.messageId ?? "" };

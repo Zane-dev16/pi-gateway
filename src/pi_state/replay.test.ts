@@ -343,23 +343,74 @@ describe("02 §7.3 replay-read path", () => {
 		}
 	});
 
-	it("active-only head: compacted prefix excluded; dedupeReplayedUserRows keeps the LAST duplicate", async () => {
+	it("explicit _branched_from branches skip the ancestor walk (own copied transcript)", async () => {
 		const store = await openLineage();
 		try {
+			// Ancestor rows that WOULD qualify for the compression walk:
 			await store.appendMessage({
 				sessionId: "root",
 				role: "user",
-				content: "dup question",
+				content: "ancestor ask",
 			});
 			await store.appendMessage({
 				sessionId: "root",
+				role: "assistant",
+				content: "ancestor reply",
+			});
+			// A /branch child owns its COPIED transcript (hermes
+			// get_messages_as_conversation → _is_explicit_branch_session): walking
+			// the live lineage would duplicate every ancestor row with the clone.
+			store.db
+				.prepare(
+					"INSERT INTO sessions (id, parent_session_id, source, started_at, model_config) VALUES ('branch', 'root', 'cli', 1, ?)",
+				)
+				.run(JSON.stringify({ _branched_from: "root" }));
+			await store.appendMessage({
+				sessionId: "branch",
+				role: "user",
+				content: "copied ancestor ask",
+			});
+
+			// Branched child: SELF rows only — no ancestor duplication.
+			expect(store.readReplayMessages("branch").map((r) => r.content)).toEqual([
+				"copied ancestor ask",
+			]);
+			// A NON-branched sibling still walks the compression lineage:
+			await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "continuation",
+			});
+			expect(store.readReplayMessages("child").map((r) => r.content)).toEqual([
+				"ancestor ask",
+				"ancestor reply",
+				"continuation",
+			]);
+		} finally {
+			await store.close();
+		}
+	});
+
+	it("active-only head: compacted prefix excluded; boundary-respecting dedupe keeps ONE copy", async () => {
+		const store = await openLineage();
+		try {
+			const rootDup = await store.appendMessage({
+				sessionId: "root",
 				role: "user",
 				content: "dup question",
+				timestamp: 1_700_000_000.001,
+			});
+			const rootActiveDup = await store.appendMessage({
+				sessionId: "root",
+				role: "user",
+				content: "dup question",
+				timestamp: 1_700_000_000.002,
 			});
 			const tailClone = await store.appendMessage({
 				sessionId: "child",
 				role: "user",
 				content: "dup question",
+				timestamp: 1_700_000_000.003,
 			});
 
 			// Compacted prefix (active=0) drops out of the replay head…
@@ -371,13 +422,137 @@ describe("02 §7.3 replay-read path", () => {
 			const activeRows = store.readReplayMessages("child");
 			expect(activeRows.map((r) => r.session_id)).toContain("root");
 
-			// …and the cloned-user-row defense keeps exactly ONE copy (the newest).
+			// …and the cloned-user-row defense keeps exactly ONE copy.
+			// Boundary-respecting backward-scan parity (_find_duplicate_replayed_
+			// user_message): same ask inside one assistant-free window ⇒ the EARLIER
+			// occurrence survives; the later clone is skipped (`continue`). The old
+			// global keep-last filter instead erased legitimate repeats elsewhere.
 			const deduped = store.readReplayMessages("child", {
 				dedupeReplayedUserRows: true,
 			});
 			const dupRows = deduped.filter((r) => r.content === "dup question");
 			expect(dupRows).toHaveLength(1);
-			expect(dupRows[0]!.id).toBe(tailClone); // last occurrence wins
+			expect(dupRows[0]!.id).toBe(rootActiveDup); // EARLIER wins, not tailClone
+			expect(dupRows[0]!.id).not.toBe(tailClone);
+		} finally {
+			await store.close();
+		}
+	});
+
+	it("repeated legitimate asks separated by an assistant reply BOTH survive dedupe", async () => {
+		const store = await openLineage();
+		try {
+			await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "what time?",
+				timestamp: 1_700_000_000.001,
+			});
+			await store.appendMessage({
+				sessionId: "child",
+				role: "assistant",
+				content: "noon.",
+				timestamp: 1_700_000_000.002,
+			});
+			await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "what time?",
+				timestamp: 1_700_000_000.003,
+			});
+
+			const deduped = store.readReplayMessages("child", {
+				dedupeReplayedUserRows: true,
+			});
+			// The backward scan STOPS at the first assistant carrying content:
+			// both asks are replayed (the global keep-last-by-content filter this
+			// replaces dropped the FIRST "what time?" entirely).
+			expect(deduped.map((r) => r.role)).toEqual(["user", "assistant", "user"]);
+		} finally {
+			await store.close();
+		}
+	});
+
+	it("EXACT rotation clones (same timestamp+content) keep the LATER carrier", async () => {
+		const store = await openLineage();
+		try {
+			// Compression rotation copies the ask VERBATIM including its
+			// timestamp — that exactness is what distinguishes a rotation artifact
+			// from a legitimate repeat at a later time.
+			await store.appendMessage({
+				sessionId: "root",
+				role: "user",
+				content: "current ask",
+				apiContent: "WIRE-current-ask",
+				timestamp: 1_700_000_000,
+			});
+			const childCarrier = await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "current ask",
+				apiContent: "WIRE-current-ask",
+				timestamp: 1_700_000_000,
+			});
+
+			const deduped = store.readReplayMessages("child", {
+				dedupeReplayedUserRows: true,
+			});
+			expect(deduped).toHaveLength(1);
+			expect(deduped[0]!.id).toBe(childCarrier);
+			expect(deduped[0]!.session_id).toBe("child"); // durable child identity wins
+		} finally {
+			await store.close();
+		}
+	});
+
+	it("assistant tool_calls alone bound the scan; an empty assistant does NOT", async () => {
+		const store = await openLineage();
+		try {
+			// Assistant with ONLY tool_calls still carries payload → boundary.
+			await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "go",
+				timestamp: 1_700_000_000.001,
+			});
+			await store.appendMessage({
+				sessionId: "child",
+				role: "assistant",
+				content: "",
+				toolCalls: '[{"id":"t1","name":"echo","arguments":{}}]',
+				timestamp: 1_700_000_000.002,
+			});
+			await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "go",
+				timestamp: 1_700_000_000.003,
+			});
+			let deduped = store.readReplayMessages("child", {
+				dedupeReplayedUserRows: true,
+			});
+			expect(deduped.map((r) => r.role)).toEqual(["user", "assistant", "user"]);
+
+			// An assistant row with NEITHER content nor tool_calls hides nothing:
+			// the scan passes it and collapses the new ask onto "go" #2 (same
+			// assistant-free window). "go" #1 lives behind the tool-call boundary
+			// and survives untouched.
+			await store.appendMessage({
+				sessionId: "child",
+				role: "assistant",
+				content: "",
+			});
+			const hiddenDup = await store.appendMessage({
+				sessionId: "child",
+				role: "user",
+				content: "go",
+				timestamp: 1_700_000_000.005,
+			});
+			deduped = store.readReplayMessages("child", {
+				dedupeReplayedUserRows: true,
+			});
+			expect(deduped.map((r) => r.id)).not.toContain(hiddenDup); // collapsed
+			expect(deduped.filter((r) => r.content === "go")).toHaveLength(2);
 		} finally {
 			await store.close();
 		}

@@ -29,7 +29,12 @@ import {
 } from "../../pi_embedded/approvals/delivery.js";
 import type { GatewayClock } from "../../pi_embedded/approvals/clock.js";
 import { ManualClock } from "../persistent-ws/manual-clock.js";
-import { SlackSocketModeServer } from "./fake-socket-mode.js";
+import { SlackSocketModeServer, type SlackEnvelopeEvent } from "./fake-socket-mode.js";
+import {
+	isSlackReactionsEnabled,
+	SLACK_PROCESSED_MESSAGE_TS_MAX,
+} from "./slack-adapter.js";
+import type { SlackCapturingWire } from "./slack-subject.js";
 
 const bridgeClock: GatewayClock = {
 	nowSeconds: () => 1_000,
@@ -37,7 +42,7 @@ const bridgeClock: GatewayClock = {
 };
 
 describe("slack socket-mode envelope shapes", () => {
-	it("cold boot subscribes with a null resume cursor; envelopes carry ids/ts/retryAttempt=0", async () => {
+	it("cold boot subscribes with a null resume cursor; EVERY envelope acked by its envelope_id", async () => {
 		const world = makeSlackWorld({ name: "slack-envelope" });
 		const { engine, socketServer } = world;
 		await world.connectAndAwaitLive();
@@ -58,8 +63,16 @@ describe("slack socket-mode envelope shapes", () => {
 		expect(env.retryAttempt).toBe(0);
 		expect(env.ts).toMatch(/^\d+\.\d+$/);
 
-		// The cursor IS the ack point: advanced past every processed event.
+		// The cursor IS the durable ack point: advanced past every event.
 		expect(engine.cursor.value).toBe("e2");
+		// Socket-Mode wire truth: EVERY delivered envelope was answered with its
+		// own {type:"ack",envelope_id} frame (adapter.py slack_bolt parity).
+		const ackIds = socketServer
+			.getFramesReceived()
+			.filter((f) => f.frame["type"] === "ack")
+			.map((f) => f.frame["envelope_id"]);
+		expect(ackIds).toContain(env.envelopeId);
+		expect(ackIds.length).toBeGreaterThanOrEqual(2);
 	});
 
 	it("interactivity payloads route through the ONE handler at the socket seam; every payload acks", async () => {
@@ -196,6 +209,113 @@ describe("thread_ts → session threading", () => {
 	});
 });
 
+describe("egress thread targeting + status + media (adapter.py send parity)", () => {
+	it("reply/thread metadata resolves to a vendor thread_ts on sends and stream START args", async () => {
+		const world = makeSlackWorld({ name: "slack-thread-egress" });
+		const { engine, wire } = world;
+		await engine.deliverText("C-t", "reply", {
+			thread_id: "1700000000.000042",
+		});
+		await engine.deliverText("C-t", "reply2", {
+			reply_to_message_id: "1700000000.000099",
+		});
+		const sends = wire.sendsOf("C-t");
+		expect(sends[0]?.metadata["thread_ts"]).toBe("1700000000.000042");
+		expect(sends[0]?.metadata["thread_id"]).toBeUndefined();
+		expect(sends[1]?.metadata["thread_ts"]).toBe("1700000000.000099");
+		// The chokepoint's internal reply stamp never reaches the wire —
+		// chat.postMessage carries ONLY thread_ts.
+		expect(sends[1]?.metadata["reply_to_message_id"]).toBeUndefined();
+
+		// chat.startStream REQUIRES a thread target: START args carry it.
+		await engine
+			.sendDraft({
+				chatId: "C-t",
+				draftId: 7,
+				content: "stream head",
+				metadata: { thread_id: "1700000000.000777" } as never,
+			})
+			.catch(() => undefined);
+		const startOp = wire
+			.draftsOf("C-t")
+			.find((d) => d.metadata["stream_op"] === "start");
+		if (startOp !== undefined) {
+			expect(startOp.metadata["thread_ts"]).toBe("1700000000.000777");
+		}
+	});
+
+	it("turn start sets assistant.threads.setStatus and finalize clears it; bare channels never activate", async () => {
+		const world = makeSlackWorld({ name: "slack-status" });
+		const { engine, socketServer } = world;
+		const capturing =
+			world.wire as unknown as import("./slack-subject.js").SlackCapturingWire;
+		await world.connectAndAwaitLive();
+
+		socketServer.pushMessage({
+			channel: "C1",
+			user: "user-1",
+			text: "work on it",
+			ts: "1700000000.000500",
+		});
+		await eventually(() => capturing.statusOps.length >= 2);
+		// SET at turn start (is thinking...) then CLEARED at finalize ("").
+		expect(capturing.statusOps[0]).toEqual({
+			channelId: "C1",
+			threadTs: "1700000000.000500",
+			status: "is thinking...",
+		});
+		expect(capturing.statusOps[capturing.statusOps.length - 1]).toEqual({
+			channelId: "C1",
+			threadTs: "1700000000.000500",
+			status: "",
+		});
+		// Direct public surface mirrors Hermes' send_typing/stop_typing.
+		await engine.sendTyping("C1", { thread_id: "1700000000.000600" });
+		await engine.stopTyping("C1", { thread_id: "1700000000.000600" });
+		expect(capturing.statusOps.at(-2)?.status).toBe("is thinking...");
+		expect(capturing.statusOps.at(-1)?.status).toBe("");
+		// No thread root ⇒ NO call (bare channel sends stay inert).
+		const before = capturing.statusOps.length;
+		await engine.sendTyping("C-nothread");
+		expect(capturing.statusOps.length).toBe(before);
+	});
+
+	it("files_upload_v2-shaped upload with conversations.open DM resolution ahead of send/upload", async () => {
+		const world = makeSlackWorld({ name: "slack-upload" });
+		const { engine, wire } = world;
+		const capturing =
+			world.wire as unknown as import("./slack-subject.js").SlackCapturingWire;
+
+		const result = await engine.deliverFile(
+			"U999",
+			{
+				filename: "trace.log",
+			},
+			{ caption: "here you go", replyTo: "1700000000.001111" },
+		);
+		expect(result.success).toBe(true);
+		expect(capturing.dmOpens[0]?.userId).toBe("U999");
+		expect(capturing.uploadOps[0]).toMatchObject({
+			channel: "D999", // resolved D conversation, not the raw U id
+			filename: "trace.log",
+			initialComment: "here you go",
+			threadTs: "1700000000.001111",
+		});
+
+		// Channel uploads skip conversations.open entirely; no thread target.
+		await engine.deliverFile("C-chan", { filename: "shot.png" });
+		expect(capturing.dmOpens).toHaveLength(1);
+		expect(capturing.uploadOps[1]?.channel).toBe("C-chan");
+		expect(capturing.uploadOps[1]?.threadTs).toBeUndefined();
+
+		// Plain sends to U/W targets resolve through conversations.open FIRST
+		// (adapter.py:_ensure_dm_conversation ahead of chat.postMessage).
+		await engine.deliverText("W888", "dm body");
+		expect(capturing.dmOpens.map((o) => o.userId)).toContain("W888");
+		expect(wire.sendsOf("D888").at(-1)?.content).toBe("dm body");
+	});
+});
+
 describe("Block Kit round-trip via THE kit grammar (build → action → resolve)", () => {
 	it("clarify card: builder → wire (blocks + mrkdwn fallback) → tap → resolver → host edited, buttons stripped; double-tap answers once", async () => {
 		const world = makeSlackWorld({ name: "slack-cl-roundtrip" });
@@ -226,7 +346,14 @@ describe("Block Kit round-trip via THE kit grammar (build → action → resolve
 		await eventually(() => subject.wire.editsOf("C-cl").length === 1);
 		expect(engine.resolvedFamilies.includes("cl")).toBe(true);
 		const edits = subject.wire.editsOf("C-cl");
-		expect(edits[0]?.metadata["buttons_removed"]).toBe(true);
+		// chat.update REPLACES the layout: section(original) + context(decision)
+		// — that replacement is HOW buttons disappear (no invented flag).
+		const resolvedBlocks = edits[0]?.metadata["blocks"] as Array<{
+			type: string;
+		}>;
+		expect(resolvedBlocks.some((b) => b.type === "section")).toBe(true);
+		expect(resolvedBlocks.some((b) => b.type === "context")).toBe(true);
+		expect(resolvedBlocks.every((b) => b.type !== "actions")).toBe(true);
 
 		tap(); // double-tap: answered, never re-resolved
 		await eventually(() => engine.interactiveAudit.length === 2);
@@ -279,7 +406,10 @@ describe("Block Kit round-trip via THE kit grammar (build → action → resolve
 		await eventually(() => engine.interactiveAudit.length === 1);
 		const edits = subject.wire.editsOf("C-o");
 		expect(edits[0]?.content).toContain("Awaiting typed response");
-		expect(edits[0]?.metadata["buttons_removed"]).toBe(true);
+		const otherBlocks = edits[0]?.metadata["blocks"] as Array<{
+			type: string;
+		}>;
+		expect(otherBlocks.every((b) => b.type !== "actions")).toBe(true);
 	});
 });
 
@@ -295,7 +425,9 @@ describe("approvals card-first e2e (pi_embedded DeliveryBridge seam)", () => {
 		const bridge = new DeliveryBridge({
 			// THE REAL ADAPTER — hasExecApprovalCard walks PROTOTYPES; a
 			// structural copy would silently disable the card path.
-			target: engine as unknown as ConstructorParameters<typeof DeliveryBridge>[0]["target"],
+			target: engine as unknown as ConstructorParameters<
+				typeof DeliveryBridge
+			>[0]["target"],
 			chatId: "C-appr",
 			ledger,
 			clock: bridgeClock,
@@ -339,7 +471,11 @@ describe("approvals card-first e2e (pi_embedded DeliveryBridge seam)", () => {
 		await eventually(() => subject.wire.editsOf("C-appr").length === 1);
 		expect(engine.resolvedFamilies.includes("ea")).toBe(true);
 		const edits = subject.wire.editsOf("C-appr");
-		expect(edits[0]?.metadata["buttons_removed"]).toBe(true);
+		const apprBlocks = edits[0]?.metadata["blocks"] as Array<{
+			type: string;
+		}>;
+		expect(apprBlocks.some((b) => b.type === "section")).toBe(true);
+		expect(apprBlocks.every((b) => b.type !== "actions")).toBe(true);
 		// The ADAPTER's pending entry was popped by the click (one-shot);
 		// the BRIDGE's ledger keeps its bind for late-tap accounting.
 		expect(engine.approvals.has(approvalId)).toBe(false);
@@ -367,7 +503,9 @@ describe("approvals card-first e2e (pi_embedded DeliveryBridge seam)", () => {
 		wire.script("send", { kind: "fail", error: "invalid_blocks" });
 		const ledger = new ApprovalCardLedger();
 		const bridge = new DeliveryBridge({
-			target: engine as unknown as ConstructorParameters<typeof DeliveryBridge>[0]["target"],
+			target: engine as unknown as ConstructorParameters<
+				typeof DeliveryBridge
+			>[0]["target"],
 			chatId: "C-fb",
 			ledger,
 			clock: bridgeClock,
@@ -386,8 +524,10 @@ describe("approvals card-first e2e (pi_embedded DeliveryBridge seam)", () => {
 		const sends = subject.wire.sendsOf("C-fb");
 		expect(sends.length).toBe(2);
 		expect(Array.isArray(sends[0]?.metadata["blocks"])).toBe(true);
-		expect(sends[1]?.metadata["blocks_dropped_on_retry"]).toBe(true);
+		// The retry ships WITHOUT blocks; the drop is LOCAL audit state only —
+		// no invented flag rides the wire.
 		expect(sends[1]?.metadata["blocks"]).toBeUndefined();
+		expect(engine.blockRetryAudit.droppedOnRetries).toBe(1);
 	});
 });
 
@@ -418,6 +558,7 @@ describe("rate-tier gating before egress (Q17, injected clock)", () => {
 			chatId: "C-rate-stream",
 			draftId: 1,
 			content: "stream bytes",
+			metadata: { thread_id: "1700000000.000100" } as never,
 		});
 		expect(draft.success).toBe(true);
 
@@ -439,6 +580,7 @@ describe("rate-tier gating before egress (Q17, injected clock)", () => {
 				chatId: "C-s",
 				draftId: i + 1,
 				content: `seg${i}`,
+				metadata: { thread_id: "1700000000.000200" } as never,
 			});
 			expect(r.success).toBe(true);
 		}
@@ -447,6 +589,7 @@ describe("rate-tier gating before egress (Q17, injected clock)", () => {
 			chatId: "C-s",
 			draftId: 99,
 			content: "nope",
+			metadata: { thread_id: "1700000000.000200" } as never,
 		});
 		expect(refusedDraft.success).toBe(false);
 		expect(refusedDraft.error).toBe("rate_limited:tier2-streaming");
@@ -462,6 +605,7 @@ describe("rate-tier gating before egress (Q17, injected clock)", () => {
 			chatId: "C-s",
 			draftId: 100,
 			content: "again",
+			metadata: { thread_id: "1700000000.000200" } as never,
 		});
 		expect(recovered.success).toBe(true);
 	});
@@ -532,13 +676,14 @@ describe("block-rejection retry drops blocks, never content", () => {
 		const sends = wire.sendsOf("C-br");
 		expect(sends.length).toBe(2);
 		expect(Array.isArray(sends[0]?.metadata["blocks"])).toBe(true);
-		expect(sends[1]?.metadata["blocks_dropped_on_retry"]).toBe(true);
+		// Retry WITHOUT blocks; drop recorded locally, never as a wire key.
 		expect(sends[1]?.metadata["blocks"]).toBeUndefined();
+		expect(engine.blockRetryAudit.droppedOnRetries).toBe(1);
 		expect(isBlockPayloadRejectionError("msg_too_long here")).toBe(true);
 		expect(isBlockPayloadRejectionError("too_many_blocks")).toBe(true);
 		expect(isBlockPayloadRejectionError("socket hang up")).toBe(false);
 
-		// Non-block failure: NO drop-retry flag anywhere; notice delivered.
+		// Non-block failure: NO drop-retry anywhere; notice delivered.
 		wire.script(
 			"send",
 			{ kind: "fail", error: "socket hang up" },
@@ -550,6 +695,7 @@ describe("block-rejection retry drops blocks, never content", () => {
 		expect(
 			all.every((o) => o.metadata["blocks_dropped_on_retry"] === undefined),
 		).toBe(true);
+		expect(engine.blockRetryAudit.droppedOnRetries).toBe(1);
 	});
 });
 
@@ -733,3 +879,427 @@ function asDeliveryTarget(engine: SlackAdapter): {
 		},
 	};
 }
+
+describe("per-turn emoji lifecycle (ws-6: reactions.add/remove, SLACK_REACTIONS)", () => {
+	it("👀 lands on the triggering message at processing start; removed + white_check_mark at completion", async () => {
+		const world = makeSlackWorld({ name: "slack-react-success" });
+		const { engine, socketServer } = world;
+		const capturing = world.wire as unknown as SlackCapturingWire;
+		await world.connectAndAwaitLive();
+
+		world.pushMessage("C1", "do the thing");
+		await eventually(() => engine.cursor.value === "e1");
+
+		const ops = capturing.reactionOps;
+		// 👀 at start → remove 👀 THEN the final mark (:4280-4284).
+		expect(ops.map((o) => `${o.action}:${o.name}`)).toEqual([
+			"add:eyes",
+			"remove:eyes",
+			"add:white_check_mark",
+		]);
+		expect(new Set(ops.map((o) => o.channelId))).toEqual(new Set(["C1"]));
+		expect(ops[0]!.ts).toMatch(/^\d+\.\d+$/); // the TRIGGERING message ts
+		expect(new Set(ops.map((o) => o.ts)).size).toBe(1); // one anchor message
+		expect(engine.reactionAudit.map((r) => r.phase)).toEqual([
+			"start",
+			"complete",
+		]);
+	});
+
+	it("a failed dispatch swaps 👀 for x (failure outcome), cursor unmoved", async () => {
+		const world = makeSlackWorld({ name: "slack-react-failure" });
+		const { engine } = world;
+		const capturing = world.wire as unknown as SlackCapturingWire;
+		await world.connectAndAwaitLive();
+
+		world.pushMessage("C1", "processed");
+		await eventually(() => engine.cursor.value === "e1");
+		capturing.reactionOps.length = 0;
+
+		engine.lifecycle.disable({
+			kind: "secret_missing",
+			secretKey: "SLACK_BOT_TOKEN",
+			manifestName: "slack-react-failure",
+		});
+		world.pushMessage("C1", "doomed");
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect(capturing.reactionOps.map((o) => `${o.action}:${o.name}`)).toEqual([
+			"add:eyes",
+			"remove:eyes",
+			"add:x",
+		]);
+		expect(
+			engine.reactionAudit.some(
+				(r) => r.phase === "complete" && r.outcome === "failure",
+			),
+		).toBe(true);
+	});
+
+	it("SLACK_REACTIONS=false (env or injected) disables the lifecycle entirely; parser matches :4250", async () => {
+		const envWorld = makeSlackWorld({ name: "slack-react-env-off" });
+		const envCapturing = envWorld.wire as unknown as SlackCapturingWire;
+		process.env["SLACK_REACTIONS"] = "false";
+		try {
+			await envWorld.connectAndAwaitLive();
+			envWorld.pushMessage("C1", "quiet");
+			await eventually(() => envWorld.engine.cursor.value === "e1");
+			expect(envCapturing.reactionOps).toEqual([]);
+			expect(envWorld.engine.reactionAudit).toEqual([]);
+		} finally {
+			delete process.env["SLACK_REACTIONS"];
+		}
+
+		const injected = makeSlackWorld({
+			name: "slack-react-injected-off",
+			reactionsEnabled: false,
+		});
+		const injectedCapturing = injected.wire as unknown as SlackCapturingWire;
+		await injected.connectAndAwaitLive();
+		injected.pushMessage("C1", "also quiet");
+		await eventually(() => injected.engine.cursor.value === "e1");
+		expect(injectedCapturing.reactionOps).toEqual([]);
+
+		for (const raw of ["false", "0", "no", "FALSE", "No"]) {
+			expect(isSlackReactionsEnabled(raw)).toBe(false);
+		}
+		for (const raw of [undefined, "", "true", "1", "yes"]) {
+			expect(isSlackReactionsEnabled(raw)).toBe(true);
+		}
+	});
+});
+
+describe("native stream START args (ws-7: recipients + pre-wire anchor guard)", () => {
+	it("START carries recipient_user_id (renamed from user_id/sender_id) and recipient_team_id from the channel→team map; originals stripped", async () => {
+		const world = makeSlackWorld({ name: "slack-start-recipients" });
+		const { engine, wire } = world;
+		await world.connectAndAwaitLive();
+
+		// An inbound event remembers C1→W0 in the channel→team map
+		// (_remember_channel_team parity).
+		world.socketServer.pushMessage({
+			channel: "C1",
+			user: "user-1",
+			text: "remember this channel",
+		});
+		await eventually(() => engine.cursor.value === "e1");
+
+		await engine.sendDraft({
+			chatId: "C1",
+			draftId: 5,
+			content: "stream head",
+			metadata: {
+				thread_id: "1700000000.000500",
+				user_id: "user-9",
+			} as never,
+		});
+		const startOp = wire
+			.draftsOf("C1")
+			.find((d) => d.metadata["stream_op"] === "start");
+		expect(startOp).toBeDefined();
+		expect(startOp!.metadata["thread_ts"]).toBe("1700000000.000500");
+		expect(startOp!.metadata["recipient_user_id"]).toBe("user-9");
+		expect(startOp!.metadata["recipient_team_id"]).toBe("W0"); // map, not auth scope
+		// The internal stamps never ship on the vendor frame.
+		expect(startOp!.metadata["user_id"]).toBeUndefined();
+		expect(startOp!.metadata["sender_id"]).toBeUndefined();
+		expect(startOp!.metadata["thread_id"]).toBeUndefined();
+
+		// sender_id fallback renames identically.
+		await engine.sendDraft({
+			chatId: "C1",
+			draftId: 6,
+			content: "more",
+			metadata: {
+				thread_id: "1700000000.000500",
+				sender_id: "user-8",
+			} as never,
+		});
+		const second = wire
+			.draftsOf("C1")
+			.filter((d) => d.metadata["stream_op"] === "start")
+			.at(-1);
+		expect(second!.metadata["recipient_user_id"]).toBe("user-8");
+
+		// Unknown channel falls back to the connect-time workspace team scope.
+		await engine.sendDraft({
+			chatId: "C-unknown",
+			draftId: 7,
+			content: "head",
+			metadata: { thread_id: "1700000000.000700" } as never,
+		});
+		const fallback = wire
+			.draftsOf("C-unknown")
+			.find((d) => d.metadata["stream_op"] === "start");
+		expect(fallback!.metadata["recipient_team_id"]).toBe("TWORKSPACE0");
+		// Appends/seals never carry recipient stamps (START-only kwargs).
+		const appendish = wire
+			.draftsOf("C-unknown")
+			.filter((d) => d.metadata["stream_op"] !== "start");
+		expect(
+			appendish.every(
+				(d) =>
+					d.metadata["recipient_user_id"] === undefined &&
+					d.metadata["recipient_team_id"] === undefined,
+			),
+		).toBe(true);
+	});
+
+	it("pre-wire guard: an unanchored START fails BEFORE calling the API (no wire op)", async () => {
+		const world = makeSlackWorld({ name: "slack-start-guard" });
+		const { engine, wire } = world;
+
+		const result = await engine.sendDraft({
+			chatId: "C-guard",
+			draftId: 1,
+			content: "anchorless",
+		});
+		expect(result.success).toBe(false);
+		expect(result.error).toBe("no thread_ts for native stream");
+		// NOTHING reached the wire — the guard precedes the API call.
+		expect(wire.draftsOf("C-guard")).toHaveLength(0);
+		// A feature-gate latch must NOT engage for an anchor failure.
+		expect(engine.nativeStreamLatch.unsupported).toBe(false);
+		// Anchored STARTs sail through.
+		const anchored = await engine.sendDraft({
+			chatId: "C-guard",
+			draftId: 2,
+			content: "anchored",
+			metadata: { thread_ts: "1700000000.000900" } as never,
+		});
+		expect(anchored.success).toBe(true);
+	});
+});
+
+describe("auth.test at connect (ws-8: token identity → self-echo + team scope)", () => {
+	it("connect resolves selfUserId + team scope from the token; the echo filter uses it", async () => {
+		const world = makeSlackWorld({ name: "slack-auth-scope" });
+		const { engine, subject } = world;
+		const capturing = world.wire as unknown as SlackCapturingWire;
+		expect(capturing.authTestCalls).toBe(0);
+
+		await world.connectAndAwaitLive();
+
+		expect(capturing.authTestCalls).toBe(1);
+		expect(engine.authProbes).toEqual([
+			{ ok: true, userId: "UBOTAUTH0", teamId: "TWORKSPACE0" },
+		]);
+		// Token identity REPLACED the 'bot-self' seed and feeds the echo filter.
+		expect(engine.resolvedSelfUserId).toBe("UBOTAUTH0");
+		subject.socketServer.pushMessage({
+			channel: "C1",
+			user: "UBOTAUTH0",
+			text: "echo of myself",
+		});
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect([...subject.turns()]).toEqual([]); // suppressed as self/echo
+
+		// Real users still dispatch.
+		world.pushMessage("C1", "hello bot");
+		await eventually(() => subject.turns().includes("hello bot"));
+	});
+
+	it("an explicit auth failure fails the connect loudly; the socket never opens", async () => {
+		const world = makeSlackWorld({
+			name: "slack-auth-fail",
+			authIdentity: { ok: false, error: "invalid_auth" },
+		});
+		const { engine, socketServer } = world;
+		const connected = await engine.connect({ isReconnect: false });
+		expect(connected).toBe(false);
+		expect(engine.isLive).toBe(false);
+		expect(socketServer.openConnectionCount).toBe(0);
+		expect(engine.authProbes).toEqual([{ ok: false }]);
+	});
+
+	it("an explicitly injected botUserId wins over the token identity", async () => {
+		const server = new SlackSocketModeServer();
+		const wire = new FakePlatformWire();
+		const engine = new SlackAdapter({
+			manifestName: "slack-injected-id",
+			transport: server,
+			rest: wire,
+			clock: new ManualClock(),
+			botUserId: "UBOT-INJECTED",
+		});
+		// No authTest bound on the plain wire ⇒ identity stays the injection.
+		const connected = await engine.connect({ isReconnect: false });
+		expect(connected).toBe(true);
+		expect(engine.resolvedSelfUserId).toBe("UBOT-INJECTED");
+		await engine.disconnect();
+	});
+});
+
+describe("chat.delete lane (ws-10: opt-in cleanup_progress capability)", () => {
+	it("deleteMessage ships chat.delete {channel,ts}; class-level presence is the run.py probe", async () => {
+		const world = makeSlackWorld({ name: "slack-delete" });
+		const { engine } = world;
+		const capturing = world.wire as unknown as SlackCapturingWire;
+
+		// run.py:28580 probes getattr(type(adapter), "delete_message") — the
+		// CLASS-LEVEL method is what arms the opt-in cleanup_progress config.
+		expect(typeof SlackAdapter.prototype.deleteMessage).toBe("function");
+
+		const ok = await engine.deleteMessage("C1", "1700000000.000555");
+		expect(ok).toBe(true);
+		expect(capturing.deleteOps).toEqual([
+			{ channel: "C1", ts: "1700000000.000555" },
+		]);
+	});
+
+	it("without a bound delete lane the capability reports false (silently disabled cleanup)", async () => {
+		const engine = new SlackAdapter({
+			manifestName: "slack-delete-bare",
+			transport: new SlackSocketModeServer(),
+			rest: new FakePlatformWire(), // no transmitDelete extra bound
+			clock: new ManualClock(),
+		});
+		expect(await engine.deleteMessage("C1", "1700000000.000001")).toBe(false);
+	});
+});
+
+describe("message_changed envelopes (ws-11: edits normalize onto changed-ts-deduped fresh turns)", () => {
+	it("an edit to a NEVER-addressed message re-processes as a fresh turn under the original thread root", async () => {
+		const world = makeSlackWorld({ name: "slack-edit-fresh" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		// Backlog edit: the original message never reached the agent.
+		const editEvt: SlackEnvelopeEvent = world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "edited body v2",
+			originalTs: "1700000000.000301",
+			eventTs: "1700000000.000900",
+		});
+		await eventually(() => engine.cursor.value === editEvt.id);
+		expect([...subject.turns()]).toEqual(["edited body v2"]);
+		// Same session/thread root as the original message (its own ts).
+		expect(engine.sessionKeysSeen.at(-1)).toBe("slack-edit-fresh:C1:1700000000.000301");
+	});
+
+	it("redelivery of a DISPATCHED edit is absorbed by the processed-original-ts guard before any re-dispatch", async () => {
+		const world = makeSlackWorld({ name: "slack-edit-dedup" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		const editEvt = world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "once only",
+			originalTs: "1700000000.000401",
+			eventTs: "1700000000.000901",
+		});
+		await eventually(() => subject.turns().includes("once only"));
+		const turnsAfterFirst = subject.turns().length;
+
+		// Redelivery (retry-flagged, same envelope): the :5779 guard fires
+		// first — routing the edit marked the original ts at :6855 — so the
+		// turn is never duplicated and the dedup window stays untouched.
+		await engine.handlePlatformEvent({
+			...editEvt,
+			retryAttempt: 1,
+			retryReason: "retry_timeout",
+		} as never);
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect(subject.turns().length).toBe(turnsAfterFirst);
+		expect(engine.dedupSuppressedCount).toBe(0);
+
+		// Malformed message_changed (no nested message) — dropped silently.
+		await engine.handlePlatformEvent({
+			id: "e-manual",
+			type: "message",
+			chatId: "C1",
+			userId: "user-1",
+			text: "",
+			subtype: "message_changed",
+		} as never);
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect(subject.turns().length).toBe(turnsAfterFirst);
+	});
+
+	it("the CHANGED-ts dedup key suppresses repeated FILTERED edits exactly once (:5797 window sees every envelope)", async () => {
+		const world = makeSlackWorld({ name: "slack-edit-changed-dedup" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		// A bot-authored edited message passes normalization + the processed-ts
+		// guard (its original was never routed) and lands in the CHANGED-ts
+		// dedup window BEFORE the allow_bots filter drops it.
+		const botEdit = world.pushMessageChanged({
+			channel: "C1",
+			user: "bot-user",
+			text: "bot edit",
+			originalTs: "1700000000.000451",
+			eventTs: "1700000000.000951",
+			botId: "B0BOT",
+		});
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect([...subject.turns()]).toEqual([]);
+
+		// Redelivered under a NEW envelope id but the SAME event_ts — the
+		// workspace-scoped CHANGED-ts key is what suppresses it.
+		await engine.handlePlatformEvent({
+			...botEdit,
+			id: `${botEdit.id}-retry`,
+			envelopeId: `${botEdit.envelopeId}-retry`,
+			retryAttempt: 1,
+			retryReason: "retry_timeout",
+		} as never);
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect([...subject.turns()]).toEqual([]);
+		expect(engine.dedupSuppressedCount).toBe(1);
+	});
+
+	it("edits to ALREADY-addressed messages are dropped (no duplicate response); a second distinct edit is likewise absorbed", async () => {
+		const world = makeSlackWorld({ name: "slack-edit-addressed" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		const originalTs = "1700000000.000501";
+		const original = world.socketServer.pushMessage({
+			channel: "C1",
+			user: "user-1",
+			text: "original question",
+			ts: originalTs,
+		});
+		await eventually(() => subject.turns().includes("original question"));
+
+		// Editing the just-answered message NEVER re-triggers (:5779 guard —
+		// the original ts was routed into the agent at :6855).
+		world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "original question EDITED",
+			originalTs,
+			eventTs: "1700000000.000902",
+		});
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect([...subject.turns()]).toEqual(["original question"]);
+		void original;
+
+		// Even processing edit #1 of an UNADDRESSED original absorbs later
+		// edits of the same message: routing edit #1 marks the original ts
+		// addressed (:6855 records the normalized event's ts).
+		const freshOriginalTs = "1700000000.000601";
+		const edit1 = world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "first edit wins",
+			originalTs: freshOriginalTs,
+			eventTs: "1700000000.000903",
+		});
+		await eventually(() => subject.turns().includes("first edit wins"));
+		world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "second edit absorbed",
+			originalTs: freshOriginalTs,
+			eventTs: "1700000000.000904",
+		});
+		await new Promise<void>((r) => setTimeout(r, 12));
+		expect(subject.turns().at(-1)).toBe("first edit wins");
+		expect(subject.turns().filter((t) => t.includes("edit"))).toHaveLength(1);
+		void edit1;
+		expect(SLACK_PROCESSED_MESSAGE_TS_MAX).toBe(5000);
+	});
+});

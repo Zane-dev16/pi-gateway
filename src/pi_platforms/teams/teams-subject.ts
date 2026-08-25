@@ -392,7 +392,10 @@ class SubjectBridgeTransport {
 		return toResponse(result);
 	}
 
-	async sendTypingActivity(): Promise<void> {
+	async sendTypingActivity(
+		_conversationId: string,
+		_activity: Record<string, unknown>,
+	): Promise<void> {
 		throw new Error("typing requires the FakeBotFrameworkServer fixture");
 	}
 

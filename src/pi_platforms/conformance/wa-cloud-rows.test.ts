@@ -227,7 +227,7 @@ function waDeltaRows(newFixture: () => WaCloudFixture): ConformanceRow[] {
 		),
 		mk(
 			"transport.wa.lid-alias-continuity",
-			"wa: phone↔LID aliases collapse to ONE canonical session key AND one stable digits recipient through the REAL identity module",
+			"wa: phone↔LID aliases collapse to ONE canonical session key (session-key side ONLY); outbound posts chatId VERBATIM — stale LID mappings never rewrite Meta-delivered wa_ids",
 			async (fx) => {
 				const PHONE = "15551234567";
 				const LID = "999999999999999";
@@ -247,14 +247,14 @@ function waDeltaRows(newFixture: () => WaCloudFixture): ConformanceRow[] {
 				expect(fx.adapter.turnLog).toContain("via phone");
 				expect(fx.adapter.turnLog).toContain("via lid");
 
-				// Outbound addressing resolves BOTH spellings to the SAME wire
-				// recipient, idempotently.
+				// Outbound addressing posts the chatId VERBATIM on every /messages
+				// body (whatsapp_cloud.py:send parity) despite the mapping file.
 				const r1 = await fx.adapter.send(PHONE, "reply a");
 				const r2 = await fx.adapter.send(LID, "reply b");
 				expect(r1.success && r2.success).toBe(true);
 				const recipients = fx.graph.textSendsOf().map((s) => s.to);
-				expect(recipients).toEqual([PHONE, PHONE]);
-				expect(fx.adapter.resolveRecipient(LID)).toBe(PHONE);
+				expect(recipients).toEqual([PHONE, LID]);
+				expect(fx.adapter.resolveRecipient(LID)).toBe(LID);
 			},
 		),
 		mk(

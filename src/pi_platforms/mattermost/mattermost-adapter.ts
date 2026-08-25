@@ -208,6 +208,10 @@ export class MattermostAdapterCore
 	}
 	/** Delivered (post-dedup, post-filter) inbound post ids, in order. */
 	readonly inboundLog: MmPost[] = [];
+	/** Test observability: the most recent IncomingEvent that passed filters. */
+	lastBuiltIncoming:
+		| import("../../pi_gateway/guards/index.js").IncomingEvent
+		| null = null;
 	readonly reconnectLog: Array<{ delayMs: number; authoritative: boolean }> =
 		[];
 	lastCapturedRetryAfterSeconds: number | null = null;
@@ -538,8 +542,22 @@ export class MattermostAdapterCore
 			this.phase = "live";
 			return;
 		}
+		if (frame["status"] === "FAIL") {
+			// In-band authentication_challenge rejection — the REAL server's
+			// reply shape for a bad token. FATAL-equivalent to the 4001 close
+			// (adapter.py:_ws_loop WSServerHandshakeError 401/403 escalation).
+			this.onAuthRejected("challenge rejected (status FAIL)");
+			return;
+		}
 		if (frame["action"] === "pong") {
 			this.socket?.markAlive();
+			return;
+		}
+		if (frame["action"] === "ping") {
+			// SERVER-initiated keepalive: real MM servers ping; clients answer.
+			const sock = this.socket;
+			sock?.markAlive();
+			sock?.send({ action: "pong", seq_reply: frame["seq"] });
 			return;
 		}
 		if (frame["event"] === "posted") {
@@ -571,18 +589,26 @@ export class MattermostAdapterCore
 			this.lastCapturedRetryAfterSeconds = info.retryAfterSeconds;
 		}
 		if (info.code === 4001) {
-			// OOF-156: auth rejection is PERMANENT — escalate loudly instead of
-			// looping while reporting healthy.
-			this.lifecycle.markFatal({
-				kind: "config_invalid",
-				detail:
-					"Mattermost WebSocket authentication rejected (HTTP 401-class). " +
-					"The bot token is invalid, revoked, or lacks permission.",
-			});
+			this.onAuthRejected("close code 4001");
 			return;
 		}
 		if (this.running)
 			void this.scheduleReconnect(info.retryAfterSeconds ?? null);
+	}
+
+	/**
+	 * Auth rejection is PERMANENT regardless of HOW the server says no —
+	 * an in-band {"status":"fail"} challenge reply OR a 4001 close both land
+	 * here (OOF-156: escalate loudly instead of looping while reporting
+	 * healthy; adapter.py WSServerHandshakeError 401/403 parity).
+	 */
+	private onAuthRejected(via: string): void {
+		this.lifecycle.markFatal({
+			kind: "config_invalid",
+			detail:
+				`Mattermost WebSocket authentication rejected (${via}; HTTP 401-class). ` +
+				"The bot token is invalid, revoked, or lacks permission.",
+		});
 	}
 
 	private async scheduleReconnect(
@@ -672,12 +698,31 @@ export class MattermostAdapterCore
 		const messageText = post.message;
 		const built = this.buildIncomingFromPost(post, chatType, messageText);
 		if (built === null) return;
+		this.lastBuiltIncoming = built;
+		// File attachments: download via the AUTHED files/{fid} lane and
+		// classify (adapter.py :944-990 — URLs need auth headers downstream
+		// tools lack). PHOTO/VOICE/DOCUMENT classification rides media types.
+		if (post.file_ids !== undefined && post.file_ids.length > 0) {
+			const media = await this.downloadPostMedia(post.file_ids);
+			if (media.urls.length > 0) {
+				built.mediaUrls = media.urls;
+				built.mediaTypes = media.types;
+				built.messageType = media.messageType;
+			}
+		}
 		this.inboundLog.push(post);
 
 		if (!this.canDispatchNow()) {
 			this.holdInbound(built, "disconnected");
 			return;
 		}
+		// Turn-start processing indicator — core-driven in Hermes:
+		// gateway/run.py:5000 fires adapter.send_typing the moment an admitted
+		// message begins its turn (users/{bot}/typing per
+		// adapter.py:send_typing). Best-effort: sendTyping never rejects (it
+		// resolves to a SendResult), so failures are swallowed here by
+		// construction and can never block dispatch.
+		await this.sendTyping(post.channel_id);
 		try {
 			await this.handleIngress(built, sessionKeyOf(built));
 		} catch (err) {
@@ -717,26 +762,21 @@ export class MattermostAdapterCore
 			const hasMention = mentionPatterns.some((p) =>
 				messageText.toLowerCase().includes(p.toLowerCase()),
 			);
-			const commandRescued = (() => {
-				const stripped = messageText.replace(/^\s+/, "");
-				return stripped.startsWith("/") ? stripped : null;
-			})();
-			if (
-				this.requireMention &&
-				!isFreeChannel &&
-				!hasMention &&
-				commandRescued === null
-			) {
+			// THE GATE RUNS FIRST — unmentioned slash-prefixed text is dropped
+			// HERE, before ANY command detection (adapter.py:_handle_ws_event
+			// :902-907 ordering).
+			if (this.requireMention && !isFreeChannel && !hasMention) {
 				return null;
 			}
-			// Strip @mention tokens so the agent sees clean input.
+			// Strip @mention tokens so the agent sees clean input — CASE-
+			// INSENSITIVE global removal (adapter.py re.sub(re.escape(pattern),
+			// "", IGNORECASE)); mixed-case '@Pi_Gateway_Bot' must not survive.
 			if (hasMention) {
 				for (const pattern of mentionPatterns) {
-					messageText = messageText
-						.split(pattern)
-						.join("")
-						.split(pattern.toLowerCase())
-						.join("");
+					messageText = messageText.replace(
+						new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+						"",
+					);
 				}
 				messageText = messageText.trim();
 			}
@@ -778,6 +818,73 @@ export class MattermostAdapterCore
 				mm_root_id: post.root_id || undefined,
 			},
 		};
+	}
+
+	/**
+	 * Download a post's file_ids through files/{fid}/info + files/{fid}
+	 * (authed) and classify: image/* → photo, audio/* → voice, else document
+	 * (adapter.py:_handle_ws_event media leg).
+	 */
+	private async downloadPostMedia(fileIds: readonly string[]): Promise<{
+		urls: string[];
+		types: string[];
+		messageType: "photo" | "voice" | "document";
+	}> {
+		const urls: string[] = [];
+		const types: string[] = [];
+		for (const fid of fileIds) {
+			try {
+				const info = await this.mm.restGetFileInfo(fid);
+				await this.mm.restDownloadFile(fid);
+				urls.push(`mattermost://file/${fid}`);
+				types.push(info.mime_type);
+			} catch (err) {
+				this.logger?.warn?.(
+					`${this.manifestName}: file ${fid} download failed: ${brief(err)}`,
+				);
+			}
+		}
+		const messageType = types.some((m) => m.startsWith("image/"))
+			? "photo"
+			: types.some((m) => m.startsWith("audio/"))
+				? "voice"
+				: "document";
+		return { urls, types, messageType };
+	}
+
+	/**
+	 * adapter.py:_upload_file + _send_local_file — POST api/v4/files
+	 * (channel_id + files multipart), then create the post referencing the
+	 * returned file id via `file_ids`.
+	 */
+	async sendFile(
+		chatId: string,
+		file: { filename: string; bytes: Uint8Array; contentType?: string },
+		opts: { message?: string | undefined } = {},
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		try {
+			const fileId = await this.mm.restUploadFile({
+				channelId: chatId,
+				filename: file.filename,
+				contentType: file.contentType ?? "application/octet-stream",
+				bytes: file.bytes,
+			});
+			const created = await this.transmitCreate(
+				{
+					channel_id: chatId,
+					message: opts.message ?? "",
+					file_ids: [fileId],
+				},
+				{},
+			);
+			return { success: true, messageId: created.id };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
 	}
 
 	private canDispatchNow(): boolean {
@@ -947,6 +1054,8 @@ export class MattermostAdapterCore
 				{ maxRetries: 2 },
 			);
 			if (retried.success) return retried;
+			// Exhausted retries → user-facing resend notice. DELIBERATE DELTA vs
+			// Hermes-MM single-shot (_api_post) — ratified by DEC-049.
 			return this.restSendPost(chatId, DELIVERY_FAILED_NOTICE, metadata);
 		}
 		if (failureClass === "formatting") {
@@ -1154,7 +1263,12 @@ export class MattermostAdapterCore
 					payload,
 				);
 			} else {
-				await this.mm.restPatchPost(postId, String(payload["message"]));
+				// adapter.py:edit_message — PUT posts/{id}/patch carries the FULL
+				// body {message, props:{disable_mentions:true}} so props persist.
+				await this.mm.restPatchPost(
+					postId,
+					payload as { message: string; props?: Record<string, unknown> },
+				);
 			}
 			return { success: true, messageId: postId };
 		} catch (err) {

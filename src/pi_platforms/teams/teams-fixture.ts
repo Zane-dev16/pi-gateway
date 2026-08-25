@@ -116,6 +116,8 @@ export class TeamsFixture {
 		aadObjectId?: string;
 		conversationType?: string;
 		conversationId?: string;
+		/** Conversation display name (webhook-39 chatName source). */
+		conversationName?: string;
 		text?: string;
 		attachments?: Array<Record<string, unknown>>;
 		botAuthored?: boolean;
@@ -139,6 +141,9 @@ export class TeamsFixture {
 				conversation_type:
 					extras.conversationType ?? DEFAULT_CONVERSATION.conversation_type,
 				tenant_id: DEFAULT_CONVERSATION.tenant_id,
+				...(extras.conversationName !== undefined
+					? { name: extras.conversationName }
+					: {}),
 			},
 			...(extras.attachments !== undefined
 				? { attachments: extras.attachments }

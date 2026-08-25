@@ -26,8 +26,20 @@
 // - The AUTHORITATIVE consume always unlinks a non-stale, home-applicable
 //   marker and returns whether it named us; the non-destructive PLANNED-STOP
 //   probe leaves matching markers for the handler to consume.
+//
+// Drain-request marker (external begin/cancel-drain contract, 08 §1.2;
+// gateway/drain_control.py): presence of `.drain_request.json` stamped with
+// the CURRENT instantiation epoch flips the gateway to externally-draining
+// and stops new turns; a PRIOR-epoch marker (survived a machine restart on a
+// durable home volume, NS-570) or one older than DRAIN_REQUEST_MAX_AGE_SECONDS
+// = 3600s (#85433) is ignored leniently. Reading NEVER raises: malformed /
+// half-written files read as present-but-contentless ({}) which still counts
+// as drain-active — fail-safe toward quiescing. Only a DEFINITE epoch mismatch
+// or a parseable, definitely-too-old timestamp is ignored; anything ambiguous
+// honours the marker.
 
 import {
+	existsSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
@@ -42,6 +54,209 @@ export const TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json";
 export const PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json";
 /** Marker older than this is treated as stale (status.py:_TAKEOVER_MARKER_TTL_S). */
 export const MARKER_TTL_SECONDS = 60;
+
+// ---------------------------------------------------------------------------
+// Drain-request marker (.drain_request.json — drain_control.py port)
+// ---------------------------------------------------------------------------
+
+export const DRAIN_REQUEST_FILENAME = ".drain_request.json";
+/** Same-epoch orphan max-age in seconds (drain_control.py:#85433). */
+export const DRAIN_REQUEST_MAX_AGE_SECONDS = 3600;
+
+export function drainRequestPath(home: string): string {
+	return join(home, DRAIN_REQUEST_FILENAME);
+}
+
+export interface DrainRequestRecord {
+	action: "drain";
+	requested_at: string;
+	principal: string;
+	epoch: string;
+	suppress_notification: boolean;
+}
+
+/** Injectable /proc reader for epoch computation (tests). */
+type ProcTextReader = (path: string) => string | null;
+
+function defaultProcText(path: string): string | null {
+	try {
+		if (!existsSync(path)) return null;
+		return readFileSync(path, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Identity of THIS container/VM instantiation (drain_control.py:
+ * current_instantiation_epoch): kernel boot id + PID 1's start time. Stable
+ * for the life of the PID-1 init (an s6 respawn of just the gateway keeps the
+ * epoch and an in-flight drain is honoured), fresh when the machine/container
+ * is recreated. Returns "" when neither source is readable — an empty epoch
+ * DISABLES the staleness check downstream (presence-only behaviour).
+ */
+export function computeInstantiationEpoch(
+	readProcText: ProcTextReader = defaultProcText,
+): string {
+	const bootId = (readProcText("/proc/sys/kernel/random/boot_id") ?? "").trim();
+	let pid1Start = "";
+	try {
+		// /proc/1/stat: comm can contain spaces/parens — split after the LAST
+		// ')'; starttime is field 22, i.e. tail index 19 (drain_control.py).
+		const stat = readProcText("/proc/1/stat") ?? "";
+		const close = stat.lastIndexOf(")");
+		if (close >= 0) {
+			pid1Start =
+				stat
+					.slice(close + 1)
+					.trim()
+					.split(/\s+/)[19] ?? "";
+		}
+	} catch {
+		pid1Start = "";
+	}
+	if (!bootId && !pid1Start) return "";
+	return `${bootId}:${pid1Start}`;
+}
+
+let cachedEpoch: string | undefined | null = null;
+
+/** Memoised epoch for THIS process (the value cannot change mid-life). */
+export function currentInstantiationEpoch(): string {
+	if (cachedEpoch !== null) return cachedEpoch as string;
+	cachedEpoch = computeInstantiationEpoch();
+	return cachedEpoch;
+}
+
+/** Test hook: drop the memoised epoch so injected readers re-compute. */
+export function resetInstantiationEpochCache(): void {
+	cachedEpoch = null;
+}
+
+/** Write the begin-drain marker (drain_control.py:write_drain_request).
+ *  Idempotent: re-writing refreshes requested_at — the sanctioned keep-alive
+ *  for drains longer than the max-age. Atomic; best-effort. */
+export function writeDrainRequest(
+	home: string,
+	options: {
+		principal?: string;
+		suppressNotification?: boolean;
+		epoch?: string;
+		nowMs?: () => number;
+	} = {},
+): boolean {
+	try {
+		const record: DrainRequestRecord = {
+			action: "drain",
+			requested_at: new Date((options.nowMs ?? Date.now)()).toISOString(),
+			principal: options.principal ?? "drain-control",
+			epoch:
+				options.epoch !== undefined
+					? options.epoch
+					: currentInstantiationEpoch(),
+			suppress_notification: options.suppressNotification === true,
+		};
+		writeJsonAtomic(drainRequestPath(home), record);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Remove the drain marker (cancel-drain). True when one existed. Best-effort. */
+export function clearDrainRequest(home: string): boolean {
+	try {
+		rmSync(drainRequestPath(home), { force: false });
+		return true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+		try {
+			rmSync(drainRequestPath(home), { force: true });
+		} catch {
+			/* cancel is idempotent — never raise */
+		}
+		return false;
+	}
+}
+
+/**
+ * Marker body or null when absent. A present-but-unparseable marker returns
+ * `{}` (truthy-presence preserved; never raises — drain_control.py:
+ * read_drain_request).
+ */
+export function readDrainRequest(home: string): Record<string, unknown> | null {
+	try {
+		if (!existsSync(drainRequestPath(home))) return null;
+		const parsed: unknown = JSON.parse(
+			readFileSync(drainRequestPath(home), "utf8"),
+		);
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed)
+		) {
+			return parsed as Record<string, unknown>;
+		}
+		return {};
+	} catch {
+		return {};
+	}
+}
+
+interface DrainStalenessOptions {
+	/** Override epoch (tests). Default currentInstantiationEpoch(). */
+	epoch?: string;
+	nowMs?: () => number;
+}
+
+function drainMarkerEpochIsStale(
+	body: Record<string, unknown>,
+	options: DrainStalenessOptions,
+): boolean {
+	const current = options.epoch ?? currentInstantiationEpoch();
+	if (!current) return false; // epoch unavailable ⇒ lenient: honour presence
+	const markerEpoch = body["epoch"];
+	if (typeof markerEpoch !== "string" || markerEpoch === "") return false; // legacy/corrupt ⇒ honour
+	return markerEpoch !== current; // definite mismatch only
+}
+
+function drainMarkerIsExpired(
+	body: Record<string, unknown>,
+	options: DrainStalenessOptions,
+): boolean {
+	const raw = body["requested_at"];
+	if (typeof raw !== "string" || raw === "") return false;
+	const requestedAt = Date.parse(raw);
+	if (!Number.isFinite(requestedAt)) return false; // unparseable ⇒ honour
+	const nowMs = options.nowMs ?? Date.now;
+	const ageS = (nowMs() - requestedAt) / 1000;
+	return ageS > DRAIN_REQUEST_MAX_AGE_SECONDS; // future-dated ⇒ honoured
+}
+
+/** Either lenient signal suffices: prior epoch OR past max-age. */
+export function drainMarkerIsStale(
+	body: Record<string, unknown>,
+	options: DrainStalenessOptions = {},
+): boolean {
+	return (
+		drainMarkerEpochIsStale(body, options) ||
+		drainMarkerIsExpired(body, options)
+	);
+}
+
+/**
+ * True iff a begin-drain marker for THIS instantiation is present and not
+ * definitely stale (drain_control.py:drain_requested). Malformed/empty bodies
+ * count as ACTIVE (fail-safe toward quiescing).
+ */
+export function drainRequested(
+	home: string,
+	options: DrainStalenessOptions = {},
+): boolean {
+	const body = readDrainRequest(home);
+	if (body === null) return false;
+	return !drainMarkerIsStale(body, options);
+}
 
 export interface MarkerOptions {
 	/** Override self PID (tests). Default process.pid. */

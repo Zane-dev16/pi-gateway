@@ -401,14 +401,16 @@ export function makeRealDiscordFixture(): WsFixture {
 			const restConvertedTable =
 				restBody.includes("```") && !restBody.includes("| a | b |");
 
-			// ── leg (iii): SUPPRESS_EMBEDS is TEXT-send-only metadata ──
+			// ── leg (iii): link previews are NOT suppressed — Hermes never sets
+			// suppress_embeds on any text path (vendor shows embeds); the flag is
+			// absent from EVERY op.
 			const textSends = wire.ops.filter((o) => o.op === "send");
 			const nonTextOps = wire.ops.filter(
 				(o) => o.op === "draft" || o.op === "seal" || o.op === "rich",
 			);
 			const linkPreviewOnAllTextSends =
 				textSends.length > 0 &&
-				textSends.every((o) => o.metadata["suppress_embeds"] === 4);
+				textSends.every((o) => o.metadata["suppress_embeds"] === undefined);
 			const linkPreviewAbsentOffTextSends = nonTextOps.every(
 				(o) => o.metadata["suppress_embeds"] === undefined,
 			);

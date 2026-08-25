@@ -108,11 +108,14 @@ import {
 	HEARTBEAT_ACK_MAX_AGE_SECONDS,
 	LIVENESS_FAILURE_THRESHOLD,
 	LIVENESS_INTERVAL_SECONDS,
-	MESSAGE_FLAG_SUPPRESS_EMBEDS,
 	ALLOWED_MENTIONS_DEFAULTS,
+	CHANNEL_TYPE_FORUM,
+	DISCORD_IDENTIFY_INTENTS,
 	MAX_SPLIT_MESSAGES,
 	MESSAGE_LENGTH_MAX,
 	NATIVE_STREAM_GATE_MARKERS,
+	FORUM_THREAD_NAME_FALLBACK,
+	FORUM_THREAD_NAME_MAX_CHARS,
 	REQUIRE_MENTION_DEFAULT,
 	RETRY_AFTER_FLOOR_SECONDS,
 	RATE_LIMIT_SLEEP_CAP_SECONDS,
@@ -120,6 +123,7 @@ import {
 	SELECT_MAX_OPTIONS,
 	SPLIT_THRESHOLD,
 	TYPING_INTERVAL_SECONDS,
+	THREAD_AUTO_ARCHIVE_DEFAULT,
 	THREAD_NAME_FALLBACK,
 	THREAD_NAME_MAX_UTF16_UNITS,
 	type AllowBots,
@@ -153,12 +157,46 @@ export interface DiscordRestPlane {
 		content: string,
 		metadata: Metadata,
 	): Promise<SendResult>;
-	/** Thread creation returns the new thread id (== starter message id). */
+	/**
+	 * POST /channels/{starter_message_id}/threads — the STARTER ID IS THE PATH
+	 * PARAMETER (adapter.py:_auto_create_thread :7242); body carries name +
+	 * auto_archive_duration only. Returns the new thread id.
+	 */
 	transmitThreadCreate(
-		chatId: string,
+		starterMessageId: string,
 		name: string,
 		metadata: Metadata,
 	): Promise<SendResult>;
+	/**
+	 * PUT/DELETE /channels/{id}/messages/{mid}/reactions/{emoji}/@me —
+	 * per-turn processing/result emojis (adapter.py:_add_reaction :3328 /
+	 * _remove_reaction :3339).
+	 */
+	transmitReaction?(
+		channelId: string,
+		messageId: string,
+		emoji: string,
+		action: "add" | "remove",
+	): Promise<SendResult>;
+	/**
+	 * GET /channels/{id} — resolve the vendor channel-type integer; the input
+	 * to forum-parent detection (adapter.py:_is_forum_parent :7892 — type 15).
+	 * OPTIONAL: planes that cannot answer it simply never route forum lanes
+	 * (every target treated as a normal channel).
+	 */
+	resolveChannelType?(chatId: string): Promise<number | null>;
+	/**
+	 * POST /channels/{forum_channel_id}/threads — create a forum POST whose
+	 * starter message carries the content (adapter.py:_send_to_forum :3593,
+	 * forum_channel.create_thread). Returns the STARTER-message SendResult;
+	 * `threadId` carries the new thread id the follow-up chunks are sent into.
+	 */
+	transmitForumThreadCreate?(
+		forumChannelId: string,
+		name: string,
+		starterContent: string,
+		metadata: Metadata,
+	): Promise<SendResult & { threadId?: string | undefined }>;
 	transmitTyping(chatId: string, metadata: Metadata): Promise<SendResult>;
 	/** Interaction callback ack (deferred-update parity). */
 	transmitInteractionAck(
@@ -204,6 +242,12 @@ export const DISCORD_REGISTRY: CommandRegistry = [
 ];
 
 export const DISCORD_REQUIRED_SECRET = "DISCORD_BOT_TOKEN";
+
+/** Auto-thread abort notice — visible channel warning paired with the
+ * abort (adapter.py :8196-8206; #20243). */
+const AUTO_THREAD_FAILURE_NOTICE =
+	"⚠︁ could not create a thread for this message, so it was not " +
+	"processed. Please retry.";
 
 const DEFAULT_ACK_MAX_AGE_MS = HEARTBEAT_ACK_MAX_AGE_SECONDS * 1000;
 const DEFAULT_LIVENESS_INTERVAL_MS = LIVENESS_INTERVAL_SECONDS * 1000;
@@ -268,7 +312,13 @@ export class DiscordAdapter
 	protected readonly rest: DiscordRestPlane;
 	protected readonly clock: AdapterClock;
 	private readonly transportFactory: GatewayConnectionFactory;
-	private readonly botUserId: string;
+	/**
+	 * Ground bot identity. Injected deps value is only the FALLBACK — Hermes
+	 * grounds self-filter/mention detection in client.user, which the gateway
+	 * populates at READY (adapter.py:on_ready :1391, _is_mentioned :6746); the
+	 * READY dispatch adopts d.user.id before any MESSAGE_CREATE can arrive.
+	 */
+	private botUserId: string;
 	private readonly sealChats: ReadonlySet<string>;
 
 	// ── gateway session state ──────────────────────────────────────────────
@@ -333,6 +383,12 @@ export class DiscordAdapter
 	private readonly cp: EgressChokepoint;
 	private formatLadder: FormattingLadder | null = null;
 	private ladderChatId = "";
+	/** Continuation anchor for the NEXT ladder send (split-chunk threading). */
+	private ladderContinuationOf: string | null = null;
+	/** chatId → forum verdict cache (_is_forum_parent probes once per chat). */
+	private readonly forumLaneCache = new Map<string, boolean>();
+	/** chatId → thread of the most recent forum post (follow-up chunk lane). */
+	private readonly forumOpenPosts = new Map<string, string>();
 	private readonly openStreams = new Map<string, OpenStreamState>();
 	private readonly descriptors: ReadonlyMap<
 		string,
@@ -490,6 +546,11 @@ export class DiscordAdapter
 	}
 
 	// ── runner wiring passthrough (reference-subject parity) ───────────────
+
+	/** The GROUNDED bot id (READY adoption wins over the injected fallback). */
+	get resolvedBotUserId(): string {
+		return this.botUserId;
+	}
 
 	override attachGuard(
 		deps: {
@@ -728,8 +789,20 @@ export class DiscordAdapter
 		if (frame.op !== OP.DISPATCH) return;
 		const t = frame.t ?? "";
 		if (t === "READY") {
-			const d = (frame.d ?? {}) as { session_id?: string };
+			const d = (frame.d ?? {}) as {
+				session_id?: string;
+				user?: { id?: string };
+			};
 			this.sessionId = d.session_id ?? null;
+			// Ground identity BEFORE any MESSAGE_CREATE can dispatch (Hermes
+			// grounds self-filter + mention matching in client.user, populated
+			// by READY d.user.id — adapter.py:on_ready :1391, _is_mentioned
+			// :6746). The injected deps value remains the fallback and is never
+			// downgraded by a payload-less READY.
+			const readyUserId = d.user?.id;
+			if (typeof readyUserId === "string" && readyUserId.length > 0) {
+				this.botUserId = readyUserId;
+			}
 			// Fresh session ⇒ baseline resets to the READY sequence itself.
 			this.lastSeenSeq = frame.s ?? null;
 			this.lastAckedSeq = frame.s ?? null;
@@ -781,7 +854,10 @@ export class DiscordAdapter
 			s: null,
 			d: {
 				token,
-				intents: ["GUILDS", "GUILD_MESSAGES", "DIRECT_MESSAGES"],
+				// VENDOR WIRE FORM: integer bitmask (discord.py Intents value).
+				// A string array never comes online; MESSAGE_CONTENT is REQUIRED
+				// or inbound content arrives empty (adapter.py:connect :1345-1353).
+				intents: DISCORD_IDENTIFY_INTENTS,
 				properties: {
 					os: "linux",
 					browser: "pi-gateway",
@@ -996,7 +1072,13 @@ export class DiscordAdapter
 				messageId,
 			);
 			if (created === null) {
-				// Failure posts a warning and ABORTS — never inline-fallback (#20243).
+				// Failure pairs a VISIBLE channel notice with the abort — users
+				// must know to retry (adapter.py :8196-8206, #20243).
+				try {
+					await this.restSendDiscord(channelId, AUTO_THREAD_FAILURE_NOTICE, {});
+				} catch {
+					/* notice is best-effort; the abort stands either way */
+				}
 				this.ledger.markFailed(messageId);
 				return;
 			}
@@ -1041,6 +1123,13 @@ export class DiscordAdapter
 		};
 
 		this.ledger.markStatus(messageId, "processing");
+		// Turn-admission typing indicator (run.py:5000 send_typing parity) —
+		// UP before the emoji REST round-trip so even instant handoffs show
+		// life; refreshes every 12s while the turn runs; stopTyping lands at
+		// finalize/failure (:20444/:21065).
+		this.startTyping(channelId);
+		// 👀 processing-start emoji (adapter.py on_processing_start parity).
+		await this.onProcessingStart(channelId, messageId);
 		try {
 			await this.handleIngress(event, sessionKey);
 		} catch (err) {
@@ -1048,16 +1137,84 @@ export class DiscordAdapter
 			this.logger?.error?.(
 				`${this.manifestName}: dispatch failed for ${messageId}: ${err instanceof Error ? err.message : String(err)}`,
 			);
+			await this.onProcessingComplete(messageId, "failure");
 			this.ledger.markFailed(messageId);
+			this.stopTyping(channelId);
 			return;
 		}
 		this.inboundLog.push(messageId);
 		this.ledger.advanceCursor(channelId, messageId);
+		// ✅ completion swap (adapter.py :3376-3381).
+		await this.onProcessingComplete(messageId, "success");
+		this.stopTyping(channelId);
 		if (s !== null) this.lastAckedSeq = Math.max(this.lastAckedSeq ?? s, s);
 		if (this.pendingRecoverySweep && s !== null) {
 			// Process the CURRENT frame fully before sweeping the gap behind it.
 			this.pendingRecoverySweep = false;
 			void this.runMissedDispatchSweep("seq-gap-in-session");
+		}
+	}
+
+	// ── per-turn emoji acks (adapter.py:_add_reaction :3328 / :3376-3381) ──
+
+	/** 👀 on dispatch → removed, then ✅/❌ on completion. */
+	static readonly REACTION_PROCESSING = "👀";
+	static readonly REACTION_SUCCESS = "✅";
+	static readonly REACTION_FAILURE = "❌";
+
+	/** messageId → channel that received the 👀 (swap anchor). */
+	private readonly pendingReactions = new Map<string, string>();
+
+	/** Processing-start emoji: PUT 👀 on the triggering message. */
+	async onProcessingStart(channelId: string, messageId: string): Promise<void> {
+		if (!channelId || !messageId) return;
+		try {
+			const fired = await this.rest.transmitReaction?.(
+				channelId,
+				messageId,
+				DiscordAdapter.REACTION_PROCESSING,
+				"add",
+			);
+			if (fired?.success) {
+				this.pendingReactions.set(messageId, channelId);
+				// The recovery ledger models emoji acks — feed it (:2849-2852:
+				// emoji-only acks recorded, never completion).
+				this.ledger.markEmojiAck(messageId);
+			}
+		} catch {
+			/* reaction failures never break processing */
+		}
+	}
+
+	/** Completion swap: remove 👀, then ✅ (success) or ❌ (failure). */
+	async onProcessingComplete(
+		messageId: string,
+		outcome: "success" | "failure",
+	): Promise<void> {
+		const channelId = this.pendingReactions.get(messageId);
+		if (channelId === undefined) return;
+		this.pendingReactions.delete(messageId);
+		try {
+			await this.rest.transmitReaction?.(
+				channelId,
+				messageId,
+				DiscordAdapter.REACTION_PROCESSING,
+				"remove",
+			);
+		} catch {
+			/* swallowed */
+		}
+		try {
+			await this.rest.transmitReaction?.(
+				channelId,
+				messageId,
+				outcome === "success"
+					? DiscordAdapter.REACTION_SUCCESS
+					: DiscordAdapter.REACTION_FAILURE,
+				"add",
+			);
+		} catch {
+			/* swallowed */
 		}
 	}
 
@@ -1080,12 +1237,9 @@ export class DiscordAdapter
 			const verdict = this.gateRoute("thread-create", channelId);
 			if (!verdict.allowed) continue;
 			const created = await this.rest.transmitThreadCreate(
-				channelId,
+				initiatingMessageId, // vendor puts the starter id IN THE PATH
 				deriveThreadName(content),
-				{
-					auto_archive_minutes: 1440,
-					initiating_message_id: initiatingMessageId,
-				},
+				{ auto_archive_duration: THREAD_AUTO_ARCHIVE_DEFAULT },
 			);
 			if (created.success && created.messageId) {
 				this.threadCreations.push({
@@ -1229,12 +1383,19 @@ export class DiscordAdapter
 		const loop = { gen, active: true };
 		this.typingLoops.set(chatId, loop);
 		void (async () => {
+			// Hermes' _typing_loop (:5605-5637) posts IMMEDIATELY on entry, THEN
+			// refreshes every 12s — a sub-interval turn must still show the
+			// indicator. The zero-length first delay realizes "request first,
+			// sleep after" while keeping the cadence schedulable on the INJECTED
+			// clock (registration stays synchronous with startTyping).
+			let delayMs = 0;
 			while (loop.active && this.running) {
-				await this.clock.sleepMs(TYPING_INTERVAL_SECONDS * 1000);
+				await this.clock.sleepMs(delayMs);
 				if (!loop.active) return;
+				delayMs = TYPING_INTERVAL_SECONDS * 1000;
 				const verdict = this.gateRoute("typing", chatId);
 				if (!verdict.allowed) {
-					await this.clock.sleepMs(verdict.retryAfterSeconds * 1000);
+					delayMs = verdict.retryAfterSeconds * 1000;
 					continue;
 				}
 				const fired = await this.rest.transmitTyping(chatId, {
@@ -1242,14 +1403,13 @@ export class DiscordAdapter
 				});
 				if (!fired.success) {
 					if (fired.retryable === true && fired.retryAfter != null) {
-						// 429 survival: sleep the authoritative delay, KEEP looping.
-						const capped = Math.min(
-							fired.retryAfter,
-							RATE_LIMIT_SLEEP_CAP_SECONDS,
-						);
-						await this.clock.sleepMs(
-							Math.max(RETRY_AFTER_FLOOR_SECONDS, capped) * 1000,
-						);
+						// 429 survival: the AUTHORITATIVE delay alone leads to the
+						// next post (:5626 sleep(retry_after); continue), KEEP looping.
+						delayMs =
+							Math.max(
+								RETRY_AFTER_FLOOR_SECONDS,
+								Math.min(fired.retryAfter, RATE_LIMIT_SLEEP_CAP_SECONDS),
+							) * 1000;
 						continue;
 					}
 					loop.active = false; // other failures END the loop
@@ -1303,6 +1463,114 @@ export class DiscordAdapter
 		content: string,
 		metadata: Metadata,
 	): Promise<SendResult> {
+		return this.restSendDiscordWithReference(chatId, content, metadata, null);
+	}
+
+	/**
+	 * THE text-send entry. Forum-parent detection FIRST (Hermes checks
+	 * _is_forum_parent at the top of send, adapter.py:3501): type-15 targets
+	 * route through the thread-create post lane — Discord REJECTS plain
+	 * channel sends into forums.
+	 */
+	private async restSendDiscordWithReference(
+		chatId: string,
+		content: string,
+		metadata: Metadata,
+		continuationOf: string | null,
+	): Promise<SendResult> {
+		if (await this.isForumParent(chatId)) {
+			return this.sendViaForumLane(chatId, content, metadata, continuationOf);
+		}
+		return this.restSendPlain(chatId, content, metadata, continuationOf);
+	}
+
+	/**
+	 * Forum-parent probe (adapter.py:_is_forum_parent :7892 — vendor channel
+	 * type 15). The verdict caches per chat (forums don't stop being forums);
+	 * probe FAILURES are not cached — the next send retries the lookup.
+	 */
+	private async isForumParent(chatId: string): Promise<boolean> {
+		const cached = this.forumLaneCache.get(chatId);
+		if (cached !== undefined) return cached;
+		if (this.rest.resolveChannelType === undefined) return false;
+		let type: number | null;
+		try {
+			type = await this.rest.resolveChannelType(chatId);
+		} catch {
+			return false; // transient lookup failure never reroutes a send
+		}
+		const isForum = type === CHANNEL_TYPE_FORUM;
+		this.forumLaneCache.set(chatId, isForum);
+		return isForum;
+	}
+
+	/**
+	 * THE forum-post lane (_send_to_forum :3593 parity). The FIRST chunk of a
+	 * delivery CREATES the post: POST /channels/{forum}/threads with the derived
+	 * name + starter content; follow-up chunks (continuationOf set) send INTO
+	 * the newly created thread, addressed by thread id with no reply reference
+	 * (:3634-3640 thread_channel.send). A follow-up with no open post falls
+	 * back to creating one — plain sends would be rejected anyway.
+	 */
+	private async sendViaForumLane(
+		chatId: string,
+		content: string,
+		metadata: Metadata,
+		continuationOf: string | null,
+	): Promise<SendResult> {
+		const openThread =
+			continuationOf !== null ? this.forumOpenPosts.get(chatId) : undefined;
+		if (openThread !== undefined) {
+			return this.restSendPlain(openThread, content, metadata, null);
+		}
+		const createPost = this.rest.transmitForumThreadCreate;
+		if (createPost === undefined) {
+			// Fail honestly instead of a doomed plain send Discord rejects.
+			return {
+				success: false,
+				error:
+					"forum channel requires thread-create support (type 15 rejects plain sends)",
+			};
+		}
+		const name = deriveForumThreadName(content);
+		const gate = this.gateRoute("thread-create", chatId);
+		if (!gate.allowed) {
+			return {
+				success: false,
+				error: `rate limited (${gate.retryAfterSeconds.toFixed(2)}s)`,
+				retryable: true,
+				retryAfter: gate.retryAfterSeconds,
+			};
+		}
+		const created = await createPost.call(this.rest, chatId, name, content, {
+			allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
+			link_preview_suppressed: true,
+			...metadata,
+			forum_post: true,
+			thread_name: name,
+		});
+		if (created.success) {
+			const threadId = created.threadId ?? created.messageId ?? null;
+			if (threadId !== null) this.forumOpenPosts.set(chatId, threadId);
+		}
+		return created;
+	}
+
+	/**
+	 * THE plain-channel text lane. Builds vendor body keys from gateway stamps:
+	 * reply_to_message_id → message_reference {message_id,
+	 * fail_if_not_exists:false} (_reply_reference_for_send parity :3394-3407);
+	 * continuation chunks pass an explicit reference that wins over the reply
+	 * stamp (_edit_overflow_split parity :3910-3912). Ping safety rides EVERY
+	 * send as vendor-shaped DATA (:519-552); link previews are NOT suppressed —
+	 * Hermes never sets suppress_embeds on any text path.
+	 */
+	private async restSendPlain(
+		chatId: string,
+		content: string,
+		metadata: Metadata,
+		continuationOf: string | null,
+	): Promise<SendResult> {
 		const gate = this.gateRoute("send", chatId);
 		if (!gate.allowed) {
 			return {
@@ -1312,14 +1580,21 @@ export class DiscordAdapter
 				retryAfter: gate.retryAfterSeconds,
 			};
 		}
-		// Ping safety rides EVERY text send as DATA (:519-552); link-preview
-		// suppression is a TEXT-SEND-only flag (DEC-034(iii)).
 		const md: Metadata = {
 			allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
-			suppress_embeds: MESSAGE_FLAG_SUPPRESS_EMBEDS,
 			link_preview_suppressed: true,
 			...metadata,
 		};
+		const replyTo = md["reply_to_message_id"];
+		const referenceId =
+			continuationOf ?? (typeof replyTo === "string" ? replyTo : undefined);
+		if (referenceId !== undefined && referenceId !== "") {
+			md["message_reference"] = {
+				message_id: referenceId,
+				fail_if_not_exists: false,
+			};
+		}
+		delete md["reply_to_message_id"]; // converted to message_reference
 		return this.rest.transmitSend(chatId, content, md);
 	}
 
@@ -1339,12 +1614,17 @@ export class DiscordAdapter
 			};
 		}
 		// The REST edit lane CONVERTS the scoped delta (tables → fenced);
-		// emphasis/link bytes stay Discord-native (see module header note).
+		// emphasis/link bytes stay Discord-native. discord.py Message.edit fills
+		// the CLIENT-WIDE safe allowed_mentions default into every PATCH —
+		// streamed/edited LLM output can NEVER ping everyone/roles (:3798).
 		return this.rest.transmitEdit(
 			chatId,
 			messageId,
 			convertGfmToDiscordMarkdown(content),
-			metadata,
+			{
+				allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
+				...metadata,
+			},
 		);
 	}
 
@@ -1364,10 +1644,20 @@ export class DiscordAdapter
 		const policy = this.chatLengthPolicyForChat(chatId);
 		const plan = chunkWithFenceCarry(content, policy);
 		const results: SendResult[] = [];
-		for (const chunk of plan.chunks) {
+		let continuationOf: string | null = null;
+		for (let i = 0; i < plan.chunks.length; i++) {
+			const chunk = plan.chunks[i] as string;
 			this.ladderChatId = chatId;
-			results.push(await this.deliverWiredChunk(chatId, chunk, metadata));
+			// Split continuations thread as REPLIES to the prior chunk so
+			// Discord groups long answers (_edit_overflow_split :3910-3912).
+			this.ladderContinuationOf = i === 0 ? null : continuationOf;
+			const sent = await this.deliverWiredChunk(chatId, chunk, metadata);
+			results.push(sent);
+			if (sent.success && typeof sent.messageId === "string") {
+				continuationOf = sent.messageId;
+			}
 		}
+		this.ladderContinuationOf = null;
 		return results;
 	}
 
@@ -1416,13 +1706,19 @@ export class DiscordAdapter
 			const transports: FormattingTransport = {
 				tryRich: (content, metadata) => this.wireRich(content, metadata),
 				sendConverted: (content, metadata) =>
-					this.restSendDiscord(
+					this.restSendDiscordWithReference(
 						this.ladderChatId,
 						convertGfmToDiscordMarkdown(content),
 						metadata,
+						this.ladderContinuationOf,
 					),
 				sendPlain: (content, metadata) =>
-					this.restSendDiscord(this.ladderChatId, content, metadata),
+					this.restSendDiscordWithReference(
+						this.ladderChatId,
+						content,
+						metadata,
+						this.ladderContinuationOf,
+					),
 			};
 			this.formatLadder = new FormattingLadder(transports, {
 				log: (m, meta) => this.logger?.warn?.(m, meta),
@@ -1492,12 +1788,18 @@ export class DiscordAdapter
 				};
 			}
 			// START frame carries the FULL RAW accumulator (family wire shape).
+			// Every streaming-edit PATCH carries the client-wide safe
+			// allowed_mentions default (discord.py Message.edit parity :3798).
 			const started = await this.rest.transmitDraft(
 				args.chatId,
 				args.draftId,
 				args.content,
 				false,
-				{ ...(args.metadata ?? {}), stream_op: "start" },
+				{
+					allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
+					...(args.metadata ?? {}),
+					stream_op: "start",
+				},
 			);
 			if (!started.success) {
 				this.nativeStreamLatch.maybeLatch(started.error ?? "");
@@ -1531,7 +1833,11 @@ export class DiscordAdapter
 			args.draftId,
 			delta,
 			false,
-			{ ...(args.metadata ?? {}), stream_op: "append" },
+			{
+				allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
+				...(args.metadata ?? {}),
+				stream_op: "append",
+			},
 		);
 		if (!appended.success) {
 			this.nativeStreamLatch.maybeLatch(appended.error ?? "");
@@ -1582,24 +1888,39 @@ export class DiscordAdapter
 			draftId,
 			sealContent.length > 0 ? sealContent : finalText,
 			true,
-			{ ...metadata, stream_op: "seal" },
+			{
+				allowed_mentions: { ...ALLOWED_MENTIONS_DEFAULTS },
+				...metadata,
+				stream_op: "seal",
+			},
 		);
 		if (!sealed.success) {
 			this.nativeStreamLatch.maybeLatch(sealed.error ?? "");
 			return sealed;
 		}
 		// Overflow tail: when the FULL final exceeds the per-chat budget the
-		// sealed head cannot hold it — split-and-deliver the remaining chunks.
+		// sealed head cannot hold it — split-and-deliver the remaining chunks,
+		// each REPLYING to its predecessor so Discord groups the answer
+		// (_edit_overflow_split :3910-3912).
 		if (decision.kind !== "append") {
 			const plan = chunkWithFenceCarry(
 				finalText,
 				this.chatLengthPolicyForChat(chatId),
 			);
+			let continuationOf: string | null = sealed.messageId ?? messageId;
 			for (let i = 1; i < plan.chunks.length && i < MAX_SPLIT_MESSAGES; i++) {
-				await this.restSendDiscord(chatId, plan.chunks[i] ?? "", {
-					...metadata,
-					split_part: `${i + 1}/${plan.chunks.length}`,
-				});
+				const sent = await this.restSendDiscordWithReference(
+					chatId,
+					plan.chunks[i] ?? "",
+					{
+						...metadata,
+						split_part: `${i + 1}/${plan.chunks.length}`,
+					},
+					continuationOf,
+				);
+				if (sent.success && typeof sent.messageId === "string") {
+					continuationOf = sent.messageId;
+				}
 			}
 		}
 		return { success: true, messageId: sealed.messageId ?? messageId };
@@ -1762,6 +2083,18 @@ export function deriveThreadName(content: string): string {
 	if (stripped.length === 0) return THREAD_NAME_FALLBACK;
 	if (utf16Len(stripped) <= THREAD_NAME_MAX_UTF16_UNITS) return stripped;
 	return `${stripped.slice(0, THREAD_NAME_MAX_UTF16_UNITS - 3)}...`;
+}
+
+/**
+ * Forum-post name derivation (`_derive_forum_thread_name` :9879-9888): FIRST
+ * line of the message, leading markdown heading prefixes stripped, capped at
+ * 100 chars, "New Post" when empty.
+ */
+export function deriveForumThreadName(content: string): string {
+	const firstLine = (content.trim().split("\n", 1)[0] ?? "").trim();
+	const stripped = firstLine.replace(/^#+/, "").trim();
+	if (stripped.length === 0) return FORUM_THREAD_NAME_FALLBACK;
+	return stripped.slice(0, FORUM_THREAD_NAME_MAX_CHARS);
 }
 
 /** Streaming-edit transmission cap (truncate IN PLACE, :3833-3845 parity). */

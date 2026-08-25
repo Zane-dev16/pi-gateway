@@ -185,8 +185,17 @@ function makeSlackSpecificRows(): ConformanceRow[] {
 				});
 				await eventually(() => subject.wire.editsOf("C-rt").length === 1);
 				const edit = subject.wire.editsOf("C-rt")[0];
-				if (edit?.metadata["buttons_removed"] !== true)
+				// chat.update REPLACES the layout — section(original) + context(
+				// decision) is HOW consumed buttons disappear (no invented flag).
+				const blocks = edit?.metadata["blocks"] as
+					| Array<{ type: string }>
+					| undefined;
+				if (!Array.isArray(blocks))
+					throw new Error("resolve edit shipped WITHOUT replacement blocks");
+				if (blocks.some((b) => b.type === "actions"))
 					throw new Error("consumed buttons NOT stripped from host message");
+				if (!blocks.some((b) => b.type === "context"))
+					throw new Error("decision context block missing");
 				// Double-tap: answered, never re-resolved.
 				world.pushInteractive({
 					type: "block_actions",
@@ -230,6 +239,7 @@ function makeSlackSpecificRows(): ConformanceRow[] {
 					chatId: "C-n",
 					draftId: 1,
 					content: raw,
+					metadata: { thread_id: "1700000000.000001" } as never,
 				});
 				const draft = world.wire.draftsOf("C-n")[0];
 				if (draft?.content !== raw)
@@ -264,6 +274,7 @@ function makeSlackSpecificRows(): ConformanceRow[] {
 					chatId: "C-other",
 					draftId: 1,
 					content: "stream",
+					metadata: { thread_id: "1700000000.000009" } as never,
 				});
 				if (!draft.success)
 					throw new Error("classes must budget independently");
@@ -319,8 +330,14 @@ function makeSlackSpecificRows(): ConformanceRow[] {
 				await eventually(() => subject.wire.editsOf("C-e2e").length === 1);
 				if (!engine.resolvedFamilies.includes("ea"))
 					throw new Error("approval resolver never fired");
+				const resolvedBlocks = (
+					subject.wire.editsOf("C-e2e")[0]?.metadata as {
+						blocks?: Array<{ type: string }>;
+					}
+				)?.blocks;
 				if (
-					subject.wire.editsOf("C-e2e")[0]?.metadata["buttons_removed"] !== true
+					!Array.isArray(resolvedBlocks) ||
+					resolvedBlocks.some((b) => b.type === "actions")
 				)
 					throw new Error("buttons not stripped after resolution");
 			},

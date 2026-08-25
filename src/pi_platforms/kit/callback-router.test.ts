@@ -25,6 +25,7 @@ import {
 	ClarifyPendingStore,
 	CallbackQueryRouter,
 	OneShotPendingStore,
+	PENDING_STATE_CACHE_SIZE,
 	type CallbackTapContext,
 } from "./callback-router.js";
 
@@ -447,5 +448,48 @@ describe("stale/expired taps always answered, NEVER dispatched as turns", () => 
 			expect(typeof answer.answerText).toBe("string");
 			expect(answer.answerText.length).toBeGreaterThanOrEqual(1);
 		}
+	});
+});
+
+describe("pending stores are FIFO-bounded at PENDING_STATE_CACHE_SIZE (_bounded_put parity)", () => {
+	it("OneShotPendingStore evicts the OLDEST registration past the bound", () => {
+		const store = new OneShotPendingStore(3);
+		store.register("p1", "sk-1");
+		store.register("p2", "sk-2");
+		store.register("p3", "sk-3");
+		expect(store.has("p1")).toBe(true);
+		store.register("p4", "sk-4"); // p1 evicted (oldest)
+		expect(store.has("p1")).toBe(false);
+		expect(store.has("p2")).toBe(true);
+		store.pop("p4", 0);
+		expect(store.has("p4")).toBe(false); // pop consumed it
+	});
+
+	it("default cap is 1000 (INTERACTIVE_STATE_CACHE_SIZE parity)", () => {
+		const store = new OneShotPendingStore();
+		for (let i = 0; i < PENDING_STATE_CACHE_SIZE + 25; i++) {
+			store.register(i, `sk-${i}`);
+		}
+		expect(store.has(0)).toBe(false); // oldest gone
+		expect(store.has(PENDING_STATE_CACHE_SIZE - 1)).toBe(true);
+		expect(store.has(PENDING_STATE_CACHE_SIZE)).toBe(true);
+	});
+
+	it("ClarifyPendingStore evicts oldest past the bound AND cleans awaitingText", () => {
+		const store = new ClarifyPendingStore(2);
+		store.register("c1", "sk-c1");
+		store.markAwaitingText("c1", 0); // finite clock vs default Infinity TTL
+		expect(store.isAwaitingText("c1")).toBe(true);
+		store.register("c2", "sk-c2");
+		store.register("c3", "sk-c3"); // c1 evicted
+		expect(store.get("c1")).toBeNull();
+		expect(store.isAwaitingText("c1")).toBe(false); // cleaned with the entry
+		expect(store.get("c2")).toBe("sk-c2");
+		expect(store.get("c3")).toBe("sk-c3");
+
+		// Re-registering an EVICTED id arms it fresh (map delete+set order).
+		store.register("c4", "sk-c4"); // c2 evicted now
+		expect(store.get("c2")).toBeNull();
+		expect(store.get("c4")).toBe("sk-c4");
 	});
 });

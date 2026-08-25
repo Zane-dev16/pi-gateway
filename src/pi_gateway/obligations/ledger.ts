@@ -31,13 +31,15 @@
 // drive/settle helpers swallow and report; only protocol violations (illegal
 // transitions, unknown ids) throw typed errors for callers to observe.
 //
-// Divergences from Hermes (each needs a DEC entry — see PROGRESS report):
+// Divergences from Hermes (each ratified by a DEC entry — see 09-open-questions.md):
 //   1. State mutations are CAS-guarded to the legal-transition set and throw
 //      IllegalTransitionError instead of silently overwriting (Hermes relied
 //      on call-site discipline with unconditional UPDATEs).
+//      DIVERGENCE RATIFIED AS DEC-054 — behavior-equivalent on legal paths.
 //   2. In-process retry scheduling with exponential backoff exists here
 //      (Hermes retries ONLY at restart boundaries). Constants proposed in
 //      scheduler.ts; caps/stale rules stay Hermes-exact.
+//      DIVERGENCE RATIFIED AS DEC-053.
 
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -80,11 +82,10 @@ export const OBLIGATION_STATES: readonly ObligationState[] = [
 
 /**
  * Backoff before the next redelivery given completed redeliveries so far.
- * PROPOSED DEC (no Hermes analogue — Hermes retries only at restart
- * boundaries): 60s base, ×4 growth, 1h cap. With MAX_ATTEMPTS=3 the worst
- * case spread is 60s + 240s + 960s ≈ 21min, comfortably inside the 24h
- * stale window. The behavior contract is: monotone growth, capped, never
- * busy.
+ * DEC-053 (no Hermes analogue — Hermes retries only at restart boundaries):
+ * 60s base, ×4 growth, 1h cap. With MAX_ATTEMPTS=3 the worst case spread is
+ * 60s + 240s + 960s ≈ 21min, comfortably inside the 24h stale window. The
+ * behavior contract is: monotone growth, capped, never busy.
  */
 export const RETRY_BASE_SECONDS = 60;
 export const RETRY_GROWTH_FACTOR = 4;
@@ -102,7 +103,8 @@ export function nextRetryDelaySeconds(attempts: number): number {
 /**
  * Legal transition sources per target state. `abandoned` is written directly
  * by the claim/prune paths (cap + stale), never via this map; terminal states
- * have no outgoing edges. Port note: divergence (1) in the header.
+ * have no outgoing edges. Port note: divergence (1) in the header, ratified
+ * as DEC-054 (behavior-equivalent on legal paths).
  */
 const LEGAL_SOURCES: Record<
 	"attempting" | "delivered" | "failed",

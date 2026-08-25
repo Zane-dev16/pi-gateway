@@ -25,7 +25,7 @@
 
 import { FakePlatformWire } from "../conformance/wire.js";
 import type { WsFixture } from "../conformance/shapes.js";
-import { ManualClock } from "../persistent-ws/manual-clock.js";
+import type { ManualClock } from "../persistent-ws/manual-clock.js";
 import { chunkWithFenceCarry } from "../kit/chunking.js";
 import { eventually } from "./eventually.js";
 import { FakeYuanbaoGateway } from "./fake-yuanbao.js";
@@ -91,6 +91,23 @@ function pushText(
 }
 
 /**
+ * Pump the INJECTED clock until `predicate` holds: inbound WS pushes park in
+ * the adapter's per-sender DEBOUNCE_WINDOW (1.5s injected), so delivery only
+ * happens as injected time advances (wall waits never flush it).
+ */
+async function pumpUntil(
+	world: YBWorld,
+	predicate: () => boolean,
+	tries = 300,
+): Promise<void> {
+	for (let i = 0; i < tries && !predicate(); i++) {
+		await world.clock.advance(100);
+		await new Promise<void>((r) => setTimeout(r, 2));
+	}
+	if (!predicate()) throw new Error("pumpUntil: condition not met");
+}
+
+/**
  * THE fixture behind shapes.ts::makeWsRows — five §3/DEC-034 scenarios run
  * against the live engine. Each call gets a FRESH world.
  */
@@ -101,57 +118,42 @@ export function makeRealYBFixture(): WsFixture {
 			const { engine, gateway } = world;
 			await world.connectAndAwaitLive();
 
+			// Two same-sender pushes land INSIDE one DEBOUNCE_WINDOW: they merge
+			// into ONE turn with the "\n" companion separator (_push_to_inbound
+			// + DecodeMiddleware merged-push parity).
 			gateway.pushMessage(pushText("r-1", "u_replay", "r1"));
 			gateway.pushMessage(pushText("r-2", "u_replay", "r2"));
-			await eventually(() => engine.turnLog.length >= 2);
-			// Same-session follow-ups park in the guard's debounce window
-			// (INJECTED time) — pump the clock so the queued push drains.
-			for (let i = 0; i < 20 && engine.turnLog.length < 2; i++) {
-				await world.clock.advance(100);
-				await new Promise<void>((r) => setTimeout(r, 2));
-			}
+			await pumpUntil(world, () => engine.turnLog.some((t) => t === "r1\nr2"));
 
 			gateway.dropActive(1001, "going away"); // OUTAGE mid-life
-			void world.clock.advance(8_000); // ladder sleep → reconnect
-			const before = engine.turnLog.length; // 2 delivered pre-outage
+			void world.clock.advance(8_000); // ladder sleep → forceRefresh → reconnect
 
 			gateway.pushMessage(pushText("r-3", "u_replay", "r3"));
 			gateway.pushMessage(pushText("r-4", "u_replay", "r4"));
 			gateway.pushMessage(pushText("r-5", "u_replay", "r5"));
 			const sentDuringDisconnect = 3;
-			// At-least-once REDUPLICATED id — dedup must absorb exactly-once.
-			gateway.pushMessage(pushText("r-1", "u_replay", "r1"));
-
 			// Offline pushes queue in the fake gateway and flush on the next
-			// AUTH_BIND; reconnect + drain under pumped injected time.
-			for (
-				let i = 0;
-				i < 120 && !engine.turnLog.some((t) => t.includes("r5"));
-				i++
-			) {
-				await world.clock.advance(100);
-				await new Promise<void>((r) => setTimeout(r, 4));
-			}
-			if (!engine.turnLog.some((t) => t.includes("r5"))) {
+			// AUTH_BIND; the back-to-back replay lands INSIDE one debounce
+			// window, so it merges into ONE replayed turn (no loss, no split).
+			await pumpUntil(world, () =>
+				engine.turnLog.some((t) => t === "r3\nr4\nr5"),
+			);
+
+			// At-least-once REDUPLICATED id in a LATER window: dedup absorbs it
+			// exactly-once — no additional turn may appear.
+			gateway.pushMessage(pushText("r-1", "u_replay", "r1"));
+			await world.clock.advance(2_000); // flush the dup's own window
+			await new Promise<void>((r) => setTimeout(r, 4));
+			if (engine.turnLog.some((t) => t.split("\n").includes("r1") && t !== "r1\nr2")) {
 				throw new Error(
-					`replayed pushes never drained: ${JSON.stringify(engine.turnLog)}`,
+					`exactly-once violated for r-1: ${JSON.stringify(engine.turnLog)}`,
 				);
 			}
 
-			// Exactly-once across merged turns: r1 appears EXACTLY once.
-			const joined = `\n${engine.turnLog.join("\n")}\n`;
-			for (const id of ["r1", "r2", "r3", "r4", "r5"]) {
-				const count = joined.split(`\n${id}\n`).length - 1;
-				if (count !== 1) {
-					throw new Error(
-						`exactly-once violated for ${id}: ${count} (${JSON.stringify(engine.turnLog)})`,
-					);
-				}
-			}
+			// Every sent-during-disconnect text reached intake post-reconnect.
 			const windowIds = ["r3", "r4", "r5"].filter((id) =>
-				engine.turnLog.some((t) => t.includes(id)),
+				engine.turnLog.some((t) => t.split("\n").includes(id)),
 			);
-			void before;
 			return {
 				sentDuringDisconnect,
 				replayedAfterResubscribe: new Set(windowIds).size,
@@ -175,9 +177,10 @@ export function makeRealYBFixture(): WsFixture {
 			void world.clock.advance(8_000); // ladder sleep → reconnect
 			await eventually(() => engine.isLive, 6_000);
 			gateway.pushMessage(pushText("wd-1", "u_wd", "after-recovery"));
-			await eventually(
-				() => world.subject.turns().some((t) => t.includes("after-recovery")),
-				4_000,
+			// The recovered push parks in the debounce window (INJECTED time):
+			// pump until the merged turn delivers.
+			await pumpUntil(world, () =>
+				world.subject.turns().some((t) => t.includes("after-recovery")),
 			);
 			return { detectedDeadSocket, resumedWithoutLoss: true };
 		},

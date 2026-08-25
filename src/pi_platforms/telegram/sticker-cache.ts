@@ -12,8 +12,9 @@
 // Census-port deltas (both documented in manifest.ts):
 //   - the cache FILE lives under an injected mkdtemp directory (mkdtemp
 //     isolation rule) instead of ~/.hermes;
-//   - reads honor a TTL measured on the INJECTED clock (Hermes never expires;
-//     proposed DEC-043 — Infinity restores exact parity).
+//   - reads honor an OPTIONAL TTL measured on the INJECTED clock — Infinity
+//     (the default) restores EXACT Hermes semantics where get_cached_description
+//     never expires entries; finite ttlMs exists for test mechanics only.
 
 import { mkdtempSync } from "node:fs";
 import { readFile, rename, writeFile } from "node:fs/promises";

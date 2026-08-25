@@ -14,17 +14,17 @@
 //   wss handshake completes           client socket OPEN
 //   `hello` event on connect          frame {type:"hello"}
 //   app-level subscription            client sends {type:"subscribe",cursor}
-//                                     (engine parity; the cursor IS the ack
-//                                     point — see below)
+//                                     (engine parity; the cursor IS the durable
+//                                     ack/replay point — see below)
 //   session live                      reply {type:"subscribed",resumeFrom}
 //   events_api envelope               frame {type:"event", event:{
 //     envelope_id, retry_attempt,       …platform fields…, envelopeId,
 //     retry_reason, payload.event}      retryAttempt, retryReason?, ts,
 //                                       threadTs?, subtype?, botId?, teamId?}
-//   envelope ack after processing     the RESUME CURSOR advancing past the
-//                                     event id (engine "ack-after-process"
-//                                     bookkeeping; EventDeduplicator TTL must
-//                                     outlast the redelivery gap — #4777)
+//   envelope ack (EVERY envelope,     client sends {type:"ack",envelope_id}
+//     within 3s, on receipt)            recorded in getFramesReceived() —
+//                                       adapter.py parity: slack_bolt acks each
+//                                       envelope independent of processing
 //   reconnect redelivery              resubscribe replays everything AFTER
 //                                     the cursor PLUS flagged un-acked ids;
 //                                     replayed envelopes carry
@@ -61,6 +61,19 @@ export const WS_CONNECTING = 0 as const;
 export const WS_OPEN = 1 as const;
 export const WS_CLOSED = 3 as const;
 
+/** Nested edited-message ref inside a message_changed envelope (:5773). */
+export interface SlackChangedMessageRef {
+	/** The ORIGINAL message's ts (the edit target). */
+	ts: string;
+	user?: string | undefined;
+	/** The NEW text after the edit. */
+	text?: string | undefined;
+	threadTs?: string | undefined;
+	botId?: string | undefined;
+	/** Slack stamps edits with {edited:{user,ts}} — ts feeds dedup ladder. */
+	edited?: { user?: string | undefined; ts?: string | undefined } | undefined;
+}
+
 /** Slack message-event fields riding ON the platform event (shape delta). */
 export interface SlackEventFields {
 	envelopeId: string;
@@ -72,6 +85,10 @@ export interface SlackEventFields {
 	subtype?: string | undefined;
 	botId?: string | undefined;
 	teamId?: string | undefined;
+	/** Outer events_api `event_ts` (dedup-ladder head for edits). */
+	eventTs?: string | undefined;
+	/** message_changed payload — the nested EDITED message (:5773). */
+	message?: SlackChangedMessageRef | undefined;
 }
 
 /** A delivered/replayed event = platform event + socket-mode envelope. */
@@ -179,6 +196,58 @@ export class SlackSocketModeServer implements WsConnectionFactory {
 	}
 
 	/**
+	 * Push a message_changed envelope (adapter.py:_handle_slack_message :5773
+	 * shape): subtype=message_changed, outer ts/event_ts, nested `message`
+	 * carrying the ORIGINAL ts plus the NEW text under `edited`. Rides the
+	 * standard buffer/replay machinery (ids eN; acks/replay identical).
+	 */
+	pushMessageChanged(
+		evt: {
+			channel: string;
+			/** Edited message author (nested message.user). */
+			user?: string | undefined;
+			/** The NEW text after the edit. */
+			text: string;
+			/** The ORIGINAL message's ts — the edit target. */
+			originalTs: string;
+			/** edited.ts stamp on the nested message. */
+			editedTs?: string | undefined;
+			/** Outer event_ts — dedup-ladder head when present. */
+			eventTs?: string | undefined;
+			thread_ts?: string | undefined;
+		},
+		opts: SlackPushOptions = {},
+	): SlackEnvelopeEvent {
+		return this.enqueue({
+			type: "message",
+			chatId: evt.channel,
+			userId: evt.user ?? "",
+			// The OUTER envelope carries no text of its own — the payload lives
+			// in the nested message ref (adapter normalizes :5803-5812).
+			text: "",
+			ts:
+				evt.eventTs ??
+				`${1_700_000_000}.${String(this.seqCounter).padStart(6, "0")}`,
+			eventTs: evt.eventTs,
+			threadTs: evt.thread_ts,
+			subtype: "message_changed",
+			botId: opts.botId,
+			teamId: opts.teamId ?? "W0",
+			message: {
+				ts: evt.originalTs,
+				...(evt.user !== undefined ? { user: evt.user } : {}),
+				text: evt.text,
+				...(evt.thread_ts !== undefined ? { threadTs: evt.thread_ts } : {}),
+				...(opts.botId !== undefined ? { botId: opts.botId } : {}),
+				edited: {
+					...(evt.user !== undefined ? { user: evt.user } : {}),
+					...(evt.editedTs !== undefined ? { ts: evt.editedTs } : {}),
+				},
+			},
+		});
+	}
+
+	/**
 	 * Flag an already-buffered id for REDelivery on the next subscribe EVEN IF
 	 * at/below the resume cursor (#4777: Slack replays un-acked events whose
 	 * original delivery raced a disconnect). Redelivered envelopes carry an
@@ -235,6 +304,8 @@ export class SlackSocketModeServer implements WsConnectionFactory {
 		subtype?: string | undefined;
 		botId?: string | undefined;
 		teamId?: string | undefined;
+		eventTs?: string | undefined;
+		message?: SlackChangedMessageRef | undefined;
 	}): SlackEnvelopeEvent {
 		this.seqCounter += 1;
 		const evt: SlackEnvelopeEvent = {

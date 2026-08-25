@@ -24,7 +24,9 @@
 //   edit_message (@2297): messages.patch, content capped at 4000 + ellipsis
 //   _resolve_thread_id (@2482) priority ladder incl. job_id new-thread rule
 //   _create_message (@2584): messageReplyOption=
-//     REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD whenever thread.name is present
+//     REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD whenever thread.name is present —
+//     a messages.create QUERY kwarg, never a body field (Message resource
+//     rejects unknown body fields)
 
 import type { CapabilityManifest } from "../kit/capabilities.js";
 import type { PluginManifest } from "../kit/registration.js";

@@ -128,6 +128,37 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 			},
 		),
 		mk(
+			"transport.msgraph.health-endpoint",
+			"msgraph: GET /health emits platform ENUM VALUE msgraph_webhook (config.py:348) + live counters; CIDR gate applies before any payload",
+			async (fx) => {
+				const health = fx.getHealth();
+				expect(health.status).toBe(200);
+				expect(health.contentType).toBe("application/json");
+				const payload = JSON.parse(health.text) as Record<string, unknown>;
+				// _handle_health:246 emits self.platform.value — the enum value,
+				// NOT the hyphenated plugin manifest name.
+				expect(payload["platform"]).toBe("msgraph_webhook");
+				expect(payload["status"]).toBe("ok");
+				expect(payload["webhook_path"]).toBe("/msgraph/webhook");
+				expect(payload["accepted"]).toBe(0);
+				expect(payload["duplicates"]).toBe(0);
+
+				// Counters are LIVE: one accepted notification moves the gauge.
+				await fx.postNotifications([
+					fx.changeNotification({ id: "h-1", resource: "r" }),
+				]);
+				await fx.adapter.drainDispatches();
+				const after = JSON.parse(fx.getHealth().text) as Record<
+					string,
+					unknown
+				>;
+				expect(after["accepted"]).toBe(1);
+
+				// Out-of-range peer is gated BEFORE any payload is built.
+				expect(fx.getHealth("203.0.113.7").status).toBe(403);
+			},
+		),
+		mk(
 			"transport.msgraph.cidr-admission-matrix",
 			"msgraph: non-loopback bind without CIDRs refuses connect; out-of-range peer 403 BEFORE body parse; in-range admits; forwarded headers never consulted",
 			async (fx) => {
@@ -157,12 +188,16 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 				expect(fx.adapter.counters.cidrDenied).toBe(1);
 				expect(fx.adapter.counters.parseInvocations).toBe(before);
 
-				// In-range peer admits (202 with accepted content).
+				// In-range peer admits (202).
 				const admitted = await fx.postNotifications(
 					[fx.changeNotification({ id: "n-admit", resource: "foo" })],
 					{ peer: "20.190.160.7" },
 				);
 				expect(admitted.status).toBe(202);
+				// webhook-42: byte-level ack — web.Response(status=202) carries NO
+				// body and NO content-type.
+				expect(admitted.contentType).toBeUndefined();
+				expect(admitted.text).toBe("");
 
 				// Unparseable peers FAIL CLOSED.
 				const junkPeer = await fx.postRaw({
@@ -243,6 +278,9 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 					]);
 				await replay();
 				await replay(); // Graph redelivery
+				// webhook-43: dispatch is DETACHED from the 202 — drain the
+				// quiescence seam before reading downstream turn state.
+				await fx.adapter.drainDispatches();
 				expect(fx.adapter.turnLog.length).toBe(1); // exactly-once downstream
 				expect(fx.adapter.counters.duplicates).toBe(1);
 				expect(fx.adapter.counters.accepted).toBe(1);
@@ -277,9 +315,17 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 					]);
 				await idless();
 				await idless();
+				await fx.adapter.drainDispatches();
 				expect(fx.adapter.counters.duplicates).toBe(1); // only the N1 replay
 				const eventIds = fx.adapter.dispatchedEvents.map((e) => e.messageId);
 				expect(eventIds[eventIds.length - 2]?.startsWith("sha1:")).toBe(true);
+				// BYTE-PARITY with the Python baseline fallback
+				// (_build_message_event:390 sha1(json.dumps(notification,
+				// sort_keys=True))) over {changeType, clientState, resource,
+				// subscriptionId} — golden computed with python3 hashlib.
+				expect(eventIds[eventIds.length - 2]).toBe(
+					"sha1:8a4fdf8278f16f1cad0d9a3f4c060c93be8ff5b4",
+				);
 				expect(eventIds[eventIds.length - 2]).toBe(
 					eventIds[eventIds.length - 1],
 				);
@@ -434,6 +480,7 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 					fx.changeNotification({ id: "late-1", resource: "r" }),
 				]);
 				expect(afterJump.status).toBe(202);
+				await fx.adapter.drainDispatches();
 				expect(fx.adapter.dispatchedEvents.length).toBeGreaterThanOrEqual(1);
 
 				// Lifecycle events ride the SAME passive path (no special casing):
@@ -472,6 +519,7 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 						resourceData: { "@odata.type": "#Microsoft.Graph.Message" },
 					}),
 				]);
+				await fx.adapter.drainDispatches();
 				const rendered = fx.adapter.dispatchedEvents[0]?.text ?? "";
 				expect(
 					rendered.startsWith("Microsoft Graph change notification:"),
@@ -487,6 +535,7 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 						value: [{ id: "big", blob, clientState: FIXTURE_CLIENT_STATE }],
 					}),
 				});
+				await huge.adapter.drainDispatches();
 				const bigText = huge.adapter.dispatchedEvents[0]?.text ?? "";
 				expect(bigText.length).toBeLessThanOrEqual(
 					bigText.indexOf("```json") + 4000 + 40,
@@ -509,9 +558,12 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 						resourceData: { z: 1, a: 2 },
 					}),
 				]);
+				await templated.adapter.drainDispatches();
 				const text = templated.adapter.dispatchedEvents[0]?.text ?? "";
 				expect(text).toContain("Change updated on me/events (sub sub-T)");
-				expect(text).toContain('{"a":2,"z":1}'); // stable sorted JSON
+				// json.dumps(sort_keys=True)[:2000] bytes: default ', '/': '
+				// separators (_render_template:432).
+				expect(text).toContain('{"a": 2, "z": 1}');
 				templated.dispose();
 
 				// Unknown template keys stay literal.
@@ -523,10 +575,42 @@ function msgraphDeltaRows(newFixture: () => MSGraphFixture): ConformanceRow[] {
 						value: [{ id: "pr-3", clientState: FIXTURE_CLIENT_STATE }],
 					}),
 				});
+				await literal.adapter.drainDispatches();
 				expect(literal.adapter.dispatchedEvents[0]?.text).toBe(
 					"keep {nope.missing} intact",
 				);
 				literal.dispose();
+
+				// Conforming template-edge matrix (_render_template:420 parity):
+				// missing FINAL segment keeps the literal {key} (dict.get
+				// sentinel — never "undefined"), explicit null renders
+				// str(None) ⇒ "None", mid-path null keeps the literal, and
+				// dict values render json.dumps(sort_keys=True) bytes
+				// (', '/': ' separators + \uXXXX ensure_ascii escaping).
+				const edges = makeMSGraphFixture({
+					config: {
+						prompt:
+							"{notification.absent}|{notification.nullish}|{notification.nullish.x}|{notification.blob}",
+					},
+				});
+				await edges.postRaw({
+					body: JSON.stringify({
+						value: [
+							{
+								id: "pr-4",
+								clientState: FIXTURE_CLIENT_STATE,
+								nullish: null,
+								blob: { z: 1, a: ["é", "😀"] },
+							},
+						],
+					}),
+				});
+				await edges.adapter.drainDispatches();
+				expect(edges.adapter.dispatchedEvents[0]?.text).toBe(
+					"{notification.absent}|None|{notification.nullish.x}|" +
+						'{"a": ["\\u00e9", "\\ud83d\\ude00"], "z": 1}',
+				);
+				edges.dispose();
 			},
 		),
 	];
@@ -598,10 +682,11 @@ describe("conformance suite — msgraph-webhook census port (shape: webhook)", (
 		}
 	});
 
-	it("passes ALL NINE msgraph shape-delta rows through the real engine fixture", async () => {
+	it("passes ALL TEN msgraph shape-delta rows through the real engine fixture", async () => {
 		const rows = msgraphDeltaRows(() => makeMSGraphFixture());
 		expect(rows.map((r) => r.id)).toEqual([
 			"transport.msgraph.validation-handshake",
+			"transport.msgraph.health-endpoint",
 			"transport.msgraph.cidr-admission-matrix",
 			"transport.msgraph.clientstate-negative-matrix",
 			"transport.msgraph.notification-dedup",

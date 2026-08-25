@@ -12,6 +12,8 @@
 //   gateway/run.py:_queue_depth                       → queueDepth
 //   gateway/run.py:_queue_or_replace_pending_event    → queueOrReplacePendingEvent (#28503)
 //   gateway/run.py:_dispatch_busy_slash_command       → dispatchBusySlashCommand
+//   gateway/run.py:_handle_message (HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS)
+//                                                     → Telegram TEXT follow-up grace ahead of the interrupt demotion
 
 import type { IncomingEvent, PendingSlotMap } from "./events.js";
 import {
@@ -29,6 +31,33 @@ import { mergePendingEvent } from "./events.js";
 
 /** run.py:_BUSY_QUEUE_MAX_PENDING. */
 export const BUSY_QUEUE_MAX_PENDING = 32;
+
+/**
+ * run.py env bridge: `float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS",
+ * "3.0"))` — the env name is ported VERBATIM per repo convention. Default
+ * 3.0s of TEXT follow-ups after RUN START queue/merge WITHOUT interrupting,
+ * even in interrupt mode.
+ */
+export const TELEGRAM_FOLLOWUP_GRACE_SECONDS_ENV =
+	"HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS";
+
+/** run.py default "3.0". */
+export const DEFAULT_FOLLOWUP_GRACE_SECONDS = 3.0;
+
+/**
+ * Env parsing for the grace value. Deviation note: Python float() would raise
+ * on garbage and take the whole busy path down with it; a messaging gate must
+ * not die on a bad env var, so unparseable values fail safe to the 3.0s
+ * default (same posture as HERMES_CRON_TIMEOUT handling).
+ */
+export function resolveFollowupGraceSeconds(
+	env: Record<string, string | undefined> = process.env,
+): number {
+	const raw = (env[TELEGRAM_FOLLOWUP_GRACE_SECONDS_ENV] ?? "").trim();
+	if (raw === "") return DEFAULT_FOLLOWUP_GRACE_SECONDS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : DEFAULT_FOLLOWUP_GRACE_SECONDS;
+}
 
 export type BusyInputMode = "queue" | "steer" | "interrupt";
 
@@ -77,6 +106,12 @@ export interface RunnerBusyOptions {
 	/** agent.steer() injection for mode==="steer"; return false ⇒ FIFO fallback. */
 	steer?: (text: string) => boolean;
 	maxPending?: number;
+	/** Explicit grace override; default resolves from the env bridge above. */
+	followupGraceSeconds?: number;
+	/** Env record for the grace env-var; defaults to process.env. */
+	env?: Record<string, string | undefined>;
+	/** Injected clock (ms) for the grace window — tests assert timing with it. */
+	now?: () => number;
 }
 
 /**
@@ -95,6 +130,10 @@ export class RunnerBusyGuard {
 	private readonly steerFn: ((text: string) => boolean) | null;
 	/** session_key → overflow tail (conversation.queued_events parity). */
 	private readonly overflow = new Map<string, IncomingEvent[]>();
+	/** session_key → wall-clock ms timestamp of the current turn's start. */
+	private readonly turnStartedAtMs = new Map<string, number>();
+	private readonly followupGraceSeconds: number;
+	private readonly nowFn: () => number;
 
 	constructor(options: RunnerBusyOptions) {
 		this.lookup = buildCommandLookup(options.registry);
@@ -104,6 +143,9 @@ export class RunnerBusyGuard {
 		this.plainHandlers = options.plainHandlers ?? {};
 		this.busyInputMode = options.busyInputMode ?? "interrupt";
 		this.steerFn = options.steer ?? null;
+		this.followupGraceSeconds =
+			options.followupGraceSeconds ?? resolveFollowupGraceSeconds(options.env);
+		this.nowFn = options.now ?? (() => Date.now());
 		this.maxPending =
 			options.maxPending !== undefined && options.maxPending > 0
 				? options.maxPending
@@ -190,6 +232,38 @@ export class RunnerBusyGuard {
 		this.slots.delete(sessionKey);
 	}
 
+	// -- turn-start tracking for the follow-up grace window -------------------
+
+	/**
+	 * The runner loop records run start here so the busy ladder can apply the
+	 * Telegram TEXT follow-up grace (run.py reads _peek_session_state(...).
+	 * turn.started_ts at the same decision point).
+	 */
+	markTurnStarted(sessionKey: string, startedAtMs?: number): void {
+		this.turnStartedAtMs.set(sessionKey, startedAtMs ?? this.nowFn());
+	}
+
+	/** Turn finished/cleaned up — the grace window closes. */
+	markTurnFinished(sessionKey: string): void {
+		this.turnStartedAtMs.delete(sessionKey);
+	}
+
+	/** Test/diagnostic probe. */
+	turnStartOf(sessionKey: string): number | undefined {
+		return this.turnStartedAtMs.get(sessionKey);
+	}
+
+	/** True when a Telegram TEXT arrival lands inside the post-start grace. */
+	withinFollowupGrace(sessionKey: string, event: IncomingEvent): boolean {
+		if (this.followupGraceSeconds <= 0) return false;
+		if (event.messageType !== "text") return false;
+		const platform = event.source?.platform;
+		if (platform !== "telegram") return false;
+		const startedAt = this.turnStartedAtMs.get(sessionKey);
+		if (startedAt === undefined) return false; // parity: falsy started_ts ⇒ skip
+		return this.nowFn() - startedAt <= this.followupGraceSeconds * 1000;
+	}
+
 	/**
 	 * run.py:_queue_or_replace_pending_event — queue-mode text follow-ups get
 	 * their OWN turn in arrival order (#28503 — no more silent overwrite).
@@ -228,11 +302,29 @@ export class RunnerBusyGuard {
 	 * Route a plain-text follow-up per busy_input_mode. Returns the disposition
 	 * taken. mode==="interrupt" demotes to queue here (subagent/compression
 	 * demotion lives in the runner loop, Phase 1 scope item 4's loop half).
+	 *
+	 * AHEAD of that ladder sits the Telegram TEXT follow-up grace
+	 * (run.py:_handle_message, HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS block):
+	 * arrivals within grace seconds of RUN START queue without interrupting —
+	 * even in interrupt mode, and even in steer mode (parity: the grace branch
+	 * enqueues in queue-mode and merges into the head slot otherwise, it never
+	 * steers). Grace dispositions report "queued".
 	 */
 	handlePlainTextFollowUp(
 		sessionKey: string,
 		event: IncomingEvent,
 	): "steered" | "queued" {
+		if (this.withinFollowupGrace(sessionKey, event)) {
+			// Parity of the grace branch's queue/merge split:
+			if (this.busyInputMode === "queue") {
+				this.enqueueFifo(sessionKey, event);
+			} else {
+				mergePendingEvent(this.slots, sessionKey, event, {
+					mergeText: true,
+				});
+			}
+			return "queued";
+		}
 		if (
 			this.busyInputMode === "steer" &&
 			event.text !== undefined &&

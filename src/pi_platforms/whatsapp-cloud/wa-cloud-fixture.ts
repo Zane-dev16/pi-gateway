@@ -10,7 +10,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { WaCloudAdapter } from "./wa-cloud-adapter.js";
+import {
+	WaCloudAdapter,
+	type WaCloudAdapterOptions,
+} from "./wa-cloud-adapter.js";
 import { FakeGraphServer } from "./graph-wire.js";
 import type { WaMediaKind } from "./manifest.js";
 
@@ -21,6 +24,10 @@ const FIXTURE_DISPLAY_PHONE = "15550001111";
 export interface WaCloudFixtureOptions {
 	outsideWindowPolicy?: "record" | "refuse" | undefined;
 	dedupCap?: number | undefined;
+	/** Skip the canned standard guard (tests attach their OWN capture guard). */
+	skipStandardGuard?: boolean | undefined;
+	/** Voice-lane transcoder seam passthrough (send_voice parity rows). */
+	transcodeMp3ToOpus?: WaCloudAdapterOptions["transcodeMp3ToOpus"] | undefined;
 }
 
 /**
@@ -61,6 +68,9 @@ export class WaCloudFixture {
 			...(opts.outsideWindowPolicy !== undefined
 				? { outsideWindowPolicy: opts.outsideWindowPolicy }
 				: {}),
+			...(opts.transcodeMp3ToOpus !== undefined
+				? { transcodeMp3ToOpus: opts.transcodeMp3ToOpus }
+				: {}),
 			secretReader: (name) =>
 				name === "WHATSAPP_CLOUD_PHONE_NUMBER_ID"
 					? "wa-phone-id"
@@ -72,7 +82,7 @@ export class WaCloudFixture {
 								? FIXTURE_VERIFY_TOKEN
 								: undefined,
 		});
-		this.adapter.attachStandardGuard();
+		if (opts.skipStandardGuard !== true) this.adapter.attachStandardGuard();
 	}
 
 	advance(ms: number): void {

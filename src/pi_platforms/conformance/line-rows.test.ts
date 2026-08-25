@@ -18,8 +18,18 @@
 //      fails its own named row.
 
 import { describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 
 import type { LineMessage } from "../line/line-webhook-adapter.js";
+import {
+	buildPostbackButtonMessage,
+	clampLoadingSeconds,
+	imageMessage,
+	audioMessage,
+	videoMessage,
+	isSystemBypass,
+} from "../line/line-webhook-adapter.js";
+import { lineBubbleText } from "../line/line-webhook-adapter.js";
 import { ManualScheduler } from "../../pi_gateway/guards/testing/manual-spawner.js";
 import { FakePlatformWire } from "./wire.js";
 import { buildSharedRows } from "./rows.js";
@@ -41,6 +51,9 @@ import {
 	LINE_BUTTON_ALT_TEXT_CAP,
 	LINE_BUTTON_TEXT_CAP,
 	LINE_DEDUP_MAX_ENTRIES,
+	LINE_MAX_MESSAGES_PER_CALL,
+	LINE_NATIVE_SPLIT_TRUNCATES,
+	LINE_SAFE_BUBBLE_CHARS,
 	LINE_WEBHOOK_BODY_CAP_BYTES,
 } from "../line/manifest.js";
 
@@ -66,6 +79,20 @@ const STREAMING_ROW_IDS: readonly string[] = [
 	"streaming.failed-seal-still-delivers",
 ];
 
+/**
+ * Kit LOSSLESS-split family — encodes the base fence-carry splitter (full
+ * output preserved as labeled pieces). Hermes' LineAdapter inherits
+ * splits_long_messages=True and chunks NATIVELY via split_for_line instead:
+ * ONE Reply/Push call of ≤5 ellipsis-capped bubbles (:1197/:1210) — full
+ * output is NOT preserved and per-chat budget pairs don't exist on this
+ * source. Excluded BY THE PROBE from manifest data
+ * (LINE_NATIVE_SPLIT_TRUNCATES), never by a hardcoded skip.
+ */
+const LOSSLESS_SPLIT_ROW_IDS: readonly string[] = [
+	"egress.chunk-flood",
+	"egress.per-chat-length-pair",
+];
+
 function computeApplicability(): {
 	streamsSupported: boolean;
 	excludedIds: string[];
@@ -74,7 +101,9 @@ function computeApplicability(): {
 	const streamsSupported =
 		probe.adapter.supportsDraftStreaming() === true &&
 		probe.adapter.supportsAsyncDelivery === true;
-	return { streamsSupported, excludedIds: [...STREAMING_ROW_IDS] };
+	const excludedIds = streamsSupported ? [] : [...STREAMING_ROW_IDS];
+	if (LINE_NATIVE_SPLIT_TRUNCATES) excludedIds.push(...LOSSLESS_SPLIT_ROW_IDS);
+	return { streamsSupported, excludedIds };
 }
 
 // ── LINE shape-delta rows (executed over the REAL engine fixture) ───────────
@@ -238,7 +267,8 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 			"transport.line.reply-push-single-use-ladder",
 			"line: reply token stashed at inbound is CONSUMED single-use; second send pushes; expired token (injected clock past 50s TTL) pushes directly; rejected reply falls back to push once",
 			async (fx) => {
-				// Inbound message stashes a fresh reply token.
+				// Inbound message stashes a fresh reply token; DM ingress ALSO fires
+				// the best-effort loading indicator (_handle_message_event parity).
 				await fx.postEvents([
 					fx.messageEvent({
 						webhookEventId: "evt-r1",
@@ -247,6 +277,12 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 					}),
 				]);
 				expect(fx.adapter.hasStashedReplyToken("U-user1")).toBe(true);
+				await new Promise<void>((r) => setTimeout(r, 10));
+				expect(fx.api.loadingCalls.length).toBeGreaterThanOrEqual(1);
+				const loading = fx.api.loadingCalls.at(-1);
+				expect(loading?.chatId).toBe("U-user1");
+				expect(loading?.seconds).toBe(clampLoadingSeconds(60));
+				expect(loading?.seconds).toBe(60);
 
 				// Send #1 rides the FREE reply endpoint.
 				let result = await fx.adapter.sendText("U-user1", "first answer");
@@ -329,7 +365,7 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 		mk(
 			"transport.line.three-allowlist-gate",
 			"line: user/group/room allowlists gate dispatch independently; denied sources still ACK 200 (silent drop); allow_all bypasses",
-			async (fx) => {
+			async () => {
 				const gated = makeLineFixture({
 					config: {
 						allow_all_users: false,
@@ -399,6 +435,20 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 				]);
 				expect(okRoom.status).toBe(200);
 				expect(gated.adapter.turnLog).toContain("right room");
+
+				// Self-echo filter (get_bot_user_id parity): connect() populates
+				// the bot userId best-effort via botInfo(); a source carrying THAT
+				// id never dispatches, allowlist notwithstanding.
+				await gated.adapter.connect({ isReconnect: false });
+				await gated.postEvents([
+					gated.messageEvent({
+						webhookEventId: "evt-self-echo",
+						text: "my own echo",
+						userId: gated.api.botId,
+					}),
+				]);
+				expect(gated.adapter.turnLog).not.toContain("my own echo");
+
 				gated.dispose();
 			},
 		),
@@ -406,7 +456,10 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 			"transport.line.postback-state-machine",
 			"line: slow-LLM postback flow — button burns the stashed token; send() routes into the PENDING cache (no wire call); a tap with a FRESH token delivers READY payload free and marks DELIVERED; second tap answers delivered-text; interrupt resolves ERROR",
 			async (fx) => {
-				// Inbound + threshold trigger arms the button (PENDING).
+				// Inbound + threshold trigger arms the button (PENDING). The wire
+				// object is a TEMPLATE bubble — {type:'template', altText, template:
+				// {type:'buttons', text, actions}} with NO top-level text (api.line.me
+				// rejects that shape) — and label/displayText cap independently.
 				await fx.postEvents([
 					fx.messageEvent({
 						webhookEventId: "evt-p1",
@@ -419,6 +472,29 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 				expect(fx.api.replyCount()).toBe(1);
 				const buttonMsg = fx.api.replyCalls[0]?.texts[0] ?? "";
 				expect(buttonMsg.length).toBeLessThanOrEqual(LINE_BUTTON_TEXT_CAP);
+
+				const rawButton = fx.api.replyCalls[0]?.messages[0] as ReturnType<
+					typeof buildPostbackButtonMessage
+				>;
+				expect(rawButton.type).toBe("template");
+				expect(
+					(rawButton as unknown as { text?: string }).text,
+				).toBeUndefined();
+				expect(rawButton.template.type).toBe("buttons");
+				expect(rawButton.template.text.length).toBeLessThanOrEqual(
+					LINE_BUTTON_TEXT_CAP,
+				);
+				const action = rawButton.template.actions[0]!;
+				expect(action.type).toBe("postback");
+				expect(action.label.length).toBeLessThanOrEqual(20);
+				expect(action.displayText.length).toBeLessThanOrEqual(300);
+
+				// Builder-level parity: label caps at 20 while displayText rides its
+				// own 300 slice (two INDEPENDENT source slices).
+				const longLabel = "L".repeat(350);
+				const shaped = buildPostbackButtonMessage("body", longLabel, "rid-x");
+				expect(shaped.template.actions[0]!.label).toHaveLength(20);
+				expect(shaped.template.actions[0]!.displayText).toHaveLength(300);
 
 				// Response while PENDING routes INTO the cache — zero API calls.
 				const routed = await fx.adapter.sendText(
@@ -499,24 +575,206 @@ function lineDeltaRows(newFixture: () => LineFixture): ConformanceRow[] {
 				expect(LINE_BUTTON_ALT_TEXT_CAP).toBe(400);
 			},
 		),
+		mk(
+			"transport.line.media-fetch-and-builders",
+			"line: injected fetchContent seam caches inbound image/audio/video/file binaries under the per-type extension map and surfaces media_urls; media builders emit vendor wire shapes; unbound seam degrades to placeholders",
+			async (fx) => {
+				// Seed a downloadable binary and deliver an IMAGE event.
+				fx.api.seedContent("msg-media-img", Buffer.from("png-bytes-9"));
+				await fx.postEvents([
+					fx.messageEvent({
+						webhookEventId: "evt-media-1",
+						text: undefined,
+						msgType: "image",
+						messageId: "msg-media-img",
+					}),
+				]);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.adapter.inboundMediaLog).toHaveLength(1);
+				const entry = fx.adapter.inboundMediaLog[0];
+				expect(entry?.chatId).toBe("U-user1");
+				expect(entry?.types).toEqual(["image/jpeg"]);
+				expect(entry?.urls[0]).toContain("msg-media-img.jpg");
+				expect(existsSync(entry?.urls[0] ?? "missing")).toBe(true);
+
+				// Unbound id (404 from the content edge) degrades to the
+				// placeholder exactly like the source's failed-download path.
+				await fx.postEvents([
+					fx.messageEvent({
+						webhookEventId: "evt-media-2",
+						msgType: "video",
+						messageId: "msg-missing",
+					}),
+				]);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.adapter.inboundMediaLog).toHaveLength(1); // unchanged
+				expect(fx.adapter.turnLog).toContain("[video]");
+
+				// Outbound media builders emit VENDOR shapes (_image_message/
+				// _audio_message/_video_message parity).
+				expect(imageMessage("https://cdn/x.jpg")).toEqual({
+					type: "image",
+					originalContentUrl: "https://cdn/x.jpg",
+					previewImageUrl: "https://cdn/x.jpg",
+				});
+				expect(audioMessage("https://cdn/a.m4a", 2500)).toEqual({
+					type: "audio",
+					originalContentUrl: "https://cdn/a.m4a",
+					duration: 2500,
+				});
+				expect(videoMessage("https://cdn/v.mp4", "https://cdn/p.jpg")).toEqual({
+					type: "video",
+					originalContentUrl: "https://cdn/v.mp4",
+					previewImageUrl: "https://cdn/p.jpg",
+				});
+			},
+		),
+		mk(
+			"transport.line.system-ack-cache-bypass",
+			"line: system busy-acks (⚡ Interrupting / ⏳ Queued / ⏩ Steered / 💾) BYPASS the pending-postback cache and reach Reply/Push as visible bubbles (_is_system_bypass parity); non-prefix responses still cache",
+			async (fx) => {
+				// Distinct chat id: the lie-scan mutant scopes its phantom push to
+				// U-user1; this row must stay truthful on ITS own chat there.
+				await fx.postEvents([
+					fx.messageEvent({
+						webhookEventId: "evt-bp0",
+						text: "question",
+						replyToken: "RT-BP0",
+						sourceId: "U-ackchat",
+					}),
+				]);
+				expect(await fx.adapter.fireSlowResponseButton("U-ackchat")).toBe(true);
+				const pushesBefore = fx.api.pushCount();
+
+				// Each busy-ack reaches the PUSH lane (button burned the stashed
+				// token) instead of being swallowed into the PENDING cache slot.
+				const acks = [
+					"⚡ Interrupting — starting a new run",
+					"⏳ Queued behind the active run",
+					"⏩ Steered onto a new direction",
+					"💾 background-review summary landed",
+				];
+				for (const ack of acks) {
+					const routed = await fx.adapter.sendText("U-ackchat", ack);
+					expect(routed.success).toBe(true);
+				}
+				expect(fx.api.pushCount()).toBe(pushesBefore + acks.length);
+				const pushedAcks = fx.api.pushCalls
+					.slice(pushesBefore)
+					.map((c) => c.texts.join("\n"));
+				expect(pushedAcks).toEqual(acks);
+
+				// The cache slot stayed PENDING throughout — acks never entered it.
+				expect([...fx.adapter.outstandingButtons.values()]).toHaveLength(1);
+
+				// A NON-bypass response while PENDING still caches silently.
+				const rid = [...fx.adapter.outstandingButtons.values()][0];
+				const cached = await fx.adapter.sendText(
+					"U-ackchat",
+					"THE CACHED ANSWER",
+				);
+				expect(cached.success).toBe(true);
+				expect(cached.messageId).toBe(rid);
+				expect(fx.api.pushCount()).toBe(pushesBefore + acks.length);
+
+				// Helper parity pinned at unit level (@664): empty content never
+				// bypasses; prefixes match by startswith.
+				expect(isSystemBypass("")).toBe(false);
+				expect(isSystemBypass("plain answer")).toBe(false);
+				expect(isSystemBypass("⚡ Interrupting")).toBe(true);
+				expect(isSystemBypass("⏳ Queued:x")).toBe(true);
+				expect(isSystemBypass("⏩ Steered now")).toBe(true);
+				expect(isSystemBypass("💾 summary")).toBe(true);
+			},
+		),
+		mk(
+			"transport.line.single-call-five-bubble-cap",
+			"line: oversized responses cap to ONE Reply/Push call of ≤5 bubbles with an ellipsis tail (split_for_line + [:5] slice parity) on EVERY lane — no lossless kit-chunked multi-push",
+			async (fx) => {
+				// ~24.5k chars: five bubble budgets cannot hold it, so the native
+				// splitter truncates the tail with an ellipsis inside ONE call.
+				const huge = Array.from(
+					{ length: 40 },
+					(_, i) => `para-${i}\n${"x".repeat(600)}`,
+				).join("\n\n");
+				expect(huge.length).toBeGreaterThan(
+					LINE_MAX_MESSAGES_PER_CALL * LINE_SAFE_BUBBLE_CHARS,
+				);
+
+				// Door-1 lane.
+				const doorResult = await fx.adapter.sendText("U-cap1", huge);
+				expect(doorResult.success).toBe(true);
+				const doorCalls = fx.api.pushCalls.filter((c) => c.chatId === "U-cap1");
+				expect(doorCalls).toHaveLength(1); // ONE API call total
+				const bubbles = doorCalls[0]?.messages ?? [];
+				expect(bubbles).toHaveLength(LINE_MAX_MESSAGES_PER_CALL);
+				for (const b of bubbles) {
+					expect(lineBubbleText(b).length).toBeLessThanOrEqual(
+						LINE_SAFE_BUBBLE_CHARS,
+					);
+				}
+				expect(lineBubbleText(bubbles[bubbles.length - 1]!).endsWith("…")).toBe(
+					true,
+				);
+
+				// The kit deliverText lane shares the SAME single-call shape
+				// (splitsLongMessages=True ⇒ the ADAPTER owns native splitting).
+				const laneResults = await fx.adapter.deliverText("U-cap2", huge);
+				expect(laneResults).toHaveLength(1);
+				expect(laneResults[0]?.success).toBe(true);
+				expect(
+					fx.api.pushCalls.filter((c) => c.chatId === "U-cap2"),
+				).toHaveLength(1);
+			},
+		),
+		mk(
+			"transport.line.typing-refresh-loading",
+			"line: sendTyping re-fires POST /v2/bot/chat/loading/start from the processing heartbeat (send_typing parity @1240) — clamped 60 s, DM-only U-guard, best-effort swallow",
+			async (fx) => {
+				await fx.postEvents([
+					fx.messageEvent({
+						webhookEventId: "evt-typ",
+						text: "hi",
+						replyToken: "RT-TYP",
+					}),
+				]);
+				await new Promise<void>((r) => setTimeout(r, 10));
+				const afterIngress = fx.api.loadingCalls.length;
+				expect(afterIngress).toBeGreaterThanOrEqual(1); // inbound-receipt beat
+
+				// Heartbeat beats re-fire the indicator (not just once at receipt).
+				await fx.adapter.sendTyping("U-user1");
+				await fx.adapter.sendTyping("U-user1");
+				expect(fx.api.loadingCalls.length).toBe(afterIngress + 2);
+				expect(fx.api.loadingCalls.at(-1)?.chatId).toBe("U-user1");
+				expect(fx.api.loadingCalls.at(-1)?.seconds).toBe(
+					clampLoadingSeconds(60),
+				);
+
+				// Group/room chats are silent no-ops (vendor rejects non-DM loads).
+				await fx.adapter.sendTyping("C-group");
+				expect(fx.api.loadingCalls.length).toBe(afterIngress + 2);
+			},
+		),
 	];
 }
 
 describe("conformance suite — line census port (shape: webhook)", () => {
-	it("applicability is COMPUTED from capability data (streaming family excluded iff passive)", () => {
+	it("applicability is COMPUTED from capability data (streaming family excluded iff passive; lossless-split family excluded iff the native splitter truncates)", () => {
 		const { streamsSupported, excludedIds } = computeApplicability();
 		expect(streamsSupported).toBe(false); // reply/push egress: no native lanes
-		expect(excludedIds).toEqual(STREAMING_ROW_IDS);
+		expect(excludedIds).toEqual([
+			...STREAMING_ROW_IDS,
+			...LOSSLESS_SPLIT_ROW_IDS,
+		]);
 	});
 
 	it("passes EVERY applicable shared row against the line subject", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const rows = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
-		// Nothing else may be silently dropped — exclusions are EXACT.
-		expect(all.length - rows.length).toBe(streamsSupported ? 0 : 3);
+		const { excludedIds } = computeApplicability();
+		// Nothing may be silently dropped — exclusions are EXACT and probe-driven.
+		const rows = all.filter((r) => !excludedIds.includes(r.id));
+		expect(all.length - rows.length).toBe(excludedIds.length);
 
 		const report = await runConformanceSuite({
 			subjectName: "line",
@@ -525,7 +783,9 @@ describe("conformance suite — line census port (shape: webhook)", () => {
 		});
 		if (report.failed > 0) console.error(formatReport(report));
 		expect(report.failed).toBe(0);
-		expect(report.passed).toBeGreaterThanOrEqual(20);
+		// 21 catalog rows minus the FIVE probe-driven exclusions (3 streaming
+		// passive + 2 lossless-split truncating).
+		expect(report.passed).toBeGreaterThanOrEqual(18);
 	});
 
 	it("passes the INHERITED webhook transport rows (reference fixture) over the REAL adapter", async () => {
@@ -569,7 +829,7 @@ describe("conformance suite — line census port (shape: webhook)", () => {
 		}
 	});
 
-	it("passes ALL SEVEN line shape-delta rows through the real engine fixture", async () => {
+	it("passes ALL ELEVEN line shape-delta rows through the real engine fixture", async () => {
 		const rows = lineDeltaRows(() => makeLineFixture());
 		expect(rows.map((r) => r.id)).toEqual([
 			"transport.line.signature-negative-matrix",
@@ -579,6 +839,10 @@ describe("conformance suite — line census port (shape: webhook)", () => {
 			"transport.line.markdown-url-preserving-strip",
 			"transport.line.three-allowlist-gate",
 			"transport.line.postback-state-machine",
+			"transport.line.media-fetch-and-builders",
+			"transport.line.system-ack-cache-bypass",
+			"transport.line.single-call-five-bubble-cap",
+			"transport.line.typing-refresh-loading",
 		]);
 		const report = await runConformanceSuite({
 			subjectName: "line-deltas",
@@ -591,10 +855,8 @@ describe("conformance suite — line census port (shape: webhook)", () => {
 
 	it("FULL applicable catalog is GREEN — merge-gate semantics hold (allApplicablePassed, zero deferred)", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const shared = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
+		const { excludedIds } = computeApplicability();
+		const shared = all.filter((r) => !excludedIds.includes(r.id));
 
 		const subject = makeSubject() as LineWebhookSubject;
 		const probe = subject.flagsAndTrustProbe();

@@ -5,7 +5,7 @@
 // handshakes, watchdog passes under the INJECTED clock, ladder sleeps, and
 // dual-path markdown dispatch. Behavior contracts, not stubbed values.
 
-import { FakePlatformWire } from "../conformance/wire.js";
+import type { FakePlatformWire } from "../conformance/wire.js";
 import type { WsFixture } from "../conformance/shapes.js";
 import type { TaskSpawner } from "../../pi_gateway/guards/index.js";
 import { ManualClock } from "../persistent-ws/manual-clock.js";
@@ -14,7 +14,11 @@ import {
 	SlackSocketModeServer,
 	type SlackInteractivePayload,
 } from "./fake-socket-mode.js";
-import { makeSlackSubject, type SlackSubject } from "./slack-subject.js";
+import {
+	makeSlackSubject,
+	SlackCapturingWire,
+	type SlackSubject,
+} from "./slack-subject.js";
 
 /** Deterministic wait-for predicate (tiny wall budget; no timing asserts). */
 export async function eventually(
@@ -40,6 +44,17 @@ export interface SlackWorld {
 	connectAndAwaitLive(): Promise<void>;
 	/** Push a user message through Socket Mode and return its envelope id. */
 	pushMessage(chatId: string, text: string): string;
+	/** Push a message_changed envelope (user edit) and return the event. */
+	pushMessageChanged(evt: {
+		channel: string;
+		user?: string | undefined;
+		text: string;
+		originalTs: string;
+		editedTs?: string | undefined;
+		eventTs?: string | undefined;
+		thread_ts?: string | undefined;
+		botId?: string | undefined;
+	}): ReturnType<SlackSocketModeServer["pushMessageChanged"]>;
 	/** Push an interactivity payload to every live connection. */
 	pushInteractive(payload: SlackInteractivePayload): void;
 }
@@ -55,13 +70,17 @@ export interface MakeSlackWorldOptions {
 	streamIsMessageChatIds?: readonly string[] | undefined;
 	richBlocks?: boolean | undefined;
 	scalarMaxUnits?: number | undefined;
+	/** SLACK_REACTIONS override (default env-driven true). */
+	reactionsEnabled?: boolean | undefined;
+	/** Deterministic auth.test identity override. */
+	authIdentity?: import("./slack-subject.js").SlackSubjectOptions["authIdentity"];
 }
 
 /** A full slack world: subject + engine + Socket-Mode server + injected clock. */
 export function makeSlackWorld(opts: MakeSlackWorldOptions = {}): SlackWorld {
 	const clock = new ManualClock();
 	const socketServer = new SlackSocketModeServer({ nowMs: clock.nowMs });
-	const wire = new FakePlatformWire();
+	const wire = new SlackCapturingWire();
 	const subject = makeSlackSubject({
 		wire,
 		ws: socketServer,
@@ -85,6 +104,12 @@ export function makeSlackWorld(opts: MakeSlackWorldOptions = {}): SlackWorld {
 		...(opts.scalarMaxUnits !== undefined
 			? { scalarMaxUnits: opts.scalarMaxUnits }
 			: {}),
+		...(opts.reactionsEnabled !== undefined
+			? { reactionsEnabled: opts.reactionsEnabled }
+			: {}),
+		...(opts.authIdentity !== undefined
+			? { authIdentity: opts.authIdentity }
+			: {}),
 	});
 	if (opts.streamIsMessageChatIds !== undefined) {
 		for (const id of opts.streamIsMessageChatIds)
@@ -107,6 +132,13 @@ export function makeSlackWorld(opts: MakeSlackWorldOptions = {}): SlackWorld {
 				user: "user-1",
 				text,
 			}).id;
+		},
+		pushMessageChanged(evt) {
+			const { botId, ...rest } = evt;
+			return socketServer.pushMessageChanged(
+				{ user: "user-1", ...rest },
+				botId !== undefined ? { botId } : {},
+			);
 		},
 		pushInteractive(payload: SlackInteractivePayload): void {
 			socketServer.pushInteractive(payload);
@@ -234,6 +266,7 @@ export function makeRealSlackFixture(): WsFixture {
 				chatId: "C-latch",
 				draftId: 1,
 				content: "**md**",
+				metadata: { thread_id: "1700000000.000001" } as never,
 			});
 			const latchedOnFirstFailure =
 				first.success === false && engine.nativeStreamLatch.unsupported;
@@ -263,11 +296,13 @@ export function makeRealSlackFixture(): WsFixture {
 				chatId: "C-t",
 				draftId: 1,
 				content: "x",
+				metadata: { thread_id: "1700000000.000002" } as never,
 			});
 			await world2.engine.sendDraft({
 				chatId: "C-t",
 				draftId: 2,
 				content: "xy",
+				metadata: { thread_id: "1700000000.000002" } as never,
 			});
 			const transientDidNotLatch =
 				world2.engine.nativeStreamLatch.unsupported === false &&
@@ -296,17 +331,22 @@ export function makeRealSlackFixture(): WsFixture {
 			const { engine, wire } = world;
 
 			// ── leg (i): native stream plane ships RAW cumulative frames ──
+			// (drafts carry the turn identity the production gateway always
+			// stamps — chat.startStream requires a thread anchor.)
 			const frame1 = "**bold** intro [link](https://x.y)";
+			const streamMd = { thread_id: "1700000000.000011" };
 			await engine.sendDraft({
 				chatId: "C-dual",
 				draftId: 11,
 				content: frame1,
+				metadata: streamMd as never,
 			});
 			const frame2 = `${frame1}\n**more**`;
 			await engine.sendDraft({
 				chatId: "C-dual",
 				draftId: 11,
 				content: frame2,
+				metadata: streamMd as never,
 			});
 			const startOps = wire
 				.draftsOf("C-dual")

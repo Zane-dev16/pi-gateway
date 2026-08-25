@@ -32,6 +32,10 @@ interface SeenEntry {
  */
 export class FeishuSeenMessageStore {
 	private readonly seen = new Map<string, SeenEntry>();
+	/** Legacy-migrated ids (:4589) — timestamp-less, treated as immortal for
+	 * one migration cycle (a bare epoch-0 sentinel is ambiguous under
+	 * injected clocks that start at 0). */
+	private readonly legacyImmortal = new Set<string>();
 	private readonly ttlMs: number;
 	private readonly maxEntries: number;
 	private readonly nowMs: () => number;
@@ -57,11 +61,16 @@ export class FeishuSeenMessageStore {
 		const now = this.nowMs();
 		this.pruneExpired(now);
 		const prior = this.seen.get(messageId);
-		if (prior !== undefined && now - prior.at <= this.ttlMs) {
+		if (
+			prior !== undefined &&
+			(now - prior.at <= this.ttlMs ||
+				(prior.at === 0 && this.legacyImmortal.has(messageId)))
+		) {
 			this.suppressedCount += 1;
 			return true;
 		}
 		this.seen.delete(messageId); // re-insert to move to the MRU end
+		this.legacyImmortal.delete(messageId); // re-recorded ⇒ ages normally
 		this.seen.set(messageId, { at: now });
 		while (this.seen.size > this.maxEntries) {
 			const oldest = this.seen.keys().next();
@@ -79,25 +88,33 @@ export class FeishuSeenMessageStore {
 
 	private pruneExpired(now: number): void {
 		for (const [key, entry] of this.seen) {
-			if (now - entry.at > this.ttlMs) this.seen.delete(key);
+			// Epoch-0 entries are LEGACY migrations (:4589 comment) — treated as
+			// immortal for one migration cycle, never nuked as expired.
+			if (entry.at !== 0 && now - entry.at > this.ttlMs) this.seen.delete(key);
 			else break; // insertion-ordered: head is oldest
 		}
 	}
 
-	/** Snapshot to `<hermes_home>/feishu_seen_message_ids.json` (atomic). */
+	/**
+	 * Snapshot to `<hermes_home>/feishu_seen_message_ids.json` (atomic).
+	 * Wire format (:4611 _persist_seen_message_ids): `{"message_ids": {id:
+	 * epoch_seconds}}` — Hermes' loader reads ONLY that key, so a flat map
+	 * would be mutually unreadable across implementations.
+	 */
 	persist(statePath: string): void {
 		if (!this.dirtySincePersist && this.seen.size === 0) return;
-		atomicWriteJson(
-			statePath,
-			Object.fromEntries([...this.seen].map(([id, e]) => [id, e.at / 1000])),
-		);
+		atomicWriteJson(statePath, {
+			message_ids: Object.fromEntries(
+				[...this.seen].map(([id, e]) => [id, e.at / 1000]),
+			),
+		});
 		this.dirtySincePersist = false;
 	}
 
 	/**
-	 * Loader (:4575 _load_seen_message_ids): migrates a legacy plain-list
-	 * format (entries get epoch 0 — treated as already-aged), drops
-	 * TTL-expired ids, caps to the most recent.
+	 * Loader (:4575 _load_seen_message_ids): reads ONLY payload["message_ids"]
+	 * (a bare dict or a LEGACY plain list inside that key — entries get epoch 0,
+	 * treated as already-aged), drops TTL-expired ids, caps to the most recent.
 	 */
 	load(statePath: string): void {
 		let raw: unknown;
@@ -106,20 +123,37 @@ export class FeishuSeenMessageStore {
 		} catch {
 			return; // missing/corrupt file ⇒ cold start (Hermes parity)
 		}
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return;
+		const seenData = (raw as Record<string, unknown>)["message_ids"];
 		const now = this.nowMs();
-		if (Array.isArray(raw)) {
-			for (const id of raw) {
-				if (typeof id === "string") this.seen.set(id, { at: 0 });
+		if (Array.isArray(seenData)) {
+			// Backward-compat migration: old format stored a plain id LIST.
+			for (const id of seenData) {
+				const key = typeof id === "string" ? id.trim() : "";
+				if (key === "") continue;
+				this.seen.set(key, { at: 0 });
+				this.legacyImmortal.add(key);
 			}
-		} else if (raw !== null && typeof raw === "object") {
-			for (const [id, ts] of Object.entries(raw as Record<string, unknown>)) {
-				const at =
+		} else if (seenData !== null && typeof seenData === "object") {
+			for (const [id, ts] of Object.entries(
+				seenData as Record<string, unknown>,
+			)) {
+				if (id.trim() === "") continue;
+				const numeric =
 					typeof ts === "number" && Number.isFinite(ts) ? ts * 1000 : 0;
-				this.seen.set(id, { at });
+				this.seen.set(id, { at: numeric });
+				// A saved ts of 0 is equally timestamp-less (:4589 validity).
+				if (numeric === 0) this.legacyImmortal.add(id);
 			}
+		} else {
+			return; // no message_ids key ⇒ nothing loadable (Hermes reads only it)
 		}
 		for (const [id, entry] of [...this.seen]) {
-			if (entry.at > 0 && now - entry.at > this.ttlMs) this.seen.delete(id);
+			if (
+				entry.at > 0 &&
+				now - entry.at > this.ttlMs
+			)
+				this.seen.delete(id);
 		}
 		while (this.seen.size > this.maxEntries) {
 			const oldest = this.seen.keys().next();

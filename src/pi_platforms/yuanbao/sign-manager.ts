@@ -10,6 +10,12 @@
 //   yuanbao.py:SignManager.get_token/force_refresh — per-app_key singleflight
 
 import { createHmac, randomBytes } from "node:crypto";
+import {
+	SIGN_APP_VERSION,
+	SIGN_BOT_VERSION,
+	SIGN_INSTANCE_ID,
+	SIGN_OPERATION_SYSTEM,
+} from "./manifest.js";
 
 export const TOKEN_PATH = "/api/v5/robotLogic/sign-token";
 export const SIGN_RETRYABLE_CODE = 10099;
@@ -22,6 +28,12 @@ export interface SignTokenData {
 	bot_id: string;
 	duration: number;
 	expire_ts: number; // epoch seconds
+	/** token_data.source — AUTH_BIND identity source ("bot" fallback at use
+	 * site, yuanbao.py:_authenticate source=token_data.get("source") or "bot"). */
+	source: string;
+	/** token_data.route_env — AUTH_BIND env_name(field 5) fallback when the
+	 * adapter has no configured routeEnv (adapter._route_env or token_data). */
+	route_env: string;
 }
 
 export interface SignHttpSeam {
@@ -143,7 +155,13 @@ export class SignManager {
 			apiDomain: string;
 			routeEnv?: string | undefined;
 		},
-	): Promise<{ token: string; bot_id: string; duration: number }> {
+	): Promise<{
+		token: string;
+		bot_id: string;
+		duration: number;
+		source: string;
+		route_env: string;
+	}> {
 		const url = `${opts.apiDomain.replace(/\/+$/, "")}${TOKEN_PATH}`;
 		for (let attempt = 0; attempt <= SIGN_MAX_RETRIES; attempt++) {
 			const nonce = randomBytes(16).toString("hex");
@@ -163,7 +181,13 @@ export class SignManager {
 					timestamp,
 				},
 				{
+					// Identity headers ride EVERY sign-token POST
+					// (yuanbao.py:SignManager.fetch headers block).
 					"Content-Type": "application/json",
+					"X-AppVersion": SIGN_APP_VERSION, // _APP_VERSION
+					"X-OperationSystem": SIGN_OPERATION_SYSTEM, // _OPERATION_SYSTEM
+					"X-Instance-Id": SIGN_INSTANCE_ID, // _YUANBAO_INSTANCE_ID
+					"X-Bot-Version": SIGN_BOT_VERSION, // _BOT_VERSION
 					...(opts.routeEnv !== undefined && opts.routeEnv !== ""
 						? { "X-Route-Env": opts.routeEnv }
 						: {}),
@@ -185,6 +209,10 @@ export class SignManager {
 					token: String(rec["token"] ?? ""),
 					bot_id: String(rec["bot_id"] ?? ""),
 					duration: Number(rec["duration"] ?? 0),
+					// token_data.source / route_env ride the sign response and are
+					// consumed by the AUTH_BIND builder (yuanbao.py:_authenticate).
+					source: String(rec["source"] ?? ""),
+					route_env: String(rec["route_env"] ?? ""),
 				};
 			}
 			if (code === SIGN_RETRYABLE_CODE && attempt < SIGN_MAX_RETRIES) {

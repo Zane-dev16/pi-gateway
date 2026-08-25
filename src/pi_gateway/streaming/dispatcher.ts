@@ -24,8 +24,11 @@ import {
 	type ToolProgressMode,
 } from "./adapter-seam.js";
 import type {
+	Commentary,
 	GatewayNotice,
 	LongToolHint,
+	MessageChunk,
+	MessageStop,
 	StreamEvent,
 	ToolCallChunk,
 	ToolCallFinished,
@@ -47,6 +50,21 @@ export interface DispatcherOptions {
 	onLongTool?: ((event: LongToolHint) => void) | undefined;
 	onNotice?: ((event: GatewayNotice) => void) | undefined;
 	log?: StreamLogger | undefined;
+}
+
+/**
+ * Render one presentation event through the adapter hook (base.py defaults;
+ * adapters override). Module-level so no lexical declaration lives lexically
+ * inside the dispatcher's switch cases.
+ */
+function renderPresentationEvent(
+	event: MessageChunk | MessageStop | Commentary,
+	render: StreamRenderAdapter,
+	sink: ConsumerSink | null,
+): void {
+	if (sink === null) return;
+	const hook = render.renderMessageEvent ?? defaultRenderMessageEvent;
+	hook.call(render, event, sink);
 }
 
 export class GatewayEventDispatcher {
@@ -93,14 +111,9 @@ export class GatewayEventDispatcher {
 		switch (event.type) {
 			case "message_chunk":
 			case "message_stop":
-			case "commentary": {
-				if (this.sink !== null) {
-					const hook =
-						this.render.renderMessageEvent ?? defaultRenderMessageEvent;
-					hook.call(this.render, event, this.sink);
-				}
+			case "commentary":
+				renderPresentationEvent(event, this.render, this.sink);
 				return;
-			}
 			case "tool_call_chunk": {
 				if (this.toolMode === "off" || this.enqueueToolLine === null) return;
 				// "new" mode: only emit when the tool changes.

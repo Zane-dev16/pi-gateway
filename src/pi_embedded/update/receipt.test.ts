@@ -61,6 +61,11 @@ describe("UpdateReceiptWriter.finalize", () => {
 		const pointer = readLatestPointer(dir);
 		expect(pointer?.outcome).toBe("partial");
 		expect(pointer?.receipt).toBe((path as string).split("/").pop());
+		// Parity finalize_update_receipt: latest.json mirrors the FULL payload
+		// (steps/skips included), not a summary pointer.
+		expect(pointer?.steps).toEqual(payload.steps);
+		expect(pointer?.skips).toEqual(payload.skips);
+		expect(pointer?.schema).toBe("pi-update-receipt/1");
 	});
 
 	it("is idempotent — one run, one receipt file even if finalized twice", () => {
@@ -94,10 +99,29 @@ describe("UpdateReceiptWriter.finalize", () => {
 });
 
 describe("exitCodeForOutcome", () => {
-	it("maps the closed outcome vocabulary onto 0/1 only", () => {
+	it("maps the closed outcome vocabulary onto 0/1/2 (exit-2 refusal convention)", () => {
 		expect(exitCodeForOutcome("success")).toBe(0);
 		expect(exitCodeForOutcome("partial")).toBe(1);
 		expect(exitCodeForOutcome("failed")).toBe(1);
+		// Parity hermes_cli/update_receipt.py:finalize_pending_update_receipt:
+		// exit 2 ⇒ "refused" (preflight refusals are not failures).
+		expect(exitCodeForOutcome("refused")).toBe(2);
+	});
+
+	it("a REFUSED finalization records outcome+exit 2 verbatim in receipt and pointer", () => {
+		const writer = new UpdateReceiptWriter(dir, new ManualClock());
+		writer.recordStep("refusal-gate", false, {
+			reason: "update refused: zip-package installs are not updatable in place",
+		});
+		const { payload } = writer.finalize(
+			"refused",
+			"update refused: zip-package installs are not updatable in place",
+		);
+		expect(payload.outcome).toBe("refused");
+		expect(payload.exit_code).toBe(2);
+		const pointer = readLatestPointer(dir);
+		expect(pointer?.outcome).toBe("refused");
+		expect(pointer?.exit_code).toBe(2);
 	});
 });
 

@@ -97,7 +97,7 @@ export function makeMattermostShapeRows(): ConformanceRow[] {
 		),
 		mk(
 			"mm.mention-gating-matrix",
-			"mattermost mention gating: channels require @mention (@username/@userid, case-insensitive, stripped cleanly), free-response channels + commands bypass, DMs exempt, allowed-channels whitelist silently drops",
+			"mattermost mention gating: THE require_mention gate runs BEFORE any command detection — unmentioned slash text is dropped; @username/@userid match case-insensitively and strip cleanly ('gi'); free-response channels and DMs bypass; allowed-channels whitelist silently drops",
 			() => f().mentionGating(),
 			(r) => {
 				for (const leg of [
@@ -106,7 +106,7 @@ export function makeMattermostShapeRows(): ConformanceRow[] {
 					"userIdMentionAccepted",
 					"caseInsensitiveMatch",
 					"freeChannelBypass",
-					"commandBypass",
+					"unmentionedCommandDroppedAtGate",
 					"dmExempt",
 					"whitelistSilentlyDrops",
 				] as const) {

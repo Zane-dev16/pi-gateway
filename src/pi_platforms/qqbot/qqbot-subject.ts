@@ -39,6 +39,8 @@ export interface QQSubjectOptions {
 	appId?: string | undefined;
 	clientSecret?: string | undefined;
 	markdownSupport?: boolean | undefined;
+	/** Local-media byte seam (fixtures inject; production reads the fs). */
+	readFileBytes?: ((path: string) => Buffer) | undefined;
 }
 
 /**
@@ -152,6 +154,9 @@ export class QQBotSubject implements ConformanceSubject {
 			clientSecret,
 			...(opts.markdownSupport !== undefined
 				? { markdownSupport: opts.markdownSupport }
+				: {}),
+			...(opts.readFileBytes !== undefined
+				? { readFileBytes: opts.readFileBytes }
 				: {}),
 			rest: makeRestCapture(this.wire, this.gateway),
 			wsFactory: this.gateway,

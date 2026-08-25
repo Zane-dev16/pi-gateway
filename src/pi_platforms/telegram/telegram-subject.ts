@@ -47,6 +47,12 @@ export interface TelegramSubjectOptions {
 	/** When false, required secrets resolve undefined (loud-disable row). */
 	withSecret?: boolean | undefined;
 	reactionsEnv?: string | undefined;
+	/** Scoped OPTIONAL-env map (rich/link-preview/status gates, tg2-3/6/9). */
+	optionalEnv?: Record<string, string | undefined> | undefined;
+	/** Post-connect DM-topic config (tg2-3 housekeeping). */
+	dmTopicsConfig?:
+		| readonly import("./telegram-adapter.js").DmTopicConfigEntry[]
+		| undefined;
 	stickerCache?: StickerDescriptionCache | undefined;
 }
 
@@ -75,6 +81,9 @@ export class TelegramSubject implements ConformanceSubject {
 			...(opts.scalarMaxUnits !== undefined
 				? { scalarMaxUnits: opts.scalarMaxUnits }
 				: {}),
+			...(opts.dmTopicsConfig !== undefined
+				? { dmTopicsConfig: opts.dmTopicsConfig }
+				: {}),
 			...(opts.stickerCache !== undefined
 				? { stickerCache: opts.stickerCache }
 				: {}),
@@ -85,7 +94,10 @@ export class TelegramSubject implements ConformanceSubject {
 						? "tok"
 						: undefined
 					: undefined,
-			optionalEnvReader: () => opts.reactionsEnv,
+			optionalEnvReader: (key) => {
+				if (key === "TELEGRAM_REACTIONS") return opts.reactionsEnv;
+				return opts.optionalEnv?.[key];
+			},
 		});
 
 		// Bind the inherited engine's egress transports to the SHARED harness
@@ -109,8 +121,8 @@ export class TelegramSubject implements ConformanceSubject {
 				true,
 				args.metadata ?? {},
 			);
-		this.adapter.editTransmit = (chatId, messageId, content) =>
-			this.wire.transmitEdit(chatId, messageId, content, {});
+		this.adapter.editTransmit = (chatId, messageId, content, metadata) =>
+			this.wire.transmitEdit(chatId, messageId, content, metadata ?? {});
 		this.adapter.lastSendContentReader = (chatId) => {
 			const sends = this.wire.sendsOf(chatId);
 			return sends[sends.length - 1]?.content ?? "";
@@ -194,8 +206,18 @@ export class TelegramSubject implements ConformanceSubject {
 			_interim_send: true,
 		} as unknown as Metadata);
 	}
-	deliverLongText(chatId: string, content: string): Promise<SendResult[]> {
-		return this.adapter.deliverText(chatId, content);
+	deliverLongText(chatId: string, content: string): Promise<SendResult[]>;
+	deliverLongText(
+		chatId: string,
+		content: string,
+		metadata: Metadata,
+	): Promise<SendResult[]>;
+	deliverLongText(
+		chatId: string,
+		content: string,
+		metadata?: Metadata,
+	): Promise<SendResult[]> {
+		return this.adapter.deliverText(chatId, content, metadata);
 	}
 	deliverToUtf16Chat(chatId: string, content: string): Promise<SendResult[]> {
 		return this.adapter.deliverText(chatId, content);

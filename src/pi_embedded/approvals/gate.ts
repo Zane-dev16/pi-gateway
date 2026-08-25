@@ -46,6 +46,42 @@ import type { HumanWaitAccounting } from "./human-wait.js";
 /** Default approvals.timeout (config `approvals.timeout`, read once — DEC-013). */
 export const DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300;
 
+/**
+ * Cron approval modes (parity tools/approval.py:_get_cron_approval_mode).
+ * Default DENY: cron jobs run without a user present to answer prompts.
+ */
+export type CronApprovalMode = "deny" | "approve";
+
+/**
+ * Normalize a raw `approvals.cron_mode` config value (parity vocabulary:
+ * approve/off/allow/yes ⇒ approve; anything else — including absent/garbage
+ * — fails safe to deny).
+ */
+export function normalizeCronApprovalMode(raw: unknown): CronApprovalMode {
+	const mode = String(raw ?? "")
+		.trim()
+		.toLowerCase();
+	return mode === "approve" ||
+		mode === "off" ||
+		mode === "allow" ||
+		mode === "yes"
+		? "approve"
+		: "deny";
+}
+
+/**
+ * The BLOCKED reason returned to a denied cron request (parity of the
+ * cron_deny_message shapes in tools/approval.py).
+ */
+export function cronDenyReason(data: NormalizedApprovalData): string {
+	return (
+		`BLOCKED: ${data.description || data.command} requires approval, but ` +
+		"cron jobs run without a user present to approve it. Find an alternative " +
+		"approach that avoids this command. To allow commands like this in cron " +
+		"jobs, set approvals.cron_mode: approve in config.yaml."
+	);
+}
+
 /** Activity-heartbeat cadence (~10 s; touch_activity_if_due default interval). */
 export const ACTIVITY_HEARTBEAT_INTERVAL_S = 10;
 
@@ -168,7 +204,37 @@ export interface AwaitDecisionDeps {
 	heartbeat?: ActivityHeartbeat;
 	isInterrupted?: () => boolean;
 	notify: SessionNotify;
+	/**
+	 * Cron-session detection (parity tools/approval.py:
+	 * _is_cron_approval_context). Wired by the composition root to the cron
+	 * module's ambient probe. When TRUE the gate resolves IMMEDIATELY from
+	 * `cronMode` below WITHOUT enqueueing — a cron job must never leave a
+	 * pending approval with no listener blocking the job for the full timeout.
+	 */
+	isCronSession?: (() => boolean) | undefined;
+	/**
+	 * `approvals.cron_mode`: raw config string, resolved mode, or a resolver
+	 * for any of those. DEFAULTS TO DENY (fail-closed parity) however it is
+	 * provided; only consulted when `isCronSession` fires.
+	 */
+	cronMode?:
+		| string
+		| CronApprovalMode
+		| (() => string | CronApprovalMode)
+		| undefined;
 	log?: { warn?(message: string): void; info?(message: string): void };
+}
+
+function resolveCronMode(deps: AwaitDecisionDeps): CronApprovalMode {
+	try {
+		const raw =
+			typeof deps.cronMode === "function" ? deps.cronMode() : deps.cronMode;
+		return normalizeCronApprovalMode(raw);
+	} catch {
+		// A failing config read fails SAFE to deny (parity of _get_cron_approval_mode's
+		// except-deny guard) — never let a broken resolver widen cron authority.
+		return "deny";
+	}
 }
 
 function hookBase(
@@ -305,6 +371,41 @@ export async function awaitGatewayDecision(
 	options: AwaitDecisionOptions = {},
 ): Promise<DecisionResult> {
 	const surface = options.surface ?? "gateway";
+
+	// ── Cron sessions are NEVER gateway-approval contexts ────────────────
+	// Parity tools/approval.py:_is_cron_approval_context + _get_cron_approval_mode
+	// (enforced first inside _is_gateway_approval_context): a cron job has no
+	// human listening on any chat surface. Falling through to the normal path
+	// would enqueue a pending approval with NO listener and block the job for
+	// the full approvals.timeout. Resolve IMMEDIATELY from cron_mode (default
+	// deny) WITHOUT enqueueing anything.
+	if (deps.isCronSession?.() === true) {
+		const data = new ApprovalEntry(request).data;
+		await fireApprovalHook(
+			deps.hooks,
+			"pre_approval_request",
+			hookBase(data, sessionKey, surface),
+			deps.log,
+		);
+		const mode = resolveCronMode(deps);
+		const choice: ApprovalChoice = mode === "approve" ? "once" : "deny";
+		if (choice === "deny") {
+			deps.log?.info?.(
+				`Cron approval denied (approvals.cron_mode: deny) for session ${sessionKey}: ${data.command}`,
+			);
+		}
+		await fireApprovalHook(
+			deps.hooks,
+			"post_approval_response",
+			{ ...hookBase(data, sessionKey, surface), choice },
+			deps.log,
+		);
+		return {
+			resolved: true,
+			choice,
+			...(choice === "deny" ? { reason: cronDenyReason(data) } : {}),
+		};
+	}
 
 	// ── Coalesce identical concurrent approvals (one prompt, one answer) ──
 	// Parallel tool calls can hit the same dangerous-command gate at the same

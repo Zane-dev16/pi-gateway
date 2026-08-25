@@ -60,6 +60,16 @@ export const LINE_DEDUP_MAX_ENTRIES = 1000;
 export const LINE_BUTTON_TEXT_CAP = 160;
 export const LINE_BUTTON_ALT_TEXT_CAP = 400;
 export const LINE_POSTBACK_LABEL_CAP = 20;
+/** displayText is capped INDEPENDENTLY of label at 300 (source parity). */
+export const LINE_POSTBACK_DISPLAY_TEXT_CAP = 300;
+
+/**
+ * Loading indicator bounds (adapter.py:_LineClient.loading @~540): LINE caps
+ * loadingSeconds in 5-step increments between 5 and 60.
+ */
+export const LINE_LOADING_MIN_SECONDS = 5;
+export const LINE_LOADING_MAX_SECONDS = 60;
+export const LINE_LOADING_STEP_SECONDS = 5;
 
 /**
  * Capabilities AS DATA (04 §2).
@@ -71,12 +81,33 @@ export const LINE_POSTBACK_LABEL_CAP = 20;
  * adapter wires no wake/resume lane: replies ride single-use reply tokens or
  * direct Push calls with no gateway-side completion push. The port declares
  * BOTH FLAGS FALSE — honest capability data for this shape.
+ *
+ * splitsLongMessages=True ports the base class attribute the adapter also
+ * inherits verbatim: send() chunks NATIVELY via split_for_line — ONE
+ * Reply/Push call of at most LINE_MAX_MESSAGES_PER_CALL bubbles with an
+ * ellipsis tail on overflow (adapter.py:_send_text_chunks :1197 + the [:5]
+ * slice :1210). The flag being true makes the kit base skip its own split;
+ * dispatchBubbles supplies THE native splitter instead — there is NO
+ * lossless kit-chunked multi-push lane on this platform.
  */
 export const LINE_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({
 		supportsAsyncDelivery: false,
 		interactiveResume: false,
+		splitsLongMessages: true,
 	});
+
+/**
+ * Native-splitter shape datum (04 §8 conditional-header probe,
+ * BB_SUPPORTS_MESSAGE_EDITING precedent): the native split_for_line lane
+ * TRUNCATES — responses beyond five bubbles lose their tail to an ellipsis
+ * (:1210). Full output is NOT preserved, so the kit LOSSLESS-split shared
+ * family (egress.chunk-flood / egress.per-chat-length-pair) probes THIS
+ * datum before applying; per-chat length-budget PAIRS do not exist on this
+ * source (split_for_line uses the fixed LINE_SAFE_BUBBLE_CHARS bubble
+ * budget for every chat).
+ */
+export const LINE_NATIVE_SPLIT_TRUNCATES = true;
 
 /**
  * THE trust boundary as DATA (DEC-017).

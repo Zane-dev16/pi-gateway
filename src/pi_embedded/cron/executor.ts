@@ -9,6 +9,10 @@
 //     the reference repo's AGENTS.md "skip_memory=True" line is a documented
 //     doc bug, never ported).
 //   cron/scheduler.py:request_hard_interrupt → runner.interrupt analogue.
+//   tools/approval.py:_is_cron_approval_context → CRON_SESSION_ENV +
+//     isCronSessionContext (session-scoped marker preferred, legacy process
+//     env var as fallback) — cron sessions must NEVER surface as
+//     gateway-approval contexts (see approvals/gate.ts).
 //
 // DEC-012 in this codebase: memory on/off is decided at agent construction
 // (GatewayAgentRunner's MemoryTurnHooks). The cron executor therefore
@@ -19,7 +23,45 @@
 // assert the constructor argument byte-for-byte, and an end-to-end harness
 // run proves the memory hooks actually fire through the REAL pipeline.
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import type { TurnOutcome } from "../../pi_agent_core/runner-types.js";
+
+// ── Cron-session context marker (HERMES_CRON_SESSION parity) ──────────────
+
+/** Legacy process-env fallback carrier for the cron-session marker. */
+export const CRON_SESSION_ENV = "HERMES_CRON_SESSION";
+
+const cronSessionStorage = new AsyncLocalStorage<true>();
+
+/**
+ * Mark `fn`'s whole async context (and everything it awaits/spawns) as a
+ * cron-job session. This is the ContextVar half of _is_cron_approval_context:
+ * one cron turn must not taint unrelated gateway/API turns running in the
+ * same process, so the marker lives in async-context storage, never a module
+ * global.
+ */
+export function runInCronSession<T>(fn: () => T): T {
+	return cronSessionStorage.run(true, fn);
+}
+
+function envFlagEnabled(raw: string | undefined): boolean {
+	return ["1", "true", "yes", "on"].includes((raw ?? "").trim().toLowerCase());
+}
+
+/**
+ * True when the CURRENT async context belongs to a cron job (parity
+ * tools/approval.py:_is_cron_approval_context: prefer the session-scoped
+ * marker; fall back to the legacy HERMES_CRON_SESSION env var). Consumers —
+ * chiefly the approvals gate via composition-root wiring — use this to keep
+ * cron turns out of interactive approval flows.
+ */
+export function isCronSessionContext(
+	env: Record<string, string | undefined> = process.env,
+): boolean {
+	if (cronSessionStorage.getStore() === true) return true;
+	return envFlagEnabled(env[CRON_SESSION_ENV]);
+}
 
 /** Structural runner surface consumed here (GatewayAgentRunner subset). */
 export interface CronRunnerSurface {
@@ -118,11 +160,16 @@ export class CronTurnExecutor {
 		this.lastConstruction = construction;
 		input.onConstructed?.(construction);
 		await input.ensureSession?.(sessionId);
-		const outcome = await this.runner.handleTurn({
-			sessionId,
-			routingKey: sessionId,
-			text: input.prompt,
-		});
+		// Every gate/hook consulted DURING the turn must see a cron-session
+		// context (approvals resolve via approvals.cron_mode without creating a
+		// pending prompt) — hence the marker wraps the WHOLE handleTurn await.
+		const outcome = await runInCronSession(() =>
+			this.runner.handleTurn({
+				sessionId,
+				routingKey: sessionId,
+				text: input.prompt,
+			}),
+		);
 		return { outcome, construction };
 	}
 

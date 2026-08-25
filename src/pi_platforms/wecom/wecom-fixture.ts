@@ -106,12 +106,14 @@ export class FakeWecomApi implements WecomApiTransport {
 		app: WecomAppConfig,
 		_token: string,
 		payload: Record<string, unknown>,
+		metadata: Record<string, unknown> = {},
 	): Promise<WecomApiResponse> {
 		this.sends.push({ appName: String(app.name ?? ""), payload });
 		// Markdown-rendering rejection script (reference-fixture parity): a
 		// forced formatting error fails unless this IS the §6.1 plain-text body.
+		// The script marker rides METADATA — never the vendor JSON body.
 		if (
-			payload["forceFormattingError"] === true &&
+			metadata["forceFormattingError"] === true &&
 			!String(
 				(payload["text"] as Record<string, unknown> | undefined)?.["content"] ??
 					"",

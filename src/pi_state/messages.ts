@@ -13,6 +13,9 @@
 //   hermes_state.py:add_message / get_messages        → insertMessage / listMessages
 //   hermes_state.py:set_latest_user_api_content       → setLatestUserApiContent (crash-resilient backfill)
 //   hermes_state.py:_scrub_surrogates                 → scrubSurrogates (driver-boundary mapping, made explicit)
+//   hermes_state.py:get_messages_as_conversation      → readReplayMessages (lineage + _is_explicit_branch_session gate)
+//   hermes_state.py:_find_duplicate_replayed_user_message
+//     + _exact_replayed_user_clone_key                → boundary-respecting replayed-user dedupe
 //
 // Strict role alternation is NEVER repaired here — repair runs pre-request in
 // the agent layer on live history AND wire copy, never at persist time
@@ -237,14 +240,114 @@ export function listMessages(
 }
 
 /**
+ * hermes_state.py:_is_explicit_branch_session — whether the SELF row is a
+ * copied user-facing branch (`_branched_from` marker in sessions.model_config).
+ * Branches and compression continuations both use parent_session_id, but a
+ * branch OWNS its copied transcript while a compression continuation needs its
+ * ended parent's archived rows; presence of the durable marker is the
+ * discriminator written by every branch-creation path.
+ */
+function isExplicitBranchSession(modelConfig: string | null): boolean {
+	if (!modelConfig) return false;
+	let cfg: unknown;
+	try {
+		cfg = JSON.parse(modelConfig);
+	} catch {
+		return false;
+	}
+	if (typeof cfg !== "object" || cfg === null) return false;
+	return Boolean((cfg as Record<string, unknown>)["_branched_from"]);
+}
+
+/**
+ * hermes_state.py:_canonical_replayed_user_content — canonical live payload of
+ * a replayed user row. Hermes splits composite handoff/live carriers via the
+ * context compressor; pi rows carry a single content payload today, so the
+ * canonical form is the sidecar-substituted content and `is_composite` is
+ * always false (the carrier-preference seam in the dedupe below stays wired
+ * for when pi grows the compaction scaffold).
+ */
+function canonicalReplayedUserContent(row: MessageRow): string {
+	return substituteApiContent(row) ?? "";
+}
+
+/**
+ * hermes_state.py:_exact_replayed_user_clone_key — hashable key for a
+ * column-exact rotation clone: (timestamp, json-encoded content). Compression
+ * rotation copies the ask verbatim INCLUDING its timestamp, so exact clones
+ * are rotation artifacts while legitimate repeats happen at later times.
+ */
+function exactReplayedUserCloneKey(row: MessageRow): string | null {
+	if (row.timestamp === null || row.timestamp === undefined) return null;
+	const content = canonicalReplayedUserContent(row);
+	if (content === "") return null; // parity: None/""/[] never clone-key
+	return `${row.timestamp}\u0000${JSON.stringify(content)}`;
+}
+
+/**
+ * Assistant rows block the backward dedupe scan only when they actually carry
+ * a reply payload (parity: `prev.get("content") or prev.get("tool_calls")`).
+ * An assistant row with neither must NOT hide an older duplicate behind it.
+ */
+function assistantCarriesPayload(row: MessageRow): boolean {
+	if ((row.content ?? "").length > 0) return true;
+	const raw = row.tool_calls;
+	if (!raw || raw.trim() === "" || raw.trim() === "[]") return false;
+	try {
+		const decoded: unknown = JSON.parse(raw);
+		return Array.isArray(decoded) && decoded.length > 0;
+	} catch {
+		return true; // corrupt non-empty blob most likely carried calls
+	}
+}
+
+/**
+ * hermes_state.py:_find_duplicate_replayed_user_message — BACKWARD scan for a
+ * duplicate of `msg` among already-kept rows. The scan STOPS at the first
+ * assistant message carrying content/tool_calls, so repeated legitimate asks
+ * separated by assistant replies survive (the global keep-last filter this
+ * replaces dropped them from replayed history entirely). Returns the duplicate
+ * index; the caller drops the LATER occurrence (earlier wins) unless the
+ * current row is a composite carrier, which pi cannot produce yet.
+ */
+function findDuplicateReplayedUserMessage(
+	kept: MessageRow[],
+	msg: MessageRow,
+): number | null {
+	if (msg.role !== "user") return null;
+	const content = canonicalReplayedUserContent(msg);
+	if (content === "") return null;
+	for (let i = kept.length - 1; i >= 0; i--) {
+		const prev = kept[i]!;
+		if (
+			prev.role === "user" &&
+			canonicalReplayedUserContent(prev) === content
+		) {
+			// Match condition `(prefer_current or prev_is_composite or
+			// isinstance(content, str))` reduces to true for pi's plain-string
+			// payloads.
+			return i;
+		}
+		if (prev.role === "assistant" && assistantCarriesPayload(prev)) {
+			return null; // assistant-boundary stop (hermes anchor above)
+		}
+	}
+	return null;
+}
+
+/**
  * The exact replay-read path projection (02 §7.3 steps 2–3): fixed projection
  * INCLUDING api_content, over self + compression ancestors, ordered by id
  * (insertion order), so the provider prefix is byte-identical to what previous
  * turns sent ⇒ cache hits. Ancestors contribute ONLY through compression-ended
- * parents (`get_compression_tip` walk semantics, bounded 100 hops). Rows are
- * returned RAW — sidecars verbatim, alternation repair left to the agent layer
- * pre-request (DEC-015), dedupe of duplicated replayed user rows available as
- * the explicit defense strip from §7.3 step 3.
+ * parents (`get_compression_tip` walk semantics, bounded 100 hops) AND only
+ * when the self row is not an explicit `_branched_from` branch — branches own
+ * copied transcripts, so walking their lineage would duplicate every ancestor
+ * row with the clone (hermes get_messages_as_conversation →
+ * _is_explicit_branch_session gate). Rows are returned RAW — sidecars
+ * verbatim, alternation repair left to the agent layer pre-request (DEC-015),
+ * dedupe of duplicated replayed user rows available as the explicit defense
+ * strip from §7.3 step 3 (boundary-respecting backward scan).
  */
 export function readReplayMessages(
 	db: Database.Database,
@@ -258,32 +361,39 @@ export function readReplayMessages(
 ): MessageRow[] {
 	const ids: string[] = [sessionId];
 	if (opts.includeAncestors !== false) {
-		const stmt = db.prepare(
-			"SELECT id, parent_session_id, end_reason FROM sessions WHERE id = ?",
-		);
-		let currentId: string | null = sessionId;
-		const seen = new Set<string>(ids);
-		let hops = 0;
-		while (currentId !== null && hops < 100) {
-			hops++;
-			const row = stmt.get(currentId) as
-				| {
-						id: string;
-						parent_session_id: string | null;
-						end_reason: string | null;
-				  }
-				| undefined;
-			if (!row) break;
-			const parent = row.parent_session_id;
-			if (!parent || seen.has(parent)) break;
-			const parentRow = stmt.get(parent) as
-				| { id: string; end_reason: string | null }
-				| undefined;
-			// Only compression-ended ancestors contribute history (§4.2/§7.3).
-			if (!parentRow || parentRow.end_reason !== "compression") break;
-			seen.add(parent);
-			ids.push(parent);
-			currentId = parent;
+		// Explicit-branch gate (hermes get_messages_as_conversation): a branched
+		// child replays ONLY its copied transcript — never the live parent rows.
+		const selfCfg = db
+			.prepare("SELECT model_config FROM sessions WHERE id = ?")
+			.get(sessionId) as { model_config: string | null } | undefined;
+		if (!isExplicitBranchSession(selfCfg?.model_config ?? null)) {
+			const stmt = db.prepare(
+				"SELECT id, parent_session_id, end_reason FROM sessions WHERE id = ?",
+			);
+			let currentId: string | null = sessionId;
+			const seen = new Set<string>(ids);
+			let hops = 0;
+			while (currentId !== null && hops < 100) {
+				hops++;
+				const row = stmt.get(currentId) as
+					| {
+							id: string;
+							parent_session_id: string | null;
+							end_reason: string | null;
+					  }
+					| undefined;
+				if (!row) break;
+				const parent = row.parent_session_id;
+				if (!parent || seen.has(parent)) break;
+				const parentRow = stmt.get(parent) as
+					| { id: string; end_reason: string | null }
+					| undefined;
+				// Only compression-ended ancestors contribute history (§4.2/§7.3).
+				if (!parentRow || parentRow.end_reason !== "compression") break;
+				seen.add(parent);
+				ids.push(parent);
+				currentId = parent;
+			}
 		}
 	}
 	const placeholders = ids.map(() => "?").join(", ");
@@ -296,24 +406,53 @@ export function readReplayMessages(
 		.all(...ids) as MessageRow[];
 	const mapped = rows.map(normalizeCounts);
 	if (opts.dedupeReplayedUserRows !== true) return mapped;
-	// Defense strip: when ancestor segments were cloned into children the same
-	// user row can appear twice under DIFFERENT session ids — key on CONTENT
-	// across the merged stream, keep the LAST occurrence (highest id).
-	const lastIndexOfUser = new Map<string, number>();
-	for (let i = mapped.length - 1; i >= 0; i--) {
-		const r = mapped[i]!;
-		if (r.role !== "user") continue;
-		const key = r.content ?? "";
-		if (!lastIndexOfUser.has(key)) {
-			lastIndexOfUser.set(key, i);
+	// Defense strip (§7.3 include_ancestors defense): when ancestor segments
+	// were cloned into children the same user ask can appear twice under
+	// DIFFERENT session ids. Dedupe is the hermes boundary-respecting backward
+	// scan — NOT a global keep-last-by-content filter, which erased repeated
+	// legitimate asks that an assistant reply separates:
+	//   1. EXACT rotation clones — identical (timestamp, json-content) key —
+	//      keep the LATER row: the child carrier owns the durable row identity
+	//      (_exact_replayed_user_clone_key + prefer_current pop).
+	//   2. Same-ask duplicates inside the current assistant-free window — the
+	//      backward scan stops at the first assistant carrying content or
+	//      tool_calls; the EARLIER occurrence survives (_find_duplicate_
+	//      replayed_user_message → `continue`). Composite-carrier preference is
+	//      wired but inert until pi grows split carriers (see
+	//      canonicalReplayedUserContent).
+	const kept: MessageRow[] = [];
+	/** clone key → exact row object kept in `kept` (identity-scanned on hit). */
+	const exactClones = new Map<string, MessageRow>();
+	for (const row of mapped) {
+		let cloneKey: string | null = null;
+		if (row.role === "user") {
+			cloneKey = exactReplayedUserCloneKey(row);
+			let duplicateIndex: number | null = null;
+			let preferCurrent = false;
+			const prevExact =
+				cloneKey === null ? undefined : exactClones.get(cloneKey);
+			if (prevExact !== undefined) {
+				const idx = kept.indexOf(prevExact);
+				if (idx >= 0) {
+					duplicateIndex = idx;
+					preferCurrent = true; // exact clone ⇒ later carrier wins
+				}
+			}
+			if (duplicateIndex === null) {
+				duplicateIndex = findDuplicateReplayedUserMessage(kept, row);
+			}
+			if (duplicateIndex !== null) {
+				if (preferCurrent) {
+					kept.splice(duplicateIndex, 1); // pop the ancestor copy
+				} else {
+					continue; // ordinary window duplicate: earlier occurrence stays
+				}
+			}
 		}
+		kept.push(row);
+		if (cloneKey !== null) exactClones.set(cloneKey, row);
 	}
-	return mapped.filter((r, i) => {
-		if (r.role !== "user") return true;
-		const key = r.content ?? "";
-		const keep = lastIndexOfUser.get(key);
-		return keep === undefined || keep === i ? true : false;
-	});
+	return kept;
 }
 
 /**

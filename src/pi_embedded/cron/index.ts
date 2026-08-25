@@ -90,11 +90,14 @@ export {
 } from "./delivery.js";
 
 export {
+	CRON_SESSION_ENV,
 	CronMemoryPolicyError,
 	CronTurnExecutor,
 	constructCronAgentPlan,
 	cronExecutorAsRunner,
 	cronSessionId,
+	isCronSessionContext,
+	runInCronSession,
 	type CronAgentConstruction,
 	type CronRunnerSurface,
 	type CronTurnExecutorOptions,

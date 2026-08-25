@@ -50,9 +50,32 @@ export type RunStatus =
 	| "failed"
 	| "cancelled";
 
-/** Typed SSE event vocabulary (api_server.py event names). */
+/**
+ * Typed SSE event vocabulary (api_server.py event names). The wire mapper in
+ * server.ts renders these as `event: <type>` frames whose data payloads carry
+ * snake_case run_id/session_id/seq/ts (webhook-46 conformance).
+ */
 export type RunEvent =
-	| { type: "message.delta"; runId: string; text: string }
+	| { type: "assistant.delta"; runId: string; text: string }
+	| {
+			type: "tool.started";
+			runId: string;
+			toolName: string;
+			preview?: string | undefined;
+	  }
+	| {
+			type: "tool.completed";
+			runId: string;
+			toolName: string;
+			duration?: number | undefined;
+			isError?: boolean | undefined;
+	  }
+	| {
+			type: "tool.failed";
+			runId: string;
+			toolName: string;
+			preview?: string | undefined;
+	  }
 	| {
 			type: "approval.request";
 			runId: string;
@@ -65,11 +88,35 @@ export type RunEvent =
 			runId: string;
 			approvalId: number;
 			choice: ApprovalChoice;
+			/** Approvals resolved by this response (_handle_run_approval @8147). */
+			resolved: number;
 	  }
 	| { type: "run.steered"; runId: string; text: string }
-	| { type: "run.completed"; runId: string; output: string }
+	| {
+			type: "run.completed";
+			runId: string;
+			output: string;
+			/** Undelivered steer text rides the terminal event (@7926). */
+			pendingSteer?: string | undefined;
+	  }
 	| { type: "run.failed"; runId: string; error: string }
 	| { type: "run.cancelled"; runId: string };
+
+/** Token usage block surfaced on the completed status view (:7926-7936). */
+export interface RunUsage {
+	promptTokens: number;
+	completionTokens: number;
+	totalTokens: number;
+}
+
+/**
+ * Executor completion payload. A bare string stays legal (usage omitted) so
+ * pre-existing executors compile unchanged.
+ */
+export interface RunCompletion {
+	output: string;
+	usage?: RunUsage | undefined;
+}
 
 /**
  * The executor seam: production wires the real agent loop; tests script the
@@ -79,6 +126,18 @@ export type RunEvent =
 export interface RunExecutorControls {
 	runId: string;
 	emitDelta(text: string): void;
+	/** api_server.py tool_progress_callback parity (typed SSE vocabulary). */
+	emitToolProgress(
+		event:
+			| { name: "tool.started"; toolName: string; preview?: string }
+			| {
+					name: "tool.completed";
+					toolName: string;
+					duration?: number;
+					isError?: boolean;
+			  }
+			| { name: "tool.failed"; toolName: string; preview?: string },
+	): void;
 	shouldStop(): boolean;
 	/**
 	 * Hold the run open for a human decision. Resolves with the approved
@@ -93,26 +152,53 @@ export interface RunExecutorControls {
 export type RunExecutor = (
 	controls: RunExecutorControls,
 	input: string,
-) => Promise<string>;
+) => Promise<string | RunCompletion>;
 
+/**
+ * Pollable status view — api_server.py:_set_run_status shape
+ * ({'object':'hermes.run','run_id','status','created_at','updated_at',...}).
+ */
 export interface RunView {
+	object: "hermes.run";
 	runId: string;
 	status: RunStatus;
+	/** Epoch SECONDS (Hermes time.time() parity). */
+	createdAt: number;
+	updatedAt: number;
+	sessionId: string;
+	/** Requested model — stored at QUEUED (body.get("model") @7690 parity). */
+	model?: string | undefined;
+	usage?: RunUsage | undefined;
+	/** Undelivered steer text retained on the completed view (@7926-7936). */
+	pendingSteer?: string | undefined;
 	output?: string | undefined;
 	error?: string | undefined;
+	lastEvent?: string | undefined;
 }
 
 interface RunRecord {
 	runId: string;
+	/** Hermes defaults session_id to the run id when the caller omits one. */
+	sessionId: string;
 	status: RunStatus;
 	events: RunEvent[];
 	listener: ((event: RunEvent) => void) | null;
 	pendingSteer: string | null;
 	stopRequested: boolean;
 	interruptListeners: Array<() => void>;
+	createdAtMs: number;
+	updatedAtMs: number;
 	completedAtMs: number | null;
+	/** Last emitted event name (status view `last_event`). */
+	lastEventName: string | null;
+	/** Monotonic per-run SSE sequence (wire field `seq`). */
+	seqCounter: number;
 	/** The currently-open approval for THIS run (namespace = run_id parity). */
 	currentApprovalId: number | null;
+	/** Requested model, fixed at start (queued-status field parity). */
+	model: string | null;
+	/** Usage reported by the executor on completion. */
+	usage: RunUsage | null;
 }
 
 export class RunRegistry {
@@ -142,19 +228,33 @@ export class RunRegistry {
 	 * registers the queue before the task), so events emitted immediately are
 	 * captured, never raced.
 	 */
-	start(input: string, executor: RunExecutor): string {
+	start(
+		input: string,
+		executor: RunExecutor,
+		opts: { sessionId?: string | undefined; model?: string | undefined } = {},
+	): string {
 		this.seq += 1;
 		const runId = `run_${String(this.seq).padStart(6, "0")}`;
+		const nowMsValue = this.nowMs();
 		const record: RunRecord = {
 			runId,
+			sessionId: opts.sessionId ?? runId,
 			status: "running",
 			events: [],
 			listener: null,
 			pendingSteer: null,
 			stopRequested: false,
 			interruptListeners: [],
+			createdAtMs: nowMsValue,
+			updatedAtMs: nowMsValue,
 			completedAtMs: null,
+			lastEventName: null,
+			seqCounter: 0,
 			currentApprovalId: null,
+			// Hermes stores body.get("model", self._model_name) at QUEUED; the
+			// caller (HTTP lane) supplies the default-model fallback.
+			model: opts.model ?? null,
+			usage: null,
 		};
 		this.runs.set(runId, record);
 
@@ -162,20 +262,59 @@ export class RunRegistry {
 			const controls: RunExecutorControls = {
 				runId,
 				emitDelta: (text) => {
-					this.pushEvent(record, { type: "message.delta", runId, text });
+					this.pushEvent(record, { type: "assistant.delta", runId, text });
+				},
+				emitToolProgress: (event) => {
+					if (event.name === "tool.started") {
+						this.pushEvent(record, {
+							type: "tool.started",
+							runId,
+							toolName: event.toolName,
+							preview: event.preview,
+						});
+					} else if (event.name === "tool.completed") {
+						this.pushEvent(record, {
+							type: "tool.completed",
+							runId,
+							toolName: event.toolName,
+							duration: event.duration,
+							isError: event.isError,
+						});
+					} else {
+						this.pushEvent(record, {
+							type: "tool.failed",
+							runId,
+							toolName: event.toolName,
+							preview: event.preview,
+						});
+					}
 				},
 				shouldStop: () => record.stopRequested,
 				requestApproval: (command, choices = APPROVAL_CHOICES) =>
 					this.openApproval(record, command, choices),
 			};
 			try {
-				const output = await executor(controls, input);
+				const result = await executor(controls, input);
+				const outcome =
+					typeof result === "string" ? { output: result } : result;
 				if (record.status === "stopping") {
 					this.finishCancelled(record);
 				} else {
 					record.status = "completed";
 					record.completedAtMs = this.nowMs();
-					this.pushEvent(record, { type: "run.completed", runId, output });
+					record.usage = outcome.usage ?? null;
+					// Undelivered steer text rides the terminal event + status
+					// (api_server.py turn_finalizer parity @7889-7936).
+					const pendingSteer =
+						record.pendingSteer !== null && record.pendingSteer.length > 0
+							? record.pendingSteer
+							: undefined;
+					this.pushEvent(record, {
+						type: "run.completed",
+						runId,
+						output: outcome.output,
+						pendingSteer,
+					});
 				}
 			} catch (err) {
 				if (
@@ -255,13 +394,17 @@ export class RunRegistry {
 	/**
 	 * POST /v1/runs/:id/approvals — BY-RUN resolution (approval namespace is
 	 * the run_id): the run's open approval pops atomically; none open ⇒
-	 * approval_not_active, already consumed ⇒ approval_not_pending.
+	 * approval_not_active, already consumed ⇒ approval_not_pending. With
+	 * `resolveAll` (body all/resolve_all booleans, _handle_run_approval @8121
+	 * parity) EVERY live approval registered under THIS run resolves FIFO and
+	 * `resolved` carries the drained count; ONE SSE frame reports it (@8147).
 	 */
 	respondApprovalForRun(
 		runId: string,
 		rawChoice: string,
+		opts: { resolveAll?: boolean | undefined } = {},
 	):
-		| { ok: true; choice: ApprovalChoice }
+		| { ok: true; choice: ApprovalChoice; resolved: number }
 		| {
 				ok: false;
 				code:
@@ -277,9 +420,54 @@ export class RunRegistry {
 		if (record.currentApprovalId === null) {
 			return { ok: false, code: "approval_not_active" };
 		}
-		const result = this.respondApproval(record.currentApprovalId, rawChoice);
-		if (result.ok) return { ok: true, choice: result.choice };
-		return { ok: false, code: result.code };
+		const choice = normalizeApprovalChoice(rawChoice);
+		if (choice === null) return { ok: false, code: "invalid_choice" };
+
+		if (opts.resolveAll === true) {
+			// resolve_gateway_approval(resolve_all=True): drain the whole
+			// session queue FIFO (tools/approval.py:2850). The store keys each
+			// entry by sessionKey=run_id, so oldestIdForSession IS the queue.
+			let resolvedCount = 0;
+			let firstApprovalId = record.currentApprovalId;
+			for (;;) {
+				const oldest = this.approvals.oldestIdForSession(runId);
+				if (oldest === null) break;
+				const id = Number(oldest);
+				if (resolvedCount === 0) firstApprovalId = id;
+				const outcome = this.resolveViaStore(id, choice);
+				if (outcome.state === "resolved") resolvedCount += 1;
+			}
+			if (resolvedCount <= 0) {
+				return { ok: false, code: "approval_not_pending" };
+			}
+			this.pushEvent(record, {
+				type: "approval.responded",
+				runId,
+				approvalId: firstApprovalId ?? 0,
+				choice,
+				resolved: resolvedCount,
+			});
+			return { ok: true, choice, resolved: resolvedCount };
+		}
+
+		const outcome = this.resolveViaStore(record.currentApprovalId, choice);
+		if (outcome.state !== "resolved") {
+			return {
+				ok: false,
+				code:
+					outcome.state === "absent"
+						? "approval_not_pending"
+						: "approval_not_active",
+			};
+		}
+		this.pushEvent(record, {
+			type: "approval.responded",
+			runId,
+			approvalId: record.currentApprovalId,
+			choice,
+			resolved: 1,
+		});
+		return { ok: true, choice, resolved: 1 };
 	}
 
 	/** Numeric-id variant (the wire grammar's shared resolution seam). */
@@ -287,37 +475,61 @@ export class RunRegistry {
 		approvalId: number,
 		rawChoice: string,
 	):
-		| { ok: true; runId: string; choice: ApprovalChoice }
+		| { ok: true; runId: string; choice: ApprovalChoice; resolved: number }
 		| {
 				ok: false;
 				code: "approval_not_active" | "approval_not_pending" | "invalid_choice";
 		  } {
 		const choice = normalizeApprovalChoice(rawChoice);
 		if (choice === null) return { ok: false, code: "invalid_choice" };
-		const pop = this.approvals.pop(approvalId, Number.MAX_SAFE_INTEGER);
-		if (pop.state === "absent") {
-			return { ok: false, code: "approval_not_pending" };
+		const outcome = this.resolveViaStore(approvalId, choice);
+		if (outcome.state !== "resolved") {
+			return {
+				ok: false,
+				code:
+					outcome.state === "absent"
+						? "approval_not_pending"
+						: "approval_not_active",
+			};
 		}
-		const waiter = this.approvalWaiters.get(approvalId);
-		this.approvalWaiters.delete(approvalId);
-		if (waiter === undefined) {
-			return { ok: false, code: "approval_not_active" };
-		}
-		const runId = pop.state === "live" ? pop.sessionKey : "";
-		const record = runId === "" ? undefined : this.runs.get(runId);
-		waiter(choice);
-		if (record !== undefined && record.status === "waiting_for_approval") {
-			record.status = "running";
-		}
+		const record =
+			outcome.runId === null ? undefined : this.runs.get(outcome.runId);
 		if (record !== undefined) {
 			this.pushEvent(record, {
 				type: "approval.responded",
 				runId: record.runId,
 				approvalId,
 				choice,
+				resolved: 1,
 			});
 		}
-		return { ok: true, runId, choice };
+		return { ok: true, runId: outcome.runId ?? "", choice, resolved: 1 };
+	}
+
+	/**
+	 * Atomic POP + waiter resolution WITHOUT event emission — the two entry
+	 * points above own their SSE frames (Hermes emits one approval.responded
+	 * frame per HTTP response, carrying the total resolved count). Also flips
+	 * a waiting_for_approval run back to running (_handle_run_approval @8153).
+	 */
+	private resolveViaStore(
+		approvalId: number,
+		choice: ApprovalChoice,
+	):
+		| { state: "resolved"; runId: string | null }
+		| { state: "absent" | "no_waiter" } {
+		const pop = this.approvals.pop(approvalId, Number.MAX_SAFE_INTEGER);
+		if (pop.state === "absent") return { state: "absent" };
+		const waiter = this.approvalWaiters.get(approvalId);
+		this.approvalWaiters.delete(approvalId);
+		if (waiter === undefined) return { state: "no_waiter" };
+		const runId = pop.state === "live" ? pop.sessionKey : null;
+		const record = runId === null ? undefined : this.runs.get(runId);
+		waiter(choice);
+		if (record !== undefined && record.status === "waiting_for_approval") {
+			record.status = "running";
+		}
+		return { state: "resolved", runId };
 	}
 
 	/** POST /v1/runs/:id/steer — only RUNNING runs accept steer text. */
@@ -346,12 +558,17 @@ export class RunRegistry {
 		return text;
 	}
 
-	/** POST /v1/runs/:id/stop — COOPERATIVE interruption. */
+	/**
+	 * POST /v1/runs/:id/stop — COOPERATIVE interruption. Once a run is
+	 * TERMINAL its agent/task refs are gone (api_server.py pops them in the
+	 * _run_and_close finally-block @7975), so a late stop answers 404
+	 * run_not_found exactly like an unknown id (_handle_stop_run @8199).
+	 */
 	stop(runId: string): { ok: boolean; code?: string | undefined } {
 		const record = this.runs.get(runId);
-		if (record === undefined) return { ok: false, code: "unknown_run" };
-		if (isTerminal(record.status))
-			return { ok: false, code: "run_already_finished" };
+		if (record === undefined || isTerminal(record.status)) {
+			return { ok: false, code: "unknown_run" };
+		}
 		record.stopRequested = true;
 		record.status = "stopping";
 		for (const listener of [...record.interruptListeners]) {
@@ -376,12 +593,25 @@ export class RunRegistry {
 	status(runId: string): RunView | null {
 		const record = this.runs.get(runId);
 		if (record === undefined) return null;
-		const view: RunView = { runId, status: record.status };
+		const view: RunView = {
+			object: "hermes.run",
+			runId,
+			status: record.status,
+			createdAt: record.createdAtMs / 1000,
+			updatedAt: Math.max(record.updatedAtMs, record.createdAtMs) / 1000,
+			sessionId: record.sessionId,
+		};
+		if (record.model !== null) view.model = record.model;
+		if (record.usage !== null) view.usage = record.usage;
+		if (record.pendingSteer !== null && record.pendingSteer.length > 0) {
+			view.pendingSteer = record.pendingSteer;
+		}
 		for (const event of [...record.events].reverse()) {
 			if (event.type === "run.completed") view.output = event.output;
 			if (event.type === "run.failed") view.error = event.error;
 			break;
 		}
+		if (record.lastEventName !== null) view.lastEvent = record.lastEventName;
 		return view;
 	}
 
@@ -409,6 +639,9 @@ export class RunRegistry {
 
 	private pushEvent(record: RunRecord, event: RunEvent): void {
 		record.events.push(event);
+		record.updatedAtMs = this.nowMs();
+		record.lastEventName = event.type;
+		record.seqCounter += 1;
 		record.listener?.(event);
 	}
 

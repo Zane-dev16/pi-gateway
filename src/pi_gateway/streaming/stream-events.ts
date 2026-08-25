@@ -17,7 +17,10 @@
 //   * The union is explicit (no marker base class) so a missing case in an
 //     exhaustive switch is a visible TYPE error rather than silent fall-through.
 
-/** A delta of streamed assistant text (think-blocks filtered UPSTREAM). */
+/** A delta of streamed assistant text (think-blocks scrubbed CONSUMER-side:
+ * GatewayStreamConsumer.filterAndAccumulate runs the streaming think-block
+ * state machine so reasoning tags never display — stream_consumer.py:
+ * _filter_and_accumulate parity). */
 export interface MessageChunk {
 	readonly type: "message_chunk";
 	readonly text: string;

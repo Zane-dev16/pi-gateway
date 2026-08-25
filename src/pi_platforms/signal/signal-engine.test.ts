@@ -5,7 +5,7 @@
 // no vendor-error-string snapshots.
 
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -28,6 +28,10 @@ import {
 } from "./rate-limit.js";
 import { guessExtension, extToMime } from "./media.js";
 import { markdownToSignal } from "./signal-format.js";
+import {
+	type PostStreamAdapter,
+	rescanPostStream,
+} from "../../pi_gateway/outbound/post-stream-rescan.js";
 import {
 	SignalAdapter,
 	isSignalServiceId,
@@ -1124,5 +1128,173 @@ describe("identifier + result-validation helpers", () => {
 		expect(parseRetryAfterSeconds("7")).toBe(7);
 		expect(parseRetryAfterSeconds(-1)).toBeNull();
 		expect(parseRetryAfterSeconds("soon")).toBeNull();
+	});
+});
+
+// ── post-stream media lanes (signal.py:_send_attachment parity) ─────────────
+
+describe("post-stream media lanes (signal.py:_send_attachment parity)", () => {
+	it("single-attachment send carries the caption as the message body over the SAME rpc/wire path", async () => {
+		const w = makeWorld();
+		try {
+			const pdf = join(w.mediaDir, "report.pdf");
+			writeFileSync(pdf, Buffer.from("%PDF-1.4 attachment payload"));
+			const r = await w.adapter.sendAttachment("+15551112222", pdf, {
+				caption: "see attached",
+				mediaLabel: "File",
+			});
+			expect(r.success).toBe(true);
+			expect(r.messageId).toBeNull(); // NO editable identity — same as text
+			const send = w.daemon.callsOf("send")[0];
+			expect(send?.params["account"]).toBe("+15550001111");
+			expect(send?.params["message"]).toBe("see attached");
+			expect(send?.params["attachments"]).toEqual([pdf]);
+			expect(send?.params["recipient"]).toEqual(["+15551112222"]);
+			expect(send?.params["groupId"]).toBeUndefined();
+		} finally {
+			w.cleanup();
+		}
+	});
+
+	it("voice/video lanes resolve addresses identically to text sends: groups strip the prefix, DMs pass through", async () => {
+		const w = makeWorld();
+		try {
+			const audio = join(w.mediaDir, "note.mp3");
+			writeFileSync(audio, Buffer.from("ID3 voice payload"));
+			const video = join(w.mediaDir, "clip.mp4");
+			writeFileSync(video, Buffer.from("ftypisom video payload"));
+
+			await w.adapter.sendVoice("group:abc123==", audio);
+			let send = w.daemon.callsOf("send")[0];
+			expect(send?.params["groupId"]).toBe("abc123==");
+			expect(send?.params["recipient"]).toBeUndefined();
+			expect(send?.params["account"]).toBe("+15550001111");
+			expect(send?.params["message"]).toBe("");
+			expect(send?.params["attachments"]).toEqual([audio]);
+
+			await w.adapter.sendVideo("+15551112222", video);
+			send = w.daemon.callsOf("send")[1];
+			expect(send?.params["recipient"]).toEqual(["+15551112222"]);
+			expect(send?.params["groupId"]).toBeUndefined();
+			expect(send?.params["attachments"]).toEqual([video]);
+		} finally {
+			w.cleanup();
+		}
+	});
+
+	it("missing files fail with the source verdict WITHOUT burning an RPC", async () => {
+		const w = makeWorld();
+		try {
+			const ghost = join(w.mediaDir, "ghost.pdf");
+			const r = await w.adapter.sendDocument("+15551112222", ghost);
+			expect(r.success).toBe(false);
+			expect(r.error).toBe(`File file not found: ${ghost}`);
+			expect(w.daemon.callsOf("send")).toHaveLength(0);
+		} finally {
+			w.cleanup();
+		}
+	});
+
+	it("image batches ride the scheduler-paced batch lane: ONE rpc, empty message body", async () => {
+		const w = makeWorld();
+		try {
+			const images = ["a.png", "b.png", "c.png"].map((n) => {
+				const p = join(w.mediaDir, n);
+				writeFileSync(p, Buffer.from("png-bytes"));
+				return p;
+			});
+			const results = await w.adapter.sendMultipleImages(
+				"+15551112222",
+				images,
+			);
+			expect(results.map((r) => r.success)).toEqual([true]); // ONE batch outcome
+			const send = w.daemon.callsOf("send")[0];
+			expect(send?.params["attachments"]).toEqual(images);
+			expect(send?.params["message"]).toBe("");
+			expect(send?.params["recipient"]).toEqual(["+15551112222"]);
+		} finally {
+			w.cleanup();
+		}
+	});
+
+	it("attachment-send timestamps feed the Note-to-Self echo filter end-to-end", async () => {
+		const w = makeWorld();
+		try {
+			w.adapter.attachStandardGuard();
+			const p = join(w.mediaDir, "f.pdf");
+			writeFileSync(p, Buffer.from("%PDF"));
+			await w.adapter.sendAttachment("+15551112222", p);
+			const ts = Number(
+				(w.daemon.callsOf("send")[0]?.result as Record<string, unknown>)[
+					"timestamp"
+				],
+			);
+			await w.adapter.handleEnvelope({
+				envelope: {
+					syncMessage: {
+						sentMessage: {
+							destinationNumber: "+15550001111",
+							timestamp: ts,
+						},
+					},
+				},
+			});
+			expect(w.adapter.counts.echoSuppressed).toBe(1);
+			expect(w.adapter.turnLog).toEqual([]);
+		} finally {
+			w.cleanup();
+		}
+	});
+
+	it("the four lanes bind the core rescan seam end-to-end (MEDIA tags dispatch real RPCs)", async () => {
+		const w = makeWorld();
+		try {
+			const png = join(w.mediaDir, "shot.png");
+			writeFileSync(png, Buffer.from("png"));
+			const png2 = join(w.mediaDir, "shot2.png");
+			writeFileSync(png2, Buffer.from("png2"));
+			const ogg = join(w.mediaDir, "memo.ogg");
+			writeFileSync(ogg, Buffer.from("ogg"));
+			const mov = join(w.mediaDir, "clip.mov");
+			writeFileSync(mov, Buffer.from("mov"));
+			const pdf = join(w.mediaDir, "paper.pdf");
+			writeFileSync(pdf, Buffer.from("pdf"));
+
+			const lane: PostStreamAdapter = w.adapter;
+			const opts = (adapter: PostStreamAdapter) => ({
+				adapter,
+				chatId: "+15551112222",
+				chatPlatform: "signal",
+				validatePath: (p: string): string | null => p,
+			});
+
+			const r1 = await rescanPostStream(
+				`MEDIA:${png} MEDIA:${png2} MEDIA:${ogg}`,
+				opts(lane),
+			);
+			expect(r1.attempts.map((a) => [a.kind, a.status])).toEqual([
+				["image_batch", "sent"],
+				["voice_or_audio", "sent"],
+			]);
+			// Batch first (ONE rpc carrying both images), then the voice send.
+			let sends = w.daemon.callsOf("send");
+			expect(sends[0]?.params["attachments"]).toEqual([png, png2]);
+			expect(sends[0]?.params["message"]).toBe("");
+			expect(sends[1]?.params["attachments"]).toEqual([ogg]);
+
+			const r2 = await rescanPostStream(
+				`MEDIA:${mov} MEDIA:${pdf}`,
+				opts(lane),
+			);
+			expect(r2.attempts.map((a) => [a.kind, a.status])).toEqual([
+				["video", "sent"],
+				["document", "sent"],
+			]);
+			sends = w.daemon.callsOf("send");
+			expect(sends[2]?.params["attachments"]).toEqual([mov]);
+			expect(sends[3]?.params["attachments"]).toEqual([pdf]);
+		} finally {
+			w.cleanup();
+		}
 	});
 });

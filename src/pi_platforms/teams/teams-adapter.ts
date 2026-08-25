@@ -17,7 +17,9 @@
 //     documents fetched through the SSRF-guarded seam) → classification
 //     precedence DOCUMENT > PHOTO > VIDEO > AUDIO > TEXT
 //   - card actions route through THE ONE kit CallbackQueryRouter with DEFAULT-
-//     DENY clicker authorization (_on_card_action posture)
+//     DENY clicker authorization (_on_card_action posture); clicks resolve by
+//     SESSION KEY (the wire carries no approval id — btn_data_base parity),
+//     and resolved taps echo the full confirmation card
 //   - send(): format_message identity → native chunking → threaded reply ONLY
 //     for digit reply_to ("0" excluded) with FLAT fallback on ANY failure;
 //     every activity ships RAW markdown (textFormat:"markdown") — Teams
@@ -145,12 +147,35 @@ export interface SkippedActivity {
 	reason: "self-message" | "duplicate" | "malformed";
 }
 
-/** InvokeResponse-shape result of an Adaptive Card action (parity). */
-export interface CardActionResponse {
-	statusCode: number;
-	kind: "message" | "card";
-	value: string;
+/** Adaptive Card TextBlock (_on_card_action response bodies @1160-1181). */
+export interface CardTextBlock {
+	type: "TextBlock";
+	text: string;
+	wrap: boolean;
+	weight?: "Bolder";
+	isSubtle?: boolean;
 }
+
+/**
+ * AdaptiveCard payload echoed by AdaptiveCardActionCardResponse bodies
+ * (AdaptiveCard().with_version("1.4").with_body(...) parity).
+ */
+export interface AdaptiveCardPayload {
+	type: "AdaptiveCard";
+	version: "1.4";
+	body: CardTextBlock[];
+}
+
+/**
+ * InvokeResponse-shape result of an Adaptive Card action (parity):
+ * kind "message" ≙ AdaptiveCardActionMessageResponse(value: string);
+ * kind "card" ≙ AdaptiveCardActionCardResponse(value: full AdaptiveCard
+ * payload). Vendor serialization of the two response classes stays
+ * SDK-delegated — only Hermes-proven fields are carried.
+ */
+export type CardActionResponse =
+	| { statusCode: number; kind: "message"; value: string }
+	| { statusCode: number; kind: "card"; value: AdaptiveCardPayload };
 
 export class TeamsAdapter extends BasePlatformAdapter {
 	readonly pluginManifest = TEAMS_PLUGIN_MANIFEST;
@@ -190,6 +215,8 @@ export class TeamsAdapter extends BasePlatformAdapter {
 
 	readonly turnLog: string[] = [];
 	readonly replyLog: string[] = [];
+	/** Source chatName per handled turn (webhook-39 conformance observability). */
+	readonly sourceChatNames: string[] = [];
 	readonly clarifyCaptures: string[] = [];
 	readonly resolvedFamilies: string[] = [];
 	/** Classified media kind per ACCEPTED activity (classification rows). */
@@ -319,10 +346,17 @@ export class TeamsAdapter extends BasePlatformAdapter {
 	// ── INBOUND: Bot Framework activity POST (handleActivityPost) ────────────
 
 	/**
-	 * Body-cap gate then the _on_message pipeline. Order ports the source:
-	 * cap (aiohttp client_max_size posture) → JSON shape → self filter →
-	 * dedupe → conv-ref cache → mention strip → chat-type map → attachments →
-	 * dispatch. Malformed bodies answer 400 (sender's problem).
+	 * Body-cap gate then SDK handler dispatch. Order ports the source: cap
+	 * (aiohttp client_max_size posture) → JSON shape → per-activity routing →
+	 * self filter → dedupe → conv-ref cache → mention strip → chat-type map →
+	 * attachments → dispatch. Malformed bodies answer 400 (sender's problem).
+	 *
+	 * The Hermes SDK registers PER-ACTIVITY handlers (@850-859): on_message
+	 * fires for MessageActivity ONLY and on_card_action for
+	 * AdaptiveCardInvokeActivity — conversationUpdate/typing pings and other
+	 * invoke names never become pipeline traffic. Card invokes answer HTTP 200
+	 * WITH the modeled InvokeResponse body ({value}); message activities ack
+	 * bare (webhook-41).
 	 */
 	async handleActivityPost(input: {
 		headers?: Record<string, string> | undefined;
@@ -342,11 +376,30 @@ export class TeamsAdapter extends BasePlatformAdapter {
 		) {
 			return { status: 400 };
 		}
-		const outcome = await this.onMessage(payload as ActivityRecord);
-		return {
-			status: 200,
-			json: outcome.skipped ? { skipped: outcome.reason } : { accepted: true },
-		};
+		const activity = payload as ActivityRecord;
+		// teams-3 gate: AdaptiveCard Action.Execute invokes route to the
+		// card-action handler; the clicker identity rides activity.from.
+		if (
+			str(activity["type"]) === "invoke" &&
+			str(activity["name"]) === "adaptiveCard/action"
+		) {
+			const actionValue = asRec(asRec(activity["value"])["action"]);
+			const resp = await this.handleCardAction(
+				asRec(actionValue["data"]),
+				clickerOf(activity),
+			);
+			return { status: resp.statusCode, json: { value: resp.value } };
+		}
+		// Non-message activities (conversationUpdate / typing pings / unknown
+		// invoke names) are IGNORED — acked empty, never dispatched.
+		if (str(activity["type"]) !== "message") return { status: 200 };
+		// webhook-41 (Hermes adapter.py:_AiohttpBridgeAdapter @403-407): message
+		// activities answer web.Response(status) with NO body — accepted AND
+		// skipped POSTs alike ack ZERO bytes. Skip reasons stay observable as
+		// counters/logs (selfMessagesSkipped / duplicatesSkipped), never on the
+		// wire.
+		await this.onMessage(activity);
+		return { status: 200 };
 	}
 
 	/**
@@ -374,13 +427,17 @@ export class TeamsAdapter extends BasePlatformAdapter {
 		// Cache the conversation reference for proactive sends.
 		const conversation = asRec(activity["conversation"]);
 		const convId = str(conversation["id"]);
+		// webhook-39 (Hermes adapter.py:_on_message @946): the conversation
+		// display name rides BOTH the cached reference and the event source —
+		// chat_name = getattr(conv, "name", None) or "".
+		const conversationName = str(conversation["name"]);
 		if (convId) {
 			this.convRefs.set(convId, {
 				conversationType: str(
 					conversation["conversation_type"] ?? conversation["conversationType"],
 				),
 				tenantId: str(conversation["tenant_id"] ?? conversation["tenantId"]),
-				name: str(conversation["name"]),
+				name: conversationName,
 			});
 		}
 
@@ -400,6 +457,14 @@ export class TeamsAdapter extends BasePlatformAdapter {
 			str(from["aad_object_id"] ?? from["aadObjectId"]) || str(from["id"]);
 		const userName = str(from["name"]);
 
+		// webhook-39 (Hermes adapter.py:_on_message @946): chat_name is ALWAYS
+		// getattr(conv,"name",None) or "" — the SENDER name never names a
+		// channel/group session (they would otherwise be named after whoever
+		// spoke last). The sender name only backs the DM fallback when the
+		// conversation carries no name of its own.
+		let chatName = conversationName;
+		if (chatName === "" && chatType === "dm") chatName = userName;
+
 		// Attachment walk (classification precedence lives in classifyMedia).
 		const media = await this.collectAttachments(activity);
 
@@ -418,7 +483,7 @@ export class TeamsAdapter extends BasePlatformAdapter {
 				chatType,
 				userId,
 				chatId: convId,
-				...(userName ? { chatName: userName } : {}),
+				...(chatName !== "" ? { chatName } : {}),
 			},
 			...(media.urls.length > 0 ? { mediaUrls: media.urls } : {}),
 			...(media.types.length > 0 ? { mediaTypes: media.types } : {}),
@@ -542,11 +607,16 @@ export class TeamsAdapter extends BasePlatformAdapter {
 		}
 	}
 
-	// ── CARD ACTIONS (_on_card_action @~1150 parity) ─────────────────────────
+	// ── CARD ACTIONS (_on_card_action @1146-1181 parity) ─────────────────────────
 
 	/**
 	 * Adaptive Card Action.Execute handler: default-DENY clicker authz, choice
-	 * mapping through THE ONE kit router, explicit expiry answers. Never
+	 * mapping, then SESSION-KEY resolution — the Teams wire carries NO approval
+	 * id in the button data (btn_data_base parity), so a click resolves through
+	 * the pending store by session_key (has_blocking_approval +
+	 * resolve_gateway_approval parity) and still rides THE ONE kit router on
+	 * the claimed approval id. Stale/expired sessions answer the explicit
+	 * expiry CARD; resolved taps echo the full confirmation card. Never
 	 * dispatched as turns; consumed taps answer inline within the ack window.
 	 */
 	async handleCardAction(
@@ -590,37 +660,46 @@ export class TeamsAdapter extends BasePlatformAdapter {
 			return { statusCode: 200, kind: "message", value: "Unknown action." };
 		}
 
-		// Stale/expired approvals answer EXPLICITLY (never dispatched as turns).
-		const rawId = Number(value["approval_id"]);
-		if (!Number.isInteger(rawId)) {
+		// has_blocking_approval(session_key) parity (@1146): nothing pending for
+		// this session ⇒ the explicit expiry card (never dispatched as a turn).
+		const pendingId = this.approvals.oldestIdForSession(sessionKey);
+		if (pendingId === null) {
 			return {
 				statusCode: 200,
 				kind: "card",
-				value: "⚠️ Approval already resolved or expired.",
+				value: approvalExpiryCard(),
 			};
 		}
+
+		// resolve_gateway_approval(session_key, choice) parity (@1156): the
+		// click claims the OLDEST pending approval for the session; resolution
+		// rides THE ONE kit router with that id (peek → route-pop is synchronous,
+		// so exactly-once holds under concurrent double-taps).
 		const answer = await this.router.route(
-			buildExecApprovalCallback(choice as "once", rawId),
+			buildExecApprovalCallback(choice as "once", pendingId),
 			{ userId: clicker.aadObjectId ?? clicker.id ?? "" },
 		);
-		switch (answer.kind) {
-			case "resolved": {
-				this.counters.cardActionsResolved += 1;
-				return { statusCode: 200, kind: "card", value: choiceLabel(choice) };
-			}
-			default:
-				return {
-					statusCode: 200,
-					kind: "card",
-					value: "⚠️ Approval already resolved or expired.",
-				};
+		if (answer.kind === "resolved") {
+			this.counters.cardActionsResolved += 1;
+			return {
+				statusCode: 200,
+				kind: "card",
+				value: resolvedApprovalCard(choice, value),
+			};
 		}
+		return {
+			statusCode: 200,
+			kind: "card",
+			value: approvalExpiryCard(),
+		};
 	}
 
 	/**
 	 * send_exec_approval parity: build the approval card, register the pending
 	 * approval under a fresh kit id, and proactively push via the stored
 	 * ConversationReference lane (flat proactive send in this port's seam).
+	 * The sequential id bookkeeping stays ADAPTER-SIDE (pending-store key);
+	 * button data carries NO approval_id anywhere on the Teams wire.
 	 */
 	async sendApprovalCard(
 		chatId: string,
@@ -650,11 +729,12 @@ export class TeamsAdapter extends BasePlatformAdapter {
 		const approvalId = this.approvalSeq;
 		this.approvals.register(approvalId, sessionKey);
 		this.approvalIdLog.push(approvalId);
+		// btn_data_base parity (@1198-1210): NO approval_id on the wire — the
+		// sequential id is adapter-side bookkeeping (pending-store key) only.
 		const baseData: ActivityRecord = {
 			session_key: sessionKey,
 			cmd: btnCmd,
 			desc: description,
-			approval_id: approvalId,
 		};
 		const actions: Array<ActivityRecord & { style?: string }> = [
 			{
@@ -815,13 +895,27 @@ export class TeamsAdapter extends BasePlatformAdapter {
 			try {
 				let resp;
 				if (replyTo && /^\d+$/.test(replyTo) && replyTo !== "0") {
-					resp = await this.transport.postReply(
-						chatId,
-						replyTo,
-						activity,
-						token.accessToken,
-						metadata,
-					);
+					try {
+						resp = await this.transport.postReply(
+							chatId,
+							replyTo,
+							activity,
+							token.accessToken,
+							metadata,
+						);
+					} catch {
+						// webhook-40 (Hermes adapter.py:send @1228-1250): ANY thrown
+						// transport error falls back to the flat send ("Teams reply()
+						// failed, falling back to flat send") — a RAISED reply() must
+						// never skip the chunk, exactly mirroring the non-200 fallback
+						// below. Only a thrown flat send reaches the outer catch.
+						resp = await this.transport.postActivity(
+							chatId,
+							activity,
+							token.accessToken,
+							metadata,
+						);
+					}
 					if (resp.status !== 200) {
 						// Group chats 400 on threaded sends; fall back to flat send.
 						resp = await this.transport.postActivity(
@@ -971,10 +1065,14 @@ export class TeamsAdapter extends BasePlatformAdapter {
 
 	// ── typing / rich / media ────────────────────────────────────────────────
 
-	/** send_typing parity: TypingActivityInput, errors swallowed. */
+	/**
+	 * send_typing parity (@1277-1283): a REAL Typing activity POST — the
+	 * activity body {type:"typing"} rides the transport seam; errors swallowed
+	 * (best-effort polish).
+	 */
 	async sendTyping(chatId: string): Promise<void> {
 		try {
-			await this.transport.sendTypingActivity(chatId);
+			await this.transport.sendTypingActivity(chatId, { type: "typing" });
 			this.counters.typingSent += 1;
 		} catch {
 			/* best-effort polish — never surfaces */
@@ -1012,12 +1110,19 @@ export class TeamsAdapter extends BasePlatformAdapter {
 	/**
 	 * Media send (_send_media_attachment parity): remote http(s) URLs attach BY
 	 * REFERENCE; local paths encode as base64 data URIs; caption rides the
-	 * activity text.
+	 * activity text. MIME resolution is guess-from-extension FIRST, then the
+	 * per-kind default (send_image/send_video/send_voice/send_document's
+	 * default_mime @1335/@1366/@1383/@1400) — extension-less sources still
+	 * ship a correctly-typed Attachment.contentType.
 	 */
 	async sendMedia(
 		chatId: string,
 		source: { url: string } | { path: string },
-		opts: { mime?: string | undefined; caption?: string | undefined } = {},
+		opts: {
+			mime?: string | undefined;
+			caption?: string | undefined;
+			defaultMime?: string | undefined;
+		} = {},
 	): Promise<SendResult> {
 		const urlErr = this.validateOutboundTarget(chatId);
 		if (urlErr !== null) return { success: false, error: urlErr };
@@ -1029,12 +1134,19 @@ export class TeamsAdapter extends BasePlatformAdapter {
 				return { success: false, error: "remote media must be http(s)" };
 			}
 			contentUrl = source.url;
-			mime = opts.mime ?? guessMime(source.url) ?? "application/octet-stream";
+			mime =
+				opts.mime ??
+				guessMime(source.url) ??
+				opts.defaultMime ??
+				"application/octet-stream";
 		} else {
 			try {
 				const bytes = readFileSync(source.path.replace(/^file:\/\//, ""));
 				mime =
-					opts.mime ?? guessMime(source.path) ?? "application/octet-stream";
+					opts.mime ??
+					guessMime(source.path) ??
+					opts.defaultMime ??
+					"application/octet-stream";
 				contentUrl = `data:${mime};base64,${bytes.toString("base64")}`;
 			} catch (err) {
 				return {
@@ -1068,6 +1180,54 @@ export class TeamsAdapter extends BasePlatformAdapter {
 		}
 	}
 
+	/** adapter.py:send_image — per-kind default contentType image/png. */
+	async sendImage(
+		chatId: string,
+		source: { url: string } | { path: string },
+		caption?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendMedia(chatId, source, {
+			...(caption !== undefined ? { caption } : {}),
+			defaultMime: "image/png",
+		});
+	}
+
+	/** adapter.py:send_video — per-kind default contentType video/mp4. */
+	async sendVideo(
+		chatId: string,
+		source: { url: string } | { path: string },
+		caption?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendMedia(chatId, source, {
+			...(caption !== undefined ? { caption } : {}),
+			defaultMime: "video/mp4",
+		});
+	}
+
+	/** adapter.py:send_voice — per-kind default contentType audio/mpeg. */
+	sendVoice(
+		chatId: string,
+		source: { url: string } | { path: string },
+		caption?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendMedia(chatId, source, {
+			...(caption !== undefined ? { caption } : {}),
+			defaultMime: "audio/mpeg",
+		});
+	}
+
+	/** adapter.py:send_document — per-kind default application/octet-stream. */
+	sendDocument(
+		chatId: string,
+		source: { url: string } | { path: string },
+		caption?: string | undefined,
+	): Promise<SendResult> {
+		return this.sendMedia(chatId, source, {
+			...(caption !== undefined ? { caption } : {}),
+			defaultMime: "application/octet-stream",
+		});
+	}
+
 	// ── guard wiring (reference-fixture inheritance) ──────────────────────────
 
 	attachStandardGuard(spawner?: TaskSpawner | undefined): void {
@@ -1084,6 +1244,7 @@ export class TeamsAdapter extends BasePlatformAdapter {
 						return null; // consumed by the clarify resolver (Lane C)
 					}
 					this.turnLog.push(text);
+					this.sourceChatNames.push(String(event.source?.chatName ?? ""));
 					const isInlineDispatch =
 						text.startsWith("/") ||
 						(ctx.task.cancelRequested() === false && ctx.task.isDone());
@@ -1260,6 +1421,77 @@ function choiceLabel(choice: string): string {
 		default:
 			return "❌ Denied";
 	}
+}
+
+/** Clicker identity off an activity envelope (aad_object_id preferred). */
+function clickerOf(activity: ActivityRecord): {
+	aadObjectId?: string | undefined;
+	id?: string | undefined;
+} {
+	const from = asRec(activity["from"]);
+	const aad = str(from["aad_object_id"] ?? from["aadObjectId"]);
+	const id = str(from["id"]);
+	return {
+		...(aad !== "" ? { aadObjectId: aad } : {}),
+		...(id !== "" ? { id } : {}),
+	};
+}
+
+function adaptiveCardOf(body: CardTextBlock[]): AdaptiveCardPayload {
+	return { type: "AdaptiveCard", version: "1.4", body };
+}
+
+/** Expiry answer card (_on_card_action @1159-1164 parity). */
+function approvalExpiryCard(): AdaptiveCardPayload {
+	return adaptiveCardOf([
+		{
+			type: "TextBlock",
+			text: "⚠️ Approval already resolved or expired.",
+			wrap: true,
+		},
+	]);
+}
+
+/**
+ * Resolved-click confirmation card (@1160-1181 parity): title + fenced cmd
+ * render only when cmd is present, the Reason line only when desc is
+ * present, and the bold label ALWAYS.
+ */
+function resolvedApprovalCard(
+	choice: string,
+	data: ActivityRecord,
+): AdaptiveCardPayload {
+	const cmd = str(data["cmd"]);
+	const desc = str(data["desc"]);
+	const body: CardTextBlock[] = [];
+	if (cmd !== "") {
+		body.push({
+			type: "TextBlock",
+			text: "⚠️ Command Approval Required",
+			wrap: true,
+			weight: "Bolder",
+		});
+		body.push({
+			type: "TextBlock",
+			text: `\`\`\`\n${cmd}\n\`\`\``,
+			wrap: true,
+		});
+	}
+	if (desc !== "") {
+		body.push({
+			type: "TextBlock",
+			text: `Reason: ${desc}`,
+			wrap: true,
+			isSubtle: true,
+		});
+	}
+	body.push({
+		type: "TextBlock",
+		text: choiceLabel(choice),
+		wrap: true,
+		weight: "Bolder",
+	});
+	return adaptiveCardOf(body);
 }
 
 function extOf(pathOrUrl: string): string {

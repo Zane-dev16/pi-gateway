@@ -10,21 +10,25 @@
 //   production inside the recency window for files outside trusted roots.
 //
 // Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
-//   base.py:validate_media_delivery_path     → validateMediaDeliveryPath
-//   base.py:_media_delivery_allowed_roots    → collectAllowedRoots
+//   gateway/platforms/base.py:validate_media_delivery_path     → validateMediaDeliveryPath
+//   base.py:_media_delivery_allowed_roots                       → collectAllowedRoots
+//   base.py:_profile_cache_roots (+_kanban_attachment_roots)     → (same fn)
 //   base.py:_path_under_denied_prefix        → pathUnderDeniedPrefix
 //   base.py:_file_is_recently_produced       → fileIsRecentlyProduced
 //   base.py:filter_media_delivery_paths      → filterMediaDeliveryPaths
 //   media_policy.py:apply_media_policy_env   → applyMediaPolicyEnv
 
 import { homedir } from "node:os";
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { resolvePiHome } from "../../pi_home.js";
 
 /** Env var names — kept byte-identical to the Hermes bridge (proposed DEC text: renaming to PI_MEDIA_* is cosmetic-only; behavior must not drift). */
 export const MEDIA_DELIVERY_STRICT_ENV = "HERMES_MEDIA_DELIVERY_STRICT";
 export const MEDIA_DELIVERY_ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS";
+/** Kanban attachment roots (base.py:_kanban_attachment_roots): override for the durable attachments root, and the kanban-home override for the root that hosts kanban/attachments + boards. Same HERMES_* convention as the rest of the bridge. */
+export const KANBAN_ATTACHMENTS_ROOT_ENV = "HERMES_KANBAN_ATTACHMENTS_ROOT";
+export const KANBAN_HOME_ENV = "HERMES_KANBAN_HOME";
 export const MEDIA_DELIVERY_TRUST_RECENT_ENV =
 	"HERMES_MEDIA_TRUST_RECENT_FILES";
 export const MEDIA_DELIVERY_TRUST_RECENT_SECONDS_ENV =
@@ -153,13 +157,104 @@ function statIsRegularFile(path: string): boolean {
 	}
 }
 
+/** Well-formed board directory name (base.py:_kanban_attachment_roots fullmatch). */
+const BOARD_DIR_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function isDir(p: string): boolean {
+	try {
+		return statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Per-profile canonical cache roots (base.py:_profile_cache_roots):
+ * <root>/profiles/<name>/cache/<subdir> for every EXISTING profile directory,
+ * enumerated dynamically at check time so profiles created after startup are
+ * covered, and so a resolved profile path is allowlisted BEFORE the /root-
+ * style system denylist is consulted (#31733).
+ */
+function profileCacheRoots(piHome: string): string[] {
+	const roots: string[] = [];
+	const profilesDir = join(piHome, "profiles");
+	let entries: string[];
+	try {
+		entries = readdirSync(profilesDir);
+	} catch {
+		return roots;
+	}
+	for (const name of entries) {
+		const profileDir = join(profilesDir, name);
+		if (!isDir(profileDir)) continue;
+		for (const sub of CACHE_SUBDIRS) {
+			roots.push(join(profileDir, "cache", sub));
+		}
+	}
+	return roots;
+}
+
+/**
+ * Durable kanban attachment roots WITHOUT importing kanban modules
+ * (base.py:_kanban_attachment_roots): HERMES_KANBAN_ATTACHMENTS_ROOT override
+ * wins; otherwise <root>/kanban/attachments plus per-board
+ * <root>/kanban/boards/<board>/attachments for well-named board directories
+ * owning a kanban.db (symlinked boards are skipped).
+ */
+function kanbanAttachmentRoots(
+	piHome: string,
+	home: string,
+	env: NodeJS.ProcessEnv,
+): string[] {
+	const override = (env[KANBAN_ATTACHMENTS_ROOT_ENV] ?? "").trim();
+	if (override) {
+		try {
+			return [expandUser(override, home)];
+		} catch {
+			return [override];
+		}
+	}
+	const homeOverride = (env[KANBAN_HOME_ENV] ?? "").trim();
+	let root = piHome;
+	if (homeOverride) {
+		try {
+			root = expandUser(homeOverride, home);
+		} catch {
+			root = homeOverride;
+		}
+	}
+	const roots = [join(root, "kanban", "attachments")];
+	const boardsRoot = join(root, "kanban", "boards");
+	let entries: string[];
+	try {
+		entries = readdirSync(boardsRoot);
+	} catch {
+		return roots;
+	}
+	for (const name of entries) {
+		const boardDir = join(boardsRoot, name);
+		let symlink = false;
+		try {
+			symlink = lstatSync(boardDir).isSymbolicLink();
+		} catch {
+			symlink = true; // unreadable ⇒ skip
+		}
+		if (symlink || !BOARD_DIR_RE.test(name) || !isDir(boardDir)) continue;
+		if (!statIsRegularFile(join(boardDir, "kanban.db"))) continue;
+		roots.push(join(boardDir, "attachments"));
+	}
+	return roots;
+}
+
 /**
  * Managed cache roots + operator allowlist (base.py:_media_delivery_allowed_roots):
  * legacy `*_cache` dirs AND canonical `cache/<subdir>` layout under the pi home,
+ * per-profile `profiles/<name>/cache/<subdir>` roots, kanban attachment roots,
  * plus HERMES_MEDIA_ALLOW_DIRS entries (os.pathsep- or comma-separated).
  */
 export function collectAllowedRoots(deps: PathValidationEnv): string[] {
 	const piHome = piHomeOf(deps);
+	const env = envOf(deps);
 	const roots: string[] = [];
 	if (piHome) {
 		for (const d of [
@@ -174,8 +269,10 @@ export function collectAllowedRoots(deps: PathValidationEnv): string[] {
 		for (const sub of CACHE_SUBDIRS) {
 			roots.push(join(piHome, "cache", sub));
 		}
+		roots.push(...profileCacheRoots(piHome));
+		roots.push(...kanbanAttachmentRoots(piHome, homeOf(deps), env));
 	}
-	const raw = envOf(deps)[MEDIA_DELIVERY_ALLOW_DIRS_ENV] ?? "";
+	const raw = env[MEDIA_DELIVERY_ALLOW_DIRS_ENV] ?? "";
 	for (const chunk of raw.split(sep === "\\" ? ";" : ":")) {
 		for (const rawRoot of chunk.split(",")) {
 			const expanded = rawRoot.trim();

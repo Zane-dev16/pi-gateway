@@ -106,6 +106,26 @@ function wrapWire(raw: FakePlatformWire): FeishuRestPlane {
 			userId: "bot-user",
 			name: "PiBot",
 		}),
+		// Reaction routing's GET-message leg: the shared harness wire carries no
+		// scripted message store, so no reacted-to message is ever bot-authored
+		// here — reaction commands stay unrouted on this subject (honest
+		// absence; engine-level contracts cover the routing behavior).
+		getMessage: async () => null,
+		// Upload/download + directory planes: the harness wire has no vendor
+		// media/name stores, so these answer the SILENT-FAILURE shapes
+		// (null / failed SendResult). Engine-level contracts cover them.
+		createImage: async () => ({
+			success: false,
+			error: "image upload unavailable on subject wire",
+		}),
+		createFile: async () => ({
+			success: false,
+			error: "file upload unavailable on subject wire",
+		}),
+		getMessageResource: async () => null,
+		resolveUserName: async () => null,
+		resolveBotNames: async () => null,
+		getChat: async () => null,
 		richScripted: () => raw.hasScript("rich"),
 		transmitRich: async (content, metadata) =>
 			raw.transmitRich("__rich__", content, metadata),

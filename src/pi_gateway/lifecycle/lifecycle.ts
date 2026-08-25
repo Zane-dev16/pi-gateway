@@ -9,12 +9,24 @@
 // boot-fingerprint, status-stamp, shutdown).
 //
 // Skeleton posture (roadmap Phase 1 item 5): the stage FRAMEWORK is built
-// now; adapters land in Phases 3+ through `stageBodies` — the default body
-// for stage 9 reports "nothing configured yet" and succeeds. Stages 7–8 are
+// now; adapters land in Phases 3+ through `stageBodies`. Stages 7–8 are
 // WIRED (DEC-040): per-service entries registered via `registerService()` /
 // the `services` option run inside their stage bodies with per-service loud
-// degradation; the engine stays service-agnostic (structural entries, no
-// pi_embedded imports — layering 01 §5.3).
+// degradation; stage 9 carries the SAME DEC-040 seam for ADAPTERS
+// (registerAdapter / the `adapters` option): per-adapter instantiate → wire →
+// connect, loud-disable per adapter, and retryable connect failures enqueue
+// into the failed-platform queue feeding the supervised reconnect watcher
+// (run.py:_failed_platforms + _platform_reconnect_watcher). The engine stays
+// service/adapter-agnostic (structural entries, no pi_embedded imports —
+// layering 01 §5.3).
+//
+// Boot choreography (run.py:start parity) runs POST-STAGE-9: clean-shutdown
+// receipt vs unclean-session recovery, stuck-loop suspension (#7536), then
+// boot sends + resume-pending scheduling under the inbound RESTORE GATE.
+// The §1.3 backstops are armed here too: signal-path forensics (<10ms
+// snapshot + detached diagnostic), an unref'd OS-level shutdown watchdog
+// around every drain (hard-exit ≤ drain+60s), and the lifetime loop-liveness
+// guard + heartbeat pair (3 missed probes ⇒ exit 75).
 
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -68,6 +80,39 @@ import {
 	type TakeoverOptions,
 	type TakeoverResult,
 } from "./takeover.js";
+import {
+	cleanShutdownMarkerExists,
+	consumeCleanShutdownMarker,
+} from "./shutdown.js";
+import {
+	formatContextForLog,
+	snapshotShutdownContext,
+	spawnAsyncDiagnostic,
+} from "./forensics.js";
+import {
+	armShutdownWatchdog,
+	realTimerPort,
+	resolveShutdownWatchdogDelayMs,
+	shutdownWatchdogDumpPath,
+	startLoopHeartbeat,
+	startLoopLivenessGuard,
+	type HeartbeatHandle,
+	type LoopLivenessGuardHandle,
+	type TimerPort,
+} from "./watchdog.js";
+import { FATAL_CONFIG_EXIT_CODE, FATAL_CONFIG_REASON_CODE } from "./restart.js";
+import {
+	runBootChoreography,
+	type BootRecoveryHooks,
+	type BootRecoveryReport,
+} from "./boot-recovery.js";
+import { createRestoreGate, type RestoreGate } from "./restore-gate.js";
+import {
+	FailedPlatformQueue,
+	createReconnectWatcherService,
+	type ReconnectHooks,
+} from "./reconnect-watcher.js";
+import type { CommandRegistry } from "../commands/registry.js";
 
 /** Minimal supervised-service seam filled by Phases 5+ (cron/watchers/adapters). */
 export interface ServiceHandle {
@@ -120,6 +165,29 @@ export interface AdapterRecord {
 	handle?: ServiceHandle;
 }
 
+/**
+ * Classified result of ONE registered stage-9 adapter entry (DEC-040 seam for
+ * platform adapters — run.py:_create_adapter + _connect_adapter_with_timeout).
+ * A throw inside start() classifies as a LOUD DISABLE (startup continues);
+ * `retryable: true` marks a connect failure the RECONNECT WATCHER should keep
+ * retrying instead of leaving the platform down until process restart.
+ */
+export interface AdapterStartOutcome {
+	ok: boolean;
+	/** true (with ok=false) ⇒ loud per-adapter DISABLE — startup continues. */
+	degraded?: boolean;
+	reason?: string;
+	handle?: ServiceHandle;
+	/** Retryable connect failure ⇒ queued for background reconnection. */
+	retryable?: boolean;
+}
+
+/** One platform adapter bound to OPTIONAL stage 9 (DEC-040, structural). */
+export interface AdapterEntry {
+	platform: string;
+	start(ctx: StageContext): Promise<AdapterStartOutcome> | AdapterStartOutcome;
+}
+
 export interface ConfigSnapshot {
 	home: string;
 	/** Raw config payload placeholder until the Phase-4/5 config system lands. */
@@ -150,6 +218,10 @@ export interface StageContext {
 	store: StateStore | null;
 	services: { cron: ServiceHandle[]; watchers: ServiceHandle[] };
 	adapters: AdapterRecord[];
+	/** The ONE built-and-frozen builtin command registry (07 §9) — constructed
+	 *  at the stage-8 assembly seam and registered here so consumers reach it
+	 *  without hand-built command lists anywhere downstream. */
+	commands: CommandRegistry | null;
 }
 
 export type StageBody = (ctx: StageContext) => Promise<void>;
@@ -170,6 +242,18 @@ export interface LifecycleOptions {
 	 * Equivalent to calling registerService() for each entry pre-startup.
 	 */
 	services?: Partial<Record<ServiceStageId, ServiceEntry[]>>;
+	/**
+	 * Per-adapter stage-9 entries registered BEFORE startup (DEC-040 seam,
+	 * structure parity of run.py:start's platform loop + _create_adapter).
+	 * Equivalent to calling registerAdapter() for each entry pre-startup.
+	 */
+	adapters?: AdapterEntry[];
+	/**
+	 * Reconnect backend for the failed-platform queue (run.py:
+	 * _connect_adapter_with_timeout(is_reconnect=true)). Absent ⇒ queued
+	 * platforms are retried against a loud no-op (queue still observable).
+	 */
+	reconnectHooks?: ReconnectHooks;
 	stateStorePath?: string;
 	stateStoreOptions?: StateStoreOptions;
 	/** Active-turn grace window for the drain (default 0 — interrupting chat
@@ -186,6 +270,29 @@ export interface LifecycleOptions {
 	hardExit?: (code: number) => void;
 	selfPid?: number;
 	selfStartTime?: number | null;
+	/**
+	 * Extra drain hooks merged UNDER the engine-provided ones (production
+	 * runner seams: notify-active-sessions, resume-pending marks, lease
+	 * release…). Engine defaults stay no-op so the skeleton drains cleanly.
+	 */
+	shutdownHooks?: Partial<DrainHooks>;
+	/** Boot-session-recovery seams (boot-recovery.ts; wired by the runner). */
+	bootRecovery?: BootRecoveryHooks;
+	/** Injectable timers for every lifecycle-owned interval/timeout (tests). */
+	timers?: TimerPort;
+	/** Command-registry override (tests); default builds the SHIPPED builtins. */
+	commandRegistry?: CommandRegistry;
+	/** Signal-path forensics toggles (both default ON — 08 §1.3(b)). */
+	forensics?: { snapshot?: boolean; spawnDiagnostic?: boolean };
+	/** Lifetime loop-liveness guard config (gateway.loop_watchdog opt-out). */
+	loopWatchdog?: {
+		enabled?: boolean;
+		probeIntervalMs?: number;
+		probeTimeoutMs?: number;
+		maxStrikes?: number;
+	};
+	/** Loop-heartbeat cadence config (08 §1.3(c) heartbeat task). */
+	loopHeartbeat?: { enabled?: boolean; intervalMs?: number };
 }
 
 export interface StartupResult {
@@ -197,6 +304,9 @@ export interface StartupResult {
 	trace: StageEvent[];
 	home: string;
 	durationMs: number;
+	/** Process exit code this abort implies (null on success). Fatal-config
+	 *  aborts exit 78 (EX_CONFIG); any other required-stage abort exits 1. */
+	exitCode: number | null;
 }
 
 function stderrLogger(): Logger {
@@ -263,6 +373,14 @@ export class GatewayLifecycle {
 		cron_scheduler: [],
 		embedded_watchers: [],
 	};
+	private readonly adapterEntries: AdapterEntry[] = [];
+	/** Failed-platform retry queue feeding the reconnect watcher (stage 9 in). */
+	readonly failedPlatforms: FailedPlatformQueue;
+	/** Inbound-dispatch gate held closed during boot restore (run.py parity). */
+	readonly restoreGate: RestoreGate = createRestoreGate();
+	private bootReportValue: BootRecoveryReport | null = null;
+	private livenessGuard: LoopLivenessGuardHandle | null = null;
+	private loopHeartbeat: HeartbeatHandle | null = null;
 	private readonly serviceDegradations: ServiceDegradation[] = [];
 	private readonly completedStages = new Set<StageId>();
 	private readonly degradedStages = new Set<StageId>();
@@ -271,6 +389,7 @@ export class GatewayLifecycle {
 	private ownedLock: RuntimeLock | null = null;
 	private ownedStore: StateStore | null = null;
 	private startupResult: StartupResult | null = null;
+	private readonly timers: TimerPort;
 
 	private _state: StartupState = "idle";
 	private pendingSlots: unknown[] = [];
@@ -288,10 +407,15 @@ export class GatewayLifecycle {
 		this.homeValue = options.home ?? resolvePiHome();
 		this.selfPid = options.selfPid ?? process.pid;
 		this.bodies = options.stageBodies ?? {};
+		this.timers = options.timers ?? realTimerPort();
+		this.failedPlatforms = new FailedPlatformQueue(() => this.timers.nowMs());
 		for (const stage of SERVICE_STAGE_IDS) {
 			for (const entry of options.services?.[stage] ?? []) {
 				this.registerService(stage, entry);
 			}
+		}
+		for (const entry of options.adapters ?? []) {
+			this.registerAdapter(entry);
 		}
 		this.ctx = {
 			home: this.homeValue,
@@ -305,6 +429,7 @@ export class GatewayLifecycle {
 			store: null,
 			services: { cron: [], watchers: [] },
 			adapters: [],
+			commands: null,
 		};
 	}
 
@@ -329,6 +454,11 @@ export class GatewayLifecycle {
 		return [...this.serviceDegradations];
 	}
 
+	/** Boot-recovery report once the post-stage-9 choreography has run. */
+	get bootReport(): BootRecoveryReport | null {
+		return this.bootReportValue;
+	}
+
 	/**
 	 * Register one per-service optional-stage entry (DEC-040). Entries run when
 	 * their stage body executes — AFTER every earlier required stage succeeded,
@@ -337,6 +467,36 @@ export class GatewayLifecycle {
 	registerService(stage: ServiceStageId, entry: ServiceEntry): this {
 		this.serviceEntries[stage].push(entry);
 		return this;
+	}
+
+	/**
+	 * Register one stage-9 adapter entry (DEC-040 seam). Entries run inside the
+	 * platform_adapters body — instantiate → wire handlers → connect per
+	 * adapter, each isolated; a missing secret / throwing start is a LOUD
+	 * DISABLE of that adapter only (08 §1.1 step 7).
+	 */
+	registerAdapter(entry: AdapterEntry): this {
+		this.adapterEntries.push(entry);
+		return this;
+	}
+
+	/**
+	 * Build the supervised reconnect-watcher entry bound to THIS lifecycle's
+	 * failed-platform queue (register into embedded_watchers via
+	 * registerService("embedded_watchers", lifecycle.reconnectWatcherService())).
+	 */
+	get reconnectWatcherService(): ServiceEntry {
+		return createReconnectWatcherService({
+			queue: this.failedPlatforms,
+			hooks: this.opts.reconnectHooks ?? {
+				reconnect(platform) {
+					// No backend wired yet — loud no-op keeps queue observable.
+					throw new Error(`no reconnect backend registered for ${platform}`);
+				},
+			},
+			logger: this.log,
+			timer: this.timers,
+		});
 	}
 
 	/** True when an UNEXPECTED signal initiated the shutdown (08 §1.2 mirror). */
@@ -533,6 +693,17 @@ export class GatewayLifecycle {
 		// 08 §1.1 step 6 second half / 01 §3.1 stage 8 (optional): registered
 		// embedded watchers/extensions start HERE under the same per-service
 		// isolation (DEC-040).
+		// Assembly seam: construct the ONE built-and-frozen builtin command
+		// registry and register it on the ctx BEFORE entries run, so every
+		// downstream consumer reaches commands through ctx (07 §9 — no hand-
+		// built lists; hermes_cli/commands.py:COMMAND_REGISTRY parity). Loaded
+		// LAZILY: bare-node strip-only runners (the two-process child drivers)
+		// cannot parse every sibling module; there the registry degrades to
+		// absent instead of failing the stage.
+		if (ctx.commands === null) {
+			ctx.commands =
+				this.opts.commandRegistry ?? (await this.loadBuiltinCommandRegistry());
+		}
 		const entries = this.serviceEntries.embedded_watchers;
 		if (entries.length === 0) {
 			ctx.log.info("embedded watchers: nothing configured yet (lands Phase 5)");
@@ -540,6 +711,26 @@ export class GatewayLifecycle {
 		}
 		for (const entry of entries) {
 			await this.startRegisteredService(ctx, "embedded_watchers", entry);
+		}
+	}
+
+	/**
+	 * Built-and-frozen builtin set (commands/builtins.ts:createBuiltinCommand-
+	 * Registry). Best-effort by design: a load failure degrades to null loudly
+	 * rather than failing the optional stage.
+	 */
+	private async loadBuiltinCommandRegistry(): Promise<CommandRegistry | null> {
+		try {
+			const mod = (await import("../commands/builtins.js")) as {
+				createBuiltinCommandRegistry(): CommandRegistry;
+			};
+			return mod.createBuiltinCommandRegistry();
+		} catch (err) {
+			this.log.warn("builtin command registry unavailable", {
+				reason_code: "command_registry_unavailable",
+				error: String(err),
+			});
+			return null;
 		}
 	}
 
@@ -592,9 +783,63 @@ export class GatewayLifecycle {
 
 	private async stagePlatformAdapters(ctx: StageContext): Promise<void> {
 		// 08 §1.1 step 7: instantiate adapters for configured platforms;
-		// missing secret ⇒ loud disable. Reference adapters land Phase 3.
+		// missing secret ⇒ loud disable. Per-adapter DEC-040 isolation parity:
+		// each entry runs instantiate → wire handlers → connect INDEPENDENTLY
+		// (run.py:start platform loop + _create_adapter); one adapter's failure
+		// never blocks siblings or later stages. Retryable connect failures are
+		// queued for the supervised reconnect watcher instead of staying down.
 		ctx.adapters = [];
-		ctx.log.info("platform adapters: none configured yet (land Phase 3+)");
+		const entries = this.adapterEntries;
+		if (entries.length === 0) {
+			ctx.log.info("platform adapters: none configured yet (land Phase 3+)");
+			return;
+		}
+		for (const entry of entries) {
+			let outcome: AdapterStartOutcome;
+			try {
+				outcome = await entry.start(ctx);
+			} catch (err) {
+				outcome = {
+					ok: false,
+					degraded: true,
+					reason: err instanceof Error ? err.message : String(err),
+				};
+			}
+			if (outcome.ok && outcome.handle !== undefined) {
+				ctx.adapters.push({
+					platform: entry.platform,
+					enabled: true,
+					handle: outcome.handle,
+				});
+				ctx.log.info(`platform adapter ${entry.platform} connected`, {
+					platform: entry.platform,
+				});
+				continue;
+			}
+			const reason = outcome.reason ?? "unspecified";
+			if (outcome.ok) {
+				// Connected but produced no stoppable handle — record enabled.
+				ctx.adapters.push({ platform: entry.platform, enabled: true });
+				continue;
+			}
+			if (outcome.retryable === true) {
+				// Connect failed but the platform is worth retrying in background
+				// (network blip class) — queue for the reconnect watcher.
+				this.failedPlatforms.enqueue(entry.platform, { reason });
+				ctx.log.warn(
+					`platform adapter ${entry.platform} connect failed — queued for reconnection: ${reason}`,
+					{ platform: entry.platform, reason_code: "reconnect_queued" },
+				);
+				continue;
+			}
+			// Loud disable (missing secret / non-retryable): recorded, logged at
+			// ERROR, never fatal to the stage (08 §1.1 step 7).
+			ctx.adapters.push({ platform: entry.platform, enabled: false, reason });
+			ctx.log.error(`platform adapter ${entry.platform} DISABLED: ${reason}`, {
+				platform: entry.platform,
+				reason_code: "adapter_disabled",
+			});
+		}
 	}
 
 	private async stageRuntimeIdentity(ctx: StageContext): Promise<void> {
@@ -619,6 +864,9 @@ export class GatewayLifecycle {
 	 * returns its recorded result without re-executing any body, and each
 	 * individual stage skips itself if already completed (partial-restart safe).
 	 * Required-stage failure aborts; optional-stage failure degrades loudly.
+	 * Post-stage-9 boot choreography (clean/unclean branch + stuck-loop
+	 * suspension + restore gate) and post-stage-10 resume scheduling run
+	 * exactly once per process (run.py:start parity).
 	 */
 	async startup(): Promise<StartupResult> {
 		if (this.startupResult !== null) return this.startupResult;
@@ -629,73 +877,70 @@ export class GatewayLifecycle {
 		for (const id of STAGE_IDS) {
 			if (this.completedStages.has(id)) continue;
 			const stageStart = Date.now();
+			let bodyOk = false;
 			try {
 				await this.bodyFor(id)(this.ctx);
-				this.completedStages.add(id);
-				trace.push({
-					stage: id,
-					ok: true,
-					durationMs: Date.now() - stageStart,
-				});
-				const recorded = trace.at(-1);
-				if (recorded !== undefined) this.events.push(recorded);
+				bodyOk = true;
 			} catch (err) {
+				if (!isOptionalStage(id)) {
+					// REQUIRED stage failure: abort startup. Stages after it never run.
+					return this.abortStartup(id, err, trace, startedAt);
+				}
+				// OPTIONAL stage failure: degrade loudly; later stages still run
+				// (01 §3.1). The slot is consumed — a partial restart never re-runs it.
 				const message = err instanceof Error ? err.message : String(err);
 				const reasonCode =
 					err instanceof LifecycleError ? err.reasonCode : "stage_error";
+				this.degradedStages.add(id);
+				this.completedStages.add(id);
+				this.log.error(`startup degraded at stage ${id}: ${message}`, {
+					stage: id,
+					reason_code: "degraded_start",
+					...(reasonCode !== "stage_error" ? { detail: reasonCode } : {}),
+				});
 				const event: StageEvent = {
 					stage: id,
 					ok: false,
+					degraded: true,
 					error: message,
 					durationMs: Date.now() - stageStart,
 				};
-				if (isOptionalStage(id)) {
-					// 01 §3.1: degraded-start allowed PER SERVICE with a loud log —
-					// never blocks later stages.
-					event.degraded = true;
-					this.degradedStages.add(id);
-					this.completedStages.add(id); // consumed its slot; do not re-run
-					this.log.error(`startup degraded at stage ${id}: ${message}`, {
-						stage: id,
-						reason_code: "degraded_start",
-						...(reasonCode !== "stage_error" ? { detail: reasonCode } : {}),
-					});
-					trace.push(event);
-					this.events.push(event);
-					continue;
-				}
-				// REQUIRED stage failure: abort startup. Stages after it never run.
 				trace.push(event);
 				this.events.push(event);
-				this.transitionSafe("aborted");
-				this.log.error(`startup ABORTED at required stage ${id}`, {
+			}
+			if (bodyOk) {
+				this.completedStages.add(id);
+				const okEvent: StageEvent = {
 					stage: id,
-					reason_code: reasonCode,
-					error: message,
-				});
-				try {
-					writeRuntimeStatus(
-						this.homeValue,
-						{ exit_reason: `startup_failed:${id}` },
-						{ pid: this.selfPid, home: this.homeValue },
-					);
-				} catch {
-					/* status persistence is best-effort */
-				}
-				this.releaseOwnership();
-				this.startupResult = {
-					ok: false,
-					failedStage: id,
-					error: message,
-					reasonCode,
-					degradedStages: [...this.degradedStages],
-					trace,
-					home: this.homeValue,
-					durationMs: Date.now() - startedAt,
+					ok: true,
+					durationMs: Date.now() - stageStart,
 				};
-				return this.startupResult;
+				trace.push(okEvent);
+				this.events.push(okEvent);
+			}
+			// POST-STAGE-9 boot choreography (run.py:start): clean-shutdown
+			// receipt vs unclean recovery + stuck-loop suspension + gate the
+			// inbound dispatch queue. Runs ONCE, immediately after the adapter
+			// stage completes — regardless of which body ran. FAIL-CLOSED: a
+			// choreography error is a REQUIRED abort (never a stage-9 degrade).
+			if (id === "platform_adapters" && !this.bootChoreographyRan) {
+				try {
+					await this.runPostAdapterBootRecovery();
+				} catch (err) {
+					return this.abortStartup(id, err, trace, startedAt, {
+						stageFailed: false,
+						reasonCode: "boot_recovery_failed",
+					});
+				}
 			}
 		}
+
+		// POST-STAGE-10 finish (run.py:_await_startup_boot_sends →
+		// _schedule_resume_pending_sessions → _finish_startup_restore): boot
+		// sends and the auto-resume pass fire here; the inbound restore gate
+		// opens in its finally so queued traffic flushes to the consumer.
+		await this.finishStartupRestore();
+		this.armLoopLivenessBackstops();
 
 		if (this._state === "starting") this.transition("running");
 		this.startupResult = {
@@ -707,6 +952,7 @@ export class GatewayLifecycle {
 			trace,
 			home: this.homeValue,
 			durationMs: Date.now() - startedAt,
+			exitCode: null,
 		};
 		return this.startupResult;
 	}
@@ -716,6 +962,161 @@ export class GatewayLifecycle {
 			this.transition(to);
 		} catch {
 			/* already terminal — keep first classification */
+		}
+	}
+
+	/**
+	 * Required-stage abort path: record the failure event loudly, persist the
+	 * exit reason, release locks (never stranded), and memoize a FAILED result.
+	 * Fatal-config reason codes exit 78 (EX_CONFIG — s6 RestartPreventExitStatus,
+	 * restart.py); every other abort exits 1.
+	 */
+	private abortStartup(
+		id: StageId,
+		err: unknown,
+		trace: StageEvent[],
+		startedAt: number,
+		options: { stageFailed?: boolean; reasonCode?: string } = {},
+	): StartupResult {
+		const message = err instanceof Error ? err.message : String(err);
+		const reasonCode =
+			options.reasonCode ??
+			(err instanceof LifecycleError ? err.reasonCode : "stage_error");
+		if (options.stageFailed !== false) {
+			const event: StageEvent = {
+				stage: id,
+				ok: false,
+				error: message,
+				durationMs: Date.now() - startedAt,
+			};
+			trace.push(event);
+			this.events.push(event);
+		}
+		this.transitionSafe("aborted");
+		this.log.error(`startup ABORTED at required stage ${id}`, {
+			stage: id,
+			reason_code: reasonCode,
+			error: message,
+		});
+		try {
+			writeRuntimeStatus(
+				this.homeValue,
+				{ exit_reason: `startup_failed:${id}` },
+				{ pid: this.selfPid, home: this.homeValue },
+			);
+		} catch {
+			/* status persistence is best-effort */
+		}
+		this.releaseOwnership();
+		this.startupResult = {
+			ok: false,
+			failedStage: id,
+			error: message,
+			reasonCode,
+			degradedStages: [...this.degradedStages],
+			trace,
+			home: this.homeValue,
+			durationMs: Date.now() - startedAt,
+			exitCode:
+				reasonCode === FATAL_CONFIG_REASON_CODE ? FATAL_CONFIG_EXIT_CODE : 1,
+		};
+		return this.startupResult;
+	}
+
+	// ---------------------------------------------------------------------
+	// Boot choreography (post-stage-9 / post-stage-10 — run.py:start parity)
+	// ---------------------------------------------------------------------
+
+	private bootChoreographyRan = false;
+
+	/**
+	 * Clean-shutdown receipt vs unclean-session recovery + stuck-loop
+	 * suspension, then CLOSE the inbound restore gate (run.py:start's
+	 * `_recover_unclean_sessions` / `.clean_shutdown` branch /
+	 * `_suspend_stuck_loop_sessions` / `_startup_restore_in_progress`). A
+	 * throw propagates — startup fails CLOSED so a stale clean receipt can
+	 * never mask an unclean exit.
+	 */
+	private async runPostAdapterBootRecovery(): Promise<void> {
+		this.bootChoreographyRan = true;
+		const report = await runBootChoreography(
+			this.homeValue,
+			this.opts.bootRecovery ?? {},
+			{
+				cleanShutdownMarkerExists: cleanShutdownMarkerExists(this.homeValue),
+				log: this.log,
+			},
+		);
+		this.bootReportValue = report;
+		// Consume the receipt file AFTER a successful pass (fail-closed ordering:
+		// runBootChoreography already decided the branch from its existence).
+		if (report.cleanShutdown) consumeCleanShutdownMarker(this.homeValue);
+		// Gate inbound dispatch while boot restore finishes (resume turns etc.).
+		this.restoreGate.begin();
+	}
+
+	/**
+	 * Boot sends + resume-pending scheduling + gate release (run.py:
+	 * _await_startup_boot_sends → _schedule_resume_pending_sessions →
+	 * _finish_startup_restore). Best-effort: hook failures are logged loudly;
+	 * the restore gate ALWAYS reopens in the finally so inbound dispatch can
+	 * never stay gated by a broken seam.
+	 */
+	private async finishStartupRestore(): Promise<void> {
+		try {
+			await this.opts.bootRecovery?.bootSends?.();
+			await this.opts.bootRecovery?.scheduleResumePending?.();
+		} catch (err) {
+			this.log.error("boot restore hooks failed", { error: String(err) });
+		} finally {
+			await this.restoreGate.finish();
+		}
+	}
+
+	/**
+	 * Lifetime loop-liveness backstops (08 §1.3(c); armed at running like
+	 * run.py:_start_loop_liveness_guards): heartbeat file refresh + the
+	 * 3-strike probe guard whose breach exits 75 (service-restart code).
+	 * Config-only opt-out via opts.loopWatchdog.enabled === false.
+	 */
+	private armLoopLivenessBackstops(): void {
+		if (this.opts.loopWatchdog?.enabled === false) return;
+		if (this.livenessGuard === null) {
+			this.livenessGuard = startLoopLivenessGuard({
+				...(this.opts.loopWatchdog?.probeIntervalMs !== undefined
+					? { probeIntervalMs: this.opts.loopWatchdog.probeIntervalMs }
+					: {}),
+				...(this.opts.loopWatchdog?.probeTimeoutMs !== undefined
+					? { probeTimeoutMs: this.opts.loopWatchdog.probeTimeoutMs }
+					: {}),
+				...(this.opts.loopWatchdog?.maxStrikes !== undefined
+					? { maxStrikes: this.opts.loopWatchdog.maxStrikes }
+					: {}),
+				timer: this.timers,
+				onBreach: (strikes) => {
+					this.log.error(
+						"event loop missed consecutive liveness probes — hard-exiting for supervisor restart",
+						{ strikes, reason_code: "loop_liveness_watchdog" },
+					);
+				},
+				hardExit: (code) => {
+					this.releaseOwnership(); // locks never stranded on ANY exit path
+					(
+						this.opts.hardExit ?? ((exitCode: number) => process.exit(exitCode))
+					)(code);
+				},
+			});
+		}
+		if (
+			this.opts.loopHeartbeat?.enabled !== false &&
+			this.loopHeartbeat === null
+		) {
+			this.loopHeartbeat = startLoopHeartbeat(this.homeValue, {
+				...(this.opts.loopHeartbeat?.intervalMs !== undefined
+					? { intervalMs: this.opts.loopHeartbeat.intervalMs }
+					: {}),
+				timer: this.timers,
+			});
 		}
 	}
 
@@ -740,7 +1141,17 @@ export class GatewayLifecycle {
 			this.ctx.services.watchers.filter((w) => w.stop !== undefined);
 		const cron = () =>
 			this.ctx.services.cron.filter((c) => c.stop !== undefined);
+		// Engine defaults are no-op seams; opts.shutdownHooks overlays them with
+		// the production runner's implementations (notify, resume-pending, …).
 		return {
+			notifyActiveSessions: async () => {
+				// Active-chat notification lands with the outbound layer; the
+				// phase pins the ORDERING — adapters are still connected here.
+			},
+			markResumePendingPreDrain: async () => {
+				// Session resume-pending marks land with the Phase-1 runner seam.
+				return [] as readonly string[];
+			},
 			stopIngress: async () => {
 				// Adapters stop polling/reading; embedded background services join
 				// this step until each gets its own cooperative-drain contract
@@ -751,9 +1162,13 @@ export class GatewayLifecycle {
 			},
 			awaitActiveTurns: async (graceMs) => {
 				// Runner turn-tracking arrives with the Phase-1 runner; the grace
-				// budget is honored here so the contract shape is fixed now.
+				// budget is honored here so the contract shape is fixed now. The
+				// skeleton NEVER reports a timeout (nothing tracked yet), so drains
+				// stay on the graceful path until real turn tracking exists.
 				if (graceMs > 0) {
-					await new Promise<void>((resolve) => setTimeout(resolve, graceMs));
+					await new Promise<void>((resolve) =>
+						this.timers.setTimeout(resolve, graceMs),
+					);
 				}
 			},
 			releaseLeases: async () => {
@@ -764,6 +1179,7 @@ export class GatewayLifecycle {
 			flushDeliveryObligations: async () => {
 				// delivery_obligations ledger logic lands Phase 2 (DEC-007).
 			},
+			activeSessionKeys: () => [] as readonly string[],
 			flushTokenRollups: async () => {
 				// Coalescing-writer flush barrier (02 §7.2) — drains queued deltas
 				// so rollups land before the DB closes.
@@ -780,6 +1196,7 @@ export class GatewayLifecycle {
 					home: this.homeValue,
 				});
 			},
+			...this.opts.shutdownHooks,
 		};
 	}
 
@@ -813,18 +1230,43 @@ export class GatewayLifecycle {
 			// Unexpected signals NEVER touch gateway_state (#42675): the file
 			// keeps its pre-signal value so a container boot never reads a
 			// clean-looking state from an externally killed gateway.
-			const outcome = await executeDrain({
-				home: this.homeValue,
-				klass,
-				graceMs: this.opts.drainGraceMs ?? DEFAULT_DRAIN_GRACE_MS,
-				hooks: this.drainHooks(),
-				takePendingSlots: () => {
-					const slots = this.pendingSlots;
-					this.pendingSlots = []; // cleared ONLY after the flush step ran
-					return slots;
+			// §1.3(c) backstop: an UNREF'D OS-LEVEL watchdog hard-exits ≤ drain
+			// + 60s grace if teardown wedges (arm_shutdown_watchdog parity). The
+			// exit callback releases PID file + runtime lock BEFORE exiting.
+			const graceMs = this.opts.drainGraceMs ?? DEFAULT_DRAIN_GRACE_MS;
+			const watch = armShutdownWatchdog({
+				delayMs: resolveShutdownWatchdogDelayMs(graceMs),
+				exitCode: SHUTDOWN_EXIT_CODES.unexpected_signal,
+				dumpPath: shutdownWatchdogDumpPath(this.homeValue),
+				timer: this.timers,
+				snapshotFn: () => ({
+					klass,
+					draining: true,
+					pending_messages: this.pendingSlots.length,
+					adapters: this.ctx.adapters.length,
+				}),
+				hardExit: (code) => {
+					this.releaseOwnership(); // locks must never be stranded
+					(this.opts.hardExit ?? ((c: number) => process.exit(c)))(code);
 				},
-				log: this.log,
 			});
+			let outcome: DrainOutcome;
+			try {
+				outcome = await executeDrain({
+					home: this.homeValue,
+					klass,
+					graceMs,
+					hooks: this.drainHooks(),
+					takePendingSlots: () => {
+						const slots = this.pendingSlots;
+						this.pendingSlots = []; // cleared ONLY after the flush step ran
+						return slots;
+					},
+					log: this.log,
+				});
+			} finally {
+				watch.disarm();
+			}
 			this.shutdownOutcome = outcome;
 			this.transitionSafe("stopped");
 			// Release PID file + runtime lock AFTER teardown (never stranded).
@@ -836,15 +1278,38 @@ export class GatewayLifecycle {
 	}
 
 	/**
-	 * Signal entry point (parity of run.py:shutdown_signal_handler). Classifies
-	 * via markers, mirrors the unexpected-signal flag BEFORE teardown begins,
-	 * schedules the drain, and escalates a SECOND signal to fast-exit.
+	 * Signal entry point (parity of run.py:shutdown_signal_handler + its
+	 * SIGUSR1 sibling restart_signal_handler). Captures the <10ms forensic
+	 * snapshot FIRST (never blocks, never raises), classifies via markers /
+	 * signal identity, mirrors the unexpected-signal flag BEFORE teardown
+	 * begins, schedules the drain, and escalates a SECOND signal to fast-exit.
 	 */
 	handleSignal(signalName: string | null): void {
 		this.signalCount++;
 		if (this.signalCount >= 2) {
 			this.escalateFastExit();
 			return;
+		}
+		// 08 §1.3(b) forensics: sync probe + one-line context log, then the
+		// heavyweight ps-walk as a DETACHED fire-and-forget subprocess.
+		if (this.opts.forensics?.snapshot !== false) {
+			try {
+				const ctx = snapshotShutdownContext({
+					signal: signalName,
+					home: this.homeValue,
+					selfPid: this.selfPid,
+				});
+				this.log.warn(`shutdown context: ${formatContextForLog(ctx)}`);
+			} catch {
+				/* forensics must never break the signal path */
+			}
+		}
+		if (this.opts.forensics?.spawnDiagnostic !== false && signalName !== null) {
+			try {
+				spawnAsyncDiagnostic(join(this.homeValue, "logs"), signalName);
+			} catch {
+				/* best-effort */
+			}
 		}
 		const klass = classifySignalForSelf(this.homeValue, signalName, {
 			selfPid: this.selfPid,
@@ -856,14 +1321,23 @@ export class GatewayLifecycle {
 	}
 
 	/**
-	 * Install SIGTERM/SIGINT handlers driving handleSignal (parity of the
-	 * loop.add_signal_handler wiring in run.py:start_gateway). SIGHUP is
-	 * deliberately NOT handled: it is not a reload signal (DEC-013), and Hermes
-	 * installs SIGHUP→SIG_IGN only around update runs (Phase 5 scope).
+	 * Install SIGTERM/SIGINT/SIGUSR1 handlers driving handleSignal (parity of
+	 * the loop.add_signal_handler wiring in run.py:start_gateway — including
+	 * `loop.add_signal_handler(SIGUSR1, restart_signal_handler)` so the update
+	 * flow's drain-first SIGUSR1 works against the REAL process; without a
+	 * listener Node would open the inspector instead of draining).
+	 * SIGHUP is deliberately NOT handled: it is not a reload signal (DEC-013),
+	 * and Hermes installs SIGHUP→SIG_IGN only around update runs (Phase 5 scope).
 	 */
 	installSignalHandlers(): void {
 		process.on("SIGTERM", () => this.handleSignal("SIGTERM"));
 		process.on("SIGINT", () => this.handleSignal("SIGINT"));
+		try {
+			process.on("SIGUSR1", () => this.handleSignal("SIGUSR1"));
+		} catch {
+			/* platform without SIGUSR1 support — drain-first restart degrades to
+			   the updater's SIGTERM escalation (08 §7 stop-after-window). */
+		}
 	}
 
 	/** Settles when a signal-initiated drain finishes (driver/test sync). */
@@ -930,6 +1404,9 @@ export class GatewayLifecycle {
 
 	/** Test/driver hook: dispose resources without a full drain. */
 	dispose(): void {
+		this.livenessGuard?.stop();
+		this.loopHeartbeat?.stop();
+		this.restoreGate.finish().catch(() => undefined);
 		this.releaseOwnership();
 		void this.ownedStore?.close(false).catch(() => undefined);
 		this.ownedStore = null;

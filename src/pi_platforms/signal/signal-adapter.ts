@@ -30,7 +30,7 @@
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -1438,6 +1438,99 @@ export class SignalAdapter extends BasePlatformAdapter {
 			}
 		}
 		return outcomes;
+	}
+
+	// ── single-attachment send (signal.py:_send_attachment parity) ──────────
+
+	/**
+	 * ONE file as ONE RPC send whose message body carries the caption
+	 * (_send_attachment @~1502): stop-typing first, size-capped against
+	 * SIGNAL_MAX_ATTACHMENT_SIZE, addressed through the SAME account +
+	 * recipient|groupId resolution as text sends, validated through the same
+	 * results[] walk, and its timestamp feeds the Note-to-Self echo filter.
+	 */
+	async sendAttachment(
+		chatId: string,
+		filePath: string,
+		opts: {
+			caption?: string | undefined;
+			mediaLabel?: string | undefined;
+		} = {},
+	): Promise<SendResult> {
+		await this.stopTypingIndicator(chatId);
+		const label = opts.mediaLabel ?? "File";
+		let fileSize: number;
+		try {
+			fileSize = statSync(filePath).size;
+		} catch {
+			return { success: false, error: `${label} file not found: ${filePath}` };
+		}
+		if (fileSize > SIGNAL_MAX_ATTACHMENT_SIZE) {
+			return {
+				success: false,
+				error: `${label} too large (${fileSize} bytes)`,
+			};
+		}
+
+		const params: Record<string, unknown> = {
+			account: this.account,
+			message: opts.caption ?? "",
+			attachments: [filePath],
+		};
+		params[this.addressKey(chatId)] = await this.addressValue(chatId);
+
+		const result = await this.rpc("send", params);
+		if (!result.ok) {
+			return {
+				success: false,
+				error: result.error ?? `RPC send ${label.toLowerCase()} failed`,
+			};
+		}
+		const verdict = validateSendResult(result.result);
+		if (!verdict.success) {
+			return { success: false, error: verdict.error, retryable: false };
+		}
+		this.trackSentTimestamp(result.result);
+		return { success: true, messageId: null };
+	}
+
+	// ── post-stream media lanes (DEC-019 explicit-tag delivery surface) ─────
+
+	/**
+	 * run.py:_deliver_media_from_response surface. WITHOUT these bindings the
+	 * post-stream rescan pass optional-chains every MEDIA-tagged file into a
+	 * silent no-op. Vendor mapping (signal.py @~1330/1560-1600): image batches
+	 * ride the scheduler-paced batch lane; voice/video/document each ride the
+	 * single-attachment send.
+	 */
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		const outcomes = await this.batchSendAttachments(chatId, images);
+		return outcomes.map((o) =>
+			o.success
+				? { success: true }
+				: {
+						success: false,
+						error: o.error ?? "attachment batch failed",
+					},
+		);
+	}
+
+	/** send_voice @~1602: Signal has no distinct voice API — same RPC send. */
+	sendVoice(chatId: string, audioPath: string): Promise<SendResult> {
+		return this.sendAttachment(chatId, audioPath, { mediaLabel: "Audio" });
+	}
+
+	/** send_video @~1611. */
+	sendVideo(chatId: string, videoPath: string): Promise<SendResult> {
+		return this.sendAttachment(chatId, videoPath, { mediaLabel: "Video" });
+	}
+
+	/** send_document @~1595. */
+	sendDocument(chatId: string, filePath: string): Promise<SendResult> {
+		return this.sendAttachment(chatId, filePath, { mediaLabel: "File" });
 	}
 
 	// ── guard wiring (reference-fixture inheritance) ─────────────────────────

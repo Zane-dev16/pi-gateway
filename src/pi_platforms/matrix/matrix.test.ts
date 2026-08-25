@@ -16,6 +16,7 @@ import {
 	normalizeBangCommand,
 } from "./manifest.js";
 import {
+	MatrixAdapterCore,
 	extractMatrixRetryAfterSeconds,
 	extractReplyFallback,
 	stripReplyFallback,
@@ -323,7 +324,7 @@ describe("matrix adapter — mention gating", () => {
 });
 
 describe("matrix adapter — content building + egress", () => {
-	it("strips image markdown and extracts outbound mention pills as data", async () => {
+	it("strips image markdown; ships m.mentions INSIDE content + format/formatted_body when HTML differs", async () => {
 		const w = freshEngine();
 		await w.wire.reset();
 		await w.engine.deliverText(
@@ -335,9 +336,37 @@ describe("matrix adapter — content building + egress", () => {
 		expect(sends[0]?.content).toBe(
 			"see https://x/y.png and ping @carol:other.example",
 		);
-		expect(sends[0]?.metadata["m_mentions_user_ids"]).toEqual([
-			"@carol:other.example",
-		]);
+		// The invented flat key is GONE; mentions serialize INTO the content.
+		expect(sends[0]?.metadata["m_mentions_user_ids"]).toBeUndefined();
+		const content = sends[0]?.metadata["event_content"] as Record<
+			string,
+			unknown
+		>;
+		expect(content["msgtype"]).toBe("m.text");
+		expect(content["m.mentions"]).toEqual({
+			user_ids: ["@carol:other.example"],
+		});
+
+		// Real markdown → html !== body ⇒ format/formatted_body ride along.
+		await w.wire.reset();
+		await w.engine.deliverText("!room:fake.example", "**bold** move");
+		const rich = w.wire.sendsOf("!room:fake.example")[0]?.metadata[
+			"event_content"
+		] as Record<string, unknown>;
+		expect(rich["format"]).toBe("org.matrix.custom.html");
+		expect(String(rich["formatted_body"])).toContain("<strong>bold</strong>");
+	});
+
+	it("plain text without markdown ships NO format keys (html === body)", async () => {
+		const w = freshEngine();
+		await w.wire.reset();
+		await w.engine.deliverText("!room:fake.example", "just words");
+		const content = w.wire.sendsOf("!room:fake.example")[0]?.metadata[
+			"event_content"
+		] as Record<string, unknown>;
+		expect(content["body"]).toBe("just words");
+		expect(content["format"]).toBeUndefined();
+		expect(content["formatted_body"]).toBeUndefined();
 	});
 
 	it("chunks oversized sends at the chat length policy (chars)", async () => {
@@ -349,15 +378,183 @@ describe("matrix adapter — content building + egress", () => {
 		expect(w.wire.sendsOf("!room:fake.example").length).toBeGreaterThan(1);
 	});
 
-	it("edits emit m.replace relation payloads", async () => {
+	it("edits ship the VENDOR replace payload: '* ' body + m.new_content + m.relates_to", async () => {
 		const w = freshEngine();
 		await w.engine.editMessage("!room:fake.example", "$target", "**edited**");
 		const edits = w.wire.editsOf("!room:fake.example");
 		expect(edits.length).toBe(1);
-		expect(edits[0]?.metadata["edit_relation"]).toEqual({
+		const content = edits[0]?.metadata["event_content"] as Record<
+			string,
+			unknown
+		>;
+		// adapter.py:edit_message — body prefixed '* ', full rebuilt content
+		// in m.new_content, relation points at the target.
+		expect(content["body"]).toBe("* **edited**");
+		const newContent = content["m.new_content"] as Record<string, unknown>;
+		expect(newContent["body"]).toBe("**edited**");
+		expect(newContent["formatted_body"]).toContain("<strong>edited</strong>");
+		expect(content["m.relates_to"]).toEqual({
 			rel_type: "m.replace",
 			event_id: "$target",
 		});
+	});
+
+	it("replies and threads emit m.relates_to on outbound content", async () => {
+		const w = freshEngine();
+		await w.wire.reset();
+		await w.engine.send("!room:fake.example", "a reply", "$parent1", {});
+		let content = w.wire.sendsOf("!room:fake.example")[0]?.metadata[
+			"event_content"
+		] as Record<string, unknown>;
+		expect(content["m.relates_to"]).toEqual({
+			"m.in_reply_to": { event_id: "$parent1" },
+		});
+
+		await w.engine.send("!room:fake.example", "threaded", undefined, {
+			thread_id: "$root7",
+		} as never);
+		content = w.wire.sendsOf("!room:fake.example")[1]?.metadata[
+			"event_content"
+		] as Record<string, unknown>;
+		expect(content["m.relates_to"]).toMatchObject({
+			rel_type: "m.thread",
+			event_id: "$root7",
+			is_falling_back: true,
+			"m.in_reply_to": { event_id: "$root7" },
+		});
+	});
+
+	it("dispatch wires the processing lifecycle: typing bubble + 👀→✅ hooks around each turn", async () => {
+		const w = freshEngine();
+		await w.engine.connect({ isReconnect: false });
+		await vi_waitFor(() => w.engine.polledOnce);
+
+		// base.py:_process_message_background — every dispatched turn opens with
+		// set_typing(timeout=30000) + the 👀 eyes reaction, and settles with the
+		// eyes redacted, a ✅ completion reaction, set_typing(timeout=0), and the
+		// fire-and-forget read receipt.
+		const pushed = w.hs.pushRoomMessage("!room:fake.example", ALICE, {
+			msgtype: "m.text",
+			body: "lifecycle me",
+		});
+		await vi_waitFor(() => w.subject.turns().includes("lifecycle me"));
+		await vi_waitFor(
+			() =>
+				w.hs.typingEvents.length >= 2 &&
+				w.hs.typingEvents[w.hs.typingEvents.length - 1]?.timeoutMs === 0,
+		);
+		expect(w.hs.typingEvents.filter((t) => t.timeoutMs === 30_000).length).toBe(
+			1,
+		);
+		const eyes = w.hs.reactions.find(
+			(r) => r.targetEventId === pushed.eventId && r.key === "\u{1F440}",
+		);
+		expect(eyes?.redacted).toBe(true);
+		expect(
+			w.hs.reactions.find(
+				(r) => r.targetEventId === pushed.eventId && r.key === "\u2705",
+			),
+		).toBeDefined();
+		expect(w.hs.readReceipts.some((r) => r.eventId === pushed.eventId)).toBe(
+			true,
+		);
+	});
+
+	it("receipts fire-and-forget after processing", async () => {
+		const w = freshEngine();
+		await w.engine.connect({ isReconnect: false });
+		await vi_waitFor(() => w.engine.polledOnce);
+		w.hs.pushRoomMessage("!room:fake.example", ALICE, {
+			msgtype: "m.text",
+			body: "mark me read",
+		});
+		await vi_waitFor(() => w.subject.turns().includes("mark me read"));
+		await vi_waitFor(() => w.hs.readReceipts.length >= 1, 2_000);
+		expect(w.hs.readReceipts[0]?.eventId).toBeDefined();
+	});
+
+	it("sendMedia uploads then ships a typed media event with info dict", async () => {
+		const w = freshEngine();
+		const result = await w.engine.sendMedia(
+			"!room:fake.example",
+			{
+				bytes: new Uint8Array([1, 2, 3, 4]),
+				filename: "shot.png",
+				mimeType: "image/png",
+			},
+			{ caption: "here" },
+		);
+		expect(result.success).toBe(true);
+		expect(w.hs.uploads).toHaveLength(1);
+		expect(w.hs.uploads[0]).toMatchObject({
+			mimeType: "image/png",
+			filename: "shot.png",
+			size: 4,
+		});
+		const content = w.wire.sendsOf("!room:fake.example")[0]?.metadata[
+			"event_content"
+		] as Record<string, unknown>;
+		expect(content["msgtype"]).toBe("m.image");
+		expect(content["body"]).toBe("here");
+		expect(content["url"]).toMatch(/^mxc:\/\/fake\.example\/up\d+$/);
+		expect(content["info"]).toEqual({ mimetype: "image/png", size: 4 });
+	});
+
+	it("invited rooms JOIN with bounded retry and then deliver (matrix-9)", async () => {
+		const w = freshEngine();
+		await w.engine.connect({ isReconnect: false });
+		await vi_waitFor(() => w.engine.polledOnce);
+
+		// Invite surfaces on sync; join succeeds after scripted failures.
+		w.hs.pushInvite("!invited:fake.example");
+		await vi_waitFor(
+			() => w.hs.joinCalls.includes("!invited:fake.example"),
+			3_000,
+		);
+		expect(w.hs.joinCalls[0]).toBe("!invited:fake.example");
+
+		// After joining, messages in that room flow through the normal filter
+		// pipeline (the room now rides the sync join set).
+		w.hs.pushRoomMessage("!invited:fake.example", ALICE, {
+			msgtype: "m.text",
+			body: "post-join hello",
+		});
+		await vi_waitFor(
+			() => w.subject.turns().includes("post-join hello"),
+			3_000,
+		);
+	});
+
+	it("password login resolves identity when MATRIX_PASSWORD configured; whoami resolves device_id", async () => {
+		const hs = new FakeMatrixHomeserver({ nowMs: () => 0 });
+		hs.loginPassword = "sekrit";
+		const clock = new ManualPollingClock();
+		const engine = new MatrixAdapterCore({
+			hs,
+			clock,
+			timer: clock.timer,
+			manifestName: "matrix-login",
+			secretReader: (key) =>
+				key === "MATRIX_HOMESERVER"
+					? "https://matrix.fake.example"
+					: key === "MATRIX_USER_ID"
+						? "@bot:fake.example"
+						: key === "MATRIX_PASSWORD"
+							? "sekrit"
+							: undefined,
+		});
+		const ok = await engine.connect({ isReconnect: false });
+		expect(ok).toBe(true);
+		expect(hs.loginCalls).toHaveLength(1);
+		expect(hs.loginCalls[0]?.identifier).toBe("@bot:fake.example");
+		expect(hs.whoamiCount).toBe(0); // password branch skips whoami
+
+		// TOKEN branch (no MATRIX_PASSWORD) still goes through whoami AND
+		// resolves device_id alongside user_id.
+		const w2 = freshEngine();
+		const me = await w2.hs.whoami();
+		expect(me.user_id).toBe("@pi-bot:fake.example");
+		expect(me.device_id).toBe("DEVFAKE");
 	});
 
 	it("honors M_LIMIT_EXCEEDED retry_after_ms ONCE at the typing site", async () => {

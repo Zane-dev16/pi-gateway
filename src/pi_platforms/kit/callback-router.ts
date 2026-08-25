@@ -71,7 +71,31 @@ interface PendingEntry {
 	expiresAtMs: number;
 }
 
-/** Atomic-pop one-shot store (ea:/sc:/appr:) — double-tap dedup by POP. */
+/**
+ * INTERACTIVE_STATE_CACHE_SIZE parity (whatsapp_cloud.py:@~102; the same bound
+ * Hermes applies to _clarify_state/_exec_approval_state/_slash_confirm_state
+ * across adapters): pending-prompt stores are FIFO-capped at 1000 with
+ * OLDEST eviction so long-running processes stay bounded.
+ */
+export const PENDING_STATE_CACHE_SIZE = 1000;
+
+/** Oldest-first eviction past `maxEntries` (Map preserves insertion order). */
+function evictOldestPast(
+	entries: Map<string, unknown>,
+	maxEntries: number,
+	onEvict?: ((key: string) => void) | undefined,
+): void {
+	while (entries.size > maxEntries) {
+		const oldest = entries.keys().next();
+		if (oldest.done === true) break;
+		entries.delete(oldest.value);
+		onEvict?.(oldest.value);
+	}
+}
+
+/** Atomic-pop one-shot store (ea:/sc:/appr:) — double-tap dedup by POP.
+ * Bounded at PENDING_STATE_CACHE_SIZE with oldest eviction (_bounded_put
+ * parity) so unbounded prompt churn cannot grow the process. */
 export type PopOutcome =
 	| { state: "live"; sessionKey: string }
 	| { state: "expired" }
@@ -79,6 +103,11 @@ export type PopOutcome =
 
 export class OneShotPendingStore {
 	private readonly entries = new Map<string, PendingEntry>();
+	private readonly maxEntries: number;
+
+	constructor(maxEntries: number = PENDING_STATE_CACHE_SIZE) {
+		this.maxEntries = Math.max(1, maxEntries);
+	}
 
 	register(
 		id: string | number,
@@ -86,6 +115,7 @@ export class OneShotPendingStore {
 		expiresAtMs = Infinity,
 	): void {
 		this.entries.set(String(id), { sessionKey, expiresAtMs });
+		evictOldestPast(this.entries, this.maxEntries);
 	}
 
 	/** Atomic POP: first tap wins; second tap finds nothing (resolved once).
@@ -104,6 +134,19 @@ export class OneShotPendingStore {
 	has(id: string | number): boolean {
 		return this.entries.has(String(id));
 	}
+
+	/**
+	 * Oldest (insertion-order) pending id registered for a session key, or
+	 * null. has_blocking_approval parity probe for wires that resolve clicks
+	 * WITHOUT carrying an approval id in the button payload (Teams
+	 * _on_card_action resolves through session_key; tools/approval.py:2882).
+	 */
+	oldestIdForSession(sessionKey: string): string | null {
+		for (const [key, entry] of this.entries) {
+			if (entry.sessionKey === sessionKey) return key;
+		}
+		return null;
+	}
 }
 
 /**
@@ -113,13 +156,22 @@ export class OneShotPendingStore {
 export class ClarifyPendingStore {
 	private readonly entries = new Map<string, PendingEntry>();
 	private readonly awaitingText = new Set<string>();
+	private readonly maxEntries: number;
+
+	constructor(maxEntries: number = PENDING_STATE_CACHE_SIZE) {
+		this.maxEntries = Math.max(1, maxEntries);
+	}
 
 	register(
 		id: string | number,
 		sessionKey: string,
 		expiresAtMs = Infinity,
 	): void {
-		this.entries.set(String(id), { sessionKey, expiresAtMs });
+		const key = String(id);
+		this.entries.set(key, { sessionKey, expiresAtMs });
+		evictOldestPast(this.entries, this.maxEntries, (evicted) => {
+			this.awaitingText.delete(evicted);
+		});
 	}
 
 	get(id: string | number): string | null {

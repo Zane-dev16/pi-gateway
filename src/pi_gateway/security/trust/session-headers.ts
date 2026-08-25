@@ -23,6 +23,53 @@ export const SESSION_KEY_HEADER = "x-hermes-session-key";
 /** Lowercased header map (the server layer normalizes once). */
 export type HeaderMap = Record<string, string>;
 
+/** Key-only verdict (api_server.py:_parse_session_key_header parity). */
+export type SessionKeyVerdict =
+	| {
+			ok: true;
+			/** Adopted memory scope key; null when the header is absent/blank. */
+			sessionKey: string | null;
+	  }
+	| {
+			ok: false;
+			status: 400 | 403;
+			error: string;
+			errorType: "invalid_request_error" | "gateway_auth_error";
+	  };
+
+/**
+ * The X-Hermes-Session-Key ladder ALONE (api_server.py:_parse_session_key_header
+ * @2296): blank/absent ⇒ adopted nothing; no API key configured ⇒ 403 (memory
+ * scoping is NEVER anonymous); [\r\n\x00] ⇒ 400 "Invalid session key";
+ * over-length ⇒ 400 "Session key too long". Lanes that honor ONLY the memory
+ * header (POST /v1/runs — Hermes does not parse the id there) compose this;
+ * the full pair helper below reuses it for its key half.
+ */
+export function extractSessionKeyHeader(
+	headers: HeaderMap,
+	opts: { apiKeyConfigured: boolean },
+): SessionKeyVerdict {
+	const rawKey = headers[SESSION_KEY_HEADER];
+	if (typeof rawKey !== "string") return { ok: true, sessionKey: null };
+	const key = rawKey.trim();
+	if (key.length === 0) return { ok: true, sessionKey: null };
+	if (!opts.apiKeyConfigured) {
+		return fail(
+			403,
+			"gateway_auth_error",
+			"X-Hermes-Session-Key requires API key authentication. " +
+				"Configure API_SERVER_KEY to enable this feature.",
+		);
+	}
+	if (HEADER_INJECTION_CHARS.test(key)) {
+		return fail(400, "invalid_request_error", "Invalid session key");
+	}
+	if (key.length > MAX_SESSION_HEADER_LEN) {
+		return fail(400, "invalid_request_error", "Session key too long");
+	}
+	return { ok: true, sessionKey: key };
+}
+
 export type SessionHeadersVerdict =
 	| {
 			ok: true;
@@ -63,25 +110,11 @@ export function extractOptInSessionHeaders(
 	const rawKey = headers[SESSION_KEY_HEADER];
 	const rawId = headers[SESSION_ID_HEADER];
 
-	let sessionKey: string | null = null;
-	if (typeof rawKey === "string" && rawKey.trim().length > 0) {
-		const key = rawKey.trim();
-		if (!opts.apiKeyConfigured) {
-			return fail(
-				403,
-				"gateway_auth_error",
-				"X-Hermes-Session-Key requires API key authentication. " +
-					"Configure API_SERVER_KEY to enable this feature.",
-			);
-		}
-		if (HEADER_INJECTION_CHARS.test(key)) {
-			return fail(400, "invalid_request_error", "Invalid session key");
-		}
-		if (key.length > MAX_SESSION_HEADER_LEN) {
-			return fail(400, "invalid_request_error", "Session key too long");
-		}
-		sessionKey = key;
-	}
+	// The KEY gate runs FIRST (a key without API-key auth rejects even when
+	// the id would validate) — same core as the standalone key-only lane.
+	const keyVerdict = extractSessionKeyHeader(headers, opts);
+	if (!keyVerdict.ok) return keyVerdict;
+	const sessionKey = keyVerdict.sessionKey;
 
 	let sessionId: string | null = null;
 	if (typeof rawId === "string" && rawId.trim().length > 0) {

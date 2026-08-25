@@ -31,6 +31,18 @@ export interface MmPost {
 	type: string;
 	root_id: string;
 	create_at: number;
+	/** Attached file ids (api/v4/files upload → posts payload). */
+	file_ids?: string[];
+	/** Post props (disable_mentions etc. persist through PATCH). */
+	props?: Record<string, unknown> | undefined;
+}
+
+/** files/{id}/info shape (_upload_file/download parity). */
+export interface MmFileInfo {
+	id: string;
+	name: string;
+	mime_type: string;
+	size: number;
 }
 
 /** One JSON frame on the MM websocket. */
@@ -116,6 +128,12 @@ export class FakeMattermost {
 	private readonly frameLog: Array<{ frame: MmFrame; at: number }> = [];
 	private readonly createdPosts: MmPost[] = [];
 	private readonly patchedPosts: Array<{ id: string; message: string }> = [];
+	/** FULL PATCH payloads received on posts/{id}/patch (props audit). */
+	readonly patchPayloads: Array<{
+		postId: string;
+		message: string;
+		props?: Record<string, unknown> | undefined;
+	}> = [];
 	private readonly typingCalls: Array<{ channelId: string; userId: string }> =
 		[];
 	private readonly restRateLimits: number[] = [];
@@ -167,6 +185,11 @@ export class FakeMattermost {
 	get typingEventCount(): number {
 		return this.typingCalls.length;
 	}
+	typingCallsFor(
+		channelId: string,
+	): Array<{ channelId: string; userId: string }> {
+		return this.typingCalls.filter((c) => c.channelId === channelId);
+	}
 	postById(id: string): MmPost | undefined {
 		return this.posts.get(id);
 	}
@@ -215,6 +238,7 @@ export class FakeMattermost {
 			rootId?: string | undefined;
 			createAt?: number | undefined;
 			postId?: string | undefined;
+			fileIds?: string[] | undefined;
 		} = {},
 	): MmPost {
 		const channelType = this.channels.get(channelId)?.type ?? "O";
@@ -226,6 +250,7 @@ export class FakeMattermost {
 			message,
 			type: opts.type ?? "",
 			root_id: opts.rootId ?? "",
+			...(opts.fileIds !== undefined ? { file_ids: [...opts.fileIds] } : {}),
 			// Strictly increasing create_at even under a frozen injected clock —
 			// the REST backfill window (since <) depends on it.
 			create_at:
@@ -271,15 +296,24 @@ export class FakeMattermost {
 			const token = (frame["data"] as Record<string, unknown> | undefined)?.[
 				"token"
 			];
-			if (
+			const ok =
 				!this.authRequired ||
-				(token === this.authToken && this.authChallengeFailures === 0)
-			) {
+				(token === this.authToken && this.authChallengeFailures === 0);
+			if (ok) {
 				conn.socket.serverFrame({ status: "OK", seq_reply: frame["seq"] });
 				conn.authed = true;
 				for (const [id, ch] of this.channels) {
 					conn.channelTypeByChannel.set(id, ch.type);
 				}
+			} else if (this.challengeReplyFailMode) {
+				// REAL server behavior: a rejected challenge is answered in-band
+				// with {"status":"fail","error":{...}} — no close at all.
+				this.authChallengeFailures -= Math.min(1, this.authChallengeFailures);
+				conn.socket.serverFrame({
+					status: "FAIL",
+					seq_reply: frame["seq"],
+					error: { id: "api.context.invalid_token" },
+				});
 			} else if (this.authChallengeFailures > 0) {
 				this.authChallengeFailures -= 1;
 				conn.socket.serverClose({
@@ -297,6 +331,26 @@ export class FakeMattermost {
 		if (action === "ping") {
 			if (!conn.stalled)
 				conn.socket.serverFrame({ action: "pong", seq_reply: frame["seq"] });
+		}
+	}
+
+	/**
+	 * Script IN-BAND challenge rejections: the next N challenges get the real
+	 * server's {"status":"fail"} reply instead of a 4001 close.
+	 */
+	challengeReplyFail(n: number): void {
+		this.challengeReplyFailMode = true;
+		this.authChallengeFailures = n;
+	}
+	private challengeReplyFailMode = false;
+
+	/** SERVER-initiated keepalive ping (real MM servers ping every ~30s). */
+	serverPing(): void {
+		serverSeq += 1;
+		for (const conn of this.connections) {
+			if (conn.socket.readyState === WS_OPEN && conn.stalled !== true) {
+				conn.socket.serverDeliver({ action: "ping", seq: serverSeq });
+			}
 		}
 	}
 
@@ -333,6 +387,7 @@ export class FakeMattermost {
 		message: string;
 		root_id?: string | undefined;
 		props?: Record<string, unknown> | undefined;
+		file_ids?: string[] | undefined;
 	}): Promise<MmPost> {
 		const limited = this.restRateLimits.shift();
 		if (limited !== undefined) {
@@ -347,21 +402,113 @@ export class FakeMattermost {
 			type: "",
 			root_id: payload.root_id ?? "",
 			create_at: this.nowMs(),
+			...(payload.file_ids !== undefined
+				? { file_ids: [...payload.file_ids] }
+				: {}),
 		};
+		this.createdPostsPayloads.push({
+			channel_id: payload.channel_id,
+			message: payload.message,
+			...(payload.root_id !== undefined ? { root_id: payload.root_id } : {}),
+			...(payload.props !== undefined ? { props: { ...payload.props } } : {}),
+			...(payload.file_ids !== undefined
+				? { file_ids: [...payload.file_ids] }
+				: {}),
+		});
 		this.posts.set(post.id, post);
 		this.createdPosts.push(post);
 		this.knownChannels.add(payload.channel_id);
 		return post;
 	}
 
-	async restPatchPost(postId: string, message: string): Promise<MmPost> {
+	/** Full payloads received on POST posts (props/file_ids audit). */
+	readonly createdPostsPayloads: Array<{
+		channel_id: string;
+		message: string;
+		root_id?: string | undefined;
+		props?: Record<string, unknown> | undefined;
+		file_ids?: string[] | undefined;
+	}> = [];
+
+	/**
+	 * POST api/v4/files — multipart channel_id+'files' → file_infos[0].id
+	 * (adapter.py:_upload_file).
+	 */
+	readonly uploadedFiles: Array<{
+		channelId: string;
+		filename: string;
+		contentType: string;
+		bytes: Uint8Array;
+	}> = [];
+	private fileSeq = 0;
+
+	async restUploadFile(op: {
+		channelId: string;
+		filename: string;
+		contentType: string;
+		bytes: Uint8Array;
+	}): Promise<string> {
 		const limited = this.restRateLimits.shift();
 		if (limited !== undefined) {
 			throw new MmRestError(429, "rate limit exceeded", limited);
 		}
+		this.uploadedFiles.push({
+			channelId: op.channelId,
+			filename: op.filename,
+			contentType: op.contentType,
+			bytes: op.bytes,
+		});
+		this.fileSeq += 1;
+		const fid = `fid${this.fileSeq}`;
+		this.fileInfos.set(fid, {
+			id: fid,
+			name: op.filename,
+			mime_type: op.contentType,
+			size: op.bytes.byteLength,
+		});
+		this.fileContents.set(fid, op.bytes.slice());
+		return fid;
+	}
+
+	private readonly fileInfos = new Map<string, MmFileInfo>();
+	private readonly fileContents = new Map<string, Uint8Array>();
+
+	/** GET files/{fid}/info. */
+	async restGetFileInfo(fileId: string): Promise<MmFileInfo> {
+		const info = this.fileInfos.get(fileId);
+		if (info === undefined) throw new MmRestError(404, "File not found");
+		return { ...info };
+	}
+
+	/** GET files/{fid} — the AUTHED download lane. */
+	async restDownloadFile(fileId: string): Promise<Uint8Array> {
+		const bytes = this.fileContents.get(fileId);
+		if (bytes === undefined) throw new MmRestError(404, "File not found");
+		return bytes.slice();
+	}
+
+	async restPatchPost(
+		postId: string,
+		payload: { message: string; props?: Record<string, unknown> | undefined },
+	): Promise<MmPost> {
+		const limited = this.restRateLimits.shift();
+		if (limited !== undefined) {
+			throw new MmRestError(429, "rate limit exceeded", limited);
+		}
+		const message = payload.message;
 		const existing = this.posts.get(postId);
 		this.patchedPosts.push({ id: postId, message });
-		if (existing) existing.message = message;
+		this.patchPayloads.push({
+			postId,
+			message,
+			...(payload.props !== undefined ? { props: { ...payload.props } } : {}),
+		});
+		if (existing) {
+			existing.message = message;
+			if (payload.props !== undefined) {
+				existing.props = { ...(existing.props ?? {}), ...payload.props };
+			}
+		}
 		return (
 			existing ?? {
 				id: postId,

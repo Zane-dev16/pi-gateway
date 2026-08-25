@@ -28,12 +28,23 @@ import { systemClock } from "./clock.js";
 export const UPDATE_RECEIPTS_DIRNAME = join("logs", "update_receipts");
 export const LATEST_POINTER_FILENAME = "latest.json";
 
-/** Outcome vocabulary is CLOSED (08 §8). */
-export type UpdateOutcome = "success" | "partial" | "failed";
+/**
+ * Outcome vocabulary is CLOSED (08 §8). "refused" is the port of the Hermes
+ * preflight-refusal convention (hermes_cli/update_receipt.py:
+ * finalize_pending_update_receipt): plan/refusal-gate terminal paths record
+ * refusal instead of failure so an operator can tell "the updater declined
+ * before mutating anything" from "a step failed mid-run".
+ */
+export type UpdateOutcome = "success" | "partial" | "failed" | "refused";
 
-/** Exit-code discipline: success ⇒ 0; partial/failed ⇒ 1 (08 §8). */
-export function exitCodeForOutcome(outcome: UpdateOutcome): 0 | 1 {
-	return outcome === "success" ? 0 : 1;
+/**
+ * Exit-code discipline: success ⇒ 0; refused ⇒ 2 (exit-2 preflight-refusal
+ * convention, recorded verbatim); partial/failed ⇒ 1 (08 §8).
+ */
+export function exitCodeForOutcome(outcome: UpdateOutcome): 0 | 1 | 2 {
+	if (outcome === "success") return 0;
+	if (outcome === "refused") return 2;
+	return 1;
 }
 
 export interface ReceiptStep {
@@ -53,7 +64,7 @@ export interface UpdateReceiptPayload {
 	started_at: string;
 	finished_at: string;
 	outcome: UpdateOutcome;
-	exit_code: 0 | 1;
+	exit_code: 0 | 1 | 2;
 	steps: ReceiptStep[];
 	skips: ReceiptSkip[];
 	plan: unknown;
@@ -155,9 +166,9 @@ export class UpdateReceiptWriter {
 	}
 
 	/**
-	 * Persist the receipt + latest.json pointer; returns the payload with its
-	 * exit code. Idempotence guard: a second finalize returns the FIRST
-	 * payload — one run, one receipt file.
+	 * Persist the receipt + the latest.json FULL-PAYLOAD mirror; returns the
+	 * payload with its exit code. Idempotence guard: a second finalize returns
+	 * the FIRST payload — one run, one receipt file.
 	 */
 	finalize(
 		outcome: UpdateOutcome,
@@ -186,11 +197,14 @@ export class UpdateReceiptWriter {
 			mkdirSync(this.dir, { recursive: true });
 			const path = join(this.dir, filename);
 			writeJsonAtomically(path, payload);
+			// Parity finalize_update_receipt: latest.json mirrors the FULL receipt
+			// JSON (not a summary pointer) so dashboard/desktop readers get every
+			// step/skip/restart/fleet detail from one stable path. The receipt
+			// FILENAME rides along as a pointer field for tooling that wants to
+			// resolve the stamped original.
 			writeJsonAtomically(join(this.dir, LATEST_POINTER_FILENAME), {
+				...payload,
 				receipt: filename,
-				outcome,
-				exit_code: payload.exit_code,
-				finished_at: payload.finished_at,
 			});
 			pruneReceipts(this.dir, RECEIPTS_KEEP_DEFAULT);
 			this.finalizedPayload = { payload, path };
@@ -216,26 +230,20 @@ export class UpdateReceiptWriter {
 
 export const RECEIPTS_KEEP_DEFAULT = 20;
 
-/** Read the latest.json pointer (null when absent/corrupt). */
-export function readLatestPointer(
-	dir: string,
-): {
+/** Full latest.json shape: the complete receipt plus the filename pointer. */
+export interface LatestReceiptPointer extends UpdateReceiptPayload {
+	/** Filename of the stamped receipt file this snapshot mirrors. */
 	receipt: string;
-	outcome: UpdateOutcome;
-	exit_code: number;
-	finished_at: string;
-} | null {
+}
+
+/** Read the latest.json full-payload mirror (null when absent/corrupt). */
+export function readLatestPointer(dir: string): LatestReceiptPointer | null {
 	try {
 		const raw: unknown = JSON.parse(
 			readFileSync(join(dir, LATEST_POINTER_FILENAME), "utf8"),
 		);
 		if (typeof raw === "object" && raw !== null) {
-			return raw as {
-				receipt: string;
-				outcome: UpdateOutcome;
-				exit_code: number;
-				finished_at: string;
-			};
+			return raw as LatestReceiptPointer;
 		}
 		return null;
 	} catch {

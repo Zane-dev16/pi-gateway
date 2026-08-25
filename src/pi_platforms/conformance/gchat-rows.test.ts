@@ -11,7 +11,9 @@
 //      format matrix (all three vendor shapes), BOT self-filter + msg.name
 //      TTL dedupe on the injected clock, body-cap pre-parse, thread-routing
 //      ladder, Chat-dialect markdown conversion, outbound verdict ladder
-//      (403 fatal / 404 skip / 429 counter), cardsV2 builder caps.
+//      (403 fatal / 404 skip / 429 counter) plus the _call_with_retry
+//      create-retry ladder and end-of-turn typing-card retirement,
+//      cardsV2 builder caps.
 //   4. Full-catalog gate: allApplicablePassed === true, deferred === [].
 //   5. The gate DETECTS: a lying verifier that admits any token fails its own
 //      named row.
@@ -19,6 +21,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ManualScheduler } from "../../pi_gateway/guards/testing/manual-spawner.js";
+import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
 import { FakePlatformWire } from "./wire.js";
 import { buildSharedRows } from "./rows.js";
 import type { ConformanceRow } from "./rows.js";
@@ -373,7 +376,9 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 					adapter.resolveThreadId(undefined, { job_id: "job-9" }, "spaces/A"),
 				).toBeNull();
 
-				// Wire-level: threaded send carries the REPLY_MESSAGE_FALLBACK data.
+				// Wire-level: threaded send carries the REPLY_MESSAGE_FALLBACK data as
+				// a CREATE QUERY PARAM (messages.create query kwarg) — NEVER a body
+				// field (the Message resource rejects unknown body fields).
 				await adapter.send("spaces/WIRE", "threaded please", undefined, {
 					thread_id: "spaces/WIRE/threads/T9",
 				});
@@ -381,7 +386,8 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 				expect(create?.body["thread"]).toEqual({
 					name: "spaces/WIRE/threads/T9",
 				});
-				expect(create?.body["messageReplyOption"]).toBe(
+				expect(create?.body["messageReplyOption"]).toBeUndefined();
+				expect(create?.queryParams?.["messageReplyOption"]).toBe(
 					"REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
 				);
 
@@ -418,6 +424,35 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 				await new Promise<void>((r) => setTimeout(r, 20));
 				expect(adapter.cachedOutboundThread("spaces/DM1")).toBe(
 					"spaces/DM1/threads/X",
+				);
+
+				// Bot-CREATED threads are known side threads (_create_message
+				// @2619-2634 outbound bump): the create-response thread.name enters
+				// the count store, so a later user "Reply in thread" on the bot's
+				// message resolves SIDE instead of misclassifying as main flow.
+				const dmBotSpace = { name: "spaces/DM2", spaceType: "DIRECT_MESSAGE" };
+				const started = await adapter.send(
+					"spaces/DM2",
+					"bot starts a thread",
+					undefined,
+					{ thread_id: "spaces/DM2/threads/B9" },
+				);
+				expect(started.success).toBe(true);
+				const dmSide = await fx.postSigned(
+					fx.workspaceAddonsEnvelope({
+						space: dmBotSpace,
+						message: fx.chatMessage({
+							name: "spaces/DM2/messages/dm-b9",
+							text: "user engages the bot's thread",
+							threadName: "spaces/DM2/threads/B9",
+							space: dmBotSpace,
+						}),
+					}),
+				);
+				expect(dmSide.status).toBe(200);
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(adapter.cachedOutboundThread("spaces/DM2")).toBe(
+					"spaces/DM2/threads/B9",
 				);
 			},
 		),
@@ -462,13 +497,15 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 				).toBe(true);
 				expect(fallbackBody).toContain("**keep** raw");
 
-				// Edit cap: >4000 chars truncate with ellipsis via patch-in-place.
+				// Edit cap: >4000 chars truncate with ellipsis via MASKED patch
+				// (_patch_message @2346 — updateMask names exactly what we ship).
 				await fx.adapter.editMessage(
 					"spaces/DIALECT",
 					"spaces/x/messages/E",
 					"y".repeat(4500),
 				);
 				const patch = fx.api.calls.filter((c) => c.op === "patch").at(-1);
+				expect(patch?.updateMask).toBe("text");
 				const patchedText = String(patch?.body["text"] ?? "");
 				expect(patchedText.length).toBeLessThanOrEqual(GCHAT_MAX_TEXT_LENGTH);
 				expect(patchedText.endsWith("…")).toBe(true);
@@ -476,26 +513,34 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 		),
 		mk(
 			"transport.gchat.outbound-verdict-ladder",
-			"gchat: 403 marks FATAL chat_forbidden; 404 surfaces target-not-found non-retryable; 429 bumps the per-chat rate-limit counter AND surfaces retryable; transient 500 classifies retryable",
+			"gchat: 403 marks FATAL chat_forbidden; 404 surfaces target-not-found non-retryable (NEVER retried); 429 bumps the per-chat rate-limit counter AND surfaces retryable; transient 500 classifies retryable",
 			async (fx) => {
-				// 429 ladder on a FRESH fixture per status keeps the ladder row
-				// deterministic — one fixture per assertion block here.
-				fx.api.script("create", { kind: "status", status: 429 });
+				// Every retryable status is scripted for ALL THREE attempts
+				// (_call_with_retry @2538) so exhaustion lands on the verdict rung.
+				const exhausted = (status: number) => [
+					{ kind: "status" as const, status },
+					{ kind: "status" as const, status },
+					{ kind: "status" as const, status },
+				];
+				fx.api.script("create", ...exhausted(429));
 				let result = await fx.adapter.send("spaces/RATE", "hit limit");
 				expect(result.success).toBe(false);
 				expect(result.retryable).toBe(true);
+				expect(fx.api.createsOf("spaces/RATE")).toHaveLength(3);
 				expect(fx.adapter.rateLimitHitsOf("spaces/RATE")).toBe(1);
 
-				fx.api.script("create", { kind: "status", status: 500 });
+				fx.api.script("create", ...exhausted(500));
 				result = await fx.adapter.send("spaces/FIVE", "server hiccup");
 				expect(result.success).toBe(false);
 				expect(result.retryable).toBe(true);
 
+				// 404 is PERMANENT — one attempt, no retry, target-not-found.
 				fx.api.script("create", { kind: "status", status: 404 });
 				result = await fx.adapter.send("spaces/GONE", "target vanished");
 				expect(result.success).toBe(false);
 				expect(result.retryable).toBe(false);
 				expect(result.error).toContain("not found");
+				expect(fx.api.createsOf("spaces/GONE")).toHaveLength(1);
 				void result;
 
 				// Rate-limit warn threshold (manifest data: 5 hits).
@@ -504,6 +549,54 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 					warnFx.adapter.noteRateLimitHit("spaces/WARN");
 				expect(warnFx.adapter.counters.rateLimitHitsByChatWarned).toBe(1);
 				warnFx.dispose();
+			},
+		),
+		mk(
+			"transport.gchat.outbound-retry-ladder",
+			"gchat: every messages.create rides _call_with_retry (@2538) — transient 5xx and transport throws recover mid-ladder; persistent failures exhaust EXACTLY 3 attempts with jittered backoff on the injected clock; timeout-CLASSIFIED outcomes NEVER retry (DEC-046)",
+			async (fx) => {
+				// Transient 500 recovers on attempt 2 — the message DELIVERS.
+				fx.api.script("create", { kind: "status", status: 500 });
+				let result = await fx.adapter.send("spaces/RETRY", "transient hiccup");
+				expect(result.success).toBe(true);
+				expect(fx.api.createsOf("spaces/RETRY")).toHaveLength(2);
+
+				// Transport-level throw (socket loss) recovers the same way.
+				fx.api.script("create", {
+					kind: "throw",
+					message: "socket hang up",
+				});
+				result = await fx.adapter.send("spaces/SOCKET", "over a flaky wire");
+				expect(result.success).toBe(true);
+				expect(fx.api.createsOf("spaces/SOCKET")).toHaveLength(2);
+
+				// Persistent 429 exhausts EXACTLY GCHAT_RETRY_MAX_ATTEMPTS, then the
+				// verdict ladder classifies. Backoff runs on the INJECTED clock:
+				// jitter pinned to 0 ⇒ waits of 1s then 2s (base doubling to cap).
+				fx.api.script(
+					"create",
+					{ kind: "status", status: 429 },
+					{ kind: "status", status: 429 },
+					{ kind: "status", status: 429 },
+				);
+				const before = fx.clock.nowMs;
+				result = await fx.adapter.send("spaces/FLOOD", "never lands");
+				expect(result.success).toBe(false);
+				expect(result.retryable).toBe(true);
+				expect(fx.api.createsOf("spaces/FLOOD")).toHaveLength(3);
+				expect(fx.clock.nowMs - before).toBe(3_000);
+
+				// Timeout-CLASSIFIED ambiguity NEVER retries (DEC-046): the send may
+				// have arrived — one attempt, zero backoff, no blind resend.
+				fx.api.script("create", {
+					kind: "throw",
+					message: "request timed out after 30s",
+				});
+				const beforeTimeout = fx.clock.nowMs;
+				result = await fx.adapter.send("spaces/SLOW", "ambiguous delivery");
+				expect(result.success).toBe(false);
+				expect(fx.api.createsOf("spaces/SLOW")).toHaveLength(1);
+				expect(fx.clock.nowMs - beforeTimeout).toBe(0);
 			},
 		),
 		mk(
@@ -562,6 +655,267 @@ function gchatDeltaRows(newFixture: () => GchatFixture): ConformanceRow[] {
 				expect(ok.success).toBe(true);
 				const create = fx.api.createsOf("spaces/CARDS").at(-1);
 				expect(Array.isArray(create?.body["cardsV2"])).toBe(true);
+			},
+		),
+		mk(
+			"transport.gchat.interactive-surfaces",
+			"gchat: slashCommand normalizes /cmd_{id} COMMAND dispatch; typing marker is TRACKED and patched IN PLACE by the reply (404 ⇒ create fallthrough, no orphan card); clarify prompts render the Question CARD with hermes_clarify buttons and a plain-text fallback on failure",
+			async (fx) => {
+				const adapter = fx.adapter;
+
+				// 1. Slash command: commandId prepended when argumentText lacks "/".
+				const slashMsg = fx.chatMessage({
+					name: "spaces/AAAA/messages/slash-1",
+					text: "deploy now",
+				});
+				slashMsg["slashCommand"] = { commandId: "42" };
+				slashMsg["argumentText"] = "deploy now";
+				await fx.postSigned(fx.nativeEnvelope({ message: slashMsg }));
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(adapter.turnLog.at(-1)).toBe("/cmd_42 deploy now");
+
+				// Leading-slash argumentText stays verbatim.
+				const slashMsg2 = fx.chatMessage({
+					name: "spaces/AAAA/messages/slash-2",
+				});
+				slashMsg2["slashCommand"] = { commandId: "7" };
+				slashMsg2["argumentText"] = "/already";
+				await fx.postSigned(fx.nativeEnvelope({ message: slashMsg2 }));
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(adapter.turnLog.at(-1)).toBe("/already");
+
+				// 2. Typing-marker lifecycle: sendTyping CREATES + tracks; the reply
+				// PATCHES chunk 0 in place with a MASKED update (zero orphan card).
+				await adapter.sendTyping("spaces/TYP", undefined);
+				expect(adapter.typingMarkerFor("spaces/TYP")).toBeDefined();
+				const markerName = adapter.typingMarkerFor("spaces/TYP") as string;
+				await adapter.send("spaces/TYP", "the real answer");
+				const patchCall = fx.api.calls.find(
+					(c) => c.op === "patch" && c.target === markerName,
+				);
+				expect(patchCall).toBeDefined();
+				expect(patchCall?.body["text"]).toBe("the real answer");
+				expect(patchCall?.updateMask).toBe("text");
+				expect(patchCall?.body["thread"]).toBeUndefined(); // immutable on patch
+				expect(adapter.typingMarkerFor("spaces/TYP")).toBeUndefined(); // popped
+				const createsForTYP = fx.api.createsOf("spaces/TYP");
+				expect(createsForTYP).toHaveLength(1); // ONLY the thinking marker
+
+				// Second sendTyping for the same chat bails while a live card exists.
+				await adapter.sendTyping("spaces/TYP2");
+				await adapter.sendTyping("spaces/TYP2");
+				expect(fx.api.createsOf("spaces/TYP2")).toHaveLength(1);
+
+				// 404-scripted patch falls through to create (card deleted under us).
+				fx.api.script("patch", { kind: "status", status: 404 });
+				await adapter.sendTyping("spaces/TYP3");
+				await adapter.send("spaces/TYP3", "after 404");
+				expect(fx.api.createsOf("spaces/TYP3").length).toBeGreaterThanOrEqual(
+					1,
+				);
+				expect(
+					fx.api
+						.createsOf("spaces/TYP3")
+						.some((c) => c.body["text"] === "after 404"),
+				).toBe(true);
+
+				// Threaded variant pins the 404-fallback WIRE SHAPE (send()
+				// @2136-2140): the recreate reuses the ORIGINAL pre-built thread-less
+				// body verbatim — Hermes never re-adds thread.name nor the
+				// messageReplyOption query param on this path.
+				await adapter.sendTyping("spaces/TYP6", {
+					thread_id: "spaces/TYP6/threads/T6",
+				});
+				fx.api.script("patch", { kind: "status", status: 404 });
+				await adapter.send("spaces/TYP6", "after threaded 404", undefined, {
+					thread_id: "spaces/TYP6/threads/T6",
+				});
+				const fallbackCreate = fx.api.createsOf("spaces/TYP6").at(-1);
+				expect(fallbackCreate?.body["text"]).toBe("after threaded 404");
+				expect(fallbackCreate?.body["thread"]).toBeUndefined();
+				expect(fallbackCreate?.queryParams).toBeUndefined();
+
+				// 3. Clarify card: choices render {text, action hermes_clarify,
+				// parameters{clarify_id, choice}} + the __other__ escape hatch.
+				const clarifyResult = await adapter.sendClarifyPrompt(
+					"spaces/CLAR",
+					"Which database?",
+					["Postgres", "SQLite"],
+					"cl-9",
+					"gchat:spaces/CLAR",
+				);
+				expect(clarifyResult.success).toBe(true);
+				expect(adapter.clarify.has("cl-9")).toBe(true);
+				const clarCreate = fx.api.createsOf("spaces/CLAR").at(-1);
+				const cardsV2 = clarCreate?.body["cardsV2"] as Array<
+					Record<string, unknown>
+				>;
+				const cardJson = JSON.stringify(cardsV2);
+				expect(cardJson).toContain("clarify-cl-9");
+				expect(cardJson).toContain("Question");
+				expect(cardJson).toContain("hermes_clarify");
+				expect(cardJson).toContain("__other__");
+				expect(cardJson).toContain("Other / type answer");
+
+				// Card FAILURE degrades to the plain-text question (super parity): the
+				// returned result is the PLAIN lane's success and the pending clarify
+				// state is NOT registered (only the rendered card registers it).
+				// The 500 is scripted for ALL THREE retry attempts (_call_with_retry
+				// @2538) so exhaustion is genuine, not a transient blip.
+				fx.api.script(
+					"create",
+					{ kind: "status", status: 500 },
+					{ kind: "status", status: 500 },
+					{ kind: "status", status: 500 },
+				);
+				const fallbackClarify = await adapter.sendClarifyPrompt(
+					"spaces/CLAR2",
+					"Pick one?",
+					["A", "B"],
+					"cl-10",
+					"gchat:spaces/CLAR2",
+				);
+				expect(fallbackClarify.success).toBe(true); // plain lane delivered
+				expect(
+					fx.api
+						.createsOf("spaces/CLAR2")
+						.some((c) => c.body["text"] === "❓ Pick one?"),
+				).toBe(true);
+				expect(adapter.clarify.has("cl-10")).toBe(false);
+
+				// Single surviving choice still ships the CARD (send_clarify @2232:
+				// `if not buttons` stays False — the __other__ escape hatch always
+				// rides along; there is NO plain-text downgrade at length===1).
+				const single = await adapter.sendClarifyPrompt(
+					"spaces/CLAR1",
+					"Proceed?",
+					["Yes"],
+					"cl-11",
+					"gchat:spaces/CLAR1",
+				);
+				expect(single.success).toBe(true);
+				expect(adapter.clarify.has("cl-11")).toBe(true);
+				const singleCreate = fx.api.createsOf("spaces/CLAR1").at(-1);
+				const singleJson = JSON.stringify(singleCreate?.body["cardsV2"]);
+				expect(singleJson).toContain('"Yes"');
+				expect(singleJson).toContain("__other__");
+				expect(singleCreate?.body["text"]).toBeUndefined(); // NOT the plain lane
+			},
+		),
+		mk(
+			"transport.gchat.attachment-download-ladder",
+			"gchat: attachment walk downloads via the injected bot-SA seam (resourceName path first; DRIVE_FILE-without-resourceName SKIPPED; downloadUri only on Google-owned hosts), caches bytes, and derives messageType from the first-seen mime when no text",
+			async (fx) => {
+				const bytes = Buffer.from("attachment-payload");
+				fx.downloader.seedResource("spaces/AAAA/attachments/r1", bytes);
+
+				// Path 1: resourceName via media.download — cached + media surfaced.
+				const att1 = fx.chatMessage({ name: "spaces/AAAA/messages/att-1" });
+				att1["attachment"] = [
+					{
+						name: "spaces/AAAA/attachments/r1",
+						contentType: "image/png",
+						source: "DRIVE_FILE",
+						attachmentDataRef: { resourceName: "spaces/AAAA/attachments/r1" },
+					},
+				];
+				att1["text"] = "";
+				att1["argumentText"] = "";
+				await fx.postSigned(fx.nativeEnvelope({ message: att1 }));
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.downloader.mediaDownloads).toEqual([
+					"spaces/AAAA/attachments/r1",
+				]);
+
+				// Path 2 skip: DRIVE_FILE WITHOUT resourceName never reaches the wire.
+				const att2 = fx.chatMessage({ name: "spaces/AAAA/messages/att-2" });
+				att2["attachment"] = [
+					{
+						name: "spaces/AAAA/attachments/drive-only",
+						contentType: "application/pdf",
+						source: "DRIVE_FILE",
+					},
+				];
+				await fx.postSigned(fx.nativeEnvelope({ message: att2 }));
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(fx.downloader.uriFetches).toHaveLength(0); // skipped, not fetched
+
+				// Path 3 SSRF guard: non-Google downloadUri is REJECTED outright.
+				const att3 = fx.chatMessage({ name: "spaces/AAAA/messages/att-3" });
+				att3["attachment"] = [
+					{
+						name: "evil.example.com/payload",
+						contentType: "application/pdf",
+						downloadUri: "https://evil.example.com/payload",
+					},
+				];
+				await fx.postSigned(fx.nativeEnvelope({ message: att3 }));
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(
+					fx.adapter.dispatchedEvents.filter((e) =>
+						e.messageId.startsWith("spaces/AAAA/messages/att-"),
+					),
+				).toHaveLength(3); // all three walked without poisoning anything
+			},
+		),
+		mk(
+			"transport.gchat.end-of-turn-typing-retirement",
+			"gchat: on_processing_complete (@2775-2810) retires stranded typing cards — unclaimed markers patch to '(no reply)'/'(interrupted)' by outcome, race-orphans to '·', and consumed slots are a no-op; failed/cancelled turns never leave '…thinking' cards forever",
+			async (fx) => {
+				const adapter = fx.adapter;
+				const evt = (chatId: string): IncomingEvent => ({
+					messageType: "text",
+					text: "",
+					messageId: "",
+					source: {
+						platform: "google-chat",
+						chatType: "group",
+						userId: "u1",
+						chatId,
+						chatName: chatId,
+					},
+				});
+				const patchOf = (target: string) =>
+					fx.api.calls.find((c) => c.op === "patch" && c.target === target);
+
+				// Unclaimed marker + FAILURE outcome → '(no reply)', MASKED patch.
+				await adapter.sendTyping("spaces/EOT1");
+				const m1 = adapter.typingMarkerFor("spaces/EOT1") as string;
+				await adapter.onProcessingComplete(evt("spaces/EOT1"), "failure");
+				const p1 = patchOf(m1);
+				expect(p1?.body["text"]).toBe("(no reply)");
+				expect(p1?.updateMask).toBe("text");
+				expect(adapter.typingMarkerFor("spaces/EOT1")).toBeUndefined();
+
+				// CANCELLED outcome → '(interrupted)'.
+				await adapter.sendTyping("spaces/EOT2");
+				const m2 = adapter.typingMarkerFor("spaces/EOT2") as string;
+				await adapter.onProcessingComplete(evt("spaces/EOT2"), "cancelled");
+				expect(patchOf(m2)?.body["text"]).toBe("(interrupted)");
+				expect(adapter.typingMarkerFor("spaces/EOT2")).toBeUndefined();
+
+				// Race-orphan: two CONCURRENT sendTyping calls both pass the bail
+				// gate; the loser's card is tracked as an orphan. The turn's real
+				// send claims the WINNER card; end-of-turn reaps ONLY the orphan
+				// ('·') — the winner was already patched with the real reply.
+				await Promise.all([
+					adapter.sendTyping("spaces/EOT3"),
+					adapter.sendTyping("spaces/EOT3"),
+				]);
+				expect(fx.api.createsOf("spaces/EOT3")).toHaveLength(2);
+				const orphan = adapter.orphanTypingMarkersFor(
+					"spaces/EOT3",
+				)[0] as string;
+				expect(orphan).toBeDefined();
+				const winner = adapter.typingMarkerFor("spaces/EOT3") as string;
+				expect(winner).toBeDefined();
+				expect(winner).not.toBe(orphan);
+				await adapter.send("spaces/EOT3", "the real answer");
+				expect(patchOf(winner)?.body["text"]).toBe("the real answer");
+				await adapter.onProcessingComplete(evt("spaces/EOT3"), "success");
+				expect(patchOf(orphan)?.body["text"]).toBe("·");
+				expect(adapter.orphanTypingMarkersFor("spaces/EOT3")).toHaveLength(0);
+				expect(adapter.typingMarkerFor("spaces/EOT3")).toBeUndefined();
 			},
 		),
 	];
@@ -632,7 +986,7 @@ describe("conformance suite — google-chat census port (shape: webhook)", () =>
 		}
 	});
 
-	it("passes ALL EIGHT google-chat shape-delta rows through the real engine fixture", async () => {
+	it("passes ALL TWELVE google-chat shape-delta rows through the real engine fixture", async () => {
 		const rows = gchatDeltaRows(() => makeGchatFixture());
 		expect(rows.map((r) => r.id)).toEqual([
 			"transport.gchat.bearer-auth-negative-matrix",
@@ -642,7 +996,11 @@ describe("conformance suite — google-chat census port (shape: webhook)", () =>
 			"transport.gchat.thread-routing-ladder",
 			"transport.gchat.chat-dialect-conversion",
 			"transport.gchat.outbound-verdict-ladder",
+			"transport.gchat.outbound-retry-ladder",
 			"transport.gchat.cardsv2-builder-caps",
+			"transport.gchat.interactive-surfaces",
+			"transport.gchat.attachment-download-ladder",
+			"transport.gchat.end-of-turn-typing-retirement",
 		]);
 		const report = await runConformanceSuite({
 			subjectName: "google-chat-deltas",

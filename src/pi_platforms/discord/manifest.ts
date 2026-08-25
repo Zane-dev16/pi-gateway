@@ -84,7 +84,7 @@ export const VIEW_TIMEOUT_MAX_S = 900;
 /** Interaction callback ack deadline parity with the kit registry window. */
 export { SLACK_ACK_WINDOW_MS as INTERACTION_ACK_WINDOW_MS } from "../kit/index.js";
 
-// ── threads ──────────────────────────────────────────────────────────────────
+// ── threads ───────────────────────────────────────────────────────────────────
 
 /** Valid auto-archive durations (minutes). adapter.py:85. */
 export const THREAD_AUTO_ARCHIVE_VALID = [60, 1440, 4320, 10080] as const;
@@ -96,25 +96,89 @@ export const THREAD_AUTO_ARCHIVE_DEFAULT = 1440;
 export const THREAD_NAME_MAX_UTF16_UNITS = 80;
 export const THREAD_NAME_FALLBACK = "Pi";
 
+// ── forum channels (adapter.py:_is_forum_parent :7892, _send_to_forum :3593,
+//    _derive_forum_thread_name :9879-9888) ────────────────────────────────────
+
+/** Vendor channel type for forum channels — plain sends are REJECTED. */
+export const CHANNEL_TYPE_FORUM = 15;
+/** Forum post name cap (first line of content). adapter.py:9888. */
+export const FORUM_THREAD_NAME_MAX_CHARS = 100;
+/** Empty-name fallback. adapter.py:9885. */
+export const FORUM_THREAD_NAME_FALLBACK = "New Post";
+
+// ── gateway IDENTIFY intents (adapter.py:connect :1345-1353, discord.py
+//    2.7.1 Intents bit positions — Hermes venv ground truth) ───────────────
+
+export const DISCORD_INTENT_GUILDS = 1 << 0;
+export const DISCORD_INTENT_MODERATION = 1 << 2;
+export const DISCORD_INTENT_EXPRESSIONS = 1 << 3;
+export const DISCORD_INTENT_INTEGRATIONS = 1 << 4;
+export const DISCORD_INTENT_WEBHOOKS = 1 << 5;
+export const DISCORD_INTENT_INVITES = 1 << 6;
+export const DISCORD_INTENT_VOICE_STATES = 1 << 7;
+export const DISCORD_INTENT_GUILD_MESSAGES = 1 << 9;
+export const DISCORD_INTENT_DM_MESSAGES = 1 << 10;
+export const DISCORD_INTENT_GUILD_REACTIONS = 1 << 11;
+export const DISCORD_INTENT_DM_REACTIONS = 1 << 12;
+export const DISCORD_INTENT_GUILD_TYPING = 1 << 13;
+export const DISCORD_INTENT_DM_TYPING = 1 << 14;
+export const DISCORD_INTENT_MESSAGE_CONTENT = 1 << 15;
+export const DISCORD_INTENT_GUILD_SCHEDULED_EVENTS = 1 << 16;
+export const DISCORD_INTENT_AUTO_MODERATION_CONFIGURATION = 1 << 20;
+export const DISCORD_INTENT_AUTO_MODERATION_EXECUTION = 1 << 21;
+export const DISCORD_INTENT_GUILD_POLLS = 1 << 24;
+export const DISCORD_INTENT_DM_POLLS = 1 << 25;
+
+/**
+ * discord.py `Intents.default()` — every NON-privileged intent (=53575421).
+ */
+export const DISCORD_INTENTS_DEFAULT =
+	DISCORD_INTENT_GUILDS |
+	DISCORD_INTENT_MODERATION |
+	DISCORD_INTENT_EXPRESSIONS |
+	DISCORD_INTENT_INTEGRATIONS |
+	DISCORD_INTENT_WEBHOOKS |
+	DISCORD_INTENT_INVITES |
+	DISCORD_INTENT_VOICE_STATES |
+	DISCORD_INTENT_GUILD_MESSAGES |
+	DISCORD_INTENT_DM_MESSAGES |
+	DISCORD_INTENT_GUILD_REACTIONS |
+	DISCORD_INTENT_DM_REACTIONS |
+	DISCORD_INTENT_GUILD_TYPING |
+	DISCORD_INTENT_DM_TYPING |
+	DISCORD_INTENT_GUILD_SCHEDULED_EVENTS |
+	DISCORD_INTENT_AUTO_MODERATION_CONFIGURATION |
+	DISCORD_INTENT_AUTO_MODERATION_EXECUTION |
+	DISCORD_INTENT_GUILD_POLLS |
+	DISCORD_INTENT_DM_POLLS;
+
+/**
+ * THE effective IDENTIFY bitmask Hermes sends: Intents.default() +
+ * message_content + dm_messages + guild_messages (members/voice_states only
+ * when allowlist username resolution requires them). VENDOR WIRE FORM IS AN
+ * INTEGER BITMASK — a string array never comes online.
+ */
+export const DISCORD_IDENTIFY_INTENTS =
+	DISCORD_INTENTS_DEFAULT |
+	DISCORD_INTENT_MESSAGE_CONTENT |
+	DISCORD_INTENT_GUILD_MESSAGES |
+	DISCORD_INTENT_DM_MESSAGES;
+
 // ── ping / typing safety (A13/A11) ───────────────────────────────────────────
 
 /**
  * Outbound ping safety: allowed_mentions DENIED for everyone/roles by default;
- * users + replied-user allowed. adapter.py:519-552 `_build_allowed_mentions`.
+ * users + replied-user allowed — serialized in the VENDOR wire shape
+ * (discord.py AllowedMentions.to_dict -> {"parse":["users"],"replied_user":true}).
+ * adapter.py:519-552 `_build_allowed_mentions`. The vendor DROPS unknown keys,
+ * so camelCase booleans would deserialize to parse=[] and suppress ALL pings.
  */
 export const ALLOWED_MENTIONS_DEFAULTS = {
-	everyone: false,
-	roles: false,
-	users: true,
-	repliedUser: true,
+	parse: ["users"],
+	replied_user: true,
 } as const;
 /** Typing refresh cadence — indicator lasts ~10s. adapter.py:5582-5636. */
 export const TYPING_INTERVAL_SECONDS = 12;
-/**
- * Message flag bit suppressing link previews/embeds on TEXT sends (vendor
- * flags model; text-send-only scope per DEC-034(iii)).
- */
-export const MESSAGE_FLAG_SUPPRESS_EMBEDS = 4;
 
 // ── gateway session health (A13 liveness knobs) ─────────────────────────────
 

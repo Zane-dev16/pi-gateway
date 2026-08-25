@@ -16,7 +16,10 @@
 // stores + resolvers, never a divergent second state machine.
 
 import type { ExecApprovalChoice } from "../kit/index.js";
-import { FEISHU_APPROVAL_CHOICE_MAP } from "./manifest.js";
+import {
+	FEISHU_APPROVAL_CHOICE_MAP,
+	FEISHU_RESOLVED_LABELS,
+} from "./manifest.js";
 
 /** Card action value as delivered inside p2_card_action_trigger. */
 export type CardActionValue = Record<string, unknown>;
@@ -96,11 +99,20 @@ function btn(
 	};
 }
 
+/**
+ * Card JSON shape (adapter.py send_exec_approval :2057 / _build_update_prompt_card
+ * :2131 / _build_resolved_approval_card :2199): header titles are PLAIN_TEXT,
+ * prompt templates are ORANGE, body content rides native `markdown`
+ * elements — never div/lark_md re-encodings.
+ */
 export interface ApprovalCard {
 	config: { wide_screen_mode: boolean };
-	header: { title: { tag: "lark_md"; content: string }; template: string };
+	header: {
+		title: { tag: "plain_text"; content: string };
+		template: string;
+	};
 	elements: Array<
-		| { tag: "div"; text: { tag: "lark_md"; content: string } }
+		| { tag: "markdown"; content: string }
 		| { tag: "action"; actions: CardButton[] }
 	>;
 }
@@ -120,21 +132,23 @@ export function buildExecApprovalCard(opts: {
 }): ApprovalCard {
 	const buttons: CardButton[] = [
 		btn("✅ Allow Once", "primary", {
+			// Button types (:2057 _btn default): Allow Once is EXPLICITLY primary;
+			// Session/Always ride the DEFAULT type; Deny is danger.
 			hermes_action: "approve_once",
 			approval_id: opts.approvalId,
 		}),
 	];
 	if (!opts.smartDenied && opts.allowSession) {
 		buttons.push(
-			btn("✅ Session", "primary", {
+			btn("✅ Session", "default", {
 				hermes_action: "approve_session",
 				approval_id: opts.approvalId,
 			}),
 		);
 	}
-	if (opts.allowSession && opts.allowPermanent) {
+	if (!opts.smartDenied && opts.allowSession && opts.allowPermanent) {
 		buttons.push(
-			btn("✅ Always", "primary", {
+			btn("✅ Always", "default", {
 				hermes_action: "approve_always",
 				approval_id: opts.approvalId,
 			}),
@@ -149,11 +163,11 @@ export function buildExecApprovalCard(opts: {
 	return {
 		config: { wide_screen_mode: true },
 		header: {
-			title: { tag: "lark_md", content: opts.title },
-			template: "blue",
+			title: { tag: "plain_text", content: opts.title },
+			template: "orange",
 		},
 		elements: [
-			{ tag: "div", text: { tag: "lark_md", content: opts.detail } },
+			{ tag: "markdown", content: opts.detail },
 			{ tag: "action", actions: buttons },
 		],
 	};
@@ -161,29 +175,33 @@ export function buildExecApprovalCard(opts: {
 
 /**
  * Resolved-state replacement card (:2199 _build_resolved_approval_card):
- * header "{icon} {label}", template green/red. This IS the ack payload for
- * an approval tap (CallBackCard type=raw; :2808).
+ * header "{icon} {label}" (plain_text), template green/red, and THE
+ * attribution line "{icon} **{label}** by {user_name}" as a markdown
+ * element. This IS the ack payload for an approval tap (CallBackCard
+ * type=raw; :2808).
  */
 export function buildResolvedApprovalCard(
 	choice: ExecApprovalChoice,
-	label: string,
+	userName: string,
 ): ApprovalCard {
+	const icon = choice === "deny" ? "❌" : "✅";
+	const label = FEISHU_RESOLVED_LABELS[choice] ?? "Resolved";
 	return {
 		config: { wide_screen_mode: true },
 		header: {
-			title: { tag: "lark_md", content: label },
+			title: { tag: "plain_text", content: `${icon} ${label}` },
 			template: choice === "deny" ? "red" : "green",
 		},
 		elements: [
 			{
-				tag: "div",
-				text: { tag: "lark_md", content: label },
+				tag: "markdown",
+				content: `${icon} **${label}** by ${userName}`,
 			},
 		],
 	};
 }
 
-/** Update-prompt card (:2131): ✓ Yes primary / ✗ No danger. */
+/** Update-prompt card (:2131): ✓ Yes primary / ✗ No danger, orange template. */
 export function buildUpdatePromptCard(opts: {
 	title: string;
 	detail: string;
@@ -192,11 +210,11 @@ export function buildUpdatePromptCard(opts: {
 	return {
 		config: { wide_screen_mode: true },
 		header: {
-			title: { tag: "lark_md", content: opts.title },
-			template: "yellow",
+			title: { tag: "plain_text", content: opts.title },
+			template: "orange",
 		},
 		elements: [
-			{ tag: "div", text: { tag: "lark_md", content: opts.detail } },
+			{ tag: "markdown", content: opts.detail },
 			{
 				tag: "action",
 				actions: [
@@ -211,6 +229,29 @@ export function buildUpdatePromptCard(opts: {
 				],
 			},
 		],
+	};
+}
+
+/**
+ * Resolved update-prompt card (:2224 _build_resolved_update_prompt_card):
+ * title "✅/❌ Update prompt answered: Yes/No", template green/red, and the
+ * "Answered by **{user_name}**" markdown element.
+ */
+export function buildResolvedUpdatePromptCard(
+	answer: "y" | "n",
+	userName: string,
+): ApprovalCard {
+	const yes = answer === "y";
+	return {
+		config: { wide_screen_mode: true },
+		header: {
+			title: {
+				tag: "plain_text",
+				content: `${yes ? "✅" : "❌"} Update prompt answered: ${yes ? "Yes" : "No"}`,
+			},
+			template: yes ? "green" : "red",
+		},
+		elements: [{ tag: "markdown", content: `Answered by **${userName}**` }],
 	};
 }
 

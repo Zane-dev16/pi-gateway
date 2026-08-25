@@ -420,7 +420,7 @@ export class IrcAdapter
 			await this.sendRaw(`PASS ${stripIrcControlChars(this.serverPassword)}`);
 		}
 		await this.sendRaw(`NICK ${this.currentNick}`);
-		await this.sendRaw(`USER ${this.nickname} 0 * :pi gateway agent`);
+		await this.sendRaw(`USER ${this.nickname} 0 * :Hermes Agent`);
 
 		// Wait for RPL_WELCOME under the injected-clock deadline. Event-driven:
 		// the 001 handler resolves the waiter; only the deadline timer can time
@@ -491,7 +491,7 @@ export class IrcAdapter
 		this.connectingNow = false;
 		if (conn !== null && !conn.closedByServer) {
 			try {
-				conn.write("QUIT :shutting down");
+				conn.write("QUIT :Hermes Agent shutting down");
 			} catch {
 				/* best-effort teardown */
 			}
@@ -787,7 +787,9 @@ export class IrcAdapter
 		// Markdown NEVER reaches IRC (vendor order: strip at send) — but the
 		// §6.1 plain-text fallback lane carries ORIGINAL chunk bytes and is
 		// therefore scrubbed WITHOUT re-stripping.
-		const isPlainLane = content.startsWith("(Response formatting failed, plain text:");
+		const isPlainLane = content.startsWith(
+			"(Response formatting failed, plain text:",
+		);
 		const clean = isPlainLane
 			? stripIrcControlChars(content)
 			: stripIrcControlChars(stripMarkdownForIrc(content));

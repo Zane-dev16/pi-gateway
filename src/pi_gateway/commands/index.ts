@@ -45,6 +45,12 @@ export {
 	type RawConfigReader,
 } from "./config-gates.js";
 
+// The SHIPPED builtin rows + frozen builtin registry (07 §1; se-3).
+export {
+	BUILTIN_COMMAND_ROWS,
+	createBuiltinCommandRegistry,
+} from "./builtins.js";
+
 // Derived consumers (07 §1.2) — zero per-surface lists.
 export {
 	buildCliDescription,

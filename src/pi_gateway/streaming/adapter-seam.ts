@@ -17,7 +17,13 @@ import type {
 //   - gateway/platforms/base.py:SendResult(success, message_id, error,
 //       retryable, retry_after)                                    (04 §1)
 //   - gateway/platforms/base.py:render_message_event / format_tool_event
-//   - gateway/stream_consumer.py:_metadata_for_send (`_interim_send` producer)
+//   - gateway/stream_consumer.py:_metadata_for_send (`_interim_send` producer;
+//       `expect_edits=not final` stamps preview sends so formatting-ladder
+//       adapters skip the rich path)
+//   - gateway/stream_consumer.py:_edit_message (routing metadata forwarded on
+//       stream edits when the adapter's edit accepts it)
+//   - gateway/stream_consumer.py:_suppress_silence_marker (best-effort
+//       delete_message retract of a streamed silence marker)
 
 /** Gateway→platform wire metadata (gateway-internal keys popped at the door). */
 export type Metadata = Record<string, unknown>;
@@ -55,6 +61,12 @@ export interface DraftFrameArgs {
 
 export interface EditOptions {
 	finalize?: boolean | undefined;
+	/**
+	 * Routing metadata forwarded when the adapter's edit accepts it
+	 * (stream_consumer.py:_edit_message — passes self.metadata so threaded
+	 * platforms keep thread routing on stream edits).
+	 */
+	metadata?: Metadata | undefined;
 }
 
 /**
@@ -106,6 +118,13 @@ export interface StreamEgressAdapter {
 
 	/** One cumulative native draft frame (base.py:send_draft). */
 	sendDraft(args: DraftFrameArgs): Promise<SendResult>;
+
+	/**
+	 * Optional best-effort deletion (base.py:delete_message analogue). Present
+	 * on adapters that CAN retract a message; the consumer's silence-marker
+	 * suppression uses it defensively and tolerates absence.
+	 */
+	deleteMessage?(chatId: string, messageId: string): Promise<unknown>;
 
 	/**
 	 * DOOR 2 (04 §1.1, finding #7): the delivery-resolver lane (queued

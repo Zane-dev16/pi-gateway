@@ -115,11 +115,15 @@ export const FEISHU_WS_THREAD_EXIT_WAIT_MS = 10_000;
  */
 export const FEISHU_CARD_SCHEMA_CAPS: readonly string[] = [];
 
-/** adapter.py:_APPROVAL_LABEL_MAP (:252) + button builder labels (:2057). */
+/**
+ * adapter.py:_APPROVAL_LABEL_MAP (:252) + button builder labels/types
+ * (_btn :2077 default "default"; ONLY Allow Once is explicitly "primary",
+ * Deny is "danger" — Session/Always ride the DEFAULT type).
+ */
 export const FEISHU_APPROVAL_BUTTONS = {
 	approve_once: { label: "✅ Allow Once", type: "primary" },
-	approve_session: { label: "✅ Session", type: "primary" },
-	approve_always: { label: "✅ Always", type: "primary" },
+	approve_session: { label: "✅ Session", type: "default" },
+	approve_always: { label: "✅ Always", type: "default" },
 	deny: { label: "❌ Deny", type: "danger" },
 } as const;
 
@@ -164,6 +168,22 @@ export const FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60;
 export const FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120;
 export const FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096;
 export const FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30;
+
+/**
+ * Webhook listener surface (adapter.py:_DEFAULT_WEBHOOK_HOST/_PORT/_PATH
+ * :229–231, env wiring :1650–1658): FEISHU_WEBHOOK_PATH feeds THE COMPOSITE
+ * RATE KEY `{app_id}:{webhook_path}:{remote_ip}` (:3562 rate_key), so a
+ * relocated endpoint isolates its rate buckets from the default path.
+ */
+export const FEISHU_WEBHOOK_DEFAULT_HOST = "127.0.0.1";
+export const FEISHU_WEBHOOK_DEFAULT_PORT = 8765;
+export const FEISHU_WEBHOOK_DEFAULT_PATH = "/feishu/webhook";
+
+/**
+ * Sender-name cache TTL — adapter.py:_FEISHU_SENDER_NAME_TTL_SECONDS = 10*60
+ * (:238): resolved display names live 10 minutes before re-resolution.
+ */
+export const FEISHU_SENDER_NAME_TTL_MS = 10 * 60 * 1000;
 
 // ── Q17 rate tiers (budgets as MANIFEST DATA) ───────────────────────────────
 
@@ -266,6 +286,15 @@ export const FEISHU_MANIFEST: PluginManifest = {
 			description: "stale-cache override of bot identity",
 		},
 		{ name: "FEISHU_HOME_CHANNEL", description: "cron deliver target" },
+		{
+			name: "FEISHU_WEBHOOK_HOST",
+			description: "webhook bind host (127.0.0.1)",
+		},
+		{ name: "FEISHU_WEBHOOK_PORT", description: "webhook bind port (8765)" },
+		{
+			name: "FEISHU_WEBHOOK_PATH",
+			description: "webhook route path (/feishu/webhook)",
+		},
 	],
 	capabilities: {
 		supportsAsyncDelivery: true,

@@ -12,13 +12,18 @@
 //     verification decrypts echostr per app (all fail ⇒ 403); callbacks run
 //     body caps (declared length then actual bytes, BOTH pre-parse) →
 //     per-app decrypt ladder (crypto errors try next app; exhausted ⇒ 400)
-//     → event build (text|event only; enter_agent/subscribe silently acked;
-//     empty event content becomes "/start") → MsgId TTL dedupe (300 s,
-//     prune >2000) → ACK-FIRST "success" text/plain — the agent's reply goes
-//     out later via the proactive send seam
+//     → event build (MsgType text|event only; enter_agent/subscribe silently
+//     acked; OTHER event names FALL THROUGH to normal construction with empty
+//     Content becoming "/start"; non-text/event MsgTypes ack-no-op) → MsgId
+//     TTL dedupe (300 s live window; prune is EXPIRED-ONLY past 2000 — live
+//     receipts are never FIFO-evicted) → ACK-FIRST "success" text/plain — the
+//     agent's reply goes out later via the proactive send seam
 //   - outbound ports send(): touser from the scoped chat id, text capped at
-//     2048 chars, safe=0; access-token cache with a 60 s early-refresh
-//     margin; errcode {40001,42001} evicts the cached token and retries ONCE
+//     2048 chars, safe=0; the message/send JSON body carries ONLY the vendor
+//     keys {touser,msgtype,agentid,text,safe} (caller metadata rides the
+//     transport seam separately, never the wire body); access-token cache
+//     with a 60 s early-refresh margin; errcode {40001,42001} evicts the
+//     cached token and retries ONCE
 //
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
@@ -48,7 +53,6 @@ import {
 	WECOM_DEFAULT_PORT,
 	WECOM_DEDUP_PRUNE_BOUND,
 	WECOM_DEDUP_TTL_MS,
-	WECOM_HEALTH_PATH,
 	WECOM_MAX_BODY_BYTES,
 	WECOM_PLUGIN_MANIFEST,
 	WECOM_TEXT_SEND_CAP_CHARS,
@@ -59,7 +63,6 @@ import {
 import type { WecomTrustBoundary } from "./manifest.js";
 import type { ScopedSecretReader } from "../kit/registration.js";
 import type { DisableReason } from "../kit/lifecycle-state.js";
-import { BoundedSeenSet } from "../../pi_gateway/security/trust/index.js";
 import {
 	extractXmlTag,
 	WxBizMsgCrypt,
@@ -107,7 +110,9 @@ export interface WecomAdapterConfig {
 	encoding_aes_key?: string | undefined;
 }
 
-/** Proactive-send seam (httpx AsyncClient parity). */
+/** Proactive-send seam (httpx AsyncClient parity). `metadata` carries the
+ * harness script markers SEPARATELY from the vendor JSON body — caller
+ * metadata never reaches qyapi.weixin.qq.com. */
 export interface WecomApiTransport {
 	/** Token fetch mirroring the gettoken payload (expires_in seconds). */
 	getAccessToken(
@@ -117,6 +122,7 @@ export interface WecomApiTransport {
 		app: WecomAppConfig,
 		token: string,
 		payload: Record<string, unknown>,
+		metadata?: Record<string, unknown>,
 	): Promise<WecomApiResponse>;
 }
 
@@ -180,7 +186,13 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 
 	/** chat key (corp:user) → app name (_user_app_map parity). */
 	private readonly userAppMap = new Map<string, string>();
-	private readonly dedup: BoundedSeenSet;
+	/**
+	 * MsgId dedupe (_seen_messages parity): msg_id → first-seen epoch ms. A
+	 * live (non-TTL-expired) entry is a duplicate; an EXPIRED entry is deleted
+	 * and re-armed. Prune past the bound drops EXPIRED entries ONLY — live
+	 * receipts are never FIFO-evicted (callback_adapter dedup prune parity).
+	 */
+	private readonly seenMessages = new Map<string, number>();
 	private readonly accessTokens = new Map<
 		string,
 		{ token: string; expiresAtMs: number }
@@ -212,6 +224,7 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 	readonly router: CallbackQueryRouter;
 
 	private readonly cp: EgressChokepoint;
+	private readonly dedupPruneBound: number;
 	private allowAllClickers = true;
 	private readonly clarifyArmedSet = new Set<string>();
 	private holding = false;
@@ -265,13 +278,13 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 			});
 		}
 
-		// MsgId TTL dedupe (callback_adapter.py _seen_messages: 300 s TTL,
-		// prune when len > 2000).
-		this.dedup = new BoundedSeenSet({
-			maxEntries: Math.max(1, opts.dedupCap ?? WECOM_DEDUP_PRUNE_BOUND),
-			ttlMs: WECOM_DEDUP_TTL_MS,
-			nowMs: this.nowFn,
-		});
+		// MsgId TTL dedupe (callback_adapter.py _seen_messages: 300 s live
+		// window; expired-only prune when len > 2000). The bound is fixture-
+		// tunable via dedupCap for eviction-semantics probes.
+		this.dedupPruneBound = Math.max(
+			1,
+			opts.dedupCap ?? WECOM_DEDUP_PRUNE_BOUND,
+		);
 
 		this.cp = new EgressChokepoint({
 			streamIsMessageForChat: () => false, // proactive send; no native lanes
@@ -465,12 +478,12 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 			}
 			const built = this.buildEvent(app, decryptedXml);
 			if (built === null) {
-				// Lifecycle/unknown events: immediately acknowledged, no dispatch.
+				// Lifecycle/unknown MsgTypes: immediately acknowledged, no dispatch.
 				return { status: 200, contentType: "text/plain", body: "success" };
 			}
 			// Deduplicate: WeCom retries callbacks on timeout (#10305).
 			if (built.messageId) {
-				if (!this.dedup.add(built.messageId)) {
+				if (this.claimSeen(built.messageId)) {
 					this.counters.duplicates += 1;
 					return { status: 200, contentType: "text/plain", body: "success" };
 				}
@@ -501,6 +514,29 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 		};
 	}
 
+	/**
+	 * _seen_messages parity (@348): returns TRUE when msg_id is a LIVE
+	 * duplicate. An entry older than the TTL is deleted and re-armed (the
+	 * message dispatches again). After arming, prune past the bound drops
+	 * EXPIRED entries ONLY — live receipts are never evicted FIFO.
+	 */
+	private claimSeen(msgId: string): boolean {
+		const now = this.nowFn();
+		const seenAt = this.seenMessages.get(msgId);
+		if (seenAt !== undefined) {
+			if (now - seenAt < WECOM_DEDUP_TTL_MS) return true;
+			this.seenMessages.delete(msgId);
+		}
+		this.seenMessages.set(msgId, now);
+		if (this.seenMessages.size > this.dedupPruneBound) {
+			const cutoff = now - WECOM_DEDUP_TTL_MS;
+			for (const [key, ts] of this.seenMessages) {
+				if (ts <= cutoff) this.seenMessages.delete(key);
+			}
+		}
+		return false;
+	}
+
 	/** _decrypt_request parity: extract Encrypt, then BizMsgCrypt decrypt. */
 	protected decryptRequest(
 		app: WecomAppConfig,
@@ -522,8 +558,9 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 
 	/**
 	 * _build_event parity: MsgType text|event only; enter_agent/subscribe
-	 * lifecycle events return null (silently acked); empty event content
-	 * becomes "/start"; msg_id falls back to `${user}:${CreateTime}`.
+	 * lifecycle events return null (silently acked); OTHER event names FALL
+	 * THROUGH to normal construction — empty Content becomes "/start"; non-
+	 * text/event MsgTypes return null; msg_id falls back to `${user}:${CreateTime}`.
 	 */
 	buildEvent(app: WecomAppConfig, xmlText: string): BuiltEvent | null {
 		const msgType = (extractXmlTag(xmlText, "MsgType") ?? "").toLowerCase();
@@ -534,10 +571,10 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 				this.counters.lifecycleAcked += 1;
 				return null;
 			}
-			this.counters.unhandledTypes += 1;
-			return null;
-		}
-		if (msgType !== "text") {
+			// Other event names FALL THROUGH to normal construction (_build_event
+			// parity: for MsgType=event ONLY enter_agent/subscribe return early;
+			// empty Content becomes the synthesized "/start" command below).
+		} else if (msgType !== "text") {
 			this.counters.unhandledTypes += 1;
 			return null;
 		}
@@ -545,7 +582,8 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 		const userId = extractXmlTag(xmlText, "FromUserName") ?? "";
 		const corpId =
 			extractXmlTag(xmlText, "ToUserName") ?? String(app.corp_id ?? "");
-		const content = (extractXmlTag(xmlText, "Content") ?? "").trim();
+		let content = (extractXmlTag(xmlText, "Content") ?? "").trim();
+		if (!content && msgType === "event") content = "/start";
 		const msgId =
 			extractXmlTag(xmlText, "MsgId") ??
 			`${userId}:${extractXmlTag(xmlText, "CreateTime") ?? "0"}`;
@@ -626,6 +664,25 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 			: chatId;
 		if (this.transport === undefined) return { success: true };
 
+		// int(str(agent_id or 0)) parity (:256): falsy config resolves to "0";
+		// a NON-NUMERIC agent_id raises upstream INSIDE the send try-block, so
+		// the send fails CLEANLY (except → SendResult(success=False)) with ZERO
+		// token fetches and ZERO qyapi POSTs — NaN→0 coercion that would wire
+		// agentid:0 is banned.
+		const rawAgentId = app.agent_id;
+		const agentIdLiteral =
+			rawAgentId === undefined || rawAgentId === "" || rawAgentId === 0
+				? "0"
+				: String(rawAgentId);
+		const trimmedLiteral = agentIdLiteral.trim();
+		if (!/^[+-]?\d+$/.test(trimmedLiteral)) {
+			return {
+				success: false,
+				error: `invalid literal for int() with base 10: '${agentIdLiteral}'`,
+			};
+		}
+		const agentId = Number(trimmedLiteral);
+
 		// content[:2048] truncation in the SOURCE; the port receives kit-chunked
 		// pieces ≤ the cap so nothing is dropped (proposed DEC note).
 		const capped =
@@ -643,14 +700,21 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 					error: err instanceof Error ? err.message : String(err),
 				};
 			}
-			const resp = await this.transport.sendMessage(app, token, {
-				...metadata,
+			// Vendor body carries ONLY the qyapi keys (send parity): caller
+			// metadata rides the transport seam separately, never the wire.
+			const payload: Record<string, unknown> = {
 				touser,
 				msgtype: "text",
-				agentid: Number(String(app.agent_id ?? "0")) || 0,
+				agentid: agentId,
 				text: { content: capped },
 				safe: 0,
-			});
+			};
+			const resp = await this.transport.sendMessage(
+				app,
+				token,
+				payload,
+				metadata,
+			);
 			const errcode = resp.errcode;
 			if (
 				errcode !== undefined &&
@@ -842,11 +906,13 @@ export class WecomCallbackAdapter extends BasePlatformAdapter {
 	// ── observability ─────────────────────────────────────────────────────────
 
 	seenDedupSize(): number {
-		return this.dedup.size();
+		return this.seenMessages.size;
 	}
 
 	hasSeenMessageId(id: string): boolean {
-		return this.dedup.has(id);
+		const seenAt = this.seenMessages.get(id);
+		if (seenAt === undefined) return false;
+		return this.nowFn() - seenAt < WECOM_DEDUP_TTL_MS;
 	}
 
 	appForUser(userId: string): string | undefined {

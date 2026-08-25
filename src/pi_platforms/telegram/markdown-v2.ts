@@ -2,17 +2,18 @@
 // (ported from READ-ONLY Hermes reference, semantics only, no code vendored):
 //   plugins/platforms/telegram/adapter.py:_MDV2_ESCAPE_RE / _escape_mdv2
 //     (every MarkdownV2 special char backslash-escaped OUTSIDE code spans)
-//   adapter.py:format_message (dialect conversion bound to the SEND path —
-//     never a global pre-send transform; §10.1)
-//   adapter.py:_strip_mdv2 → kit stripMarkdownMarkup (tier-3 stripping is
-//     OWNED by the kit formatting ladder; this module only converts)
+//   adapter.py::send (formatted=self.format_message(content) under
+//     parse_mode=MARKDOWN_V2 — chunk markers "(1/2)" escaped "\\(1/2\\)" so
+//     Telegram cannot reject the chunk)
+//   adapter.py:edit_message finalize branch (parse_mode=MARKDOWN_V2,
+//     _strip_mdv2 plain retry; mid-stream edits carry NO parse_mode)
 //
-// Scope split enforced here (keeps shared conformance rows byte-stable):
-//   - SENDS (converted lane): STRUCTURAL markers only (**bold** → *bold*,
-//     fences preserved verbatim); NO punctuation escaping — chunk indicators
-//     "(i/n)" must survive byte-exact.
-//   - FINALIZE EDITS (REQUIRES_EDIT_FINALIZE path, #25710): FULL conversion
-//     incl. _escape_mdv2 punctuation escaping outside protected regions.
+// Scope (tg-2 parity): BOTH user-visible text lanes — sends AND finalize
+// edits (#25710 REQUIRES_EDIT_FINALIZE) — emit FULL format_message-style
+// conversion: structural markdown collapsed AND every remaining MarkdownV2
+// special escaped OUTSIDE protected regions, so text always matches its
+// parse_mode=MarkdownV2 stamp. Plain lanes (§6.1 fallback body / explicit
+// parse_mode "none") ship RAW with no parse_mode.
 
 const MDV2_ESCAPE_RE = /([_*[\]()~`>#+=|{}.!\\])/g;
 
@@ -25,9 +26,11 @@ export function escapeMarkdownV2(text: string): string {
 const FENCED_BLOCK_RE = /```[^\n]*\n[\s\S]*?(?:```|$)/g;
 
 /**
- * FULL finalize-path conversion (#25710 anchor): structural markdown →
- * MarkdownV2 WITH punctuation escaping outside fenced blocks. Fences are
- * preserved verbatim; prose specials get backslash-escaped.
+ * FULL format_message-style conversion (adapter.py::send + edit_message
+ * finalize): structural markdown → MarkdownV2 WITH punctuation escaping
+ * outside fenced blocks. Fences are preserved verbatim; prose specials get
+ * backslash-escaped. This is THE converted lane for sends and finalize edits
+ * alike — emitted text always parses under parse_mode=MarkdownV2.
  */
 export function toTelegramMarkdownV2Full(text: string): string {
 	if (!text.includes("```")) {
@@ -42,32 +45,6 @@ export function toTelegramMarkdownV2Full(text: string): string {
 	}
 	out += fullConvertProse(text.slice(pos));
 	return out;
-}
-
-/**
- * Structural-only send-path conversion: bold/italic markers collapsed to the
- * MarkdownV2 single-delimiter forms; NO punctuation escaping. This is the
- * tier-2 "converted" lane of the formatting ladder for telegram.
- */
-export function toTelegramMarkdownV2(text: string): string {
-	return convertStructural(text);
-}
-
-/** **x** → *x* (MDV2 bold) and __x__ → _x_ (MDV2 italic), fences untouched. */
-function convertStructural(text: string): string {
-	return (
-		text
-			// fenced blocks first: protect by splitting (convert outside only)
-			.split(FENCED_BLOCK_PROTECT)
-			.map((part) =>
-				part.startsWith("```")
-					? part
-					: part
-							.replace(/\*\*([^*]+)\*\*/g, "*$1*")
-							.replace(/__([^_]+)__/g, "_$1_"),
-			)
-			.join("")
-	);
 }
 
 /**
@@ -89,8 +66,6 @@ function fullConvertProse(prose: string): string {
 		})
 		.join("");
 }
-
-const FENCED_BLOCK_PROTECT = /(```[^\n]*\n[\s\S]*?(?:```|$)|```[^`]*```)/g;
 
 /**
  * Plain-lane probe: does this content carry the §6.1 fallback body prefix?

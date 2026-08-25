@@ -59,7 +59,9 @@ export {
 	SESSION_ID_HEADER,
 	SESSION_KEY_HEADER,
 	extractOptInSessionHeaders,
+	extractSessionKeyHeader,
 	type SessionHeadersVerdict,
+	type SessionKeyVerdict,
 } from "./session-headers.js";
 export {
 	DEFAULT_ARTIFACT_TTL_MS,

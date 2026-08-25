@@ -19,6 +19,8 @@ import {
 	parseIrcMessage,
 	type SanitizerImpls,
 } from "./sanitize.js";
+import { FakeIrcServer } from "./fake-irc-server.js";
+import { IrcAdapter } from "./irc-adapter.js";
 
 /** Run ONE named contract against an impl bundle; returns null when it PASSES
  * and the violation message when it THROWS. */
@@ -171,5 +173,37 @@ describe("line-protocol helpers (parse/nick/CTCP classification)", () => {
 		expect(isCtcpAction("\x01VERSION\x01")).toBe(false);
 		expect(isCtcp("\x01PING 123\x01")).toBe(true);
 		expect(isCtcp("plain text")).toBe(false);
+	});
+
+	// ══════════════════════════════════════════════════════════════════════
+	// Wire identity parity (plugins/platforms/irc/adapter.py :: connect :219 /
+	// disconnect :258): the registration realname and the QUIT reason are vendor-
+	// visible strings — BYTE-IDENTICAL to Hermes.
+	// ══════════════════════════════════════════════════════════════════════
+
+	describe("wire identity parity (adapter.py::connect / disconnect)", () => {
+		it('USER realname is "Hermes Agent"; QUIT reason is "Hermes Agent shutting down"', async () => {
+			const server = new FakeIrcServer();
+			const adapter = new IrcAdapter({
+				fakeServer: server,
+				secretReader: (k) =>
+					k === "IRC_SERVER"
+						? server.address
+						: k === "IRC_CHANNEL"
+							? "#hermes"
+							: k === "IRC_NICKNAME"
+								? "hermes-bot"
+								: undefined,
+			});
+			expect(await adapter.connect({ isReconnect: false })).toBe(true);
+			expect(server.receivedLines).toContain(
+				`USER hermes-bot 0 * :Hermes Agent`,
+			);
+
+			await adapter.disconnect();
+			expect(server.receivedLines[server.receivedLines.length - 1]).toBe(
+				"QUIT :Hermes Agent shutting down",
+			);
+		});
 	});
 });

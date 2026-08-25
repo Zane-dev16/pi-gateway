@@ -3,10 +3,10 @@
 // Hermes redelivers ONLY at restart boundaries (run.py:_redeliver_pending_obligations
 // sweeps once at boot). A long-lived gateway process additionally owes its own
 // failed sends a bounded, backoff-capped retry between boots; this module is
-// that loop. PROPOSED DEC text: "the gateway runs a periodic obligation retry
-// tick (default every 15s). Dead-owner rows claim immediately (restart-
-// boundary parity); self-owned pending/failed rows wait out the exponential
-// backoff (60s ×4 growth, 1h cap) so the ledger never busy-retries."
+// that loop. DIVERGENCE RATIFIED AS DEC-053: "the gateway runs a periodic
+// obligation retry tick (default every 15s). Dead-owner rows claim immediately
+// (restart-boundary parity); self-owned pending/failed rows wait out the
+// exponential backoff (60s ×4 growth, 1h cap) so the ledger never busy-retries."
 //
 // HARD RULE honored here: time enters only through the injected GatewayClock.
 // The default systemClock touches Date.now/setTimeout; logic never does.

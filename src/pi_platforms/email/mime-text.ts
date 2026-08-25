@@ -38,7 +38,10 @@ export function safeDecodeBytes(
 	for (const candidate of [label, "utf-8"]) {
 		try {
 			return new TextDecoder(candidate).decode(payload);
-		} catch {}
+		} catch {
+			// Label rejected by TextDecoder — deliberately swallowed: fall
+			// through the ladder to latin1 below, which cannot fail.
+		}
 	}
 	return new TextDecoder("latin1").decode(payload);
 }
@@ -260,6 +263,157 @@ export function domainsAligned(a: string, b: string): boolean {
 	if (x.length === 0 || y.length === 0) return false;
 	if (x === y) return true;
 	return x.endsWith(`.${y}`) || y.endsWith(`.${x}`);
+}
+
+/** adapter.py:_IMAGE_EXTS — extensions eligible for image classification. */
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+
+/**
+ * base.py:_looks_like_image — True when data starts with a known image
+ * magic-byte sequence (PNG/JPEG/GIF87a/GIF89a/BMP/RIFF…WEBP); len < 4 fails.
+ */
+export function looksLikeImage(data: Buffer): boolean {
+	if (data.length < 4) return false;
+	if (
+		data
+			.subarray(0, 8)
+			.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+	)
+		return true; // PNG
+	if (data.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return true; // JPEG
+	const head6 = data.subarray(0, 6).toString("latin1");
+	if (head6 === "GIF87a" || head6 === "GIF89a") return true;
+	if (data.subarray(0, 2).toString("latin1") === "BM") return true;
+	return (
+		data.subarray(0, 4).toString("latin1") === "RIFF" &&
+		data.length >= 12 &&
+		data.subarray(8, 12).toString("latin1") === "WEBP"
+	);
+}
+
+export interface ExtractedAttachment {
+	/** Deterministic cache-path stand-in for the vendor uuid cache write. */
+	path: string;
+	filename: string;
+	kind: "image" | "document";
+	mediaType: string;
+}
+
+/** Cache-path root standing in for base.py get_image/document_cache_dir(). */
+export const EMAIL_MEDIA_CACHE_ROOT = "/tmp/email-media";
+
+/** base.py:cache_document_from_bytes — basename only, NUL stripped, fallback. */
+function sanitizeCachedFilename(filename: string): string {
+	const base = filename
+		.replace(/^.*[\\/]/u, "")
+		.replaceAll("\x00", "")
+		.trim();
+	return base.length > 0 ? base : "document";
+}
+
+/**
+ * adapter.py:_extract_attachments over StoredMail.parts — walks parts with an
+ * attachment/inline Content-Disposition (inline text/plain|html bodies stay
+ * excluded), derives the filename (Content-Disposition name or
+ * `attachment.<subtype>`), classifies images by EXTENSION and then verifies
+ * MAGIC BYTES (base.py:_looks_like_image — a non-image payload is SKIPPED,
+ * never misclassified); everything else caches as a document. Paths mirror the
+ * vendor cache naming shape (`img_*<ext>` / `doc_*_<name>`) keyed by UID + part
+ * index instead of a random uuid so contracts stay deterministic.
+ */
+export function extractAttachments(
+	uid: string,
+	parts: ReadonlyArray<{
+		contentType: string;
+		disposition: string | null;
+		payload: Buffer | null;
+		filename?: string | null;
+	}>,
+): ExtractedAttachment[] {
+	const out: ExtractedAttachment[] = [];
+	for (const part of parts) {
+		const disposition = part.disposition ?? "";
+		if (!disposition.includes("attachment") && !disposition.includes("inline"))
+			continue;
+		// Skip text/plain and text/html BODY parts (adapter.py parity) unless
+		// explicitly declared as attachments.
+		const contentType = part.contentType.toLowerCase();
+		if (
+			(contentType === "text/plain" || contentType === "text/html") &&
+			!disposition.includes("attachment")
+		)
+			continue;
+		const payload = part.payload;
+		if (payload === null || payload.length === 0) continue;
+
+		const rawName =
+			part.filename !== undefined && part.filename !== null
+				? decodeHeaderValue(part.filename)
+				: "";
+		const subtype = contentType.includes("/")
+			? contentType.slice(contentType.indexOf("/") + 1)
+			: "";
+		const filename =
+			rawName.length > 0 ? rawName : `attachment.${subtype || "bin"}`;
+		const dot = filename.lastIndexOf(".");
+		const ext = dot >= 0 ? filename.slice(dot).toLowerCase() : "";
+		const index = out.length;
+		if (IMAGE_EXTS.has(ext)) {
+			if (!looksLikeImage(payload)) continue; // invalid magic bytes → skipped
+			out.push({
+				path: `${EMAIL_MEDIA_CACHE_ROOT}/${uid}/img_${String(index).padStart(2, "0")}${ext}`,
+				filename,
+				kind: "image",
+				mediaType: contentType,
+			});
+		} else {
+			out.push({
+				path: `${EMAIL_MEDIA_CACHE_ROOT}/${uid}/doc_${String(index).padStart(2, "0")}_${sanitizeCachedFilename(filename)}`,
+				filename,
+				kind: "document",
+				mediaType: contentType,
+			});
+		}
+	}
+	return out;
+}
+
+const RFC2822_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const RFC2822_MONTHS = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+];
+
+function pad2(n: number): string {
+	return String(n).padStart(2, "0");
+}
+
+/**
+ * adapter.py:_send_email msg["Date"] — utils.formatdate(localtime=True):
+ * RFC 2822 date in LOCAL time with numeric ±HHMM zone. Takes an epoch-ms so
+ * callers can pin time via the clock seam deterministically.
+ */
+export function formatRfc2822Date(epochMs: number): string {
+	const d = new Date(epochMs);
+	const offsetMinutes = -d.getTimezoneOffset();
+	const sign = offsetMinutes < 0 ? "-" : "+";
+	const abs = Math.abs(offsetMinutes);
+	const zone = `${sign}${pad2(Math.floor(abs / 60))}${pad2(abs % 60)}`;
+	return (
+		`${RFC2822_DAYS[d.getDay()]}, ${pad2(d.getDate())} ` +
+		`${RFC2822_MONTHS[d.getMonth()]} ${d.getFullYear()} ` +
+		`${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())} ${zone}`
+	);
 }
 
 // ── A19 contract runners ────────────────────────────────────────────────────

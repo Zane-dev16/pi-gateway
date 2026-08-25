@@ -2,10 +2,11 @@
 // servers (04 §8: rows run headless against fake platform servers; NO
 // external network, no OS sockets). Vendor-true behaviors only:
 //
-//   FakeImapServer  — LOGIN ok/bad; SELECT INBOX; UID SEARCH ALL|UNSEEN with
-//     server-side \\Seen flags set on RFC822 fetch; per-UID scripted fetch
-//     refusals; LOGOUT abort simulation (IMAP4.abort parity); connection
-//     failure arming (#79889/#80032 surfaces).
+//   FakeImapServer  — LOGIN ok/bad; RFC 2971 ID surface recording the EXACT
+//     client identity argument (rejection armable); SELECT INBOX; UID SEARCH
+//     ALL|UNSEEN with server-side \\Seen flags set on RFC822 fetch; per-UID
+//     scripted fetch refusals; LOGOUT abort simulation (IMAP4.abort parity);
+//     connection failure arming (#79889/#80032 surfaces).
 //   FakeSmtpServer  — AUTH ok/bad (typed SMTPAuthenticationError analog);
 //     send_message capture; port modeling (587 STARTTLS / 465 implicit TLS);
 //     RESOLVER SEAM returning candidate addresses for the A21 IPv4 fallback
@@ -53,6 +54,16 @@ export class ImapLogoutAbortError extends Error {
 
 let mailSeq = 0;
 
+/** An attachment/inline MIME part scripted into a delivered mail. */
+export interface ImapMailAttachmentInput {
+	/** Raw filename as it would appear in Content-Disposition (RFC 2047 raw). */
+	filename?: string | undefined;
+	contentType: string;
+	payload: Buffer;
+	/** Defaults to "attachment"; "inline" exercises the inline leg too. */
+	disposition?: "attachment" | "inline" | undefined;
+}
+
 export interface ImapMailInput {
 	from: string;
 	subject?: string | undefined;
@@ -60,6 +71,7 @@ export interface ImapMailInput {
 	htmlBody?: string | undefined;
 	headers?: Record<string, string> | undefined;
 	inReplyTo?: string | undefined;
+	attachments?: readonly ImapMailAttachmentInput[] | undefined;
 }
 
 export class FakeImapServer {
@@ -76,6 +88,10 @@ export class FakeImapServer {
 	/** Armed connect() failures remaining (transport unreachable). */
 	connectFailuresArmed = 0;
 	connectCalls = 0;
+	/** Exact arguments received for RFC 2971 ID commands, in order (audit). */
+	readonly idCommands: string[] = [];
+	/** Arm ID rejection: server answers BAD for the unknown command. */
+	idRejectionArmed = false;
 
 	reset(): void {
 		this.mailbox.clear();
@@ -84,6 +100,8 @@ export class FakeImapServer {
 		this.fetchRefusals.clear();
 		this.logoutAborts = false;
 		this.connectFailuresArmed = 0;
+		this.idCommands.length = 0;
+		this.idRejectionArmed = false;
 	}
 
 	deliver(mail: ImapMailInput): string {
@@ -103,6 +121,15 @@ export class FakeImapServer {
 				disposition: null,
 				payload: Buffer.from(mail.htmlBody, "utf8"),
 				charset: "utf-8",
+			});
+		}
+		for (const att of mail.attachments ?? []) {
+			parts.push({
+				contentType: att.contentType,
+				disposition: att.disposition ?? "attachment",
+				payload: att.payload,
+				charset: null,
+				...(att.filename !== undefined ? { filename: att.filename } : {}),
 			});
 		}
 		if (parts.length === 0) {
@@ -137,6 +164,17 @@ export class FakeImapServer {
 		}
 		if (this.authBad) throw new Error("LOGIN failed: bad credentials");
 		this.loggedIn = true;
+	}
+
+	/**
+	 * RFC 2971 ID (adapter.py:_send_imap_id call sites): records the EXACT
+	 * identity argument sent after LOGIN; rejection is armable for the
+	 * swallowed-failure contract (non-supporting servers must keep working).
+	 */
+	id(argument: string): void {
+		if (!this.loggedIn) throw new Error("NO: not authenticated");
+		if (this.idRejectionArmed) throw new Error("BAD: unknown command");
+		this.idCommands.push(argument);
 	}
 
 	selectInbox(): void {

@@ -39,6 +39,16 @@ export interface WaMediaUploadInput {
 	filename?: string | undefined;
 	mime?: string | undefined;
 	bytes: Buffer;
+	/**
+	 * Meta-REQUIRED multipart field (whatsapp_cloud.py:_upload_media: every
+	 * /media POST carries `messaging_product='whatsapp'` alongside `file`).
+	 */
+	messagingProduct: string;
+	/**
+	 * Meta-REQUIRED multipart field: the mime type of the file part, sent as
+	 * the `type` form field alongside `file` and `messaging_product`.
+	 */
+	type: string;
 }
 
 /**
@@ -198,6 +208,20 @@ export class FakeGraphServer implements WaCloudTransport {
 	async uploadMedia(upload: WaMediaUploadInput): Promise<GraphResponse> {
 		this.seqCounter += 1;
 		this.uploads.push({ ...upload, seq: this.seqCounter });
+		// Vendor-parity field gate: Meta REJECTS /media multipart uploads that
+		// omit messaging_product='whatsapp' or the mime-typed `type` form field
+		// (_upload_media always sends both alongside `file`).
+		if (upload.messagingProduct !== "whatsapp" || !upload.type) {
+			return this.fail({
+				status: 400,
+				error: {
+					message:
+						"(#100) Param messaging_product/type is required for media upload",
+					type: "OAuthException",
+					code: 100,
+				},
+			});
+		}
 		const failure = this.next("upload");
 		if (failure !== undefined) return this.fail(failure);
 		// Vendor-parity server-side cap: oversized uploads are rejected BY META.

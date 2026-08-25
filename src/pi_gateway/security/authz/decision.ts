@@ -113,6 +113,20 @@ export interface PlatformRegistryEntry {
 	allowAllEnv?: string | null | undefined;
 }
 
+/**
+ * Per-call chain options. Hermes parity:
+ * gateway/authz_mixin.py:_is_user_authorized(allow_adapter_delegation=True) —
+ * the plugin message-injection re-auth caller (run.py) passes False, which
+ * disables upstream-relay delegation (gate 1), adapter-verified role auth
+ * (gate 6), and adapter own-policy trust (gate 8, own-policy branch ONLY —
+ * the config.extra allow_from sub-check and the explicit allow-all flags
+ * remain operator-configured opt-ins, not delegation).
+ */
+export interface AuthzOptions {
+	/** Default true; an EXPLICIT false disables the three delegation gates. */
+	allowAdapterDelegation?: boolean;
+}
+
 /** Structured decision/denial record — the reason-code contract (06 §2.3). */
 export interface AuthzDecisionRecord {
 	allowed: boolean;
@@ -216,11 +230,16 @@ function isWhatsAppFamily(platform: string): boolean {
 export function isUserAuthorized(
 	source: AuthzSource,
 	deps: AuthzDeps = {},
+	options: AuthzOptions = {},
 ): AuthzDecisionRecord {
 	const platform = text(source.platform);
 	const userId = text(source.userId);
 	const chatId = text(source.chatId);
 	const chatType = chatTypeOf(source);
+	// Delegation is ON unless the caller passes an explicit false — a missing
+	// option never silently widens or narrows policy (parity of the Python
+	// keyword default True).
+	const allowDelegation = options.allowAdapterDelegation !== false;
 
 	const base = {
 		platform,
@@ -271,8 +290,9 @@ export function isUserAuthorized(
 	// `is True` discipline: the marker is a real bool on a genuine source; an
 	// explicit identity check refuses non-bool stand-ins (fail-open defense).
 	if (
-		source.deliveredViaUpstreamRelay === true ||
-		view?.authorizationIsUpstream === true
+		allowDelegation &&
+		(source.deliveredViaUpstreamRelay === true ||
+			view?.authorizationIsUpstream === true)
 	) {
 		return allow(1, "upstream_auth_delegation");
 	}
@@ -341,8 +361,10 @@ export function isUserAuthorized(
 		return allow(5, "allow_all_users");
 	}
 
-	// ── 6. Adapter-verified role auth (`is True` identity check) ────────────
-	if (source.roleAuthorized === true) {
+	// ── 6. Adapter-verified role auth (`is True` identity check) ──
+	// Delegation-gated: a plugin re-auth pass must not inherit the ADAPTER's
+	// role verification, only locally configured policy.
+	if (allowDelegation && source.roleAuthorized === true) {
 		return allow(6, "role_authorized");
 	}
 
@@ -387,7 +409,9 @@ export function isUserAuthorized(
 		// an actual "allowlist" restriction — "open" forwards EVERY sender and
 		// reading reach as authorization was the #34515 fail-open bug; the
 		// misconfigured-open case MUST land in the default deny below.
-		if (view?.enforcesOwnAccessPolicy === true) {
+		// Delegation-gated (gate 8): plugin re-auth passes must not trust the
+		// adapter's own intake decision at all.
+		if (allowDelegation && view?.enforcesOwnAccessPolicy === true) {
 			let effectivePolicy = "";
 			if (CHAT_TYPES_WITH_CHANNEL.has(chatType)) {
 				effectivePolicy = lower(view.groupPolicy);

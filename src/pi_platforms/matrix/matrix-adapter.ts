@@ -88,7 +88,6 @@ import {
 	MATRIX_MAX_MESSAGE_LENGTH_CEILING,
 	MATRIX_MAX_MESSAGE_LENGTH_FLOOR,
 	MATRIX_MAX_RECOVERY_ATTEMPTS,
-	type MatrixOutboundContent,
 	MATRIX_REACTION_EYES,
 	MATRIX_REACTION_FAILURE,
 	MATRIX_REACTION_SUCCESS,
@@ -266,6 +265,8 @@ export class MatrixAdapterCore
 	hooks: MatrixHooks | undefined;
 
 	ownUserId = "";
+	/** Resolved device id (whoami / login response parity). */
+	private deviceId: string | null = null;
 	private heldInbound: IncomingEvent[] = [];
 	private readonly heldIdentity = new Set<IncomingEvent>();
 	private drainInFlight = false;
@@ -342,6 +343,19 @@ export class MatrixAdapterCore
 		this.processNoticesFlag = deps.processNotices ?? false;
 
 		// §11 step 3: required secrets enablement — missing ⇒ LOUD disable.
+		// adapter.py connect() accepts EITHER MATRIX_ACCESS_TOKEN (whoami
+		// branch) OR MATRIX_USER_ID + MATRIX_PASSWORD (login branch) — a
+		// password-configured deployment is fully credentialed, so the token
+		// requirement is satisfied by that pair (matrix-7).
+		const hasPasswordPair =
+			this.secretReader("MATRIX_USER_ID") !== undefined &&
+			this.secretReader("MATRIX_PASSWORD") !== undefined &&
+			this.secretReader("MATRIX_PASSWORD") !== "";
+		const enablementReader = hasPasswordPair
+			? (key: string): string | undefined =>
+					this.secretReader(key) ??
+					(key === "MATRIX_ACCESS_TOKEN" ? "password-login" : undefined)
+			: this.secretReader;
 		const enablement = resolveEnablement(
 			{
 				name: this.manifestName,
@@ -350,7 +364,7 @@ export class MatrixAdapterCore
 				requiresEnv: REQUIRED_SECRETS.map((name) => ({ name })),
 				capabilities: {},
 			},
-			this.secretReader,
+			enablementReader,
 		);
 		if (!enablement.enabled && enablement.reason) {
 			this.lifecycle.disable(enablement.reason);
@@ -440,14 +454,39 @@ export class MatrixAdapterCore
 	async connect(opts: { isReconnect: boolean }): Promise<boolean> {
 		this.throwIfDisabled();
 		this.teardownStarted = false;
-		try {
-			const me = await this.hs.whoami();
-			this.ownUserId = me.user_id;
-		} catch (err) {
-			this.logger?.error?.(
-				`${this.manifestName}: whoami failed — ${brief(err)}`,
-			);
-			return false;
+		const password = this.secretReader("MATRIX_PASSWORD");
+		const configuredUserId = this.secretReader("MATRIX_USER_ID");
+		if (password !== undefined && password !== "" && configuredUserId) {
+			// adapter.py connect PASSWORD branch — client.login(identifier,
+			// password, device_name, device_id); whoami is not required after.
+			try {
+				const resp = await this.hs.login({
+					identifier: configuredUserId,
+					password,
+					deviceName: "pi-gateway",
+					...(this.deviceId !== null ? { deviceId: this.deviceId } : {}),
+				});
+				this.ownUserId = resp.user_id;
+				this.deviceId = resp.device_id;
+			} catch (err) {
+				this.logger?.error?.(
+					`${this.manifestName}: login failed — ${brief(err)}`,
+				);
+				return false;
+			}
+		} else {
+			// TOKEN branch: whoami validates the token and resolves the bot
+			// mxid AND device_id (adapter.py parity).
+			try {
+				const me = await this.hs.whoami();
+				this.ownUserId = me.user_id;
+				this.deviceId = me.device_id;
+			} catch (err) {
+				this.logger?.error?.(
+					`${this.manifestName}: whoami failed — ${brief(err)}`,
+				);
+				return false;
+			}
 		}
 		if (!opts.isReconnect || this.committedSyncToken === null) {
 			// adapter.py: client.sync(timeout=10000, full_state=True) BEFORE loop start.
@@ -581,7 +620,7 @@ export class MatrixAdapterCore
 		return new Promise<MatrixSyncResult>((resolve, reject) => {
 			const settled = { done: false };
 			const cancelTimer = this.timer(MATRIX_SYNC_WATCHDOG_TIMEOUT_MS, () => {
-					if (settled.done) return;
+				if (settled.done) return;
 				settled.done = true;
 				const err = new Error("sync long-poll exceeded the watchdog window");
 				err.name = "MatrixSyncWatchdogError";
@@ -625,7 +664,10 @@ export class MatrixAdapterCore
 	private recordProgress(generation: number): void {
 		if (generation !== this.generation) return;
 		if (this.stuckWatchdogStreak > 0)
-			console.error(`DBG progress-reset streak=${this.stuckWatchdogStreak}`, new Error("trace").stack);
+			console.error(
+				`DBG progress-reset streak=${this.stuckWatchdogStreak}`,
+				new Error("trace").stack,
+			);
 		this.polledOnce = true;
 		this.stuckWatchdogStreak = 0;
 		this.recoveryAttempts = 0;
@@ -638,11 +680,40 @@ export class MatrixAdapterCore
 		}
 	}
 
+	/**
+	 * adapter.py:_join_room_by_id / _schedule_invite_join — process sync
+	 * INVITE memberships: join with BOUNDED retry so invited rooms deliver.
+	 */
+	private async handleRoomInvite(roomId: string): Promise<void> {
+		const MAX_ATTEMPTS = 3;
+		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			try {
+				await this.hs.joinRoom(roomId);
+				this.logger?.warn?.(
+					`${this.manifestName}: joined invited room ${roomId}`,
+				);
+				return;
+			} catch (err) {
+				this.logger?.warn?.(
+					`${this.manifestName}: join ${roomId} failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${brief(err)}`,
+				);
+				if (attempt < MAX_ATTEMPTS) {
+					await this.clock.sleep(100 * attempt);
+				}
+			}
+		}
+	}
+
 	/** Dispatch one sync response's events; hold when the transport is dead. */
 	private async dispatchBatch(
 		data: MatrixSyncResponse,
 		opts: { duringInitialSync: boolean },
 	): Promise<void> {
+		// INVITE state first — startup reconciliation AND live invites ride
+		// the same bounded-retry join path (dead invites simply exhaust).
+		for (const roomId of Object.keys(data.rooms.invite ?? {})) {
+			await this.handleRoomInvite(roomId);
+		}
 		const events: MatrixTimelineEvent[] = [];
 		for (const roomEvents of Object.values(data.rooms.join)) {
 			events.push(...roomEvents.timeline.events);
@@ -673,15 +744,38 @@ export class MatrixAdapterCore
 			this.holdInbound(built, "disconnected");
 			return;
 		}
+		// base.py:_process_message_background turn lifecycle — typing bubble up
+		// (send_typing → set_typing timeout=30000), 👀 processing-start reaction
+		// (on_processing_start), THEN the handler. DEC-052 excludes only the
+		// room-mgmt/presence/history planes: typing and the emoji hooks are core
+		// turn lifecycle (base.py:6418 runs them for every adapter).
+		await this.sendTyping(evt.roomId);
+		await this.onProcessingStart(evt.roomId, evt.eventId);
+		let outcome: "success" | "failure" | "cancelled" = "success";
 		try {
 			await this.handleIngress(built, sessionKeyOf(built));
 		} catch (err) {
 			if (err instanceof Error && err.name === "AdapterDisabledError") {
 				this.holdInbound(built, "disabled");
+				// Deferred, not failed (CancelledError analog): eyes cleared,
+				// NO final emoji, no read receipt — redispatch re-runs the turn.
+				await this.onProcessingComplete(evt.roomId, evt.eventId, "cancelled");
+				await this.stopTyping(evt.roomId);
 				return;
 			}
 			this.holdInbound(built, "dispatch-failed");
+			outcome = "failure";
 		}
+		// on_processing_complete — swap 👀 for ✅/❌; then stop_typing (timeout=0)
+		// clears the bubble once the turn settles (base.py finalize ordering).
+		await this.onProcessingComplete(evt.roomId, evt.eventId, outcome);
+		await this.stopTyping(evt.roomId);
+		// adapter.py:_background_read_receipt — mark the processed event read
+		// (fully_read marker + m.read receipt), FIRE-AND-FORGET: failures are
+		// swallowed and never block the turn.
+		void this.hs
+			.sendReadReceipt(evt.roomId, evt.eventId)
+			.catch(() => undefined);
 	}
 
 	private canDispatchNow(): boolean {
@@ -955,7 +1049,7 @@ export class MatrixAdapterCore
 			return this.buildTextIncoming(evt, relatesTo);
 		}
 		// Media msgtypes (m.image/m.audio/m.video/m.file): tolerated, no turn
-		// (media ingress is a documented exclusion of this port).
+		// (inbound media download is a documented exclusion — DEC-052).
 		return null;
 	}
 
@@ -1398,15 +1492,41 @@ export class MatrixAdapterCore
 		content: string,
 		metadata: Metadata,
 	): Promise<SendResult> {
-		const structured: MatrixOutboundContent = buildTextMessageContent(content);
-		const md: Metadata = {
-			msgtype: structured.msgtype,
-			...(structured.mentionUserIds.length > 0
-				? { m_mentions_user_ids: structured.mentionUserIds }
-				: {}),
-			...metadata,
-		};
-		return this.wireTransmitSend(chatId, structured.body, md);
+		const md0 = metadata as Record<string, unknown>;
+		// THE FULL VENDOR EVENT CONTENT — the exact dict a real client PUTs to
+		// /rooms/{id}/send/m.room.message. Mentions ride m.mentions INSIDE the
+		// content (MSC3952); format/formatted_body ride when HTML rendering
+		// differs (_build_text_message_content parity).
+		const eventContent: Record<string, unknown> =
+			buildTextMessageContent(content);
+		// adapter.py:_apply_relation_metadata — reply_to → m.in_reply_to;
+		// thread_id → rel_type m.thread + is_falling_back (+ reply fallback).
+		const replyTo =
+			typeof md0["reply_to_message_id"] === "string"
+				? md0["reply_to_message_id"]
+				: undefined;
+		const threadId =
+			typeof md0["thread_id"] === "string" ? md0["thread_id"] : undefined;
+		const relatesTo: Record<string, unknown> = {};
+		if (replyTo !== undefined) {
+			relatesTo["m.in_reply_to"] = { event_id: replyTo };
+		}
+		if (threadId !== undefined && threadId !== "") {
+			relatesTo["rel_type"] = "m.thread";
+			relatesTo["event_id"] = threadId;
+			relatesTo["is_falling_back"] = true;
+			if (relatesTo["m.in_reply_to"] === undefined) {
+				relatesTo["m.in_reply_to"] = { event_id: threadId };
+			}
+		}
+		if (Object.keys(relatesTo).length > 0) {
+			eventContent["m.relates_to"] = relatesTo;
+		}
+		const md: Record<string, unknown> = { ...metadata };
+		delete md["reply_to_message_id"]; // converted into m.relates_to
+		delete md["thread_id"]; // converted into m.relates_to
+		md["event_content"] = eventContent;
+		return this.wireTransmitSend(chatId, content, md as Metadata);
 	}
 
 	/**
@@ -1420,11 +1540,30 @@ export class MatrixAdapterCore
 		content: string,
 		opts: EditOptions & { finalize: boolean },
 	): Promise<SendResult> {
-		const md: Metadata = {
-			edit_relation: { rel_type: "m.replace", event_id: messageId },
-		};
 		void opts;
-		return this.wireTransmitEdit(chatId, messageId, content, md);
+		// adapter.py:edit_message — an edit is a NEW event whose body is
+		// "* "+text, carrying m.new_content (the FULL rebuilt content with
+		// mentions copied + '* '-prefixed formatted_body) and m.relates_to
+		// {rel_type:m.replace,event_id}. Vendor clients apply edits via
+		// m.new_content; without it nothing is replaced.
+		const newContent = buildTextMessageContent(content);
+		const editContent: Record<string, unknown> = {
+			msgtype: "m.text",
+			body: `* ${content}`,
+			"m.new_content": newContent,
+			"m.relates_to": { rel_type: "m.replace", event_id: messageId },
+		};
+		if ("m.mentions" in newContent) {
+			editContent["m.mentions"] = newContent["m.mentions"];
+		}
+		if ("formatted_body" in newContent) {
+			editContent["format"] = "org.matrix.custom.html";
+			editContent["formatted_body"] =
+				`* ${String(newContent["formatted_body"])}`;
+		}
+		return this.wireTransmitEdit(chatId, messageId, content, {
+			event_content: editContent,
+		} as unknown as Metadata);
 	}
 
 	/** Bound by the subject to the shared harness wire's edit lane. */
@@ -1570,6 +1709,64 @@ export class MatrixAdapterCore
 	}
 
 	// ══════════════════════════════════════════════════════════════════════
+	// Media plane (adapter.py:_upload_and_send)
+	// ══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Upload bytes then send a TYPED media event: msgtype m.image/m.file/…,
+	 * body caption||filename, info{mimetype,size}, url mxc://. Mirrors
+	 * _upload_and_send field-for-field (encryption excluded — no crypto
+	 * stack on this port).
+	 */
+	async sendMedia(
+		chatId: string,
+		file: {
+			bytes: Uint8Array;
+			filename: string;
+			mimeType: string;
+			msgtype?: "m.image" | "m.video" | "m.audio" | "m.file";
+		},
+		opts: { caption?: string | undefined } = {},
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		let mxcUrl: string;
+		try {
+			mxcUrl = await this.hs.uploadMedia({
+				data: file.bytes,
+				mimeType: file.mimeType,
+				filename: file.filename,
+			});
+		} catch (err) {
+			return {
+				success: false,
+				error: brief(err),
+			};
+		}
+		const msgtype =
+			file.msgtype ??
+			(file.mimeType.startsWith("image/") ? "m.image" : "m.file");
+		const content: Record<string, unknown> = {
+			msgtype,
+			body:
+				opts.caption !== undefined && opts.caption !== ""
+					? opts.caption
+					: file.filename,
+			info: {
+				mimetype: file.mimeType,
+				size: file.bytes.byteLength,
+			},
+			url: mxcUrl,
+		};
+		return this.wireTransmitSend(
+			chatId,
+			content["body"] as string,
+			{
+				event_content: content,
+			} as unknown as Metadata,
+		);
+	}
+
+	// ══════════════════════════════════════════════════════════════════════
 	// Typing + reaction-ack lifecycle (A11/A1 ride-alongs)
 	// ══════════════════════════════════════════════════════════════════════
 
@@ -1611,7 +1808,6 @@ export class MatrixAdapterCore
 		try {
 			const reactionEventId = await this.hs.sendReaction(
 				roomId,
-				this.ownUserId,
 				messageId,
 				MATRIX_REACTION_EYES,
 			);
@@ -1644,7 +1840,7 @@ export class MatrixAdapterCore
 		const emoji =
 			outcome === "success" ? MATRIX_REACTION_SUCCESS : MATRIX_REACTION_FAILURE;
 		try {
-			await this.hs.sendReaction(roomId, this.ownUserId, messageId, emoji);
+			await this.hs.sendReaction(roomId, messageId, emoji);
 		} catch {
 			/* swallowed */
 		}

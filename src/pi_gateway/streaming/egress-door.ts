@@ -77,7 +77,7 @@ export interface DoorTransport {
 		chatId: string,
 		messageId: string,
 		content: string,
-		opts: { finalize: boolean },
+		opts: { finalize: boolean; metadata?: Metadata | undefined },
 		platform?: string | undefined,
 	): Promise<SendResult>;
 	/**

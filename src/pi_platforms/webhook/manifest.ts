@@ -54,6 +54,13 @@ export const COMPLETIONS_IDEMPOTENCY_TTL_MS = 300_000;
 export const COMPLETIONS_IDEMPOTENCY_MAX_ENTRIES = 1_000;
 
 /**
+ * api_server.py self._model_name parity — the virtual model name surfaced in
+ * /v1/chat/completions responses when the caller sends no "model" field
+ * (wake.ts already uses this identifier as its self-post model).
+ */
+export const DEFAULT_COMPLETIONS_MODEL = "pi-gateway";
+
+/**
  * Capability pairing for the STATELESS shape (04 §8 webhook row): BOTH flags
  * False. Hermes splits them across webhook.py (interactive_resume=False only)
  * and api_server.py (supports_async_delivery=False); the Pi reference adapter

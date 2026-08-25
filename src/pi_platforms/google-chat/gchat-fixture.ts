@@ -9,11 +9,15 @@
 // claim allowlist, tamper rejection); the Chat API never leaves the process.
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { GoogleChatWebhookAdapter } from "./google-chat-adapter.js";
 import type {
 	GchatAdapterConfig,
 	GchatApiResponse,
+	GchatAttachmentDownloader,
 	GchatTransport,
 	OidcTokenVerifier,
 } from "./google-chat-adapter.js";
@@ -98,19 +102,30 @@ export class ClaimsOidcVerifier implements OidcTokenVerifier {
 
 type ScriptedBehavior =
 	| { kind: "ok"; name?: string }
-	| { kind: "status"; status: number; error?: string };
+	| { kind: "status"; status: number; error?: string }
+	| { kind: "throw"; message: string };
 
 export interface GchatApiCall {
 	op: "create" | "patch";
 	target: string;
 	body: Record<string, unknown>;
 	metadata: Record<string, unknown>;
+	/** REST query parameters (messageReplyOption rides HERE, never the body). */
+	queryParams?: Record<string, string> | undefined;
+	/** messages.patch updateMask (_patch_message @2346) — masked updates only. */
+	updateMask?: string | undefined;
 }
 
 /**
  * Instrumented Chat REST endpoint. Records every create/patch with its FULL
- * body so rows assert wire shapes (thread.name, messageReplyOption,
- * cardsV2, text dialect); scripts status-code behaviors FIFO per op.
+ * body + query params + updateMask so rows assert wire shapes (thread.name,
+ * messageReplyOption as a QUERY param, cardsV2, text dialect, MASKED patches);
+ * scripts status-code behaviors and TRANSPORT throws FIFO per op.
+ *
+ * Vendor-edge fidelity: messages.create ALWAYS resolves a thread (the real
+ * API echoes a requested thread.name or mints a fresh one) so the outbound
+ * thread-count bump is exercised against realistic payloads; messages.patch
+ * REJECTS a thread-carrying body (thread is immutable on update).
  */
 export class FakeChatApi implements GchatTransport {
 	readonly calls: GchatApiCall[] = [];
@@ -134,11 +149,19 @@ export class FakeChatApi implements GchatTransport {
 		chatId: string,
 		body: Record<string, unknown>,
 		metadata: Record<string, unknown> = {},
+		queryParams?: Record<string, string>,
 	): Promise<GchatApiResponse> {
-		this.calls.push({ op: "create", target: chatId, body, metadata });
+		this.calls.push({
+			op: "create",
+			target: chatId,
+			body,
+			metadata,
+			queryParams,
+		});
 		const rejected = this.rejectionScript(body, metadata);
 		if (rejected !== null) return rejected;
 		const behavior = this.take("create");
+		if (behavior.kind === "throw") throw new Error(behavior.message);
 		if (behavior.kind === "status") {
 			return {
 				success: false,
@@ -147,18 +170,46 @@ export class FakeChatApi implements GchatTransport {
 			};
 		}
 		this.seq += 1;
-		return { success: true, messageId: `spaces/x/messages/${this.seq}` };
+		// The real API echoes the requested thread (REPLY_MESSAGE_FALLBACK data)
+		// or mints a fresh one for top-level creates.
+		const requestedThread = body["thread"];
+		const threadName =
+			requestedThread !== null && typeof requestedThread === "object"
+				? String((requestedThread as Record<string, unknown>)["name"] ?? "") ||
+					`${chatId}/threads/gc-${this.seq}`
+				: `${chatId}/threads/gc-${this.seq}`;
+		return {
+			success: true,
+			messageId: `spaces/x/messages/${this.seq}`,
+			thread: { name: threadName },
+		};
 	}
 
 	async patchMessage(
 		messageName: string,
 		body: Record<string, unknown>,
 		metadata: Record<string, unknown> = {},
+		updateMask?: string,
 	): Promise<GchatApiResponse> {
-		this.calls.push({ op: "patch", target: messageName, body, metadata });
+		// Thread is IMMUTABLE on update — the real API rejects such bodies.
+		if ("thread" in body) {
+			return {
+				success: false,
+				status: 400,
+				error: "INVALID_ARGUMENT: thread cannot be updated (immutable field)",
+			};
+		}
+		this.calls.push({
+			op: "patch",
+			target: messageName,
+			body,
+			metadata,
+			updateMask,
+		});
 		const rejected = this.rejectionScript(body, metadata);
 		if (rejected !== null) return rejected;
 		const behavior = this.take("patch");
+		if (behavior.kind === "throw") throw new Error(behavior.message);
 		if (behavior.kind === "status") {
 			return {
 				success: false,
@@ -204,6 +255,29 @@ export class FakeChatApi implements GchatTransport {
 	}
 }
 
+/** Scriptable bot-SA attachment edges (GchatAttachmentDownloader parity). */
+export class FakeAttachmentDownloader implements GchatAttachmentDownloader {
+	readonly mediaDownloads: string[] = [];
+	readonly uriFetches: string[] = [];
+	private readonly resources = new Map<string, Buffer>();
+
+	seedResource(resourceName: string, bytes: Buffer): void {
+		this.resources.set(resourceName, bytes);
+	}
+
+	async downloadMedia(resourceName: string): Promise<Buffer | null> {
+		this.mediaDownloads.push(resourceName);
+		return this.resources.get(resourceName) ?? null;
+	}
+
+	async fetchUri(downloadUri: string): Promise<Buffer | null> {
+		this.uriFetches.push(downloadUri);
+		// Only Google-owned hosts serve bytes (SSRF guard models the vendor edge).
+		if (!/https:\/\/([^/]*\.)?googleapis\.com\//.test(downloadUri)) return null;
+		return Buffer.from("uri-bytes");
+	}
+}
+
 export interface FixtureResponse {
 	status: number;
 	contentType: string | undefined;
@@ -228,10 +302,15 @@ export const DEFAULT_GCHAT_CONFIG: GchatAdapterConfig = {
 export class GchatFixture {
 	readonly adapter: GoogleChatWebhookAdapter;
 	readonly api = new FakeChatApi();
+	readonly downloader = new FakeAttachmentDownloader();
 	readonly verifier: OidcTokenVerifier;
 	readonly clock = new FixtureClock();
 	readonly audience: string;
 	readonly saEmails: readonly string[];
+	/** Isolated attachment cache root. */
+	readonly mediaDir: string;
+
+	private readonly tempRoot: string;
 
 	constructor(opts: GchatFixtureOptions = {}) {
 		this.audience = opts.audience ?? FIXTURE_HTTP_EVENTS_AUDIENCE;
@@ -239,12 +318,23 @@ export class GchatFixture {
 		this.verifier =
 			opts.verifier ??
 			new ClaimsOidcVerifier(TOKEN_SIGNING_KEY, () => this.clock.nowMs);
+		this.tempRoot = mkdtempSync(join(tmpdir(), "gchat-fix-"));
+		this.mediaDir = join(this.tempRoot, "attachments");
+		mkdirSync(this.mediaDir, { recursive: true });
 		this.adapter = new GoogleChatWebhookAdapter({
 			config: { ...DEFAULT_GCHAT_CONFIG, ...(opts.config ?? {}) },
 			nowMs: () => this.clock.nowMs,
 			transport: this.api,
 			verifier: this.verifier,
+			attachmentDownloader: this.downloader,
+			mediaCacheDir: this.mediaDir,
 			dedupCap: opts.dedupCap,
+			// Retry ladder on the INJECTED clock: sleeps advance the fixture
+			// clock instantly (no wall time) and jitter is pinned to zero.
+			retrySleep: async (ms) => {
+				this.clock.advance(ms);
+			},
+			retryRng: () => 0,
 			secretReader: (name) => {
 				if (opts.withSecret === false) return undefined;
 				if (name === "GOOGLE_CHAT_HTTP_EVENTS_AUDIENCE") return this.audience;
@@ -262,7 +352,7 @@ export class GchatFixture {
 	}
 
 	dispose(): void {
-		/* pure in-process fixture */
+		rmSync(this.tempRoot, { recursive: true, force: true });
 	}
 
 	bearerFor(saEmail: string = this.saEmails[0] ?? FIXTURE_SA_EMAIL): string {

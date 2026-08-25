@@ -410,3 +410,109 @@ describe("system clock sanity", () => {
 		expect(systemClock.nowSeconds()).toBeGreaterThan(1_700_000_000);
 	});
 });
+
+// ── cron-session contexts (secops-9; tools/approval.py parity) ────────────
+// Cron jobs are NEVER gateway-approval contexts: no human listens on any
+// chat surface, so the gate must resolve IMMEDIATELY from approvals.cron_mode
+// (default deny) WITHOUT enqueueing a pending prompt that would block the job
+// for the full timeout.
+describe("cron-session gate branch", () => {
+	it("default cron_mode DENIES immediately: no entry, no notify, no wait", async () => {
+		const clock = new ManualClock();
+		let notifyCalls = 0;
+		const hooks: Array<{ event: string; choice?: string | undefined }> = [];
+		const emit: ObserverEmit = async (event, context) => {
+			hooks.push({
+				event,
+				choice: (context as { choice?: string } | undefined)?.choice,
+			});
+		};
+		const deps = makeDeps(clock, {
+			isCronSession: () => true,
+			hooks: { emit },
+			notify: async () => {
+				notifyCalls += 1;
+			},
+		});
+
+		const result = await awaitGatewayDecision(deps, cronSessionId(), REQUEST, {
+			surface: "cron",
+		});
+
+		expect(result).toMatchObject({ resolved: true, choice: "deny" });
+		expect(result.reason).toContain("approvals.cron_mode: approve");
+		expect(notifyCalls).toBe(0); // NO prompt was ever sent
+		expect(deps.queues.hasBlocking(cronSessionId())).toBe(false); // NOTHING pending
+		expect(deps.queues.listApprovals(cronSessionId())).toEqual([]);
+		expect(clock.nowMs).toBe(1_000_000); // resolved without consuming ANY time
+		expect(hooks.map((h) => h.event)).toEqual([
+			"pre_approval_request",
+			"post_approval_response",
+		]);
+		expect(hooks[1]?.choice).toBe("deny");
+	});
+
+	it("cron_mode approve resolves as single-use consent, still without enqueueing", async () => {
+		const clock = new ManualClock();
+		const deps = makeDeps(clock, {
+			isCronSession: () => true,
+			cronMode: "approve",
+		});
+		const result = await launch(deps, "cron:job");
+		expect(result).toMatchObject({ resolved: true, choice: "once" });
+		expect(result.reason).toBeUndefined();
+		expect(deps.queues.hasBlocking("cron:job")).toBe(false);
+	});
+
+	it("raw config vocabulary normalizes: allow/yes/off approve, garbage denies", async () => {
+		for (const [raw, expected] of [
+			["allow", "once"],
+			[" yes ", "once"],
+			["off", "once"],
+			["banana", "deny"],
+			["", "deny"],
+		] as const) {
+			const clock = new ManualClock();
+			const deps = makeDeps(clock, {
+				isCronSession: () => true,
+				cronMode: () => raw,
+			});
+			const result = await launch(deps, "cron:job");
+			expect(result.choice).toBe(expected);
+		}
+	});
+
+	it("a resolver THROWING fails safe to deny (parity of the except-deny guard)", async () => {
+		const clock = new ManualClock();
+		const deps = makeDeps(clock, {
+			isCronSession: () => true,
+			cronMode: (): string => {
+				throw new Error("config read failed");
+			},
+		});
+		const result = await launch(deps, "cron:job");
+		expect(result).toMatchObject({ resolved: true, choice: "deny" });
+	});
+
+	it("non-cron sessions keep the NORMAL blocking path (marker absent ⇒ untouched)", async () => {
+		const clock = new ManualClock();
+		let notifyCalls = 0;
+		const deps = makeDeps(clock, {
+			isCronSession: () => false,
+			notify: async () => {
+				notifyCalls += 1;
+			},
+		});
+		const pending = launch(deps, "s");
+		await flush();
+		expect(notifyCalls).toBe(1); // prompt delivered normally
+		expect(deps.queues.hasBlocking("s")).toBe(true); // pending approval exists
+		deps.queues.resolve("s", "once");
+		const result = await pending;
+		expect(result.resolved).toBe(true);
+	});
+});
+
+function cronSessionId(): string {
+	return "cron:job-secops9";
+}

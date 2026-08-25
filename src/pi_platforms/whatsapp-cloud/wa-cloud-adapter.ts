@@ -26,8 +26,8 @@
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
 
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 
 import {
 	ActionHandlerRegistry,
@@ -36,6 +36,7 @@ import {
 	ClarifyPendingStore,
 	OneShotPendingStore,
 	resolveEnablement,
+	secureCompare,
 	validateTrustBoundaryManifest,
 } from "../kit/index.js";
 import type {
@@ -50,10 +51,7 @@ import type {
 	TaskSpawner,
 } from "../../pi_gateway/guards/index.js";
 import { buildSessionKey } from "../../pi_gateway/resolution/session-key.js";
-import {
-	expandWhatsappAliases,
-	normalizeWhatsappIdentifier,
-} from "../../pi_gateway/resolution/whatsapp-identity.js";
+import { normalizeWhatsappIdentifier } from "../../pi_gateway/resolution/whatsapp-identity.js";
 import { verifyHmacSignature } from "../kit/trust.js";
 import type { ScopedSecretReader } from "../kit/registration.js";
 import type {
@@ -72,13 +70,17 @@ import {
 	LIST_ROW_TITLE_CAP,
 	MAX_LIST_ROWS,
 	MAX_QUICK_BUTTONS,
+	MAX_TEXT_INJECT_BYTES,
 	MEDIA_ID_SAFE_RE,
 	MEDIA_SIZE_LIMITS,
-	MIME_EXTENSION_OVERRIDES,
+	TEXT_INJECT_EXTENSIONS,
+	VOICE_NOTE_MIME,
 	WA_MAX_MESSAGE_LENGTH,
 	WAMID_DEDUP_CACHE_SIZE,
 	WHATSAPP_CLOUD_PLUGIN_MANIFEST,
 	whatsAppCloudTrustBoundary,
+	resolveMediaExtension,
+	tryResolveMediaExtension,
 	type WaMediaKind,
 } from "./manifest.js";
 import type {
@@ -127,6 +129,20 @@ export interface WaCloudAdapterOptions {
 	 */
 	outsideWindowPolicy?: "record" | "refuse" | undefined;
 	dmAllowFrom?: readonly string[] | undefined;
+	/**
+	 * MP3→opus transcoder seam (send_voice/_convert_to_opus upstream shells
+	 * out to ffmpeg when present). Given the source MP3 bytes it returns the
+	 * converted opus-in-Ogg bytes (any temp artifact lifecycle is the
+	 * converter's own), or null on missing tool/failure. Default: undefined ⇒
+	 * the documented no-ffmpeg fallback path — voice MP3s ship verbatim as
+	 * audio/mpeg attachments; no OS child is ever spawned from this port.
+	 */
+	transcodeMp3ToOpus?:
+		| ((
+				bytes: Buffer,
+				filename: string,
+		  ) => Promise<{ bytes: Buffer; filename: string } | null>)
+		| undefined;
 }
 
 export interface ReceiptRecord {
@@ -162,6 +178,12 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 	private readonly dedupCap: number;
 	private readonly outsideWindowPolicy: "record" | "refuse";
 	private readonly dmAllowSet: Set<string>;
+	private readonly transcodeMp3ToOpus:
+		| ((
+				bytes: Buffer,
+				filename: string,
+		  ) => Promise<{ bytes: Buffer; filename: string } | null>)
+		| undefined;
 	readonly whatsappSessionDir: string | undefined;
 	readonly mediaCacheDir: string;
 
@@ -215,6 +237,7 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 		this.nowFn = opts.nowMs ?? (() => Date.now());
 		this.dedupCap = opts.dedupCap ?? WAMID_DEDUP_CACHE_SIZE;
 		this.outsideWindowPolicy = opts.outsideWindowPolicy ?? "record";
+		this.transcodeMp3ToOpus = opts.transcodeMp3ToOpus;
 		this.whatsappSessionDir = opts.whatsappSessionDir;
 		this.mediaCacheDir =
 			opts.mediaCacheDir ??
@@ -319,7 +342,9 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 		}
 		if (query["hub.mode"] !== "subscribe")
 			return { status: 400, text: "bad mode" };
-		if (query["hub.verify_token"] !== this.verifyToken) {
+		// Constant-time compare (_handle_verify hmac.compare_digest parity):
+		// token-length/content timing must not leak the shared secret.
+		if (!secureCompare(query["hub.verify_token"] ?? "", this.verifyToken)) {
 			return { status: 403, text: "verify_token mismatch" };
 		}
 		const challenge = query["hub.challenge"] ?? "";
@@ -597,12 +622,41 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 			}
 		}
 
+		// Text-readable documents inject their file content INLINE so the agent
+		// can reason about the attachment without a separate read_file call
+		// (_build_message_event_from_cloud @~2020; same heuristic as the Baileys
+		// adapter). 100KB cap matches Telegram/Discord/Slack; oversize/failed
+		// reads keep the metadata-only body. The injection PREPENDS (caption or
+		// '[Document: fname]' marker rides AFTER the content).
+		if (msgType === "document" && mediaUrls.length > 0 && mediaUrls[0]) {
+			const docPath = mediaUrls[0];
+			const ext = extname(docPath).toLowerCase();
+			if (TEXT_INJECT_EXTENSIONS.has(ext)) {
+				try {
+					if (statSync(docPath).size <= MAX_TEXT_INJECT_BYTES) {
+						// Node utf8 decoding replaces malformed sequences with
+						// U+FFFD (read_text(errors="replace") parity).
+						const content = readFileSync(docPath, "utf8");
+						const displayName = basename(docPath);
+						const injection = `[Content of ${displayName}]:\n${content}`;
+						body = body ? `${injection}\n\n${body}` : injection;
+					}
+				} catch {
+					/* best-effort (OSError parity): metadata-only body stands */
+				}
+			}
+		}
+
 		// Quoted-message context: Meta carries only the id (+ author); the text
 		// resolves from our own send/receive index (rich_sent_store parity).
+		// Without the resolved text the run loop cannot inject the
+		// '[Replying to: …]' disambiguation prefix (it gates on reply_to_text).
 		const context = asRec(raw["context"]);
 		const replyToId = str(context["id"]) || undefined;
 		let replyToIsOwn = false;
+		let replyToText: string | undefined;
 		if (replyToId) {
+			replyToText = this.quotedTextOf(chatId, replyToId);
 			const quotedFrom = str(context["from"]);
 			const ourNumber = str(metadata["display_phone_number"]);
 			replyToIsOwn = Boolean(
@@ -637,6 +691,7 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 				...(replyToId !== undefined
 					? { reply_to_is_own_message: replyToIsOwn }
 					: {}),
+				...(replyToText !== undefined ? { reply_to_text: replyToText } : {}),
 			},
 			source: {
 				platform: "whatsapp",
@@ -845,33 +900,17 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 	}
 
 	/**
-	 * OUTBOUND recipient resolution at the WIRE level: aliases collapse through
-	 * the REAL identity module to ONE canonical identifier (the SAME min-pick
-	 * the session-key module uses), then Graph requires bare digits — so
-	 * replies address the STABLE canonical recipient regardless of which
-	 * phone/LID alias delivered the latest message (02 §4.3: outbound
-	 * addressing resolves through the identity module; phone→LID idempotency).
+	 * OUTBOUND recipient at the WIRE level: chatId VERBATIM on every /messages
+	 * POST body's `to` field (whatsapp_cloud.py:send @~544 and _send_media post
+	 * ``chat_id`` unchanged; Meta addressed us AT this wa_id, so it IS the
+	 * deliverable recipient). Alias expansion + min-pick canonicalization is a
+	 * SESSION-KEY-side concern ONLY (02 §4.3): letting a stale LID mapping
+	 * rewrite the outbound `to` would put a LID-derived digit string where Meta
+	 * expects the delivered wa_id. The dmAllowSet normalization upstream stays
+	 * allowlist-side (_normalize_allow_ids parity).
 	 */
 	resolveRecipient(chatId: string): string {
-		const aliases = expandWhatsappAliases(chatId, this.aliasOpts());
-		let canonical: string | null = null;
-		for (const candidate of aliases) {
-			if (
-				canonical === null ||
-				candidate.length < canonical.length ||
-				(candidate.length === canonical.length && candidate < canonical)
-			) {
-				canonical = candidate;
-			}
-		}
-		const normalized = normalizeWhatsappIdentifier(canonical ?? chatId);
-		return /^\d+$/.test(normalized) ? normalized : chatId;
-	}
-
-	private aliasOpts(): { sessionDir?: string } {
-		return this.whatsappSessionDir
-			? { sessionDir: this.whatsappSessionDir }
-			: {};
+		return chatId;
 	}
 
 	/**
@@ -903,6 +942,13 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 		content: string,
 		metadata: Metadata,
 	): Promise<SendResult> {
+		// Blank/whitespace content short-circuits BEFORE any Graph call
+		// (send parity: "if not content or not content.strip(): return success" —
+		// Hermes never POSTs an empty text body).
+		if (!content || content.trim() === "") {
+			return { success: true, messageId: null };
+		}
+
 		// Messaging-window routing decision RECORDED before any wire call.
 		const decision = this.classifier.decideForSend(chatId);
 		if (!decision.withinWindow && this.outsideWindowPolicy === "refuse") {
@@ -1010,23 +1056,55 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 
 		const mediaBlock: Record<string, unknown> = {};
 		if (!("link" in source)) {
+			let bytes = source.bytes;
+			let mime = source.mime ?? DEFAULT_MEDIA_MIME[kind];
+			let filename = source.filename ?? `${kind}${resolveMediaExtension(mime)}`;
+
+			// Voice lane transcoder seam (send_voice @~1194 parity): WhatsApp
+			// renders 'audio/ogg; codecs=opus' as the native voice-note bubble,
+			// so local MP3s convert pre-upload. The lane keys off CALLER-declared
+			// MP3 evidence (.mp3 filename / audio/mpeg mime) — never the derived
+			// defaults, so undeclared bytes ship verbatim exactly as before.
+			// Conversion failure degrades to the MP3 attachment (audio/mpeg),
+			// never an error.
+			const declaredMp3 =
+				(source.filename !== undefined &&
+					source.filename.toLowerCase().endsWith(".mp3")) ||
+				source.mime === "audio/mpeg";
+			if (
+				kind === "audio" &&
+				declaredMp3 &&
+				this.transcodeMp3ToOpus !== undefined
+			) {
+				const converted = await this.transcodeMp3ToOpus(bytes, filename);
+				if (converted !== null) {
+					bytes = converted.bytes;
+					filename = converted.filename;
+					mime = VOICE_NOTE_MIME;
+				} else {
+					// Will deliver as MP3 attachment, not voice bubble.
+					mime = "audio/mpeg";
+				}
+			}
+
 			const cap = MEDIA_SIZE_LIMITS[kind];
-			const filename = source.filename ?? kind;
-			if (source.bytes.length > cap) {
+			if (bytes.length > cap) {
 				// PRE-upload refusal (whatsapp_cloud.py:_upload_media: refuse
 				// above-cap uploads "instead of round-tripping to Graph").
 				return {
 					success: false,
-					error: `File ${filename} is ${source.bytes.length} bytes; Cloud API ${kind} cap is ${cap} bytes`,
+					error: `File ${filename} is ${bytes.length} bytes; Cloud API ${kind} cap is ${cap} bytes`,
 					retryable: false,
 				};
 			}
-			const mime = source.mime ?? DEFAULT_MEDIA_MIME[kind];
 			const upload: WaMediaUploadInput = {
 				kind,
-				bytes: source.bytes,
+				bytes,
 				mime,
-				...(filename !== undefined ? { filename } : {}),
+				filename,
+				// Meta-required multipart fields (_upload_media parity).
+				messagingProduct: "whatsapp",
+				type: mime,
 			};
 			const resp = await this.transport.uploadMedia(upload);
 			if (resp.status !== 200) {
@@ -1132,9 +1210,8 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 	/**
 	 * Pending-prompt registration. Hermes FIFO-caps these dicts at
 	 * INTERACTIVE_STATE_CACHE_SIZE (1000) with oldest-eviction; in the Pi kit
-	 * retention/growth policy belongs to the pending stores themselves
-	 * (kit-owned), so this adapter registers directly and cites the cap from
-	 * manifest data.
+	 * that retention policy IS the pending store's own contract — every
+	 * register() call enforces the 1000-entry bound internally.
 	 */
 	private registerPending(
 		store: OneShotPendingStore,
@@ -1146,7 +1223,9 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 
 	/**
 	 * Render an exec-approval prompt with the reduced `appr:` vocabulary into
-	 * the SAME approval resolver (§9.1 cross-family clause).
+	 * the SAME approval resolver (§9.1 cross-family clause). `smartDenied`
+	 * appends the owner-override suffix line exactly like the source's
+	 * send_exec_approval smart_denied=True branch.
 	 */
 	async sendWhatsappApproval(
 		chatId: string,
@@ -1154,13 +1233,19 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 		approvalId: string,
 		sessionKey: string,
 		description = "dangerous command",
-		opts: { replyToMessageId?: string | undefined } = {},
+		opts: {
+			replyToMessageId?: string | undefined;
+			smartDenied?: boolean | undefined;
+		} = {},
 	): Promise<SendResult> {
 		this.throwIfDisabled();
 		const cmdPreview =
 			command.length <= 800 ? command : `${command.slice(0, 800)}...`;
 		const bodyText = this.truncateBody(
-			`⚠️ *Command Approval Required*\n\n\`\`\`\n${cmdPreview}\n\`\`\`\n\nReason: ${description}`,
+			`⚠️ *Command Approval Required*\n\n\`\`\`\n${cmdPreview}\n\`\`\`\n\nReason: ${description}` +
+				(opts.smartDenied === true
+					? "\n\nSmart DENY: owner override applies to this one operation only."
+					: ""),
 		);
 		const interactive = {
 			type: "button",
@@ -1188,6 +1273,59 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 	}
 
 	/**
+	 * Render a 3-button slash-command confirmation prompt (send_slash_confirm
+	 * @~903 parity; mirrors Telegram's Approve Once / Always / Cancel card).
+	 * Button ids carry the sc:{once|always|cancel}:{confirm_id} grammar so taps
+	 * route through THE one kit router; on a successful POST the confirm id is
+	 * registered into slashConfirms for the inbound resolver. The caller owns
+	 * the confirm_id (slash-command handler) and it must satisfy the kit
+	 * callback grammar (short numeric ids — 64-byte callback_data cap).
+	 */
+	async sendSlashConfirm(
+		chatId: string,
+		title: string,
+		message: string,
+		sessionKey: string,
+		confirmId: string | number,
+		opts: { replyToMessageId?: string | undefined } = {},
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		const bodyText = this.truncateBody(`*${title}*\n\n${message}`);
+		const interactive = {
+			type: "button",
+			body: { text: bodyText },
+			action: {
+				buttons: [
+					{
+						type: "reply",
+						reply: {
+							id: `sc:once:${confirmId}`,
+							title: "✅ Approve Once",
+						},
+					},
+					{
+						type: "reply",
+						reply: { id: `sc:always:${confirmId}`, title: "🔒 Always" },
+					},
+					{
+						type: "reply",
+						reply: { id: `sc:cancel:${confirmId}`, title: "❌ Cancel" },
+					},
+				],
+			},
+		};
+		const result = await this.postInteractive(
+			chatId,
+			interactive,
+			opts.replyToMessageId,
+		);
+		if (result.success) {
+			this.registerPending(this.slashConfirms, confirmId, sessionKey);
+		}
+		return result;
+	}
+
+	/**
 	 * Clarify prompt: ≤3 choices render quick-reply buttons; more render a list
 	 * sheet (≤10 rows + the ✏️ Other escape hatch); zero choices degrade to a
 	 * plain question (gateway captures the next message).
@@ -1202,7 +1340,10 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 	): Promise<SendResult> {
 		this.throwIfDisabled();
 		if (choices.length === 0) {
-			return this.send(chatId, `❓ ${question}`, undefined, {});
+			// Zero-choice clarify passes reply context through (send_clarify
+			// parity: reply_to rides the plain question so context.message_id is
+			// set where Hermes sets it).
+			return this.send(chatId, `❓ ${question}`, opts.replyToMessageId, {});
 		}
 		const list = choices
 			.slice(0, MAX_LIST_ROWS)
@@ -1279,12 +1420,14 @@ export class WaCloudAdapter extends BasePlatformAdapter {
 		if (!url) return null;
 		const bytesResp = await this.transport.fetchMediaBytes(url);
 		if (bytesResp.status !== 200) return null;
-		const mime = metaMime || hintMime || "";
-		// Parameterized media types ("audio/ogg; codecs=opus") resolve on their
-		// bare type — Python mimetypes.guess_type ignores parameters, so the
-		// override map must too (_ext_for_mime parity).
-		const bareMime = mime.split(";")[0]?.trim() ?? "";
-		const ext = MIME_EXTENSION_OVERRIDES[bareMime] ?? ".bin";
+		// Extension precedence (_download_media_to_cache @~1388 parity): the
+		// WEBHOOK inner mime hint resolves FIRST; the Graph-metadata mime only
+		// backfills when the hint is blank/unresolvable, then '.bin'. Divergent
+		// mimes must not cache under the metadata-derived extension.
+		const ext =
+			(hintMime !== undefined ? tryResolveMediaExtension(hintMime) : null) ??
+			(metaMime !== undefined ? tryResolveMediaExtension(metaMime) : null) ??
+			".bin";
 		mkdirSync(this.mediaCacheDir, { recursive: true });
 		const outPath = join(this.mediaCacheDir, `${id}${ext}`);
 		writeFileSync(outPath, bytesResp.bytes);

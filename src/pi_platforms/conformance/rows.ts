@@ -238,8 +238,14 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 			);
 			expectTrue(sends.length > 1, "long content splits");
 			sends.forEach((op, idx) => {
+				// MarkdownV2 dialects escape the kit-appended chunk marker on the
+				// wire (Hermes telegram format_message output: "(1/2)" ships as
+				// "\\(1/2\\)" so Telegram cannot reject the chunk). Normalize the
+				// escaped form before matching the (i/n) invariant — raw-dialect
+				// platforms are unaffected (their bytes carry no backslashes).
+				const tail = op.content.slice(-24).replace(/\\([()])/g, "$1");
 				expectTrue(
-					op.content.endsWith(`(${idx + 1}/${sends.length})`),
+					tail.endsWith(`(${idx + 1}/${sends.length})`),
 					`chunk ${idx + 1} carries (i/n): …${JSON.stringify(op.content.slice(-12))}`,
 				);
 			});
@@ -340,6 +346,9 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 					editIntervalMs: 0,
 					bufferThreshold: 1,
 				},
+				// Turn identity rides the run like production (_metadata_for_send:
+				// thread anchors are REQUIRED by anchor-gated native streams).
+				{ reply_to_message_id: "turn-m" },
 			);
 			const runP = consumer.run();
 			// Pace deltas across drain batches — real streams arrive over time;

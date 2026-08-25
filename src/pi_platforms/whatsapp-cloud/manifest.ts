@@ -100,6 +100,76 @@ export const MIME_EXTENSION_OVERRIDES: Readonly<Record<string, string>> =
 	});
 
 /**
+ * mimetypes.guess_extension-equivalent fallback table (whatsapp_cloud.py:
+ * _ext_for_mime chain step 2: "overrides → mimetypes → None, never the shared
+ * default table"). Transcribed from Python 3.12's stdlib mimetypes database
+ * for the media types Meta actually delivers; entries where guess_extension
+ * returns None (audio/wav, application/javascript) are omitted so they fall
+ * through to the '.bin' terminal fallback exactly like the source's None.
+ */
+export const MIMETYPES_EXTENSION_FALLBACK: Readonly<Record<string, string>> =
+	Object.freeze({
+		"image/png": ".png",
+		"image/gif": ".gif",
+		"image/webp": ".webp",
+		"image/bmp": ".bmp",
+		"image/tiff": ".tiff",
+		"image/svg+xml": ".svg",
+		"video/mp4": ".mp4",
+		"video/webm": ".webm",
+		"video/quicktime": ".mov",
+		"video/x-msvideo": ".avi",
+		"video/mpeg": ".mpeg",
+		"audio/mpeg": ".mp3",
+		"audio/x-wav": ".wav",
+		"audio/aac": ".aac",
+		"audio/flac": ".flac",
+		"application/pdf": ".pdf",
+		"application/json": ".json",
+		"application/zip": ".zip",
+		"application/gzip": ".gz",
+		"application/x-tar": ".tar",
+		"application/msword": ".doc",
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+			".docx",
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+			".xlsx",
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation":
+			".pptx",
+		"text/plain": ".txt",
+		"text/html": ".html",
+		"text/csv": ".csv",
+		"text/css": ".css",
+		"application/rtf": ".rtf",
+	});
+
+/**
+ * THE extension resolution chain (_ext_for_mime Optional[str] parity):
+ * parameterized media types resolve on their bare type (Python mimetypes
+ * ignores parameters), then override map → mimetypes-equivalent table; a
+ * blank or unresolvable mime yields null so callers chain fallbacks BEFORE
+ * the '.bin' terminal default (_download_media_to_cache: "ext = ext_hint; if
+ * not ext and mime: ext = _ext_for_mime(mime); if not ext: ext = '.bin'").
+ */
+export function tryResolveMediaExtension(mime: string): string | null {
+	const bareMime = mime.split(";")[0]?.trim().toLowerCase() ?? "";
+	if (!bareMime) return null;
+	return (
+		MIME_EXTENSION_OVERRIDES[bareMime] ??
+		MIMETYPES_EXTENSION_FALLBACK[bareMime] ??
+		null
+	);
+}
+
+/**
+ * Terminal extension resolution: tryResolveMediaExtension with the '.bin'
+ * default folded in (_ext_for_mime + "if not ext: ext = '.bin'" parity).
+ */
+export function resolveMediaExtension(mime: string): string {
+	return tryResolveMediaExtension(mime) ?? ".bin";
+}
+
+/**
  * Media kinds that accept a caption on the message block (_send_media:
  * caption on image/video/document only; filename on document only).
  */
@@ -111,6 +181,46 @@ export const CAPTION_KINDS: readonly WaMediaKind[] = [
 
 /** Defense-in-depth media-id guard (_download_media_to_cache). */
 export const MEDIA_ID_SAFE_RE = /^[A-Za-z0-9._-]+$/;
+
+// ── voice-note lane ──────────────────────────────────────────────────────────
+
+/**
+ * whatsapp_cloud.py:send_voice — WhatsApp renders ``audio/ogg; codecs=opus``
+ * as the native green voice-note bubble; other audio types (MP3, AAC) appear
+ * as generic audio attachments. The voice lane converts local MP3 to this
+ * mime pre-upload and falls back to audio/mpeg when conversion is unavailable.
+ */
+export const VOICE_NOTE_MIME = "audio/ogg; codecs=opus";
+
+// ── inbound document text injection ─────────────────────────────────────────
+
+/**
+ * Text-readable document extensions whose file content injects INLINE into
+ * the inbound event body (_build_message_event_from_cloud @~2020): the agent
+ * reasons about the attachment without a separate read_file roundtrip. Same
+ * heuristic as the Baileys bridge.
+ */
+export const TEXT_INJECT_EXTENSIONS: ReadonlySet<string> = new Set([
+	".txt",
+	".md",
+	".csv",
+	".json",
+	".xml",
+	".yaml",
+	".yml",
+	".log",
+	".py",
+	".js",
+	".ts",
+	".html",
+	".css",
+]);
+
+/**
+ * Injection size cap (@~2024 "100KB cap matches Telegram/Discord/Slack"):
+ * larger documents keep the metadata-only '[Document: fname]' body.
+ */
+export const MAX_TEXT_INJECT_BYTES = 100 * 1024;
 
 // ── text plane ───────────────────────────────────────────────────────────────
 

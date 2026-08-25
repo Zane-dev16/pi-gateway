@@ -26,6 +26,17 @@ export const EMAIL_SMTP_PORT_DEFAULT = 587;
 export const EMAIL_SMTP_IMPLICIT_TLS_PORT = 465;
 
 /**
+ * adapter.py:_send_imap_id — RFC 2971 IMAP ID identity argument, BYTE-IDENTICAL
+ * to the vendor f-string with hermes_cli.__version__ = "0.20.5" (the pinned
+ * version in the READ-ONLY reference tree). Issued after EVERY login: required
+ * by 163/NetEase or every UID SEARCH/FETCH returns ``BYE Unsafe Login``.
+ */
+export const EMAIL_IMAP_ID_ARGUMENT =
+	'("name" "hermes-agent" "version" "0.20.5" ' +
+	'"vendor" "NousResearch" ' +
+	'"support-email" "noreply@nousresearch.com")';
+
+/**
  * adapter.py:_NOREPLY_PATTERNS — automated senders are silently ignored.
  * Substring match against the lowercased envelope address.
  */
@@ -125,6 +136,13 @@ export const EMAIL_PLUGIN_MANIFEST: PluginManifest = {
 		{
 			name: "EMAIL_ALLOW_ALL_USERS",
 			description: "Accept any sender (dev only)",
+			password: false,
+		},
+		{
+			name: "GATEWAY_ALLOW_ALL_USERS",
+			// adapter.py:_dispatch_message — gateway-wide open-access opt-in,
+			// honored when EMAIL_ALLOWED_USERS is unset (feishu parity).
+			description: "Gateway-wide open-access opt-in (dev only)",
 			password: false,
 		},
 		{

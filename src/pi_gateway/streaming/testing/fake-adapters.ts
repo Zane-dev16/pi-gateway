@@ -39,6 +39,8 @@ export type WireOp =
 			content: string;
 			finalize?: boolean | undefined;
 			metadata?: MetadataType | undefined;
+			/** True when the transport FORCED this attempt to fail (observability). */
+			failed?: boolean | undefined;
 			platform?: string | undefined;
 	  }
 	| {
@@ -50,7 +52,8 @@ export type WireOp =
 			/** Sealing frames carry the stream's message identity. */
 			messageId?: string | undefined;
 			metadata?: MetadataType | undefined;
-	  };
+	  }
+	| { op: "delete"; chatId: string; messageId: string };
 
 export type SendOp = Extract<WireOp, { op: "send" }>;
 export type EditOp = Extract<WireOp, { op: "edit" }>;
@@ -65,6 +68,8 @@ abstract class FakeAdapterBase {
 	// Connector-side knobs (model transport conditions).
 	failSeals = false;
 	failDraftFrames = false;
+	/** Force progressive editMessage failures (fallback-final contracts). */
+	failEdits = false;
 
 	// Probe observability for latch assertions.
 	supportsProbeCalls = 0;
@@ -104,13 +109,27 @@ abstract class FakeAdapterBase {
 				opts,
 				platform,
 			): Promise<SendResult> => {
+				if (this.failEdits) {
+					// Record the ATTEMPT so strike-count contracts are observable.
+					await this.pushOp({
+						op: "edit",
+						chatId,
+						messageId,
+						content,
+						finalize: opts?.finalize,
+						metadata: opts?.metadata,
+						failed: true,
+						platform,
+					});
+					return { success: false, error: "forced edit failure" };
+				}
 				await this.pushOp({
 					op: "edit",
 					chatId,
 					messageId,
 					content,
 					finalize: opts?.finalize,
-					metadata: undefined,
+					metadata: opts?.metadata,
 					platform,
 				});
 				return { success: true, messageId };
@@ -220,14 +239,19 @@ abstract class FakeAdapterBase {
 		content: string,
 		opts?: EditOptions | undefined,
 	): Promise<SendResult> {
-		const res = await this.transport().transmitEdit(
+		return this.transport().transmitEdit(
 			chatId,
 			messageId,
 			content,
-			{ finalize: opts?.finalize === true },
+			{ finalize: opts?.finalize === true, metadata: opts?.metadata },
 			undefined,
 		);
-		return res;
+	}
+
+	/** Best-effort retraction used by silence-marker suppression. */
+	async deleteMessage(chatId: string, messageId: string): Promise<boolean> {
+		await this.pushOp({ op: "delete", chatId, messageId });
+		return true;
 	}
 
 	// ── test observability (event-based sync; no sleeps) ──────────────────

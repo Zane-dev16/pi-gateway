@@ -77,6 +77,10 @@ function contentPayload(
 	return {};
 }
 
+/**
+ * _parse_user (:99): reads ONLY user_name — payloads carrying a bare `name`
+ * field yield an EMPTY user_name (single-field read parity).
+ */
 function parseUser(raw: unknown): MeetingInviteUser {
 	const d = asDict(raw);
 	const ids = asDict(d["id"]);
@@ -84,7 +88,7 @@ function parseUser(raw: unknown): MeetingInviteUser {
 		openId: String(d["open_id"] ?? ids["open_id"] ?? ""),
 		userId: String(d["user_id"] ?? ids["user_id"] ?? ""),
 		unionId: String(d["union_id"] ?? ids["union_id"] ?? ""),
-		userName: String(d["user_name"] ?? d["name"] ?? ""),
+		userName: String(d["user_name"] ?? ""),
 	};
 }
 
@@ -102,7 +106,9 @@ function parseMeeting(raw: unknown): MeetingInviteMeeting {
 
 /**
  * The parsing chain (:117). Returns null unless inviter AND meeting exist AND
- * meeting_no is non-empty.
+ * meeting_no is non-empty. The event id rides the ENVELOPE ROOT header
+ * (`root.header.event_id` :131) — the caller passes the full frame, not the
+ * bare inner event body.
  */
 export function parseMeetingInvitedEvent(
 	data: Record<string, unknown> | undefined,
@@ -110,8 +116,8 @@ export function parseMeetingInvitedEvent(
 	if (data === undefined || data === null) return null;
 	let event = asDict(data["event"]);
 	if (Object.keys(event).length === 0) event = asDict(data);
-	const header = asDict(event["header"]);
-	const eventId = String(header["event_id"] ?? data["event_id"] ?? "");
+	// root.header.event_id (:131/:159 — vc_invite:{event_id} dedup key input).
+	const eventId = String(asDict(data["header"])["event_id"] ?? "");
 	const merged = { ...asDict(data), ...event };
 	const content = contentPayload(merged);
 	const withContent =
@@ -119,10 +125,11 @@ export function parseMeetingInvitedEvent(
 
 	const inviter = parseUser(withContent["inviter"]);
 	const meeting = parseMeeting(withContent["meeting"]);
+	// Validation parity (:141): inviter AND meeting dicts must EXIST and
+	// meeting_no must be non-empty. An idless-but-present inviter parses —
+	// it fails LATER in the handler's inviter check (after dedup).
 	if (
-		(inviter.openId === "" &&
-			inviter.userId === "" &&
-			inviter.unionId === "") ||
+		Object.keys(asDict(withContent["inviter"])).length === 0 ||
 		Object.keys(asDict(withContent["meeting"])).length === 0 ||
 		meeting.meetingNo === ""
 	)
@@ -180,9 +187,9 @@ export function buildMeetingInviteMessageEvent(
 		platform,
 		chatType: "dm",
 		userId: p.inviter.openId || p.inviter.userId,
-		...(p.inviter.unionId !== "" ? { userIdAlt: p.inviter.unionId } : {}),
+		...(p.inviter.unionId === "" ? {} : { userIdAlt: p.inviter.unionId }),
 		chatId: p.inviter.openId,
-		...(p.inviter.userName !== "" ? { chatName: p.inviter.userName } : {}),
+		...(p.inviter.userName === "" ? {} : { chatName: p.inviter.userName }),
 	};
 	const prompt = buildMeetingInvitePrompt(p);
 	return {

@@ -14,7 +14,16 @@
 //     (webhookEventId dedup → self-filter → allowlist gate) → 200 "ok"
 //   - Reply-token-first egress with Push fallback (_send_text_chunks):
 //     tokens are STASHED per chat at inbound (TTL 50 s under the ~60 s vendor
-//     TTL) and CONSUMED single-use; reply rejection falls back to Push once
+//     TTL) and CONSUMED single-use; reply rejection falls back to Push once.
+//     EVERY text lane lands as ONE Reply/Push call of ≤5 bubbles with an
+//     ellipsis tail (split_for_line parity — splits_long_messages=True
+//     inheritance means the ADAPTER owns native splitting; no lossless
+//     kit-chunked multi-push)
+//   - system busy-acks (⚡ Interrupting / ⏳ Queued / ⏩ Steered / 💾) BYPASS
+//     the pending-postback cache so they reach the user while a button is
+//     outstanding (_is_system_bypass parity @656-667/:1185-1188, PR #18153)
+//   - send_typing re-fires the loading indicator from the processing
+//     heartbeat (send_typing parity @1240), not just once at inbound receipt
 //   - slow-LLM postback state machine (RequestCache PENDING → READY →
 //     DELIVERED / ERROR): the source fires the button from a 45 s typing
 //     timer; the port exposes the SAME transition as a deterministic method
@@ -28,6 +37,8 @@
 // cross-imports.
 
 import { createHmac } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
 	BasePlatformAdapter,
@@ -59,9 +70,13 @@ import {
 	LINE_DEFAULT_PORT,
 	LINE_DEFAULT_WEBHOOK_PATH,
 	LINE_HEALTH_PATH_SUFFIX,
+	LINE_LOADING_MAX_SECONDS,
+	LINE_LOADING_MIN_SECONDS,
+	LINE_LOADING_STEP_SECONDS,
 	LINE_MAX_MESSAGES_PER_CALL,
 	LINE_PER_BUBBLE_CHARS,
 	LINE_PLUGIN_MANIFEST,
+	LINE_POSTBACK_DISPLAY_TEXT_CAP,
 	LINE_POSTBACK_LABEL_CAP,
 	LINE_REPLY_TOKEN_TTL_SECONDS,
 	LINE_SAFE_BUBBLE_CHARS,
@@ -115,6 +130,16 @@ export interface LineAdapterConfig {
  * OUTBOUND transport seam (adapter.py:_LineClient parity). `reply` POSTs the
  * free reply-token endpoint; `push` POSTs the metered Push endpoint. Both
  * take fully-built message objects.
+ *
+ * Optional vendor edges (same _LineClient surface):
+ *   - `loading` — POST /v2/bot/chat/loading/start (DM only; clamp helper
+ *     `clampLoadingSeconds` mirrors the source's 5..60 step-5 bound)
+ *   - `botInfo` — GET /v2/bot/info, best-effort source of our own userId for
+ *     self-echo filtering (get_bot_user_id parity; fail-open undefined)
+ *   - `fetchContent` — GET api-data.line.me/v2/bot/message/{id}/content
+ *     (Bearer); INJECTED and unexercised headlessly (probe-computed exclusion,
+ *     DEC-GCHAT-style note in the module header) — when a harness binds it,
+ *     inbound media binaries are cached and surfaced on the event.
  */
 export interface LineApiTransport {
 	reply(
@@ -127,6 +152,9 @@ export interface LineApiTransport {
 		messages: LineMessage[],
 		metadata?: Record<string, unknown>,
 	): Promise<SendResult>;
+	loading?(chatId: string, seconds: number): Promise<SendResult>;
+	botInfo?(): Promise<{ userId?: string | undefined }>;
+	fetchContent?(messageId: string): Promise<Buffer>;
 }
 
 /**
@@ -139,10 +167,96 @@ export interface LineCaptureWire {
 	transmitRich(chatId: string, content: string): Promise<SendResult>;
 }
 
-/** Wire message objects (text bubbles; media builders live beside them). */
-export interface LineMessage {
+/** Wire message objects (media builders live beside them). */
+export interface LineTextMessage {
 	type: "text";
 	text: string;
+}
+
+/** Template Buttons bubble (build_postback_button_message @~630 parity):
+ * NO top-level text — api.line.me rejects {type:'text'} + altText/template. */
+export interface LineTemplateButtonsMessage {
+	type: "template";
+	altText: string;
+	template: {
+		type: "buttons";
+		text: string;
+		actions: Array<{
+			type: "postback";
+			label: string;
+			data: string;
+			displayText: string;
+		}>;
+	};
+}
+
+/** _image_message parity (@595). */
+export interface LineImageMessage {
+	type: "image";
+	originalContentUrl: string;
+	previewImageUrl: string;
+}
+
+/** _audio_message parity (@603). */
+export interface LineAudioMessage {
+	type: "audio";
+	originalContentUrl: string;
+	duration: number;
+}
+
+/** _video_message parity (@611). */
+export interface LineVideoMessage {
+	type: "video";
+	originalContentUrl: string;
+	previewImageUrl: string;
+}
+
+export type LineMessage =
+	| LineTextMessage
+	| LineTemplateButtonsMessage
+	| LineImageMessage
+	| LineAudioMessage
+	| LineVideoMessage;
+
+/** The user-visible bubble text of any message object (template bubbles
+ * render their inner template.text; text bubbles carry it top-level). */
+export function lineBubbleText(message: LineMessage): string {
+	if (message.type === "text") return message.text;
+	if (message.type === "template") return message.template.text;
+	return "";
+}
+
+// ── outbound media builders (_image_message/_audio_message/_video_message
+//    @595-617 parity) — public HTTPS URLs are REQUIRED by the vendor; the
+//    serving seams stay injected/unexercised headlessly (documented exclusion).
+export function imageMessage(
+	originalUrl: string,
+	previewUrl?: string | undefined,
+): LineImageMessage {
+	return {
+		type: "image",
+		originalContentUrl: originalUrl,
+		previewImageUrl: previewUrl ?? originalUrl,
+	};
+}
+
+export function audioMessage(url: string, durationMs = 1000): LineAudioMessage {
+	return {
+		type: "audio",
+		originalContentUrl: url,
+		duration: Math.trunc(durationMs),
+	};
+}
+
+export function videoMessage(
+	url: string,
+	previewUrl: string,
+): LineVideoMessage {
+	return {
+		type: "video",
+		originalContentUrl: url,
+		previewImageUrl: previewUrl,
+	};
 }
 
 export interface LineWebhookAdapterOptions {
@@ -154,6 +268,13 @@ export interface LineWebhookAdapterOptions {
 	/** Conformance-harness rich probe capture (see LineCaptureWire). */
 	captureWire?: LineCaptureWire | undefined;
 	dedupCap?: number | undefined;
+	/**
+	 * Inbound media cache root — only exercised when the transport binds
+	 * `fetchContent` (injected seam; headless runs leave both unbound and
+	 * degrade to '[image]'-style placeholders exactly like the source's
+	 * failed-download path).
+	 */
+	mediaCacheDir?: string | undefined;
 }
 
 // ── markdown stripping, URL-preserving (@216-330 parity) ────────────────────
@@ -189,10 +310,10 @@ export function stripMarkdownPreservingUrls(text: string): string {
 /**
  * split_for_line parity: split into bubble-sized chunks preferring paragraph
  * > newline > space breaks; AT MOST 5 chunks — overflow truncates the final
- * chunk with an ellipsis so one Reply/Push call stays deliverable. The Pi
- * shared-row lane chunks via the kit instead (lossless, no 5-bubble cap) —
- * this function is the SOURCE-shaped splitter kept for postback-cache
- * deliveries, which must fit ONE call by contract (proposed DEC note).
+ * chunk with an ellipsis so one Reply/Push call stays deliverable. This is
+ * THE native splitter for EVERY text lane on this platform
+ * (splits_long_messages=True inheritance): dispatchBubbles applies it to the
+ * whole response so no lane ever issues a lossless kit-chunked multi-push.
  */
 export function splitForLine(
 	text: string,
@@ -229,13 +350,47 @@ export function splitForLine(
 	return chunks;
 }
 
-/** _text_message parity: hard per-bubble cap with ellipsis. */
-export function textMessage(raw: string): LineMessage {
+export function textMessage(raw: string): LineTextMessage {
 	const text =
 		raw.length > LINE_PER_BUBBLE_CHARS
 			? `${raw.slice(0, LINE_PER_BUBBLE_CHARS - 1)}…`
 			: raw;
 	return { type: "text", text };
+}
+
+/**
+ * _LineClient.loading clamp parity (@~545): "LINE caps loadingSeconds in
+ * 5-step increments, max 60" — max(5, min(60, (seconds // 5) * 5 or 5)).
+ */
+export function clampLoadingSeconds(seconds: number): number {
+	const step =
+		Math.floor(seconds / LINE_LOADING_STEP_SECONDS) * LINE_LOADING_STEP_SECONDS;
+	return Math.max(
+		LINE_LOADING_MIN_SECONDS,
+		Math.min(LINE_LOADING_MAX_SECONDS, step || LINE_LOADING_MIN_SECONDS),
+	);
+}
+
+// ── system busy-ack bypass (_SYSTEM_BYPASS_PREFIXES @656 parity) ───────────
+
+/**
+ * Prefixes the gateway uses for system busy-acks (interrupting / queued /
+ * steered / background-review summary). When the postback cache holds a
+ * PENDING entry these BYPASS it and route directly to Reply/Push so they
+ * reach the user as visible bubbles instead of being silently swallowed.
+ * From PR #18153.
+ */
+export const SYSTEM_BYPASS_PREFIXES: readonly string[] = Object.freeze([
+	"⚡ Interrupting",
+	"⏳ Queued",
+	"⏩ Steered",
+	"💾", // background-review summary
+]);
+
+/** _is_system_bypass parity (@664). */
+export function isSystemBypass(content: string): boolean {
+	if (!content) return false;
+	return SYSTEM_BYPASS_PREFIXES.some((p) => content.startsWith(p));
 }
 
 // ── slow-LLM postback cache (State/_CacheEntry/RequestCache @336-423) ───────
@@ -333,12 +488,15 @@ export class PostbackRequestCache {
 	}
 }
 
-/** build_postback_button_message parity (@~630): Template Buttons bubble. */
+/** build_postback_button_message parity (@~630): Template Buttons bubble.
+ * Wire shape is {type:'template', altText, template:{type:'buttons',text,
+ * actions}} — NO top-level text field (api.line.me rejects it). label caps
+ * at 20 while displayText caps INDEPENDENTLY at 300 (two source slices). */
 export function buildPostbackButtonMessage(
 	text: string,
 	buttonLabel: string,
 	requestId: string,
-): LineMessage & { altText: string; template: unknown } {
+): LineTemplateButtonsMessage {
 	const truncated =
 		text.length <= LINE_BUTTON_TEXT_CAP
 			? text
@@ -348,9 +506,10 @@ export function buildPostbackButtonMessage(
 			? text
 			: `${text.slice(0, LINE_BUTTON_ALT_TEXT_CAP - 3)}...`;
 	const label = buttonLabel.slice(0, LINE_POSTBACK_LABEL_CAP) || "Get answer";
+	const displayText =
+		buttonLabel.slice(0, LINE_POSTBACK_DISPLAY_TEXT_CAP) || "Get answer";
 	return {
-		type: "text",
-		text: truncated,
+		type: "template",
 		altText: alt,
 		template: {
 			type: "buttons",
@@ -363,7 +522,7 @@ export function buildPostbackButtonMessage(
 						action: "show_response",
 						request_id: requestId,
 					}),
-					displayText: label,
+					displayText,
 				},
 			],
 		},
@@ -426,6 +585,7 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 	private readonly nowFn: () => number;
 	private readonly transport: LineApiTransport | undefined;
 	private readonly captureWire: LineCaptureWire | undefined;
+	readonly mediaCacheDir: string;
 	private readonly allowAll: boolean;
 	private readonly allowedUsers: ReadonlySet<string>;
 	private readonly allowedGroups: ReadonlySet<string>;
@@ -483,6 +643,8 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 		this.nowFn = opts.nowMs ?? (() => Date.now());
 		this.transport = opts.transport;
 		this.captureWire = opts.captureWire;
+		this.mediaCacheDir =
+			opts.mediaCacheDir ?? join(process.cwd(), "platforms", "line", "media");
 		this.port = Number(config.port ?? LINE_DEFAULT_PORT);
 		this.webhookPath = normalizePath(
 			config.webhook_path ?? LINE_DEFAULT_WEBHOOK_PATH,
@@ -590,29 +752,29 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 		return this.configAccessToken;
 	}
 
-	/**
-	 * Per-chat length descriptor (§6.3/A15 relay-shaped override point): the
-	 * harness's utf16-marked chats return budget AND unit TOGETHER; production
-	 * chats return undefined ⇒ manifest default (LINE_SAFE_BUBBLE_CHARS).
-	 */
-	protected override chatDescriptorFor(chatId: string):
-		| {
-				maxMessageLength?: number | undefined;
-				lenUnit?: import("../kit/length-policy.js").LengthUnit | undefined;
-		  }
-		| undefined {
-		if (chatId.includes("utf16")) {
-			return { maxMessageLength: 30, lenUnit: "utf16" };
-		}
-		return undefined;
-	}
+	// NOTE: no chatDescriptorFor override — Hermes' LineAdapter has NO
+	// per-chat length budgets (split_for_line uses the fixed
+	// LINE_SAFE_BUBBLE_CHARS bubble budget for every chat), and with
+	// splitsLongMessages=True the base kit split never runs anyway.
 
 	get channelSecret(): string | undefined {
 		return this.configChannelSecret;
 	}
 
-	/** Bot identity for self-filtering (get_bot_user_id parity; injected). */
-	readonly botUserId: string | undefined = undefined;
+	/** Bot identity for self-filtering (get_bot_user_id parity). Populated
+	 * best-effort during connect() via the transport's botInfo() edge; a
+	 * failed/absent lookup fails OPEN as undefined (source parity). */
+	private botUserIdValue: string | undefined = undefined;
+	get botUserId(): string | undefined {
+		return this.botUserIdValue;
+	}
+
+	/** Observability: inbound media binaries cached through fetchContent. */
+	readonly inboundMediaLog: Array<{
+		chatId: string;
+		urls: string[];
+		types: string[];
+	}> = [];
 
 	// ── webhook signature verification (verify_line_signature parity) ────────
 
@@ -811,9 +973,13 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 			});
 		}
 
-		// Media inbound downloads binaries from api-data.line.me — that seam is
-		// INJECTED and unexercised headlessly (probe-computed exclusion); the
-		// text placeholder renders exactly like the source's failed-download path.
+		// Media inbound downloads binaries from api-data.line.me via the
+		// INJECTED fetchContent seam (probe-computed exclusion — headless runs
+		// leave it unbound and degrade to the source's failed-download
+		// placeholder). When bound, bytes are cached under mediaCacheDir with
+		// the source's per-type extension map and surfaced as media_urls.
+		const mediaUrls: string[] = [];
+		const mediaTypes: string[] = [];
 		let text: string;
 		if (msgType === "text") {
 			text = String(msg["text"] ?? "");
@@ -834,8 +1000,30 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 			msgType === "file"
 		) {
 			text = `[${msgType}]`;
+			const cached = await this.downloadInboundMedia(
+				messageId,
+				msgType,
+				String(msg["fileName"] ?? msg["file_name"] ?? "") || undefined,
+			);
+			if (cached !== null) {
+				mediaUrls.push(cached.path);
+				mediaTypes.push(cached.mime);
+				this.inboundMediaLog.push({
+					chatId,
+					urls: [cached.path],
+					types: [cached.mime],
+				});
+			}
 		} else {
 			text = `[unsupported message type: ${msgType}]`;
+		}
+
+		// Best-effort loading indicator — DM ONLY (LINE rejects it for groups/
+		// rooms; _handle_message_event fires it right after text resolution).
+		if (chatType === "dm" && chatId.startsWith("U")) {
+			void this.invokeLoading(chatId).catch(() => {
+				/* best-effort; never raises */
+			});
 		}
 
 		this.counters.accepted += 1;
@@ -843,6 +1031,8 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 			messageType: MESSAGE_TYPES[msgType] ?? "text",
 			text,
 			messageId,
+			...(mediaUrls.length > 0 ? { mediaUrls } : {}),
+			...(mediaTypes.length > 0 ? { mediaTypes } : {}),
 			source: {
 				platform: LINE_PLUGIN_MANIFEST.name,
 				chatType: chatType === "group" || chatType === "room" ? "group" : "dm",
@@ -853,6 +1043,80 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 		};
 		this.dispatchedEvents.push({ messageId, text });
 		await this.deliverInbound(incoming, `line:${chatId}`);
+	}
+
+	/**
+	 * _LineClient.loading parity: U-prefix guard (LINE rejects the indicator
+	 * outside DMs) + clamp, then ONE best-effort POST. Absent transport ⇒
+	 * silent skip; failures never raise.
+	 */
+	private async invokeLoading(chatId: string): Promise<void> {
+		if (!chatId || !chatId.startsWith("U")) return;
+		if (this.transport?.loading === undefined) return;
+		await this.transport.loading(chatId, clampLoadingSeconds(60));
+	}
+
+	/**
+	 * send_typing parity (@1240): re-fire the loading-animation indicator so
+	 * long runs keep a refreshed indicator instead of the single inbound-receipt
+	 * beat (the source's base _keep_typing heartbeat calls this every beat
+	 * while the turn processes). invokeLoading carries the DM-only U-guard,
+	 * the 5..60 step-5 clamp, and best-effort swallow; absent transport is a
+	 * silent skip.
+	 */
+	async sendTyping(chatId: string): Promise<void> {
+		await this.invokeLoading(chatId);
+	}
+
+	/**
+	 * _download_media parity (@1130): fetchContent bytes → cached file under
+	 * mediaCacheDir with the source's per-type extension map. Returns null on
+	 * ANY failure (unbound seam included) — the caller keeps the placeholder
+	 * text exactly like the source's failed-download path.
+	 */
+	private async downloadInboundMedia(
+		messageId: string,
+		msgType: string,
+		filenameHint?: string | undefined,
+	): Promise<{ path: string; mime: string } | null> {
+		if (!messageId || this.transport?.fetchContent === undefined) return null;
+		const extMap: Record<string, string> = {
+			image: ".jpg",
+			audio: ".m4a",
+			video: ".mp4",
+			file: ".bin",
+		};
+		const ext = extMap[msgType] ?? ".bin";
+		let data: Buffer;
+		try {
+			data = await this.transport.fetchContent(messageId);
+		} catch {
+			return null;
+		}
+		try {
+			mkdirSync(this.mediaCacheDir, { recursive: true });
+			if (msgType === "image") {
+				const path = join(this.mediaCacheDir, `${messageId}${ext}`);
+				writeFileSync(path, data);
+				return { path, mime: "image/jpeg" };
+			}
+			if (msgType === "audio") {
+				const path = join(this.mediaCacheDir, `${messageId}${ext}`);
+				writeFileSync(path, data);
+				return { path, mime: "audio/mp4" };
+			}
+			if (msgType === "video") {
+				const path = join(this.mediaCacheDir, `${messageId}${ext}`);
+				writeFileSync(path, data);
+				return { path, mime: "video/mp4" };
+			}
+			const name = filenameHint || `line_file${ext}`;
+			const path = join(this.mediaCacheDir, name);
+			writeFileSync(path, data);
+			return { path, mime: "application/octet-stream" };
+		} catch {
+			return null;
+		}
 	}
 
 	// ── postback events (@1071 parity) ───────────────────────────────────────
@@ -965,6 +1229,12 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 		replyTo?: string | undefined,
 		metadata?: Metadata | undefined,
 	): Promise<SendResult> {
+		// System busy-acks BYPASS the postback cache and route straight to
+		// Reply/Push so they reach the user as visible bubbles even while a
+		// button is outstanding (_is_system_bypass parity @1185-1188).
+		if (isSystemBypass(content)) {
+			return super.send(chatId, content, replyTo, metadata);
+		}
 		// A PENDING postback slot routes the response into the cache — the user
 		// fetches it via tap with a FRESH free reply token (no wire call here).
 		const pendingRid = this.pendingButtons.get(chatId);
@@ -976,14 +1246,16 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 			return { success: true, messageId: pendingRid };
 		}
 		// Everything else rides DOOR 1 (the audited chokepoint) like every
-		// adapter — kit chunking + ladder + retry live in the base pipeline.
+		// adapter — formatting ladder + §6.1 retry live in the base pipeline;
+		// splitting is the ADAPTER's native split_for_line (dispatchBubbles).
 		return super.send(chatId, content, replyTo, metadata);
 	}
 
 	/**
-	 * ONE wire piece: convert (unless the §6.1 fallback envelope), split into
-	 * bubbles, then ride the Reply/Push ladder. Called BY the base pipeline
-	 * per kit-chunked piece — never re-strip prefixed fallback bytes.
+	 * THE native splitter's wire hop (split_for_line + the [:5] slice :1210):
+	 * ≤5 ellipsis-capped text bubbles ride ONE Reply/Push call — reply token
+	 * first, ONE push fallback on rejection. Never more than one API call per
+	 * piece reaches the wire on this platform.
 	 */
 	private async dispatchBubbles(
 		chatId: string,
@@ -1063,6 +1335,16 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 				"[line] Refusing to start without LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET configured",
 			);
 			return false;
+		}
+		// Best-effort bot identity fetch for self-echo filtering
+		// (get_bot_user_id parity): failure fails OPEN as undefined — "the cost
+		// is minor (LINE doesn't echo every message) and offline tests must not
+		// block connect".
+		try {
+			const info = await this.transport?.botInfo?.();
+			if (info?.userId) this.botUserIdValue = info.userId;
+		} catch {
+			/* fail-open */
 		}
 		return true;
 	}
@@ -1160,11 +1442,11 @@ export class LineWebhookAdapter extends BasePlatformAdapter {
 	}
 
 	/**
-	 * DOOR transport — one kit-chunked piece per call. Content converts to
-	 * LINE's plain dialect FIRST (URL-preserving markdown strip) except the
-	 * §6.1 plain-text fallback envelope, which carries ORIGINAL chunk bytes by
-	 * contract. The chunk then rides ONE API call: reply-first with push
-	 * fallback (dispatchBubbles).
+	 * DOOR transport — ONE Reply/Push call (split_for_line parity). Content
+	 * converts to LINE's plain dialect FIRST (URL-preserving markdown strip)
+	 * except the §6.1 plain-text fallback envelope, which carries ORIGINAL
+	 * chunk bytes by contract. dispatchBubbles then caps the response at ≤5
+	 * ellipsis-truncated bubbles riding reply-first-with-push-fallback ONCE.
 	 */
 	protected override async wireSend(
 		chatId: string,

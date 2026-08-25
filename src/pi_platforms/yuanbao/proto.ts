@@ -13,6 +13,11 @@
 //     {uid=1,source=2,token=3}, device_info=3{app_version=1,os=2,instance_id=10,
 //     bot_version=24}, env_name=5}
 //   yuanbao_proto.py:encode_send_c2c_message / encode_send_group_message
+//   yuanbao_proto.py:encode_get_group_member_list / decode_get_group_member_list_rsp
+//     — GetGroupMemberListReq{group_code=1, offset=2, limit=3} wrapped via
+//     encode_biz_msg(method="get_group_member_list"); Rsp{code=1, message=2,
+//     members=3 repeated MemberInfo{user_id=1,nickname=2,role=3,join_time=4,
+//     name_card=5}, next_offset=4, is_complete=5}
 //   yuanbao_proto.py:decode_inbound_push — InboundMessagePush fields 1..20
 
 export const WT_VARINT = 0;
@@ -678,6 +683,111 @@ export function encodeSendGroupHeartbeat(
 		`hb_grp_${nextSeqNo()}`,
 		buf,
 	);
+}
+
+// ── get_group_member_list ───────────────────────────────────────────────────
+
+export interface GroupMemberInfo {
+	user_id: string;
+	nickname: string;
+	/** 0 = member, 1 = admin, 2 = owner. */
+	role: number;
+	join_time: number;
+	/** Group card (group nickname). */
+	name_card: string;
+}
+
+export interface GroupMemberListResult {
+	code: number;
+	message: string;
+	members: GroupMemberInfo[];
+	next_offset: number;
+	is_complete: boolean;
+}
+
+/** GetGroupMemberListReq → ConnMsg bytes
+ * (yuanbao_proto.py:encode_get_group_member_list). */
+export function encodeGetGroupMemberList(
+	groupCode: string,
+	offset = 0,
+	limit = 200,
+): Uint8Array {
+	const parts: Uint8Array[] = [encField(1, WT_LEN, encString(groupCode))];
+	if (offset !== 0) parts.push(encField(2, WT_VARINT, encodeVarint(offset)));
+	parts.push(encField(3, WT_VARINT, encodeVarint(limit)));
+	const reqId = `gml_${nextSeqNo()}`;
+	return encodeBizMsg(BIZ_PKG, "get_group_member_list", reqId, concat(parts));
+}
+
+export function decodeGetGroupMemberListReq(data: Uint8Array): {
+	groupCode: string;
+	offset: number;
+	limit: number;
+} {
+	const d = fieldsToDict(parseFields(data));
+	return {
+		groupCode: getString(d, 1),
+		offset: getVarint(d, 2),
+		limit: getVarint(d, 3, 200),
+	};
+}
+
+/** GetGroupMemberListRsp biz payload decode; null on parse failure
+ * (yuanbao_proto.py:decode_get_group_member_list_rsp). Fields absent on the
+ * wire normalize to ""/0 exactly like the reference's per-field defaults. */
+export function decodeGetGroupMemberListRsp(
+	data: Uint8Array,
+): GroupMemberListResult | null {
+	try {
+		const d = fieldsToDict(parseFields(data));
+		const members = getRepeatedBytes(d, 3).map((b) => {
+			const md = fieldsToDict(parseFields(b));
+			return {
+				user_id: getString(md, 1),
+				nickname: getString(md, 2),
+				role: getVarint(md, 3),
+				join_time: getVarint(md, 4),
+				name_card: getString(md, 5),
+			};
+		});
+		return {
+			code: getVarint(d, 1),
+			message: getString(d, 2),
+			members,
+			next_offset: getVarint(d, 4),
+			is_complete: getVarint(d, 5) !== 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Fixture-side encoder mirroring decodeGetGroupMemberListRsp's field map:
+ * zero-valued/empty members are omitted from the wire exactly as the decoder
+ * normalizes them back (byte-faithful round-trip for populated entries). */
+export function encodeGetGroupMemberListRspFixture(
+	result: GroupMemberListResult,
+): Uint8Array {
+	const parts: Uint8Array[] = [];
+	if (result.code !== 0)
+		parts.push(encField(1, WT_VARINT, encodeVarint(result.code)));
+	if (result.message !== "")
+		parts.push(encField(2, WT_LEN, encString(result.message)));
+	for (const m of result.members) {
+		const mp: Uint8Array[] = [];
+		if (m.user_id !== "") mp.push(encField(1, WT_LEN, encString(m.user_id)));
+		if (m.nickname !== "") mp.push(encField(2, WT_LEN, encString(m.nickname)));
+		if (m.role !== 0) mp.push(encField(3, WT_VARINT, encodeVarint(m.role)));
+		if (m.join_time !== 0)
+			mp.push(encField(4, WT_VARINT, encodeVarint(m.join_time)));
+		if (m.name_card !== "")
+			mp.push(encField(5, WT_LEN, encString(m.name_card)));
+		parts.push(encField(3, WT_LEN, encBytes(concat(mp))));
+	}
+	if (result.next_offset !== 0)
+		parts.push(encField(4, WT_VARINT, encodeVarint(result.next_offset)));
+	if (result.is_complete) parts.push(encField(5, WT_VARINT, encodeVarint(1)));
+	return concat(parts);
 }
 
 // ── inbound push decode ─────────────────────────────────────────────────────

@@ -67,6 +67,8 @@ export function makeEmailWorld(
 		withSecret?: boolean | undefined;
 		requireAuthenticatedSender?: boolean | undefined;
 		allowAllUsers?: boolean | undefined;
+		gatewayAllowAllUsers?: boolean | undefined;
+		unsetAllowedUsers?: boolean | undefined;
 	} = {},
 ): EmailWorld {
 	const clock = opts.clock ?? new AutoAdvanceClock();
@@ -85,6 +87,12 @@ export function makeEmailWorld(
 		requireAuthenticatedSender: opts.requireAuthenticatedSender ?? false,
 		...(opts.allowAllUsers !== undefined
 			? { allowAllUsers: opts.allowAllUsers }
+			: {}),
+		...(opts.gatewayAllowAllUsers !== undefined
+			? { gatewayAllowAllUsers: opts.gatewayAllowAllUsers }
+			: {}),
+		...(opts.unsetAllowedUsers !== undefined
+			? { unsetAllowedUsers: opts.unsetAllowedUsers }
 			: {}),
 	});
 

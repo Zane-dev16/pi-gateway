@@ -128,7 +128,7 @@ export function normalizeBangCommand(
  * adapter.py:_OUTBOUND_MENTION_RE shape — @user:server pills in outbound text
  * are collected into `m.mentions.user_ids` (MSC3952), deduplicated.
  * (Ported as the conservative MXID-shaped subset; displayname pills are NOT
- * linkified here because the HTML renderer is a documented exclusion.)
+ * linkified by the conservative matcher.)
  */
 export function extractOutboundMentionUserIds(text: string): string[] {
 	const seen = new Set<string>();
@@ -144,26 +144,206 @@ export function extractOutboundMentionUserIds(text: string): string[] {
 }
 
 /**
- * adapter.py:_build_text_message_content builds `{msgtype, body,
- * m.mentions?, format?, formatted_body?}`. The markdown→HTML renderer behind
- * `formatted_body` is a DOCUMENTED EXCLUSION of this port (see report);
- * outbound payloads carry the structured body + mention metadata only.
+ * adapter.py:_build_text_message_content builds the FULL vendor event
+ * content `{msgtype, body, m.mentions?, format?, formatted_body?}` —
+ * mentions ride MSC3952 INSIDE the content dict, and the markdown→HTML
+ * renderer feeds format/formatted_body whenever rendering differs from the
+ * plain body (_markdown_to_html regex-fallback parity).
  */
-export interface MatrixOutboundContent {
-	msgtype: string;
-	body: string;
-	mentionUserIds: string[];
+export type MatrixOutboundContent = Record<string, unknown>;
+
+// ── markdown → org.matrix.custom.html (adapter.py:_markdown_to_html_fallback)
+//    The dependency-free REGEX FALLBACK path is the ported truth; it handles
+//    fenced code, inline code, links, hr, headers, blockquotes, lists, and
+//    the inline emphasis family with the same output shape.
+
+function htmlEscape(text: string): string {
+	return text
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;");
+}
+
+/** adapter.py:_pre_sanitize_matrix_markdown — strip unsafe raw HTML first. */
+function preSanitizeMatrixMarkdown(text: string): string {
+	let out = text.replace(
+		/<\s*(script|style)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
+		"",
+	);
+	out = out.replace(
+		/\s+on[a-z0-9_-]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+		"",
+	);
+	return out;
+}
+
+/** adapter.py:_sanitize_link_url — javascript/data/vbscript hrefs drop. */
+function sanitizeLinkUrl(url: string): string {
+	const stripped = url.trim();
+	const scheme = stripped.includes(":")
+		? (stripped.split(":", 1)[0] ?? "").toLowerCase().trim()
+		: "";
+	if (["javascript", "data", "vbscript"].includes(scheme)) return "";
+	return stripped.replaceAll('"', "&quot;");
+}
+
+const PLACEHOLDER_RE = /\x00PROTECTED(\d+)\x00/g;
+
+/**
+ * THE markdown→HTML conversion (regex-fallback parity). Returns null when
+ * rendering equals the plain text (no format/formatted_body keys then).
+ */
+export function markdownToMatrixHtml(text: string): string | null {
+	if (!text) return null;
+	let result = preSanitizeMatrixMarkdown(text);
+
+	const placeholders: string[] = [];
+	const protect = (html: string): string => {
+		const token = `\u0000PROTECTED${placeholders.length}\u0000`;
+		placeholders.push(html);
+		return token;
+	};
+
+	// Fenced code blocks: ```lang\n...```
+	result = result.replace(
+		/```(\w*)\n([\s\S]*?)```/g,
+		(_m, lang: string, code: string) =>
+			protect(
+				lang
+					? `<pre><code class="language-${htmlEscape(lang)}">${htmlEscape(code)}</code></pre>`
+					: `<pre><code>${htmlEscape(code)}</code></pre>`,
+			),
+	);
+	// Inline code
+	result = result.replace(/`([^`\n]+)`/g, (_m, code: string) =>
+		protect(`<code>${htmlEscape(code)}</code>`),
+	);
+	// Links (URL sanitized, label escaped)
+	result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, url: string) =>
+		protect(`<a href="${sanitizeLinkUrl(url)}">${htmlEscape(label)}</a>`),
+	);
+
+	// HTML-escape remaining segments.
+	result = result
+		.split(/(\x00PROTECTED\d+\x00)/g)
+		.map((part) => (PLACEHOLDER_RE.test(part) ? part : htmlEscape(part)))
+		.join("");
+	PLACEHOLDER_RE.lastIndex = 0;
+
+	// Block-level transforms (line-oriented).
+	const lines = result.split("\n");
+	const outLines: string[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i] ?? "";
+		if (/^[\s]*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
+			outLines.push("<hr>");
+			i += 1;
+			continue;
+		}
+		const hdr = /^(#{1,6})\s+(.+)$/.exec(line);
+		if (hdr !== null) {
+			const level = (hdr[1] as string).length;
+			outLines.push(`<h${level}>${(hdr[2] as string).trim()}</h${level}>`);
+			i += 1;
+			continue;
+		}
+		if (
+			line.startsWith("&gt; ") ||
+			line === "&gt;" ||
+			line.startsWith("> ") ||
+			line === ">"
+		) {
+			const bqLines: string[] = [];
+			while (i < lines.length) {
+				const ln = lines[i] ?? "";
+				if (ln.startsWith("&gt; ")) {
+					bqLines.push(ln.slice(5));
+				} else if (ln.startsWith("> ")) {
+					bqLines.push(ln.slice(2));
+				} else if (ln === "&gt;" || ln === ">") {
+					bqLines.push("");
+				} else break;
+				i += 1;
+			}
+			outLines.push(`<blockquote>${bqLines.join("<br>")}</blockquote>`);
+			continue;
+		}
+		const ulMatch = /^[\s]*[-*+]\s+(.+)$/.exec(line);
+		if (ulMatch !== null) {
+			const items: string[] = [];
+			while (i < lines.length) {
+				const m = /^[\s]*[-*+]\s+(.+)$/.exec(lines[i] ?? "");
+				if (m === null) break;
+				items.push(m[1] as string);
+				i += 1;
+			}
+			outLines.push(`<ul>${items.map((it) => `<li>${it}</li>`).join("")}</ul>`);
+			continue;
+		}
+		const olMatch = /^[\s]*\d+[.)]\s+(.+)$/.exec(line);
+		if (olMatch !== null) {
+			const items: string[] = [];
+			while (i < lines.length) {
+				const m = /^[\s]*\d+[.)]\s+(.+)$/.exec(lines[i] ?? "");
+				if (m === null) break;
+				items.push(m[1] as string);
+				i += 1;
+			}
+			outLines.push(`<ol>${items.map((it) => `<li>${it}</li>`).join("")}</ol>`);
+			continue;
+		}
+		outLines.push(line);
+		i += 1;
+	}
+	result = outLines.join("\n");
+
+	// Inline transforms.
+	result = result.replace(/\*\*(.+?)\*\*/gs, "<strong>$1</strong>");
+	result = result.replace(/__(.+?)__/gs, "<strong>$1</strong>");
+	result = result.replace(/\*(.+?)\*/gs, "<em>$1</em>");
+	result = result.replace(/(?<![\w])_(.+?)_(?![\w])/gs, "<em>$1</em>");
+	result = result.replace(/~~(.+?)~~/gs, "<del>$1</del>");
+	result = result.replace(/\n/g, "<br>\n");
+	result = result.replace(
+		/<br>\n(<\/?(?:pre|blockquote|h[1-6]|ul|ol|li|hr))/g,
+		"\n$1",
+	);
+	result = result.replace(
+		/(<\/(?:pre|blockquote|h[1-6]|ul|ol|li)>)<br>/g,
+		"$1",
+	);
+
+	// Restore protected regions.
+	placeholders.forEach((original, idx) => {
+		result = result.replaceAll(`\u0000PROTECTED${idx}\u0000`, original);
+	});
+
+	return result;
 }
 
 export function buildTextMessageContent(
 	text: string,
 	msgtype = "m.text",
+	opts: { allowRoomMentions?: boolean | undefined } = {},
 ): MatrixOutboundContent {
-	return {
-		msgtype,
-		body: text,
-		mentionUserIds: extractOutboundMentionUserIds(text),
-	};
+	const msgContent: MatrixOutboundContent = { msgtype, body: text };
+	const mentionUserIds = extractOutboundMentionUserIds(text);
+	if (mentionUserIds.length > 0) {
+		msgContent["m.mentions"] = { user_ids: mentionUserIds };
+	}
+	const roomMentioned =
+		opts.allowRoomMentions === true && /(^|[\s(])@room(?![\w:.-])/.test(text);
+	if (roomMentioned) {
+		const existing = msgContent["m.mentions"] as Record<string, unknown>;
+		msgContent["m.mentions"] = { ...(existing ?? {}), room: true };
+	}
+	const html = markdownToMatrixHtml(text);
+	if (html !== null && html !== text) {
+		msgContent["format"] = "org.matrix.custom.html";
+		msgContent["formatted_body"] = html;
+	}
+	return msgContent;
 }
 
 // ── the PluginManifest (registration path, 04 §4.2) ─────────────────────────

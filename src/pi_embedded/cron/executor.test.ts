@@ -5,13 +5,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	CRON_SESSION_ENV,
 	CronMemoryPolicyError,
 	CronTurnExecutor,
 	constructCronAgentPlan,
 	cronExecutorAsRunner,
 	cronSessionId,
+	isCronSessionContext,
 } from "./executor.js";
 import type { TimestampActivityLog } from "./inactivity.js";
+import {
+	awaitGatewayDecision,
+	HumanWaitAccounting,
+	systemClock,
+} from "../approvals/index.js";
+import { ApprovalQueues } from "../approvals/queue.js";
 import {
 	createRunnerHarness,
 	type RunnerHarness,
@@ -213,5 +221,114 @@ describe("ScheduledJobRunner adapter", () => {
 		const runner = cronExecutorAsRunner(executor);
 		await runner.interrupt("job9");
 		expect(interruptedSession).toBe("cron:job9");
+	});
+});
+
+// ── cron-session context marker (secops-9; tools/approval.py parity) ──────
+// Cron turns must be DETECTABLE as cron sessions by the approvals gate, so a
+// dangerous-command approval inside a cron job resolves via approvals.cron_mode
+// instead of enqueueing a pending prompt no human will ever answer.
+describe("cron-session context marker", () => {
+	it("the turn's whole async context reads as a cron session; nothing leaks after", async () => {
+		const seenDuringTurn: boolean[] = [];
+		const executor = new CronTurnExecutor({
+			handleTurn: async () => {
+				seenDuringTurn.push(isCronSessionContext());
+				return {
+					exitReason: "finalized",
+					finalText: "ok",
+					iterations: 1,
+					repairs: 0,
+					userRowId: null,
+					assistantRowId: null,
+					usage: null,
+				};
+			},
+			interrupt: async () => true,
+		});
+		expect(isCronSessionContext()).toBe(false); // outside: unmarked
+		await executor.run({ jobId: "mark1", prompt: "p" });
+		expect(seenDuringTurn).toEqual([true]); // marked DURING the turn
+		expect(isCronSessionContext()).toBe(false); // and unmarked after
+	});
+
+	it("concurrent non-cron work is NOT tainted by a running cron turn", async () => {
+		let releaseCron!: () => void;
+		const gate = new Promise<void>((resolvePromise) => {
+			releaseCron = resolvePromise;
+		});
+		const executor = new CronTurnExecutor({
+			handleTurn: async () => {
+				await gate; // still parked while the outsider probe runs
+				return {
+					exitReason: "finalized" as const,
+					finalText: "",
+					iterations: 1,
+					repairs: 0,
+					userRowId: null,
+					assistantRowId: null,
+					usage: null,
+				};
+			},
+			interrupt: async () => true,
+		});
+		const cronTurn = executor.run({ jobId: "mark2", prompt: "p" });
+		// The interleaved NON-cron probe sees NO session marker.
+		expect(isCronSessionContext()).toBe(false);
+		releaseCron();
+		await cronTurn;
+	});
+
+	it("env fallback: HERMES_CRON_SESSION truthy marks the process (legacy carrier)", () => {
+		for (const v of ["1", "true", "yes", "on"]) {
+			expect(isCronSessionContext({ [CRON_SESSION_ENV]: v })).toBe(true);
+		}
+		for (const v of ["", "0", "false", "no", "off", "banana"]) {
+			expect(isCronSessionContext({ [CRON_SESSION_ENV]: v })).toBe(false);
+		}
+	});
+
+	it("END-TO-END: an approval raised during a cron turn resolves via the gate WITHOUT a pending prompt", async () => {
+		const queues = new ApprovalQueues();
+		let notifyCalls = 0;
+		const executor = new CronTurnExecutor({
+			handleTurn: async () => {
+				// Composition-root wiring shape: the gate probes the ambient
+				// context; default cron_mode deny.
+				const decision = await awaitGatewayDecision(
+					{
+						queues,
+						clock: systemClock,
+						timeoutSeconds: 300,
+						humanWait: new HumanWaitAccounting(systemClock, 360),
+						isCronSession: isCronSessionContext,
+						notify: async () => {
+							notifyCalls += 1;
+						},
+					},
+					cronSessionId("e2e"),
+					{
+						command: "rm -rf /srv/data",
+						description: "hardline delete",
+						patternKey: "rm_rf",
+						patternKeys: ["rm_rf"],
+					},
+				);
+				return {
+					exitReason: "finalized" as const,
+					finalText: decision.choice ?? "",
+					iterations: decision.resolved ? 1 : 0,
+					repairs: 0,
+					userRowId: null,
+					assistantRowId: null,
+					usage: null,
+				};
+			},
+			interrupt: async () => true,
+		});
+		const { outcome } = await executor.run({ jobId: "e2e", prompt: "p" });
+		expect(outcome.finalText).toBe("deny"); // immediate fail-closed resolution
+		expect(notifyCalls).toBe(0); // no prompt was ever delivered
+		expect(queues.hasBlocking(cronSessionId("e2e"))).toBe(false);
 	});
 });

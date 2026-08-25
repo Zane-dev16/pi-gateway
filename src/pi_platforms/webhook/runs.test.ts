@@ -39,13 +39,80 @@ describe("run lifecycle + typed events", () => {
 		});
 		await done.promise;
 		expect(events.map((e) => e.type)).toEqual([
-			"message.delta",
-			"message.delta",
+			"assistant.delta",
+			"assistant.delta",
 			"run.completed",
 		]);
 		const completed = events.find((e) => e.type === "run.completed");
 		expect(completed).toMatchObject({ output: "the final output" });
-		expect(registry.status(runId)?.status).toBe("completed");
+		const view = registry.status(runId);
+		expect(view?.status).toBe("completed");
+		// api_server.py:_set_run_status parity — pollable hermes.run object.
+		expect(view).toMatchObject({
+			object: "hermes.run",
+			runId,
+			status: "completed",
+			sessionId: runId, // session_id defaults to the run id
+			output: "the final output",
+			lastEvent: "run.completed",
+		});
+	});
+
+	it("tool.* events flow through emitToolProgress with typed payloads", async () => {
+		const registry = new RunRegistry();
+		const events: RunEvent[] = [];
+		const done = deferred<void>();
+		let runId = "";
+		registry.start("use tools", async (controls) => {
+			runId = controls.runId;
+			controls.emitToolProgress({
+				name: "tool.started",
+				toolName: "bash",
+				preview: "ls",
+			});
+			controls.emitToolProgress({
+				name: "tool.completed",
+				toolName: "bash",
+				duration: 0.25,
+				isError: false,
+			});
+			return "ok";
+		});
+		registry.subscribe(runId, (event) => {
+			events.push(event);
+			if (event.type === "run.completed") done.resolve();
+		});
+		await done.promise;
+		expect(events.map((e) => e.type)).toEqual([
+			"tool.started",
+			"tool.completed",
+			"run.completed",
+		]);
+		expect(events[0]).toMatchObject({ type: "tool.started", toolName: "bash" });
+		expect(events[1]).toMatchObject({
+			type: "tool.completed",
+			toolName: "bash",
+			duration: 0.25,
+			isError: false,
+		});
+	});
+
+	it("explicit sessionId rides start opts and surfaces in the view", async () => {
+		const registry = new RunRegistry();
+		const done = deferred<void>();
+		registry.start(
+			"hi",
+			async () => {
+				done.resolve();
+				return "out";
+			},
+			{ sessionId: "agent:main:api_server:dm:user-42" },
+		);
+		const runId = registry.runIds()[0] ?? "";
+		await done.promise;
+		expect(registry.status(runId)?.sessionId).toBe(
+			"agent:main:api_server:dm:user-42",
+		);
 	});
 
 	it("executor failure surfaces run.failed with the error", async () => {

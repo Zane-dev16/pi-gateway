@@ -200,25 +200,31 @@ async function makeE2E(): Promise<E2EHarness> {
 		completions,
 		runs,
 		bodyCapBytes: 64 * 1024,
+		// webhook-44: EVERY /v1/runs lane is Bearer-gated like /v1/chat/completions.
+		apiKeyProvider: () => API_KEY,
 	});
 	// Runs started over HTTP get the lifecycle-complete default executor.
-	server.startRunWithDefaultExecutor = (input) =>
-		runs.start(input, async (controls, text) => {
-			controls.emitDelta(`working on ${text}`);
-			if (text.includes("need-approval")) {
-				await controls.requestApproval("rm -rf /tmp/staging");
-				return "output after approval"; // approval runs complete after the choice
-			}
-			while (!controls.shouldStop()) {
-				const steered = runs.consumeSteer(controls.runId);
-				if (steered !== null) {
-					controls.emitDelta(`steered:${steered}`);
-					return "output after steer";
+	server.startRunWithDefaultExecutor = (input, sessionId) =>
+		runs.start(
+			input,
+			async (controls, text) => {
+				controls.emitDelta(`working on ${text}`);
+				if (text.includes("need-approval")) {
+					await controls.requestApproval("rm -rf /tmp/staging");
+					return "output after approval"; // approval runs complete after the choice
 				}
-				await new Promise<void>((r) => setTimeout(r, 2));
-			}
-			throw new Error("stopped");
-		});
+				while (!controls.shouldStop()) {
+					const steered = runs.consumeSteer(controls.runId);
+					if (steered !== null) {
+						controls.emitDelta(`steered:${steered}`);
+						return "output after steer";
+					}
+					await new Promise<void>((r) => setTimeout(r, 2));
+				}
+				throw new Error("stopped");
+			},
+			{ sessionId },
+		);
 
 	const baseUrl = await server.listen();
 	void nowMsValue;
@@ -236,17 +242,40 @@ function sign(body: string, secret = ROUTE_SECRET): string {
 	return createHmac("sha256", secret).update(body).digest("hex");
 }
 
+/** POST a JSON body to a /v1/runs lane WITH the required Bearer key. */
+function postRun(
+	baseUrl: string,
+	path: string,
+	body: unknown,
+	headers: Record<string, string> = {},
+): Promise<Response> {
+	return fetch(`${baseUrl}${path}`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${API_KEY}`,
+			...headers,
+		},
+		body: typeof body === "string" ? body : JSON.stringify(body),
+	});
+}
+
 /** Collect SSE frames until a predicate matches or timeout. */
 async function collectFrames(
-	url: string,
+	baseUrl: string,
+	runId: string,
 	until: (type: string) => boolean,
 	timeoutMs = 5_000,
 ): Promise<Array<{ type: string; payload: Record<string, unknown> }>> {
+	const url = `${baseUrl}/v1/runs/${runId}/events`;
 	const controller = new AbortController();
 	const collected: Array<{ type: string; payload: Record<string, unknown> }> =
 		[];
 	try {
-		const res = await fetch(url, { signal: controller.signal });
+		const res = await fetch(url, {
+			signal: controller.signal,
+			headers: { authorization: `Bearer ${API_KEY}` },
+		});
 		const reader = res.body?.getReader();
 		if (!reader) throw new Error("no stream");
 		const decoder = new TextDecoder();
@@ -256,10 +285,11 @@ async function collectFrames(
 			const { done, value } = await reader.read();
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
-			let idx: number;
-			while ((idx = buffer.indexOf("\n\n")) >= 0) {
+			let idx = buffer.indexOf("\n\n");
+			while (idx >= 0) {
 				const frame = buffer.slice(0, idx);
 				buffer = buffer.slice(idx + 2);
+				idx = buffer.indexOf("\n\n");
 				const eventLine = /^event: (.+)$/m.exec(frame);
 				const dataLine = /^data: (.+)$/m.exec(frame);
 				if (!eventLine || !dataLine) continue;
@@ -390,79 +420,269 @@ describe("E2E pipeline row — real loopback sockets", () => {
 		const h = await makeE2E();
 		try {
 			// ── APPROVAL: run holds open; endpoint resolves; run completes. ──
-			const startA = await fetch(`${h.baseUrl}/v1/runs`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ input: "deploy need-approval please" }),
+			const startA = await postRun(h.baseUrl, "/v1/runs", {
+				input: "deploy need-approval please",
 			});
 			expect(startA.status).toBe(202);
 			const { run_id: runA } = (await startA.json()) as { run_id: string };
 
 			const framesA = collectFrames(
-				`${h.baseUrl}/v1/runs/${runA}/events`,
-				(t) => t === "run.completed" || t === "run.cancelled",
+				h.baseUrl,
+				runA,
+				(t) => t === "done", // ride through the terminal sentinel
 			);
 			// Give the run a moment to open the approval gate…
 			await new Promise<void>((r) => setTimeout(r, 15));
-			const approveRes = await fetch(`${h.baseUrl}/v1/runs/${runA}/approvals`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ choice: "once" }),
+			// SINGULAR /approval is the documented route (webhook-45).
+			const approveRes = await postRun(h.baseUrl, `/v1/runs/${runA}/approval`, {
+				choice: "once",
 			});
 			expect(approveRes.status).toBe(200);
 			const seenA = await framesA;
 			const typesA = seenA.map((f) => f.type);
-			expect(typesA).toContain("message.delta");
+			expect(typesA).toContain("assistant.delta");
 			expect(typesA).toContain("approval.request");
 			expect(typesA).toContain("approval.responded");
 			expect(typesA).toContain("run.completed");
+			// Terminal done sentinel closes every stream (webhook-46).
+			expect(typesA[typesA.length - 1]).toBe("done");
+			// snake_case payload parity on the wire.
+			for (const frame of seenA) {
+				if (frame.type === "done") continue;
+				expect(frame.payload["run_id"]).toBe(runA);
+				expect(frame.payload["session_id"]).toBe(runA);
+				expect(typeof frame.payload["seq"]).toBe("number");
+				expect(typeof frame.payload["ts"]).toBe("number");
+			}
+			const approvalFrame = seenA.find((f) => f.type === "approval.request");
+			expect(approvalFrame?.payload["command"]).toBe("rm -rf /tmp/staging");
+			expect(Array.isArray(approvalFrame?.payload["choices"])).toBe(true);
+
+			// The plural alias still resolves (route-table compatibility).
+			const startAlias = await postRun(h.baseUrl, "/v1/runs", {
+				input: "deploy need-approval please",
+			});
+			const { run_id: runAlias } = (await startAlias.json()) as {
+				run_id: string;
+			};
+			await new Promise<void>((r) => setTimeout(r, 15));
+			const aliasRes = await postRun(
+				h.baseUrl,
+				`/v1/runs/${runAlias}/approvals`,
+				{ choice: "always" },
+			);
+			expect(aliasRes.status).toBe(200);
 
 			// Double-resolve answers 409 (pop-or-409).
-			const again = await fetch(`${h.baseUrl}/v1/runs/${runA}/approvals`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ choice: "once" }),
+			const again = await postRun(h.baseUrl, `/v1/runs/${runA}/approval`, {
+				choice: "once",
 			});
 			expect([409, 400]).toContain(again.status); // invalid_choice(400): slot popped ⇒ not active
 
 			// ── STEER: only while running; text reaches the executor. ──
-			const startB = await fetch(`${h.baseUrl}/v1/runs`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ input: "refactor steerable-target" }),
+			const startB = await postRun(h.baseUrl, "/v1/runs", {
+				input: "refactor steerable-target",
 			});
 			const { run_id: runB } = (await startB.json()) as { run_id: string };
-			const steerRes = await fetch(`${h.baseUrl}/v1/runs/${runB}/steer`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ input: "prefer the small diff" }),
+			const steerRes = await postRun(h.baseUrl, `/v1/runs/${runB}/steer`, {
+				input: "prefer the small diff",
 			});
 			expect(steerRes.status).toBe(200);
+			// hermes.run.steer envelope (api_server.py:_handle_steer_run parity).
+			expect(await steerRes.json()).toEqual({
+				object: "hermes.run.steer",
+				run_id: runB,
+				accepted: true,
+			});
 
 			// ── STOP: cooperative cancel lands run.cancelled. ──
-			const startC = await fetch(`${h.baseUrl}/v1/runs`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ input: "endless loop work" }),
+			const startC = await postRun(h.baseUrl, "/v1/runs", {
+				input: "endless loop work",
 			});
 			const { run_id: runC } = (await startC.json()) as { run_id: string };
-			const framesC = collectFrames(
-				`${h.baseUrl}/v1/runs/${runC}/events`,
-				(t) => t === "run.cancelled",
-			);
+			const framesC = collectFrames(h.baseUrl, runC, (t) => t === "done");
 			await new Promise<void>((r) => setTimeout(r, 10));
-			const stopRes = await fetch(`${h.baseUrl}/v1/runs/${runC}/stop`, {
-				method: "POST",
-			});
+			const stopRes = await postRun(h.baseUrl, `/v1/runs/${runC}/stop`, {});
 			expect(stopRes.status).toBe(200);
 			const seenC = await framesC;
 			expect(seenC.some((f) => f.type === "run.cancelled")).toBe(true);
+			expect(seenC[seenC.length - 1]?.type).toBe("done");
 
-			// Unknown run ids answer 409/404-shaped errors, never crash.
-			const ghost = await fetch(`${h.baseUrl}/v1/runs/run_ghost/stop`, {
+			// UNKNOWN runs answer 404 run_not_found envelopes (webhook-50),
+			// never 409 and never a crash.
+			for (const lane of ["stop", "steer", "approval"] as const) {
+				const ghost = await postRun(
+					h.baseUrl,
+					`/v1/runs/run_ghost/${lane}`,
+					lane === "steer" ? { input: "x" } : {},
+				);
+				expect(ghost.status).toBe(404);
+				const body = (await ghost.json()) as {
+					error: {
+						message: string;
+						type: string;
+						param: unknown;
+						code: string;
+					};
+				};
+				expect(body.error.code).toBe("run_not_found");
+				expect(body.error.type).toBe("invalid_request_error");
+			}
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("Bearer gate covers EVERY /v1/runs lane (webhook-44)", async () => {
+		const h = await makeE2E();
+		try {
+			const started = await fetch(`${h.baseUrl}/v1/runs`, {
 				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ input: "auth probe" }),
 			});
-			expect(ghost.status).toBe(409);
+			const { run_id: runId } = (await started.json()) as { run_id: string };
+			const lanes: Array<[string, RequestInit]> = [
+				[
+					"/v1/runs",
+					{
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ input: "x" }),
+					},
+				],
+				[`/v1/runs/${runId}`, { method: "GET" }],
+				[`/v1/runs/${runId}/events`, { method: "GET" }],
+				[
+					`/v1/runs/${runId}/approval`,
+					{ method: "POST", body: JSON.stringify({ choice: "once" }) },
+				],
+				[
+					`/v1/runs/${runId}/steer`,
+					{ method: "POST", body: JSON.stringify({ input: "x" }) },
+				],
+				[`/v1/runs/${runId}/stop`, { method: "POST" }],
+			];
+			for (const [path, init] of lanes) {
+				const res = await fetch(`${h.baseUrl}${path}`); // NO Authorization
+				expect(res.status).toBe(401);
+				const body = (await res.json()) as {
+					error: { message: string; type: string; code: string };
+				};
+				expect(body.error.message).toBe(
+					"Invalid gateway API key (API_SERVER_KEY)",
+				);
+				expect(body.error.type).toBe("gateway_auth_error");
+				expect(body.error.code).toBe("gateway_auth_failed");
+				const wrong = await fetch(`${h.baseUrl}${path}`, {
+					...init,
+					headers: {
+						...(init.headers ?? {}),
+						authorization: "Bearer wrong-key",
+					},
+				});
+				expect(wrong.status).toBe(401);
+			}
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("POST /v1/runs validation ladder answers error-shaped 400s (webhook-49)", async () => {
+		const h = await makeE2E();
+		try {
+			// Invalid JSON never becomes a raw-text prompt.
+			const badJson = await postRun(h.baseUrl, "/v1/runs", "{not json");
+			expect(badJson.status).toBe(400);
+			expect(
+				((await badJson.json()) as { error: { message: string } }).error
+					.message,
+			).toBe("Invalid JSON");
+
+			// Missing 'input'.
+			const noInput = await postRun(h.baseUrl, "/v1/runs", {
+				model: "m",
+			});
+			expect(noInput.status).toBe(400);
+			expect(
+				((await noInput.json()) as { error: { message: string } }).error
+					.message,
+			).toBe("Missing 'input' field");
+
+			// Empty user messages: empty LIST, non-message shapes (NOTE: an empty
+			// STRING is falsy like Python and answers "Missing 'input' field").
+			for (const input of [[], [{ role: "user" }], 42]) {
+				const empty = await postRun(h.baseUrl, "/v1/runs", { input });
+				expect(empty.status).toBe(400);
+				expect(
+					((await empty.json()) as { error: { message: string } }).error
+						.message,
+				).toBe("No user message found in input");
+			}
+			const emptyString = await postRun(h.baseUrl, "/v1/runs", { input: "" });
+			expect(emptyString.status).toBe(400);
+			expect(
+				((await emptyString.json()) as { error: { message: string } }).error
+					.message,
+			).toBe("Missing 'input' field");
+			expect(h.runs.runIds().length).toBe(0); // nothing was ever started
+
+			// A multi-message list takes the LAST message's content.
+			const multi = await postRun(h.baseUrl, "/v1/runs", {
+				input: [
+					{ role: "user", content: "earlier" },
+					{ role: "user", content: "the real task" },
+				],
+			});
+			expect(multi.status).toBe(202);
+			const { run_id } = (await multi.json()) as { run_id: string };
+			const view = h.runs.status(run_id);
+			expect(view?.sessionId).toBe(run_id); // session defaults to run id
+		} finally {
+			await h.close();
+		}
+	}, 20_000);
+
+	it("GET /v1/runs/:id answers the hermes.run status envelope (webhook-50)", async () => {
+		const h = await makeE2E();
+		const bearer = { authorization: `Bearer ${API_KEY}` };
+		try {
+			// need-approval ⇒ the scripted executor completes once approved.
+			const started = await postRun(h.baseUrl, "/v1/runs", {
+				input: "deploy need-approval please",
+				session_id: "agent:main:api_server:dm:probe",
+			});
+			expect(started.status).toBe(202);
+			const { run_id } = (await started.json()) as { run_id: string };
+			await new Promise<void>((r) => setTimeout(r, 15));
+			const midFlight = await fetch(`${h.baseUrl}/v1/runs/${run_id}`, {
+				headers: bearer,
+			});
+			expect(midFlight.status).toBe(200);
+			const midView = (await midFlight.json()) as Record<string, unknown>;
+			expect(midView).toMatchObject({
+				object: "hermes.run",
+				run_id,
+				created_at: expect.any(Number),
+				updated_at: expect.any(Number),
+				session_id: "agent:main:api_server:dm:probe",
+			});
+			await postRun(h.baseUrl, `/v1/runs/${run_id}/approval`, {
+				choice: "once",
+			});
+			await new Promise<void>((r) => setTimeout(r, 10));
+			const res = await fetch(`${h.baseUrl}/v1/runs/${run_id}`, {
+				headers: bearer,
+			});
+			const view = (await res.json()) as Record<string, unknown>;
+			expect(view).toMatchObject({
+				object: "hermes.run",
+				run_id,
+				status: "completed",
+				session_id: "agent:main:api_server:dm:probe",
+				output: "output after approval",
+				last_event: "run.completed",
+			});
 		} finally {
 			await h.close();
 		}
@@ -488,6 +708,171 @@ describe("E2E pipeline row — real loopback sockets", () => {
 				true,
 			);
 			expect(h.adapter.guardSessionsForTest()).toContain(rawSessionId);
+		} finally {
+			await h.close();
+		}
+	});
+});
+
+// ── /v1/chat/completions response contract (webhook-47/48/51) ────────────
+
+describe("completions lane contract", () => {
+	const BEARER = { authorization: `Bearer ${API_KEY}` };
+
+	function postCompletions(
+		h: E2EHarness,
+		body: Record<string, unknown>,
+		headers: Record<string, string> = {},
+	): Promise<Response> {
+		return fetch(`${h.baseUrl}/v1/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json", ...BEARER, ...headers },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("non-streaming responses carry created/model/usage/finish_reason (webhook-47)", async () => {
+		const h = await makeE2E();
+		try {
+			const res = await postCompletions(h, {
+				model: "pi-gateway",
+				messages: [{ role: "user", content: "completions contract" }],
+				stream: false,
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("x-hermes-session-id")).toBeTruthy();
+			const body = (await res.json()) as {
+				id: string;
+				object: string;
+				created: number;
+				model: string;
+				choices: Array<{
+					index: number;
+					message: { role: string; content: string };
+					finish_reason: string;
+				}>;
+				usage: {
+					prompt_tokens: number;
+					completion_tokens: number;
+					total_tokens: number;
+				};
+			};
+			expect(body.object).toBe("chat.completion");
+			expect(body.id.startsWith("chatcmpl-")).toBe(true);
+			expect(Number.isFinite(body.created)).toBe(true);
+			expect(body.model).toBe("pi-gateway"); // caller's model echoed
+			expect(body.choices[0]?.finish_reason).toBe("stop");
+			expect(body.choices[0]?.message).toEqual({
+				role: "assistant",
+				content: "reply:completions contract",
+			});
+			expect(body.usage).toEqual({
+				prompt_tokens: 0,
+				completion_tokens: 0,
+				total_tokens: 0,
+			});
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("stream=true rides SSE chat.completion.chunk frames ending data: [DONE] (webhook-48)", async () => {
+		const h = await makeE2E();
+		try {
+			const res = await postCompletions(h, {
+				model: "pi-gateway",
+				messages: [{ role: "user", content: "stream me" }],
+				stream: true,
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toContain("text/event-stream");
+			const text = await res.text();
+			const dataLines = text
+				.split("\n\n")
+				.filter((frame) => frame.startsWith("data: "))
+				.map((frame) => frame.slice("data: ".length));
+			expect(dataLines[dataLines.length - 1]).toBe("[DONE]");
+			const chunks = dataLines
+				.slice(0, -1)
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			for (const chunk of chunks) {
+				expect(chunk["object"]).toBe("chat.completion.chunk");
+				expect(String(chunk["id"]).startsWith("chatcmpl-")).toBe(true);
+			}
+			// Role chunk first…
+			expect(chunks[0]).toMatchObject({
+				choices: [{ delta: { role: "assistant" }, finish_reason: null }],
+			});
+			// …content chunk(s) in the middle…
+			const contentChunk = chunks.find(
+				(c) =>
+					(c as { choices?: Array<{ delta?: { content?: string } }> })
+						.choices?.[0]?.delta?.content !== undefined,
+			);
+			expect(
+				(
+					contentChunk as {
+						choices: Array<{ delta: { content: string } }>;
+					}
+				).choices[0]?.delta.content,
+			).toBe("reply:stream me");
+			// …finish chunk LAST with the usage block.
+			const finish = chunks[chunks.length - 1] as {
+				choices: Array<{
+					delta: Record<string, unknown>;
+					finish_reason: string;
+				}>;
+				usage?: Record<string, unknown>;
+			};
+			expect(finish.choices[0]?.finish_reason).toBe("stop");
+			expect(finish.usage).toEqual({
+				prompt_tokens: 0,
+				completion_tokens: 0,
+				total_tokens: 0,
+			});
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("Idempotency-Key replays ONLY on request-fingerprint match (webhook-51)", async () => {
+		const h = await makeE2E();
+		try {
+			const bodyA = {
+				model: "pi-gateway",
+				messages: [{ role: "user", content: "idem probe A" }],
+			};
+			const first = await postCompletions(h, bodyA, {
+				"idempotency-key": "key-1",
+			});
+			expect(first.status).toBe(200);
+			const firstJson = (await first.json()) as {
+				choices: Array<{ message: { content: string } }>;
+			};
+
+			// SAME key + SAME body → cached replay.
+			const replay = await postCompletions(h, bodyA, {
+				"idempotency-key": "key-1",
+			});
+			expect(await replay.json()).toEqual(firstJson);
+
+			// SAME key + DIFFERENT body → fingerprint mismatch ⇒ FRESH compute,
+			// never a stale replay of the first answer.
+			const different = await postCompletions(
+				h,
+				{
+					model: "pi-gateway",
+					messages: [{ role: "user", content: "idem probe B" }],
+				},
+				{ "idempotency-key": "key-1" },
+			);
+			expect(different.status).toBe(200);
+			const differentJson = (await different.json()) as {
+				choices: Array<{ message: { content: string } }>;
+			};
+			expect(differentJson.choices[0]?.message.content).toBe(
+				"reply:idem probe B",
+			);
 		} finally {
 			await h.close();
 		}

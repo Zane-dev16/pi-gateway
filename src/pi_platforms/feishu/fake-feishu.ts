@@ -149,6 +149,33 @@ export function driveCommentEnvelope(body: {
 	};
 }
 
+/** im.message.reaction.{created,deleted}_v1 envelope (reaction ingress). */
+export function reactionEnvelope(opts: {
+	eventId: string;
+	eventType:
+		| "im.message.reaction.created_v1"
+		| "im.message.reaction.deleted_v1";
+	messageId: string;
+	operatorType?: string | undefined;
+	operatorOpenId?: string | undefined;
+	userOpenId?: string | undefined;
+	emojiType: string;
+}): FeishuEventEnvelope {
+	return {
+		header: {
+			event_id: opts.eventId,
+			event_type: opts.eventType,
+		},
+		event: {
+			message_id: opts.messageId,
+			operator_type: opts.operatorType ?? "user",
+			operator_id: { open_id: opts.operatorOpenId ?? "ou_reactor" },
+			user_id: { open_id: opts.userOpenId ?? "ou_reactor" },
+			reaction_type: { emoji_type: opts.emojiType },
+		},
+	};
+}
+
 /** customized vc.bot.meeting_invited_v1 envelope (A12 VC invites). */
 export function meetingInvitedEnvelope(body: {
 	eventId?: string | undefined;
@@ -228,6 +255,28 @@ export class FakeFeishuServer implements FeishuConnectionFactory {
 
 	/** Scripted behaviors per REST endpoint key ("messages", "replies", …). */
 	private readonly endpoints = new Map<string, ScriptedEndpoint>();
+	/** Scripted GET-message bodies for reaction routing
+	 * (adapter.py:_build_get_message_request plane). */
+	readonly scriptedMessages = new Map<
+		string,
+		{ senderId: string; chatId: string; chatType: string }
+	>();
+	/** Scripted message-resource bodies keyed by file_key
+	 * (GET im/v1/messages/:id/resources?type=image|file :4001). The filename
+	 * rides the vendor response header/file_name field. */
+	readonly scriptedResources = new Map<
+		string,
+		{ bytes: Uint8Array; contentType: string; filename: string }
+	>();
+	/** Scripted contact/v3/users/:id display names (:4205). */
+	readonly scriptedUserNames = new Map<string, string>();
+	/** Scripted bot/v3/bots/basic_batch names (:4257). */
+	readonly scriptedBotNames = new Map<string, string>();
+	/** Scripted im/v1/chats/:chat_id metadata (:2424). */
+	readonly scriptedChats = new Map<
+		string,
+		{ name: string; chatType: string }
+	>();
 	/** Every REST transmission, in order. */
 	readonly restCalls: RestCallRecord[] = [];
 	private seqCounter = 0;
@@ -275,11 +324,18 @@ export class FakeFeishuServer implements FeishuConnectionFactory {
 		};
 		const msgType = payload["msg_type"];
 		if (typeof msgType === "string") record.msgType = msgType;
-		if (msgType === "text") {
-			record.textContent = String(
-				(payload["content"] as Record<string, unknown> | undefined)?.["text"] ??
-					"",
-			);
+		// Vendor create-message wire: content is ALWAYS a JSON STRING
+		// (json.dumps payload, :4655/:4657). text lane carries {"text": …}.
+		if (msgType === "text" && typeof payload["content"] === "string") {
+			try {
+				const parsed = JSON.parse(payload["content"]) as Record<
+					string,
+					unknown
+				>;
+				record.textContent = String(parsed["text"] ?? "");
+			} catch {
+				record.textContent = String(payload["content"]);
+			}
 		}
 		this.restCalls.push(record);
 		return this.nextBehavior(endpoint);

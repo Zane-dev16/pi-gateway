@@ -2,9 +2,10 @@
 // per session so system prompt and toolset stay byte-stable across turns")
 // with the DEC-021 MEMORY-PRESSURE BOUND on top of LRU entry counting.
 //
-// Port parity: gateway/run.py::_agent_cache (OrderedDict + lock + cap
-// enforcement + idle sweep) and gateway/agent_cache_pressure.py (byte-aware
-// shedding + idle-TTL blind-spot removal).
+// Port parity: gateway/run.py::_AGENT_CACHE_MAX_SIZE / _AGENT_CACHE_IDLE_TTL_SECS
+// (OrderedDict + lock + cap enforcement + idle sweep; 128 entries / 3600s idle)
+// and gateway/agent_cache_pressure.py:plan_pressure_evictions (byte-aware
+// shedding: per-pass eviction cap + hottest-entries protection).
 //
 // Why bytes matter (DEC-021): warm transcripts average megabytes each, so a
 // count-based cap alone lets the cache reach gigabytes. Byte estimates are
@@ -12,14 +13,14 @@
 // tests drive it with synthetic accounting per the DEC verification clause.
 
 export interface AgentCacheOptions {
-	/** LRU entry cap (parity _agent_cache max entries). Default 512. */
+	/** LRU entry cap (parity _AGENT_CACHE_MAX_SIZE). Default 128. */
 	maxEntries?: number;
 	/**
 	 * DEC-021 pressure bound in bytes; when totalBytes exceeds it the
 	 * least-recently-used entries are shed until back under budget.
 	 */
 	maxTotalBytes?: number;
-	/** Entries idle longer than this are evicted by sweepIdle(). */
+	/** Entries idle longer than this are evicted by sweepIdle(). Default 1h. */
 	idleTtlMs?: number;
 	/** Injected clock for recency/idle tracking. */
 	now?: () => number;
@@ -47,12 +48,14 @@ export class AgentInstanceCache<V = unknown> {
 	private readonly now: () => number;
 
 	constructor(options: AgentCacheOptions = {}) {
-		this.maxEntries = Math.max(1, options.maxEntries ?? 512);
+		// Parity run.py:_AGENT_CACHE_MAX_SIZE = 128 / _AGENT_CACHE_IDLE_TTL_SECS
+		// = 3600.0 — the shipped gateway cache bounds.
+		this.maxEntries = Math.max(1, options.maxEntries ?? 128);
 		this.maxTotalBytes = Math.max(
 			0,
 			options.maxTotalBytes ?? Number.POSITIVE_INFINITY,
 		);
-		this.idleTtlMs = Math.max(0, options.idleTtlMs ?? 30 * 60 * 1000);
+		this.idleTtlMs = Math.max(0, options.idleTtlMs ?? 3_600_000);
 		this.now = options.now ?? (() => Date.now());
 	}
 
@@ -126,22 +129,53 @@ export class AgentInstanceCache<V = unknown> {
 	}
 
 	/**
-	 * DEC-021 pressure shedding: evict least-recently-used entries until total
-	 * bytes fit the bound. The most-recently-used entry is NEVER a victim — an
-	 * active session's agent must not be shed out from under its turn even when
-	 * it alone exceeds the budget (kept rather than thrashed on every op).
-	 * Returns the evicted keys.
+	 * DEC-021 pressure shedding — port of agent_cache_pressure.py:
+	 * plan_pressure_evictions. Evicts least-recently-used entries until total
+	 * bytes fit the bound, under TWO guards Hermes learned the hard way:
+	 *
+	 *  • maxEvictionsPerPass caps ONE pass so a single call cannot stall the
+	 *    caller tearing down dozens of clients; over-budget caches shed across
+	 *    successive passes instead.
+	 *  • protectRecent is an UPPER BOUND on the hottest entries spared, CLAMPED
+	 *    to len//2 (parity protect_recent): a few huge sessions can exhaust the
+	 *    budget alone, and an unclamped guard would then protect the entire
+	 *    cache while the process climbs toward the OOM killer with nothing it
+	 *    is willing to shed.
+	 *
+	 * Returns the evicted keys in eviction order (oldest first).
 	 */
-	shedPressure(): string[] {
+	shedPressure(
+		options: { protectRecent?: number; maxEvictionsPerPass?: number } = {},
+	): string[] {
+		const maxEvictions = Math.trunc(
+			options.maxEvictionsPerPass ?? DEFAULT_MAX_EVICTIONS_PER_PASS,
+		);
+		if (maxEvictions <= 0 || this.entries.size === 0) return [];
 		if (this.totalBytes <= this.maxTotalBytes) return [];
-		const keys = [...this.entries.keys()];
-		if (keys.length <= 1) return [];
-		const protect = keys.at(-1);
-		if (protect === undefined) return [];
+		// Clamp to half the cache (plan_pressure_evictions' `min(..., len//2)`):
+		// Map iteration order IS LRU→MRU order, so the protected tail is the
+		// hottest slice.
+		const requestedProtect = Math.max(
+			0,
+			Math.trunc(options.protectRecent ?? DEFAULT_PROTECT_RECENT),
+		);
+		const protect = Math.min(
+			requestedProtect,
+			Math.floor(this.entries.size / 2),
+		);
+		const candidates = [...this.entries.keys()];
+		const evictable =
+			protect > 0
+				? candidates.slice(0, candidates.length - protect)
+				: candidates;
 		const evicted: string[] = [];
-		for (const key of keys) {
-			if (this.totalBytes <= this.maxTotalBytes) break;
-			if (key === protect) continue;
+		for (const key of evictable) {
+			if (
+				evicted.length >= maxEvictions ||
+				this.totalBytes <= this.maxTotalBytes
+			) {
+				break;
+			}
 			this.entries.delete(key);
 			evicted.push(key);
 		}
@@ -162,7 +196,8 @@ export class AgentInstanceCache<V = unknown> {
 	}
 
 	private enforceBounds(): void {
-		// Entry-cap eviction first (LRU), then byte-pressure shedding.
+		// Entry-cap eviction first (LRU), then byte-pressure shedding (capped
+		// per pass — see shedPressure).
 		while (this.entries.size > this.maxEntries) {
 			const oldest = this.entries.keys().next();
 			if (oldest.done) break;
@@ -171,3 +206,9 @@ export class AgentInstanceCache<V = unknown> {
 		this.shedPressure();
 	}
 }
+
+/** Parity agent_cache_pressure.py:_DEFAULT_MAX_EVICTIONS_PER_PASS. */
+export const DEFAULT_MAX_EVICTIONS_PER_PASS = 16;
+
+/** Parity agent_cache_pressure.py:_DEFAULT_PROTECT_RECENT. */
+export const DEFAULT_PROTECT_RECENT = 8;

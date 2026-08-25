@@ -38,6 +38,8 @@ export interface MatrixSyncResponse {
 	next_batch: string;
 	rooms: {
 		join: Record<string, { timeline: { events: MatrixTimelineEvent[] } }>;
+		/** INVITE membership: the bot was invited but has not joined yet. */
+		invite: Record<string, { invite_state: { events: unknown[] } }>;
 	};
 }
 
@@ -130,6 +132,84 @@ export class FakeMatrixHomeserver {
 		redacted: boolean;
 	}> = [];
 	readonly readReceipts: Array<{ roomId: string; eventId: string }> = [];
+	/** Pending INVITE memberships surfaced on every sync until joined. */
+	private readonly pendingInvites = new Set<string>();
+	/** join_room_by_id calls (adapter.py:_join_room_by_id parity). */
+	readonly joinCalls: string[] = [];
+	/** POST /login calls (adapter.py password branch). */
+	readonly loginCalls: Array<{
+		identifier: string;
+		deviceName?: string | undefined;
+		deviceId?: string | undefined;
+	}> = [];
+	/** Configured password for the login flow (MATRIX_PASSWORD modeling). */
+	loginPassword: string | null = null;
+	/** Media uploads: POST /_matrix/media/v3/upload. */
+	readonly uploads: Array<{
+		mimeType: string;
+		filename?: string | undefined;
+		size: number;
+	}> = [];
+	private uploadSeq = 0;
+
+	/** Surface an INVITE membership on subsequent syncs (test control). */
+	pushInvite(roomId: string): void {
+		this.pendingInvites.add(roomId);
+		this.wakeWaiters();
+	}
+
+	/**
+	 * POST _matrix/client/v3/join/{roomId} — joining clears the pending
+	 * invite and adds the room to the syncable set.
+	 */
+	async joinRoom(roomId: string): Promise<{ room_id: string }> {
+		this.assertReachable("general", "joinRoom");
+		this.joinCalls.push(roomId);
+		if (!this.rooms.has(roomId)) {
+			this.addRoom(roomId, { name: roomId, memberCount: 2 });
+		}
+		this.pendingInvites.delete(roomId);
+		return { room_id: roomId };
+	}
+
+	/**
+	 * POST /login — identifier/password/device_name/device_id. Rejects a
+	 * wrong password like a real homeserver (M_FORBIDDEN).
+	 */
+	async login(op: {
+		identifier: string;
+		password: string;
+		deviceName?: string | undefined;
+		deviceId?: string | undefined;
+	}): Promise<{ user_id: string; device_id: string }> {
+		this.assertReachable("general", "login");
+		this.loginCalls.push({
+			identifier: op.identifier,
+			...(op.deviceName !== undefined ? { deviceName: op.deviceName } : {}),
+			...(op.deviceId !== undefined ? { deviceId: op.deviceId } : {}),
+		});
+		if (this.loginPassword === null || op.password !== this.loginPassword) {
+			throw new Error("M_FORBIDDEN: Invalid username or password");
+		}
+		return { user_id: op.identifier, device_id: op.deviceId ?? "DEVLOGIN" };
+	}
+
+	/** POST /_matrix/media/v3/upload → mxc:// URI (_upload_and_send parity). */
+	async uploadMedia(op: {
+		data: Uint8Array;
+		mimeType: string;
+		filename?: string | undefined;
+	}): Promise<string> {
+		this.assertReachable("general", "uploadMedia");
+		this.uploads.push({
+			mimeType: op.mimeType,
+			...(op.filename !== undefined ? { filename: op.filename } : {}),
+			size: op.data.byteLength,
+		});
+		this.uploadSeq += 1;
+		return `mxc://fake.example/up${this.uploadSeq}`;
+	}
+
 	whoamiCount = 0;
 	initialSyncCount = 0;
 	unknownTokenSyncResponses = 0;
@@ -212,12 +292,12 @@ export class FakeMatrixHomeserver {
 
 	// ── Client-Server API surface ───────────────────────────────────────────
 
-	async whoami(): Promise<{ user_id: string }> {
+	async whoami(): Promise<{ user_id: string; device_id: string }> {
 		this.assertReachable("general", "whoami");
 		this.whoamiCount += 1;
 		if (this.authRevoked)
 			throw new Error("M_UNKNOWN_TOKEN: Invalid auth token");
-		return { user_id: this.ownUserId };
+		return { user_id: this.ownUserId, device_id: "DEVFAKE" };
 	}
 
 	async getRoomName(roomId: string): Promise<string | null> {
@@ -411,15 +491,16 @@ export class FakeMatrixHomeserver {
 
 	async sendReaction(
 		roomId: string,
-		sender: string,
 		targetEventId: string,
 		key: string,
 	): Promise<string> {
 		this.assertReachable("general", "redact/sendReaction");
 		const eventId = `$reaction${this.reactions.length + 1}`;
+		// The SENDER derives from the auth token server-side (adapter.py
+		// _send_reaction PUTs only {m.relates_to}; no sender argument exists).
 		this.reactions.push({
 			roomId,
-			sender,
+			sender: this.ownUserId,
 			targetEventId,
 			key,
 			eventId,
@@ -451,9 +532,13 @@ export class FakeMatrixHomeserver {
 			const bucket = (join[evt.roomId] ??= { timeline: { events: [] } });
 			bucket.timeline.events.push(evt);
 		}
+		const invite: MatrixSyncResponse["rooms"]["invite"] = {};
+		for (const roomId of this.pendingInvites) {
+			invite[roomId] = { invite_state: { events: [] } };
+		}
 		return {
 			next_batch: makeSinceToken(this.epoch, this.tokenSeq),
-			rooms: { join },
+			rooms: { join, invite },
 		};
 	}
 

@@ -353,12 +353,55 @@ function wecomDeltaRows(newFixture: () => WecomFixture): ConformanceRow[] {
 
 				// Manifest pins the production prune bound.
 				expect(WECOM_DEDUP_PRUNE_BOUND).toBe(2000);
+
+				// Prune semantics are EXPIRED-ONLY (callback_adapter parity): past the
+				// bound, LIVE receipts survive — a small-bound fixture keeps ALL live
+				// ids even when their count exceeds it (FIFO eviction would shrink the
+				// duplicate window under bursts instead). Then one clock advance past
+				// TTL + a fresh insert prunes every EXPIRED entry at once.
+				const burst = makeWecomFixture({ dedupCap: 3 });
+				for (let i = 0; i < 5; i++) {
+					const r = await burst.postValidCallback(DEFAULT_APP_A, {
+						ToUserName: FIXTURE_CORP_ID_A,
+						FromUserName: "W-burst",
+						MsgType: "text",
+						Content: `burst-${i}`,
+						MsgId: `M-BURST-${i}`,
+					});
+					expect(r.text).toBe("success");
+				}
+				await new Promise<void>((r) => setTimeout(r, 25));
+				expect(burst.adapter.seenDedupSize()).toBe(5); // all LIVE beyond bound
+				// Live duplicates still deduped despite being past the FIFO bound.
+				const replayBurst = await burst.postValidCallback(DEFAULT_APP_A, {
+					ToUserName: FIXTURE_CORP_ID_A,
+					FromUserName: "W-burst",
+					MsgType: "text",
+					Content: "burst-0",
+					MsgId: "M-BURST-0",
+				});
+				expect(replayBurst.text).toBe("success");
+				await new Promise<void>((r) => setTimeout(r, 25));
+				expect(
+					burst.adapter.turnLog.filter((t) => t === "burst-0"),
+				).toHaveLength(1);
+				// Clock past TTL + fresh insert ⇒ expired-only prune fires.
+				burst.advance(301_000);
+				await burst.postValidCallback(DEFAULT_APP_A, {
+					ToUserName: FIXTURE_CORP_ID_A,
+					FromUserName: "W-burst",
+					MsgType: "text",
+					Content: "after-ttl",
+					MsgId: "M-BURST-FRESH",
+				});
+				expect(burst.adapter.seenDedupSize()).toBeLessThanOrEqual(2); // pruned
+				burst.dispose();
 			},
 		),
 		mk(
 			"transport.wecom.xml-event-ladder",
 			"wecom: text messages dispatch with scoped corp:user chat ids; enter_agent/subscribe lifecycle events silently ack with NO turn; empty event content becomes '/start'; unknown MsgTypes ack-no-op; multi-app routing records user→app so later sends resolve the RIGHT agent",
-			async (fx) => {
+			async () => {
 				const both = makeWecomFixture({ apps: [DEFAULT_APP_A, DEFAULT_APP_B] });
 
 				// Lifecycle events: enter_agent + subscribe — acked, zero turns.
@@ -384,6 +427,32 @@ function wecomDeltaRows(newFixture: () => WecomFixture): ConformanceRow[] {
 				});
 				expect(image.status).toBe(200);
 				expect(both.adapter.counters.unhandledTypes).toBe(1);
+
+				// OTHER EVENT NAMES fall through to normal construction — empty
+				// Content becomes the synthesized "/start" (_build_event parity:
+				// only enter_agent/subscribe return early for MsgType=event).
+				const foreign = await both.postValidCallback(DEFAULT_APP_A, {
+					ToUserName: FIXTURE_CORP_ID_A,
+					FromUserName: "W-fall",
+					MsgType: "event",
+					Event: "report_job",
+					Content: "",
+					MsgId: "M-FALL1",
+				});
+				expect(foreign.text).toBe("success");
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(both.adapter.turnLog).toContain("/start");
+				// A foreign event CARRYING Content keeps its own text.
+				await both.postValidCallback(DEFAULT_APP_A, {
+					ToUserName: FIXTURE_CORP_ID_A,
+					FromUserName: "W-fall2",
+					MsgType: "event",
+					Event: "report_location",
+					Content: "where am I",
+					MsgId: "M-FALL2",
+				});
+				await new Promise<void>((r) => setTimeout(r, 20));
+				expect(both.adapter.turnLog).toContain("where am I");
 
 				// Text message under corp B routes through B and records mapping.
 				const bMsg = await both.postValidCallback(DEFAULT_APP_B, {
@@ -441,6 +510,8 @@ function wecomDeltaRows(newFixture: () => WecomFixture): ConformanceRow[] {
 
 					// Outbound payload SHAPE through the real send() door → the
 					// proactive message/send seam (fixture records qyapi payloads).
+					// The body carries EXACTLY the vendor keys — caller metadata is
+					// never spread into the wire JSON.
 					const sent = await fx.adapter.send("corp-alpha:W-held", "the reply");
 					expect(sent.success).toBe(true);
 					const call = fx.api.sendsOfUser("W-held").at(-1);
@@ -450,6 +521,13 @@ function wecomDeltaRows(newFixture: () => WecomFixture): ConformanceRow[] {
 						(call?.payload["text"] as Record<string, unknown>)["content"],
 					).toBe("the reply");
 					expect(call?.payload["safe"]).toBe(0);
+					expect(Object.keys(call?.payload ?? {}).sort()).toEqual([
+						"agentid",
+						"msgtype",
+						"safe",
+						"text",
+						"touser",
+					]);
 
 					// Token caching: two sends ⇒ exactly ONE token fetch.
 					await fx.adapter.send("corp-alpha:W-held", "second reply");
@@ -479,6 +557,42 @@ function wecomDeltaRows(newFixture: () => WecomFixture): ConformanceRow[] {
 					expect(failed.success).toBe(false);
 					deadFx.dispose();
 				}
+			},
+		),
+		mk(
+			"transport.wecom.non-numeric-agentid-fails-clean",
+			"wecom: NON-NUMERIC configured agent_id fails the proactive send CLEANLY (int() ValueError parity, success:false) with ZERO token fetches and ZERO qyapi POSTs — NaN→agentid:0 coercion banned; missing/absent agent_id still wires agentid:0 per int(str(0)); numeric STRINGS parse to numbers on the wire",
+			async () => {
+				// Non-numeric agent_id: clean failure BEFORE any HTTP traffic.
+				const badFx = makeWecomFixture({
+					apps: [{ ...DEFAULT_APP_A, name: "badid", agent_id: "not-a-number" }],
+				});
+				const bad = await badFx.adapter.send("badid:W-userZ", "should fail");
+				expect(bad.success).toBe(false);
+				expect(bad.error).toBe(
+					"invalid literal for int() with base 10: 'not-a-number'",
+				);
+				expect(badFx.api.tokenFetches).toHaveLength(0);
+				expect(badFx.api.sends).toHaveLength(0);
+				badFx.dispose();
+
+				// Absent agent_id keeps Hermes' int(str(0)) ⇒ wire carries 0.
+				const noIdFx = makeWecomFixture({
+					apps: [{ ...DEFAULT_APP_A, name: "noid", agent_id: undefined }],
+				});
+				const zeroId = await noIdFx.adapter.send("noid:W-zero", "zero id");
+				expect(zeroId.success).toBe(true);
+				expect(noIdFx.api.sends.at(-1)?.payload["agentid"]).toBe(0);
+				noIdFx.dispose();
+
+				// Numeric STRING configs parse to a real number on the wire.
+				const strIdFx = makeWecomFixture({
+					apps: [{ ...DEFAULT_APP_A, name: "strid", agent_id: "1000002" }],
+				});
+				const strId = await strIdFx.adapter.send("strid:W-str", "string id");
+				expect(strId.success).toBe(true);
+				expect(strIdFx.api.sends.at(-1)?.payload["agentid"]).toBe(1000002);
+				strIdFx.dispose();
 			},
 		),
 		mk(
@@ -587,7 +701,7 @@ describe("conformance suite — wecom-callback census port (shape: webhook)", ()
 		}
 	});
 
-	it("passes ALL SEVEN wecom shape-delta rows through the real engine fixture", async () => {
+	it("passes ALL EIGHT wecom shape-delta rows through the real engine fixture", async () => {
 		const rows = wecomDeltaRows(() => makeWecomFixture());
 		expect(rows.map((r) => r.id)).toEqual([
 			"transport.wecom.url-verification-handshake",
@@ -596,6 +710,7 @@ describe("conformance suite — wecom-callback census port (shape: webhook)", ()
 			"transport.wecom.msgid-dedupe-ttl",
 			"transport.wecom.xml-event-ladder",
 			"transport.wecom.ack-first-proactive-send",
+			"transport.wecom.non-numeric-agentid-fails-clean",
 			"transport.wecom.text-send-cap-lossless",
 		]);
 		const report = await runConformanceSuite({

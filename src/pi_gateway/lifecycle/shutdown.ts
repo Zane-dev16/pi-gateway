@@ -16,10 +16,18 @@
 //     → flushAgentHistoryToFile (operator-recovery schema; auto-recovery skips)
 //   §1.2 "Second signal escalates to fast-exit" + §1.3(c) watchdog ordering
 //     → escalateFastExit releases PID file + runtime lock BEFORE hard exit
+//   run.py:_stop_impl_body
+//     → notify_active_sessions + pre-drain mark_resume_pending run BEFORE
+//       teardown completes (adapters still connected); .clean_shutdown marker
+//       written ONLY on non-timed-out drains; .restart_failure_counts
+//       incremented for sessions active at shutdown (#7536 stuck-loop input)
 //
 // Binding drain order (08 §1.2): stop ingress → active turns within grace →
 // release leases → flush delivery obligations + token rollups + pending
-// messages → close DB → exit non-zero only on failed flushes.
+// messages → close DB → exit non-zero only on failed flushes. The notify /
+// pre-drain resume-pending phases PRECEDE stop_ingress (Hermes notifies while
+// adapters are still connected); the clean-shutdown marker and restart-failure
+// counts follow close_database exactly as _stop_impl_body orders them.
 // Binding backstop order (§1.3(a)): pending-message flush (and its recovery-
 // file fallback) runs BEFORE any in-memory slot clear.
 
@@ -46,7 +54,23 @@ import {
 	consumeTakeoverMarkerForSelf,
 } from "./markers.js";
 
-export type ShutdownClass = "takeover" | "planned_stop" | "unexpected_signal";
+/**
+ * Shutdown classes (08 §1.2 + gateway/restart.py supervisor contract):
+ * - takeover / planned_stop exit 0 (systemd Restart=on-failure must not
+ *   flap-fight a replacer or an operator stop);
+ * - service_restart exits 75 (EX_TEMPFAIL — SIGUSR1-initiated in-band
+ *   restart, loop-liveness hard-exit; asks the supervisor to REPLACE us,
+ *   run.py:restart_signal_handler → request_restart(via_service=True));
+ * - fatal_config exits 78 (EX_CONFIG — s6 RestartPreventExitStatus stops
+ *   restarting a fatally misconfigured gateway, #51228);
+ * - unexpected_signal exits 1 so the supervisor revives us.
+ */
+export type ShutdownClass =
+	| "takeover"
+	| "planned_stop"
+	| "service_restart"
+	| "fatal_config"
+	| "unexpected_signal";
 
 /**
  * Exit-code discipline (08 §1.2): planned takeover exits 0 so systemd's
@@ -56,6 +80,8 @@ export type ShutdownClass = "takeover" | "planned_stop" | "unexpected_signal";
 export const SHUTDOWN_EXIT_CODES: Record<ShutdownClass, number> = {
 	takeover: 0,
 	planned_stop: 0,
+	service_restart: 75,
+	fatal_config: 78,
 	unexpected_signal: 1,
 };
 
@@ -72,6 +98,17 @@ export function persistsStopped(klass: ShutdownClass): boolean {
  *
  * `signalName` null means a programmatic stop (treated like a marked stop).
  */
+/**
+ * Signal classification parity of run.py:shutdown_signal_handler (+ its
+ * sibling restart_signal_handler): the takeover marker is consumed FIRST
+ * regardless of signal name; SIGINT is an intentional foreground stop by
+ * definition; SIGUSR1 IS the in-band restart signal by definition (the pi
+ * fleet updater drains gateways via SIGUSR1 first — 08 §7 — so it classifies
+ * as service_restart and exits 75); otherwise the planned-stop marker
+ * decides; a bare unmarked signal is UNEXPECTED.
+ *
+ * `signalName` null means a programmatic stop (treated like a marked stop).
+ */
 export function classifySignalForSelf(
 	home: string,
 	signalName: string | null,
@@ -80,6 +117,7 @@ export function classifySignalForSelf(
 	const opts = { selfPid: options.selfPid ?? process.pid };
 	if (consumeTakeoverMarkerForSelf(home, opts)) return "takeover";
 	if (signalName === "SIGINT") return "planned_stop";
+	if (signalName === "SIGUSR1") return "service_restart";
 	if (signalName === null || consumePlannedStopMarkerForSelf(home, opts)) {
 		return "planned_stop";
 	}
@@ -98,6 +136,8 @@ export interface DrainStepTrace {
 }
 
 export type DrainPhase =
+	| "notify_active_sessions"
+	| "pre_drain_resume_pending"
 	| "stop_ingress"
 	| "active_turns_grace"
 	| "release_leases"
@@ -107,9 +147,13 @@ export type DrainPhase =
 	| "flush_pending_messages"
 	| "clear_pending_slots"
 	| "close_database"
+	| "write_clean_shutdown_marker"
+	| "increment_restart_failure_counts"
 	| "persist_exit_status";
 
 export const DRAIN_PHASE_ORDER: readonly DrainPhase[] = [
+	"notify_active_sessions",
+	"pre_drain_resume_pending",
 	"stop_ingress",
 	"active_turns_grace",
 	"release_leases",
@@ -119,15 +163,29 @@ export const DRAIN_PHASE_ORDER: readonly DrainPhase[] = [
 	"flush_pending_messages",
 	"clear_pending_slots",
 	"close_database",
+	"write_clean_shutdown_marker",
+	"increment_restart_failure_counts",
 	"persist_exit_status",
 ];
 
 export interface DrainHooks {
+	/** Notify chats with active agents BEFORE anything tears down — adapters
+	 *  are still connected here, so messages can be sent (run.py:
+	 *  _stop_impl_body notify phase). */
+	notifyActiveSessions?: () => Promise<void>;
+	/** Durable pre-drain resume-pending marks (#27856): if the process is
+	 *  killed mid-drain, the marker is already written. Returns the marked
+	 *  session keys (cleared again when the drain completes gracefully). */
+	markResumePendingPreDrain?: () => Promise<readonly string[]>;
 	/** Adapters stop polling/reading (08 §1.2 step 1). Embedded background
 	 *  services join here until Phase 5 gives them cooperative-drain contracts. */
 	stopIngress?: () => Promise<void>;
-	/** Active turns finish within a grace window. */
-	awaitActiveTurns?: (graceMs: number) => Promise<void>;
+	/** Active turns finish within a grace window. Returns TRUE when the window
+	 *  expired with turns still active (drain TIMED OUT) — void/false is a
+	 *  graceful completion. */
+	awaitActiveTurns?: (
+		graceMs: number,
+	) => Promise<boolean | void> | boolean | void;
 	releaseLeases?: () => Promise<void>;
 	flushDeliveryObligations?: () => Promise<void>;
 	/** Token-rollup flush barrier (02 §7.2) — callers MUST run before model
@@ -138,6 +196,12 @@ export interface DrainHooks {
 	flushAgentHistories?: () => Promise<void>;
 	/** Final DB close. */
 	closeDatabase?: () => Promise<void>;
+	/** Sessions still active at teardown time — restart-failure counting input
+	 *  (#7536 stuck-loop detection across restarts). */
+	activeSessionKeys?: () => readonly string[];
+	/** Graceful-completion hook: clear the pre-drain resume-pending marks for
+	 *  sessions that finished inside the window (only runs when !timedOut). */
+	clearResumePending?: (keys: readonly string[]) => Promise<void>;
 	/** Status persist for the exit transition. */
 	persistExitStatus?: (outcome: DrainOutcome) => Promise<void>;
 }
@@ -149,6 +213,12 @@ export interface DrainOutcome {
 	persistedStopped: boolean;
 	/** True ONLY when data could reach neither the DB nor a recovery file. */
 	flushesFailed: boolean;
+	/** True when active turns were still running when the grace window closed.
+	 *  Gates the clean-shutdown marker (timed-out drains skip it so the next
+	 *  boot suspends half-finished tool loops, _stop_impl_body parity). */
+	timedOut: boolean;
+	/** Whether `.clean_shutdown` was written (non-timed-out drains only). */
+	cleanShutdownWritten: boolean;
 	trace: DrainStepTrace[];
 	escalated: boolean;
 }
@@ -171,6 +241,8 @@ export interface Logger {
 }
 
 const STEP_FOR_PHASE: Record<DrainPhase, string> = {
+	notify_active_sessions: "notify_active_sessions",
+	pre_drain_resume_pending: "pre_drain_resume_pending",
 	stop_ingress: "stop_ingress",
 	active_turns_grace: "active_turns_grace",
 	release_leases: "release_leases",
@@ -180,6 +252,8 @@ const STEP_FOR_PHASE: Record<DrainPhase, string> = {
 	flush_pending_messages: "flush_pending_messages",
 	clear_pending_slots: "clear_pending_slots",
 	close_database: "close_database",
+	write_clean_shutdown_marker: "write_clean_shutdown_marker",
+	increment_restart_failure_counts: "increment_restart_failure_counts",
 	persist_exit_status: "persist_exit_status",
 };
 
@@ -211,11 +285,35 @@ export async function executeDrain(
 	let agentHistoryFlushFailed = false;
 
 	const hooks = options.hooks;
+
+	// Notify active sessions FIRST — adapters are still connected so shutdown
+	// notices actually reach chats (run.py:_notify_active_sessions_of_shutdown).
+	await runStep(trace, STEP_FOR_PHASE.notify_active_sessions, async () => {
+		await hooks.notifyActiveSessions?.();
+	});
+
+	// Pre-drain resume-pending marks (#27856): durable BEFORE the grace wait,
+	// so a kill mid-drain still leaves recoverable sessions behind.
+	let preDrainKeys: readonly string[] = [];
+	await runStep(trace, STEP_FOR_PHASE.pre_drain_resume_pending, async () => {
+		preDrainKeys = (await hooks.markResumePendingPreDrain?.()) ?? [];
+	});
+
 	await runStep(trace, STEP_FOR_PHASE.stop_ingress, async () => {
 		await hooks.stopIngress?.();
 	});
+	let timedOut = false;
 	await runStep(trace, STEP_FOR_PHASE.active_turns_grace, async () => {
-		await hooks.awaitActiveTurns?.(options.graceMs);
+		timedOut = (await hooks.awaitActiveTurns?.(options.graceMs)) === true;
+		// Graceful completion: sessions that finished INSIDE the window must not
+		// carry a stale resume-pending flag (_stop_impl_body clear_resume_pending).
+		if (
+			!timedOut &&
+			preDrainKeys.length > 0 &&
+			hooks.clearResumePending !== undefined
+		) {
+			await hooks.clearResumePending(preDrainKeys);
+		}
 	});
 	await runStep(trace, STEP_FOR_PHASE.release_leases, async () => {
 		await hooks.releaseLeases?.();
@@ -282,12 +380,39 @@ export async function executeDrain(
 		await hooks.closeDatabase?.();
 	});
 
+	// Graceful completion writes the clean-shutdown marker; a TIMED-OUT drain
+	// skips it so the next boot suspends half-finished tool loops instead of
+	// resuming them (_stop_impl_body: `if not timed_out: (.clean_shutdown).touch()`).
+	if (!timedOut) {
+		await runStep(
+			trace,
+			STEP_FOR_PHASE.write_clean_shutdown_marker,
+			async () => {
+				writeCleanShutdownMarker(options.home);
+			},
+		);
+	}
+
+	// Restart-failure counting (#7536): sessions active across 3+ consecutive
+	// restarts get auto-suspended at next boot. Only recorded when something
+	// was actually running at teardown (parity of the active_agents gate).
+	await runStep(
+		trace,
+		STEP_FOR_PHASE.increment_restart_failure_counts,
+		async () => {
+			const keys = hooks.activeSessionKeys?.() ?? [];
+			if (keys.length > 0) incrementRestartFailureCounts(options.home, keys);
+		},
+	);
+
 	const klass = options.klass;
 	const outcome: DrainOutcome = {
 		klass,
 		exitCode: SHUTDOWN_EXIT_CODES[klass],
 		persistedStopped: false,
 		flushesFailed: pendingFlushFailed || agentHistoryFlushFailed,
+		timedOut,
+		cleanShutdownWritten: !timedOut,
 		trace,
 		escalated: false,
 	};
@@ -543,4 +668,102 @@ export async function recoverPendingToDb(
 /** Remove leftover planned-stop markers at boot (stale-guard hygiene). */
 export function clearShutdownMarkersAtBoot(home: string): void {
 	clearPlannedStopMarker(home);
+}
+
+// ---------------------------------------------------------------------------
+// Clean-shutdown receipt + restart-failure counts (#7536 / _stop_impl_body)
+// ---------------------------------------------------------------------------
+
+export const CLEAN_SHUTDOWN_MARKER_FILENAME = ".clean_shutdown";
+export const RESTART_FAILURE_COUNTS_FILENAME = ".restart_failure_counts";
+/** Restarts-while-active before a session is auto-suspended (#7536). */
+export const STUCK_LOOP_THRESHOLD = 3;
+
+export function cleanShutdownMarkerPath(home: string): string {
+	return join(home, CLEAN_SHUTDOWN_MARKER_FILENAME);
+}
+
+/** Touch-parity receipt: "this drain completed gracefully" (never raises). */
+export function writeCleanShutdownMarker(home: string): boolean {
+	try {
+		mkdirSync(home, { recursive: true });
+		writeFileSync(cleanShutdownMarkerPath(home), "", { mode: 0o600 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export function cleanShutdownMarkerExists(home: string): boolean {
+	try {
+		return existsSync(cleanShutdownMarkerPath(home));
+	} catch {
+		return false;
+	}
+}
+
+/** Consume the receipt exactly once (boot side unlinks BEFORE acting). */
+export function consumeCleanShutdownMarker(home: string): boolean {
+	const existed = cleanShutdownMarkerExists(home);
+	if (!existed) return false;
+	try {
+		unlinkSync(cleanShutdownMarkerPath(home));
+	} catch {
+		/* best-effort */
+	}
+	return true;
+}
+
+export function restartFailureCountsPath(home: string): string {
+	return join(home, RESTART_FAILURE_COUNTS_FILENAME);
+}
+
+/** Read the persisted counters; unreadable/absent ⇒ {} (never raises). */
+export function readRestartFailureCounts(home: string): Record<string, number> {
+	try {
+		if (!existsSync(restartFailureCountsPath(home))) return {};
+		const parsed: unknown = JSON.parse(
+			readFileSync(restartFailureCountsPath(home), "utf8"),
+		);
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed)
+		) {
+			return {};
+		}
+		const out: Record<string, number> = {};
+		for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+			const n = typeof v === "number" ? v : Number(v);
+			if (Number.isFinite(n)) out[k] = n;
+		}
+		return out;
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Increment counters for sessions ACTIVE at shutdown; sessions NOT active are
+ * dropped entirely — their loop is broken (run.py:
+ * _increment_restart_failure_counts writes exactly the active set).
+ */
+export function incrementRestartFailureCounts(
+	home: string,
+	activeSessionKeys: readonly string[],
+): void {
+	try {
+		const counts = readRestartFailureCounts(home);
+		const next: Record<string, number> = {};
+		for (const key of activeSessionKeys) {
+			next[key] = (counts[key] ?? 0) + 1;
+		}
+		mkdirSync(home, { recursive: true });
+		const path = restartFailureCountsPath(home);
+		const tmp = `${path}.${randomUUID()}.tmp`;
+		writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
+		renameSync(tmp, path);
+	} catch {
+		/* best-effort — counting must never break teardown */
+	}
 }

@@ -3,8 +3,9 @@
 //   plan ──▶ snapshot ──▶ apply ──▶ restart-per-kind ──▶ verify ──▶ receipt
 //
 // Stage contracts realized here:
-//   - refusal gates (non-in-place installs) exit 1 BEFORE mutating anything,
-//     yet still persist a receipt ("a begun-but-unwritten receipt is a bug");
+//   - refusal gates (non-in-place installs, dirty-tree overlay) record
+//     outcome "refused" and EXIT 2 before mutating anything, yet still
+//     persist a receipt ("a begun-but-unwritten receipt is a bug");
 //   - dirty-tree refusals at BOTH apply sites are terminal+receipted;
 //   - an incomplete restart phase fails CLOSED (⇒ failed);
 //   - a provably-stale gateway after verify ⇒ outcome `partial`, exit 1;
@@ -85,7 +86,7 @@ export interface UpdatePipelineOptions {
 
 export interface UpdatePipelineResult {
 	outcome: UpdateOutcome;
-	exitCode: 0 | 1;
+	exitCode: 0 | 1 | 2;
 	receiptPath: string | null;
 	plan: UpdatePlan | null;
 	snapshots: ProfileSnapshotResult[];
@@ -180,8 +181,9 @@ export async function runUpdatePipeline(
 			discoverDefaultUnits(options.homes, readStatus, liveness);
 		// ONE git-identity seam for plan + verify: injected probes win (tests),
 		// otherwise the production file-based HEAD reader serves BOTH stages.
-		const gitProbe: GitIdentityProbe =
-			options.gitProbe ?? { headSha: headShaViaFiles };
+		const gitProbe: GitIdentityProbe = options.gitProbe ?? {
+			headSha: headShaViaFiles,
+		};
 		const planInputs: PlanStageInputs = {
 			treeRoot: options.treeRoot,
 			profiles: options.homes.map((h) => h.profile),
@@ -202,7 +204,10 @@ export async function runUpdatePipeline(
 		if (!plan.updatableInPlace) {
 			result.error = `update refused: ${plan.installMethod} installs are not updatable in place — ${plan.updateMechanism}`;
 			writer.recordStep("refusal-gate", false, { reason: result.error });
-			return finishAs(result, writer, "failed");
+			// Exit-2 preflight-refusal convention (parity
+			// hermes_cli/update_receipt.py:finalize_pending_update_receipt): a
+			// DECLINED run is not a failed one — nothing mutated.
+			return finishAs(result, writer, "refused");
 		}
 
 		// --- Snapshot (best-effort; skips recorded WITH reasons) ---
@@ -249,14 +254,15 @@ export async function runUpdatePipeline(
 				});
 				break;
 			case "refused-dirty-tree":
-				// BOTH refusal sites land here — each its own receipted failure.
+				// BOTH refusal sites land here — each its own receipted refusal,
+				// exit 2 (preflight-refusal convention; see the gate above).
 				result.error = `ZIP overlay refused at ${apply.phase}: ${apply.reason}`;
 				writer.recordStep("apply", false, {
 					refused: apply.phase,
 					class: apply.class,
 					reason: apply.reason,
 				});
-				return finishAs(result, writer, "failed");
+				return finishAs(result, writer, "refused");
 			case "failed":
 				result.error =
 					`update step failed (${apply.failureClass}): ${apply.failure.stderr}`.trim();

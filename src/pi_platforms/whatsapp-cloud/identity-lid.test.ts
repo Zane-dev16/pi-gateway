@@ -1,6 +1,7 @@
-// Phone→LID alias continuity through the REAL resolution module at the WIRE
-// level (02 §4.3 invariant): two wire identities for one human MUST collapse
-// to ONE session key AND one stable outbound recipient. Consumes
+// Phone→LID alias continuity (02 §4.3 invariant): two wire identities for one
+// human MUST collapse to ONE session key, while OUTBOUND addressing posts the
+// chatId VERBATIM (whatsapp_cloud.py:send — a stale LID mapping must never
+// rewrite the Meta-delivered wa_id). Consumes
 // src/pi_gateway/resolution/whatsapp-identity.ts via buildSessionKey +
 // expandWhatsappAliases — no local re-implementation anywhere.
 
@@ -73,7 +74,7 @@ describe("LID alias continuity through the real identity module", () => {
 		}
 	});
 
-	it("outbound addressing resolves BOTH aliases to the SAME wire recipient (idempotent)", async () => {
+	it("outbound addressing posts chatId VERBATIM — stale LID mappings never rewrite Meta-delivered wa_ids", async () => {
 		const fx = makeWaCloudFixture();
 		try {
 			fx.writeLidMapping(PHONE, LID);
@@ -81,17 +82,16 @@ describe("LID alias continuity through the real identity module", () => {
 			// Addressed via the phone form…
 			const r1 = await fx.adapter.send(PHONE, "reply one");
 			expect(r1.success).toBe(true);
-			// …and via the LID form.
+			// …and via the LID form. The mapping file exists but MUST NOT
+			// canonicalize the outbound `to` (Hermes posts chat_id unchanged;
+			// Meta expects the wa_id it delivered).
 			const r2 = await fx.adapter.send(LID, "reply two");
 			expect(r2.success).toBe(true);
 
 			const recipients = fx.graph.textSendsOf().map((s) => s.to);
-			expect(recipients).toEqual([PHONE, PHONE]); // STABLE digits recipient
-			expect(fx.adapter.resolveRecipient(LID)).toBe(PHONE);
-			// Idempotency: repeated resolution is byte-stable.
-			expect(fx.adapter.resolveRecipient(LID)).toBe(
-				fx.adapter.resolveRecipient(PHONE),
-			);
+			expect(recipients).toEqual([PHONE, LID]); // VERBATIM passthrough
+			expect(fx.adapter.resolveRecipient(LID)).toBe(LID);
+			expect(fx.adapter.resolveRecipient(PHONE)).toBe(PHONE);
 		} finally {
 			fx.dispose();
 		}

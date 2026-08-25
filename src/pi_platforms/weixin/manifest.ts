@@ -16,10 +16,20 @@ export const EP_GET_UPDATES = "ilink/bot/getupdates"; // EP_GET_UPDATES
 export const EP_SEND_MESSAGE = "ilink/bot/sendmessage"; // EP_SEND_MESSAGE
 export const EP_SEND_TYPING = "ilink/bot/sendtyping"; // EP_SEND_TYPING
 export const EP_GET_CONFIG = "ilink/bot/getconfig"; // EP_GET_CONFIG
+export const EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"; // EP_GET_UPLOAD_URL
+export const EP_GET_BOT_QR = "ilink/bot/get_bot_qrcode"; // EP_GET_BOT_QR
+export const EP_GET_QR_STATUS = "ilink/bot/get_qrcode_status"; // EP_GET_QR_STATUS
 
 export const LONG_POLL_TIMEOUT_MS = 35_000; // LONG_POLL_TIMEOUT_MS
 export const API_TIMEOUT_MS = 15_000; // API_TIMEOUT_MS
 export const CONFIG_TIMEOUT_MS = 10_000; // CONFIG_TIMEOUT_MS
+export const QR_TIMEOUT_MS = 35_000; // QR_TIMEOUT_MS
+
+// ── QR login flow (weixin.py:qr_login) ───────────────────────────────────────
+export const QR_LOGIN_TIMEOUT_S = 480; // qr_login timeout_seconds default
+export const QR_MAX_EXPIRED_REFRESHES = 3; // refresh cap before giving up
+export const QR_POLL_INTERVAL_S = 1; // per-cycle poll sleep
+export const QR_DEFAULT_BOT_TYPE = "3"; // qr_login bot_type default
 
 export const MAX_CONSECUTIVE_FAILURES = 3; // MAX_CONSECUTIVE_FAILURES
 export const RETRY_DELAY_SECONDS = 2; // RETRY_DELAY_SECONDS
@@ -27,6 +37,8 @@ export const BACKOFF_DELAY_SECONDS = 30; // BACKOFF_DELAY_SECONDS
 export const SESSION_EXPIRED_PAUSE_S = 600; // _poll_loop session-expired pause
 export const SESSION_EXPIRED_ERRCODE = -14; // SESSION_EXPIRED_ERRCODE
 export const RATE_LIMIT_ERRCODE = -2; // RATE_LIMIT_ERRCODE (iLink frequency limit)
+/** weixin.py:WeixinAdapter.MAX_MESSAGE_LENGTH — outbound text split budget. */
+export const WX_MAX_MESSAGE_LENGTH = 2000;
 export const MESSAGE_DEDUP_TTL_SECONDS = 300; // MESSAGE_DEDUP_TTL_SECONDS
 
 // ── media/item type codes (weixin.py) ────────────────────────────────────────
@@ -35,6 +47,12 @@ export const ITEM_IMAGE = 2;
 export const ITEM_VOICE = 3;
 export const ITEM_FILE = 4;
 export const ITEM_VIDEO = 5;
+
+// ── CDN upload media-type codes (weixin.py MEDIA_*) ─────────────────────────
+export const MEDIA_IMAGE = 1; // MEDIA_IMAGE
+export const MEDIA_VIDEO = 2; // MEDIA_VIDEO
+export const MEDIA_FILE = 3; // MEDIA_FILE (audio/* non-.silk rides this too)
+export const MEDIA_VOICE = 4; // MEDIA_VOICE (.silk)
 
 export const MSG_TYPE_USER = 1; // MSG_TYPE_USER
 export const MSG_TYPE_BOT = 2; // MSG_TYPE_BOT
@@ -67,9 +85,9 @@ export const TYPING_TICKET_TTL_S = 600.0;
 // ── capabilities AS DATA (04 §2) ─────────────────────────────────────────────
 /**
  * Hermes parity: WeixinAdapter overrides NEITHER supports_async_delivery nor
- * interactive_resume (base defaults hold); splitting rides the shared kit
- * chunker at the conformance surface (the platform's own delivery-unit
- * splitter ships as data in text-splitting.ts with its own contracts).
+ * interactive_resume (base defaults hold); egress splitting is Hermes send()
+ * truth — format_message parity then _split_text_for_weixin_delivery
+ * (text-splitting.ts), NOT the shared kit chunker.
  */
 export const WEIXIN_CAPABILITIES = Object.freeze({
 	typedCommandPrefix: "/",

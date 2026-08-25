@@ -277,11 +277,8 @@ export function makeRealFeishuFixture(): WsFixture {
 			// Post-latch attempt: must skip the wire (no new rich op, no count).
 			const attemptsBefore = engine.richWireAttempts;
 			await engine.deliverText("oc_latch", "second send skips rich");
-			const richOpsAfter = wire.ops.filter(
-				(o) => o.op === "rich",
-			).length;
-			const wireAttemptsAfterSkip =
-				richOpsAfter === 1 ? attemptsBefore : -1;
+			const richOpsAfter = wire.ops.filter((o) => o.op === "rich").length;
+			const wireAttemptsAfterSkip = richOpsAfter === 1 ? attemptsBefore : -1;
 
 			const supportsStreamingFalse =
 				engine.supportsDraftStreaming("dm") === false;
@@ -324,13 +321,16 @@ export function makeRealFeishuFixture(): WsFixture {
 			const { engine, wire } = world;
 
 			// ── leg (i): markdown decision locks WHOLE-MESSAGE per deliver call.
+			// The post lane ships the VENDOR JSON-STRING payload ({"zh_cn":
+			// {"content":rows}} :580/:4641) with fence-split rows; RAW bytes are
+			// preserved VERBATIM inside the row texts.
 			const md = "**bold** intro [link](https://x.y)";
 			await engine.deliverText("oc_md", md);
 			const mdSends = wire.sendsOf("oc_md");
 			const nativeRawByteExact =
 				mdSends.length >= 1 &&
 				mdSends.every((o) => o.metadata["msg_type"] === "post") &&
-				mdSends.some((o) => o.content === md); // RAW bytes preserved VERBATIM
+				mdSends.some((o) => decodePostPayload(o.content) === md); // RAW bytes preserved VERBATIM
 
 			// Prefix stability across chunks: a long markdown doc splits with
 			// fence carry and the STRIPPED pieces reconstruct byte-exact.
@@ -340,7 +340,7 @@ export function makeRealFeishuFixture(): WsFixture {
 			await engine.deliverText("oc_longmd", long);
 			const longSends = wire.sendsOf("oc_longmd");
 			const reconstructed = reconstructFromChunks(
-				longSends.map((o) => o.content),
+				longSends.map((o) => decodePostPayload(o.content)),
 			);
 			const nativePrefixStable = reconstructed === long;
 
@@ -358,12 +358,16 @@ export function makeRealFeishuFixture(): WsFixture {
 
 			await engine.deliverText("oc_table", "| a | b |\n|---|---|\n| 1 | 2 |");
 			const tableSends = wire.sendsOf("oc_table");
-			const tableBody = tableSends.map((s) => s.content).join("\n");
+			const tableBody = tableSends
+				.map((s) => decodePostPayload(s.content))
+				.join("\n");
+			const mdBody = mdSends
+				.map((o) => decodePostPayload(o.content))
+				.join("\n");
 			const restConvertedBold =
-				tableBody.includes("**x**") ||
-				mdSends.some((o) => o.content.includes("**bold**"));
+				tableBody.includes("**x**") || mdBody.includes("**bold**");
 			const restConvertedLink =
-				mdSends.some((o) => o.content.includes("[link](https://x.y)")) &&
+				mdBody.includes("[link](https://x.y)") &&
 				!tableBody.includes("<https://x.y|");
 			const restConvertedTable =
 				tableBody.includes("| a | b |") && !(tableBody.split("```").length > 1);
@@ -405,6 +409,24 @@ function reconstructFromChunks(contents: string[]): string {
 		})
 		.join("")
 		.trim();
+}
+
+/** Decode the vendor post payload JSON STRING back to its joined row texts
+ * (:580 _build_markdown_post_payload inverse); non-JSON content (the text
+ * lane) passes through unchanged. */
+function decodePostPayload(content: string): string {
+	try {
+		const parsed = JSON.parse(content) as {
+			zh_cn?: { content?: Array<Array<{ text?: string }>> };
+		};
+		const rows = parsed.zh_cn?.content ?? [];
+		if (rows.length === 0) return content;
+		return rows
+			.map((row) => row.map((el) => el.text ?? "").join(""))
+			.join("\n");
+	} catch {
+		return content;
+	}
 }
 
 function freshWorld(

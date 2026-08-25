@@ -16,7 +16,11 @@ import {
 	DRAIN_PHASE_ORDER,
 	SHUTDOWN_EXIT_CODES,
 	classifySignalForSelf,
+	cleanShutdownMarkerPath,
 	executeDrain,
+	incrementRestartFailureCounts,
+	readRestartFailureCounts,
+	writeCleanShutdownMarker,
 	normalizePendingPayload,
 	recoveryDir,
 	type DrainHooks,
@@ -44,11 +48,15 @@ function runningLifecycle(
 	extra: {
 		stageBodies?: Partial<Record<string, StageBody>>;
 		logger?: Logger;
+		options?: Partial<ConstructorParameters<typeof GatewayLifecycle>[0]>;
 	} = {},
 ): GatewayLifecycle {
 	return new GatewayLifecycle({
 		home,
 		logger: extra.logger ?? QUIET_LOGGER,
+		// Unit tests stay hermetic: no detached ps-walks from the signal path.
+		forensics: { snapshot: false, spawnDiagnostic: false },
+		...extra.options,
 	});
 }
 
@@ -74,6 +82,12 @@ describe("signal classification (run.py:shutdown_signal_handler parity)", () => 
 
 	it("SIGINT is a planned stop BY DEFINITION — even without any marker", () => {
 		expect(classifySignalForSelf(home, "SIGINT")).toBe("planned_stop");
+	});
+
+	it("SIGUSR1 IS an in-band restart by definition ⇒ service_restart (exit 75)", () => {
+		// run.py:restart_signal_handler parity — the fleet updater drains
+		// gateways with SIGUSR1 first (08 §7); it must NEVER read as unexpected.
+		expect(classifySignalForSelf(home, "SIGUSR1")).toBe("service_restart");
 	});
 
 	it("planned-stop marker + SIGTERM ⇒ planned_stop; bare unmarked SIGTERM ⇒ unexpected_signal", () => {
@@ -317,6 +331,7 @@ describe("double-signal escalation (08 §1.2 fast-exit)", () => {
 		const lifecycle = new GatewayLifecycle({
 			home,
 			logger: QUIET_LOGGER,
+			forensics: { snapshot: false, spawnDiagnostic: false },
 			hardExit: (code) => {
 				exitSpy.code = code;
 				// At hard-exit time ownership MUST already be released (§1.3c).
@@ -331,5 +346,117 @@ describe("double-signal escalation (08 §1.2 fast-exit)", () => {
 		lifecycle.handleSignal("SIGTERM"); // escalates immediately
 
 		expect(exitSpy.code).toBe(1);
+	});
+});
+
+describe("notify + pre-drain resume-pending phases (run.py:_stop_impl_body)", () => {
+	it("notify runs FIRST (adapters still connected); pre-drain marks precede stop_ingress", async () => {
+		const lifecycle = runningLifecycle();
+		await lifecycle.startup();
+		const order: string[] = [];
+		const outcome = await executeDrain({
+			home,
+			klass: "planned_stop",
+			graceMs: 0,
+			hooks: {
+				notifyActiveSessions: async () => {
+					order.push("notify");
+				},
+				markResumePendingPreDrain: async () => {
+					order.push("pre-drain-marks");
+					return ["s1"];
+				},
+				stopIngress: async () => {
+					order.push("stop_ingress");
+				},
+			},
+			takePendingSlots: () => [],
+			log: QUIET_LOGGER,
+		});
+		expect(order).toEqual(["notify", "pre-drain-marks", "stop_ingress"]);
+
+		const idxOf = (step: string) =>
+			outcome.trace.findIndex((t) => t.step === step);
+		expect(idxOf("notify_active_sessions")).toBeLessThan(
+			idxOf("pre_drain_resume_pending"),
+		);
+		expect(idxOf("pre_drain_resume_pending")).toBeLessThan(
+			idxOf("stop_ingress"),
+		);
+	});
+
+	it("graceful drain writes .clean_shutdown and CLEARS pre-drain marks; counts recorded", async () => {
+		const cleared: string[][] = [];
+		const outcome = await executeDrain({
+			home,
+			klass: "service_restart",
+			graceMs: 0,
+			hooks: {
+				markResumePendingPreDrain: async () => ["done-s1", "done-s2"],
+				clearResumePending: async (keys) => {
+					cleared.push([...keys]);
+				},
+				activeSessionKeys: () => ["done-s1"],
+			},
+			takePendingSlots: () => [],
+			log: QUIET_LOGGER,
+		});
+		expect(outcome.klass).toBe("service_restart");
+		expect(outcome.exitCode).toBe(75);
+		expect(outcome.timedOut).toBe(false);
+		expect(outcome.cleanShutdownWritten).toBe(true);
+		expect(existsSync(cleanShutdownMarkerPath(home))).toBe(true);
+		expect(cleared).toEqual([["done-s1", "done-s2"]]);
+		// Sessions active at teardown land in the stuck-loop counters (#7536).
+		expect(readRestartFailureCounts(home)).toEqual({ "done-s1": 1 });
+	});
+
+	it("TIMED-OUT drain skips the clean marker, skips clearing, still records active sessions", async () => {
+		const lifecycle = runningLifecycle();
+		await lifecycle.startup();
+		writeCleanShutdownMarker(home); // stale receipt from an earlier life
+		const cleared: string[][] = [];
+
+		const hooks = lifecycle["drainHooks"]();
+		const outcome = await executeDrain({
+			home,
+			klass: "unexpected_signal",
+			graceMs: 5,
+			hooks: {
+				...hooks,
+				markResumePendingPreDrain: async () => ["stuck-s"],
+				clearResumePending: async (keys) => {
+					cleared.push([...keys]);
+				},
+				awaitActiveTurns: (graceMs) => graceMs > 0, // turns STILL running
+				activeSessionKeys: () => ["stuck-s"],
+			},
+			takePendingSlots: () => [],
+			log: QUIET_LOGGER,
+		});
+
+		expect(outcome.timedOut).toBe(true);
+		expect(outcome.cleanShutdownWritten).toBe(false);
+		expect(existsSync(cleanShutdownMarkerPath(home))).toBe(true); // stale receipt untouched
+		expect(cleared).toEqual([]);
+		expect(readRestartFailureCounts(home)).toEqual({ "stuck-s": 1 });
+	});
+});
+
+describe("SIGUSR1 in-band restart (restart_signal_handler parity)", () => {
+	it("handleSignal(SIGUSR1) drives the graceful drain to class service_restart / exit 75", async () => {
+		const lifecycle = runningLifecycle();
+		await lifecycle.startup();
+
+		lifecycle.handleSignal("SIGUSR1");
+		const outcome = await lifecycle.drainSettled;
+
+		expect(outcome.klass).toBe("service_restart");
+		expect(outcome.exitCode).toBe(SHUTDOWN_EXIT_CODES.service_restart);
+		expect(outcome.exitCode).toBe(75);
+		// A completed restart drain is CLEAN — the supervisor replaces us.
+		expect(outcome.persistedStopped).toBe(true);
+		expect(lifecycle.unexpectedSignalInitiated).toBe(false);
+		expect(readRuntimeStatus(home)?.gateway_state).toBe("stopped");
 	});
 });

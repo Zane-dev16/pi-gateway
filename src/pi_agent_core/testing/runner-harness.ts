@@ -13,6 +13,7 @@ import type {
 	GatewayAgentRunnerOptions,
 	MemoryTurnHooks,
 	RunnerStore,
+	RunnerTurnLeaseRegistry,
 } from "../runner.js";
 import { GatewayAgentRunner } from "../runner.js";
 import {
@@ -44,6 +45,16 @@ export interface RunnerHarnessOptions {
 	memoryHooks?: MemoryTurnHooks;
 	cacheOptions?: GatewayAgentRunnerOptions["cacheOptions"];
 	poolMaxWorkers?: number;
+	/** Wire the durable turn-lease layer (StateStore.leases) into the runner. */
+	withTurnLeases?: boolean;
+	/** L1 in-process registry passed straight through to the runner. */
+	turnLeaseRegistry?: RunnerTurnLeaseRegistry;
+	leaseTtlSeconds?: number;
+	leaseWaitSeconds?: number;
+	leasePollIntervalSeconds?: number;
+	leaseRefreshIntervalMs?: number;
+	cacheSweepIntervalMs?: number;
+	startInterval?: GatewayAgentRunnerOptions["startInterval"];
 }
 
 export async function createRunnerHarness(
@@ -63,6 +74,7 @@ export async function createRunnerHarness(
 		appendMessage: (m) => store.appendMessage(m),
 		queueTokenCounts: (sessionId, delta) =>
 			store.queueTokenCounts(sessionId, delta),
+		...(options.withTurnLeases === true ? { leases: store.leases } : {}),
 	};
 	const runner = new GatewayAgentRunner({
 		store: storeAdapter,
@@ -77,6 +89,27 @@ export async function createRunnerHarness(
 		...(options.cacheOptions ? { cacheOptions: options.cacheOptions } : {}),
 		...(options.poolMaxWorkers !== undefined
 			? { poolMaxWorkers: options.poolMaxWorkers }
+			: {}),
+		...(options.turnLeaseRegistry !== undefined
+			? { turnLeaseRegistry: options.turnLeaseRegistry }
+			: {}),
+		...(options.leaseTtlSeconds !== undefined
+			? { leaseTtlSeconds: options.leaseTtlSeconds }
+			: {}),
+		...(options.leaseWaitSeconds !== undefined
+			? { leaseWaitSeconds: options.leaseWaitSeconds }
+			: {}),
+		...(options.leasePollIntervalSeconds !== undefined
+			? { leasePollIntervalSeconds: options.leasePollIntervalSeconds }
+			: {}),
+		...(options.leaseRefreshIntervalMs !== undefined
+			? { leaseRefreshIntervalMs: options.leaseRefreshIntervalMs }
+			: {}),
+		...(options.cacheSweepIntervalMs !== undefined
+			? { cacheSweepIntervalMs: options.cacheSweepIntervalMs }
+			: {}),
+		...(options.startInterval !== undefined
+			? { startInterval: options.startInterval }
 			: {}),
 	});
 	return {

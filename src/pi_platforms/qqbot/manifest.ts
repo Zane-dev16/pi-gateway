@@ -17,6 +17,17 @@ export const QQBOT_API_BASE = "https://api.sgroup.qq.com"; // constants.py:API_B
 export const QQBOT_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"; // constants.py:TOKEN_URL
 export const QQBOT_GATEWAY_URL_PATH = "/gateway"; // constants.py:GATEWAY_URL_PATH
 
+// ── User-Agent (qqbot/utils.py:build_user_agent) ─────────────────────────────
+/**
+ * Descriptive User-Agent carried on EVERY authenticated REST leg — gateway-url
+ * GET, every _api_request, interaction ACK, and the q.qq.com onboard calls
+ * (utils.py:get_api_headers notes q.qq.com answers anti-bot challenge pages
+ * without an identifying UA). Hermes format:
+ *   `QQBotAdapter/<version> (Python/<py>; <os>; Hermes/<version>)`
+ * This port preserves the vendor contract with truthful runtime tokens.
+ */
+export const QQBOT_USER_AGENT = `QQBotAdapter/${QQBOT_VERSION} (Node/${process.version}; ${process.platform}; pi-gateway)`;
+
 // ── timeouts & retry (constants.py) ──────────────────────────────────────────
 export const QQBOT_DEFAULT_API_TIMEOUT_S = 30.0; // DEFAULT_API_TIMEOUT
 export const QQBOT_FILE_UPLOAD_TIMEOUT_S = 120.0; // FILE_UPLOAD_TIMEOUT
@@ -102,6 +113,54 @@ export const QQ_MAX_CONCURRENT_PARTS = 10;
 export const QQ_BIZ_CODE_DAILY_LIMIT = 40093002;
 /** biz_code 40093001 — upload_part_finish transient; retry until timeout. */
 export const QQ_BIZ_CODE_PART_RETRYABLE = 40093001;
+
+// ── typing indicator (adapter.py:_TYPING_INPUT_SECONDS/_TYPING_DEBOUNCE_SECONDS)
+export const QQ_TYPING_INPUT_SECONDS = 60; // duration reported to QQ (60s indicator)
+export const QQ_TYPING_DEBOUNCE_MS = 50_000; // refresh before it expires
+
+// ── send-path connection gate (adapter.py:_wait_for_reconnection) ────────────
+/** Max seconds a send waits for the listener to reconnect before failing. */
+export const QQ_RECONNECT_WAIT_S = 15.0; // _RECONNECT_WAIT_SECONDS
+/** Seconds between is_connected polls while waiting (adapter.py). */
+export const QQ_RECONNECT_POLL_INTERVAL_S = 0.5; // _RECONNECT_POLL_INTERVAL
+
+// ── inbound attachments / STT (adapter.py:_download_and_cache, _call_stt) ────
+/** httpx timeout on CDN media GETs and the STT transcription POST (30s). */
+export const QQ_MEDIA_HTTP_TIMEOUT_S = 30.0;
+/** adapter.py:_resolve_stt_config provider→base-url map (data, verbatim). */
+export const QQ_STT_PROVIDER_BASE_URLS: Readonly<Record<string, string>> =
+	Object.freeze({
+		zai: "https://open.bigmodel.cn/api/coding/paas/v4",
+		glm: "https://open.bigmodel.cn/api/coding/paas/v4",
+		openai: "https://api.openai.com/v1",
+	});
+/** Env fallbacks resolved by _resolve_qq_secret (hermes setup gateway). */
+export const QQ_STT_ENV_API_KEY = "QQ_STT_API_KEY";
+export const QQ_STT_ENV_BASE_URL = "QQ_STT_BASE_URL";
+export const QQ_STT_ENV_MODEL = "QQ_STT_MODEL";
+/** Default models per config shape (_resolve_stt_config). */
+export const QQ_STT_DEFAULT_MODEL_EXPLICIT = "whisper-1";
+export const QQ_STT_DEFAULT_MODEL_ZAI = "glm-asr";
+export const QQ_STT_DEFAULT_BASE_URL_ZAI =
+	"https://open.bigmodel.cn/api/coding/paas/v4";
+
+// ── QR scan-to-configure endpoints (constants.py PORTAL_HOST / ONBOARD_*) ────
+/** Portal host override rides the optionalEnv QQ_PORTAL_HOST (corporate proxies). */
+export const QQ_PORTAL_HOST_DEFAULT = "q.qq.com"; // PORTAL_HOST default
+export const QQ_ONBOARD_CREATE_PATH = "/lite/create_bind_task"; // ONBOARD_CREATE_PATH
+export const QQ_ONBOARD_POLL_PATH = "/lite/poll_bind_result"; // ONBOARD_POLL_PATH
+/** QR target URL template (constants.py:QR_URL_TEMPLATE); attribution token is this port's own. */
+export const QQ_QR_CONNECT_URL_TEMPLATE =
+	"https://q.qq.com/qqbot/openclaw/connect.html?task_id={task_id}&_wv=2&source=pi-gateway";
+export const QQ_ONBOARD_POLL_INTERVAL_S = 2.0; // ONBOARD_POLL_INTERVAL
+export const QQ_ONBOARD_API_TIMEOUT_S = 10.0; // ONBOARD_API_TIMEOUT
+export const QQ_ONBOARD_MAX_REFRESHES = 3; // onboard.py:_MAX_REFRESHES
+
+/** Bind task statuses (onboard.py:BindStatus IntEnum). */
+export const QQ_BIND_STATUS_NONE = 0;
+export const QQ_BIND_STATUS_PENDING = 1;
+export const QQ_BIND_STATUS_COMPLETED = 2;
+export const QQ_BIND_STATUS_EXPIRED = 3;
 
 // ── approvals (adapter.py:send_exec_approval) ────────────────────────────────
 /** Matches gateway's default gateway_timeout (keyboards.py ApprovalRequest doc). */

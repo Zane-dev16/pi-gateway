@@ -175,6 +175,8 @@ export class WebhookAdapter extends BasePlatformAdapter {
 	>();
 	/** Sessions bound via RAW-key direct turns (DEC-022 observability). */
 	private readonly boundRawKeySet = new Set<string>();
+	/** Adopted X-Hermes-Session-Key memory scopes (DEC-017 observability). */
+	private readonly boundMemoryScopes = new Set<string>();
 
 	private holdGate: Promise<void> = Promise.resolve();
 	private releaseHold: () => void = () => {};
@@ -268,8 +270,8 @@ export class WebhookAdapter extends BasePlatformAdapter {
 			apiKeyProvider: this.apiKeyProvider,
 			idempotency: this.idempotency(),
 			nowMs: () => this.nowSecondsFn() * 1000,
-			runDirectTurn: async ({ rawSessionId, prompt }) =>
-				this.runDirectTurn(rawSessionId, prompt),
+			runDirectTurn: async ({ rawSessionId, prompt, sessionKey }) =>
+				this.runDirectTurn(rawSessionId, prompt, sessionKey),
 		});
 	}
 
@@ -423,6 +425,7 @@ export class WebhookAdapter extends BasePlatformAdapter {
 	private async runDirectTurn(
 		rawSessionId: string | undefined,
 		prompt: string,
+		sessionKey?: string | undefined,
 	): Promise<DirectTurnResult> {
 		// The RAW session id IS the key real turns bind under (DEC-022):
 		// no derivation, no namespace reshaping.
@@ -437,9 +440,16 @@ export class WebhookAdapter extends BasePlatformAdapter {
 				chatId: sessionId,
 			},
 			// Stamp the routing key so the guard's internal-routing check and
-			// the reply-waiter registry agree on the RAW key.
-			metadata: { gateway_session_key: sessionId },
+			// the reply-waiter registry agree on the RAW key. An adopted
+			// X-Hermes-Session-Key rides ALONGSIDE as the long-term memory
+			// scope (api_server.py gateway_session_key — independent of the
+			// continuity id; DEC-017).
+			metadata: {
+				gateway_session_key: sessionId,
+				...(sessionKey !== undefined ? { memory_scope: sessionKey } : {}),
+			},
 		};
+		if (sessionKey !== undefined) this.boundMemoryScopes.add(sessionKey);
 		const waiter = this.registerReplyWaiter(sessionId);
 		await this.handleIngress(event, sessionId);
 		const reply = (await waiter.promise) ?? "";
@@ -450,13 +460,19 @@ export class WebhookAdapter extends BasePlatformAdapter {
 	runDirectTurnForTest(
 		rawSessionId: string | undefined,
 		prompt: string,
+		sessionKey?: string | undefined,
 	): Promise<DirectTurnResult> {
-		return this.runDirectTurn(rawSessionId, prompt);
+		return this.runDirectTurn(rawSessionId, prompt, sessionKey);
 	}
 
 	/** Session keys bound via RAW-key direct turns (DEC-022 observability). */
 	rawKeyBoundSessions(): readonly string[] {
 		return [...this.boundRawKeySet];
+	}
+
+	/** Memory scopes bound via adopted session keys (DEC-017 observability). */
+	memoryScopeBindings(): readonly string[] {
+		return [...this.boundMemoryScopes];
 	}
 
 	/** Alias used by e2e wiring to assert RAW-key binding. */

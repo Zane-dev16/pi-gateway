@@ -18,6 +18,7 @@
 //   - outbound is /send {spaceId, text, format?} with the markdown kill-switch
 //     dual path, URL-only rich-link routing, and the 8000-char budget; typing,
 //     reactions, polls, effects ride sibling loopback endpoints
+//     (adapter.py:send_effect → /send-effect {spaceId,text,effect})
 //   - THE presence watchdog ports _probe_once/_presence_watchdog decision
 //     logic as STEPWISE methods (injected clock, no internal timers): alive /
 //     hung / inconclusive tri-state, N-consecutive-hung ⇒ EXACTLY ONE respawn
@@ -1305,6 +1306,35 @@ export class PhotonAdapter extends BasePlatformAdapter {
 		const messageId =
 			typeof data["messageId"] === "string" ? data["messageId"] : undefined;
 		this.recordSentMessage(messageId);
+		return { success: true, messageId };
+	}
+
+	/**
+	 * adapter.py:send_effect — text with a native iMessage bubble or screen
+	 * effect: POST /send-effect {spaceId, text, effect} with BOTH fields
+	 * stripped and validated non-empty BEFORE any call; empty input fails
+	 * without touching the sidecar.
+	 */
+	async sidecarSendEffect(
+		spaceId: string,
+		text: string,
+		effect: string,
+	): Promise<SendResult> {
+		if (!text.trim() || !effect.trim()) {
+			return { success: false, error: "text and effect are required" };
+		}
+		let data: Record<string, unknown>;
+		try {
+			data = await this.sidecarCall("/send-effect", {
+				spaceId,
+				text: text.trim(),
+				effect: effect.trim(),
+			});
+		} catch (err) {
+			return sidecarErrorResult(err);
+		}
+		const messageId =
+			typeof data["messageId"] === "string" ? data["messageId"] : undefined;
 		return { success: true, messageId };
 	}
 

@@ -12,19 +12,36 @@
 //     bearer verification reads ONLY headers BEFORE any body parse; body caps
 //     (declared length then actual bytes) run pre-parse; JSON shape failures
 //     are 400; recognized/deduped/non-MESSAGE envelopes all ACK 200
-//   - Pub/Sub mode, SA credential loading, attachment downloads (SSRF-guarded
-//     Drive/media fetches) and the /setup-files OAuth helper stay OUT of this
-//     port's transport surface: they require GCP infrastructure or user-OAuth
-//     daemons Hermes itself delegates — documented probe-computed exclusions,
-//     never faked green
+//   - EXCLUDED SURFACES (sanctioned, not silently dropped — proposed DEC text
+//     DEC-GCHAT-EXCL logged per DEC-026 protocol):
+//       * Pub/Sub supervisor lane (_run_supervisor/_on_pubsub_message): needs
+//         a live GCP Pub/Sub subscription; HTTP-events mode is the ported
+//         transport surface.
+//       * SA credential loading (_load_sa_credentials) + service-account JWT
+//         signing: GCP metadata/file infrastructure only exists on Cloud Run.
+//       * oauth.py per-user OAuth subsystem (PKCE auth URL, code exchange,
+//         token refresh powering attachment delivery): user-OAuth daemon
+//         Hermes itself delegates; attachment DOWNLOAD stays available via
+//         the INJECTED GchatAttachmentDownloader seam below, so the bot-SA
+//         three-path priority IS exercised without the OAuth daemon.
 //   - outbound ports send()/_create_message/edit_message semantics: markdown→
 //     Chat dialect conversion before chunking, thread resolution ladder incl.
-//     the job_id new-thread rule, messageReplyOption data on threaded sends,
-//     typing-marker PATCH-in-place (no delete tombstone), 403-fatal /
-//     404-skip / 429-counter verdict ladder
+//     the job_id new-thread rule, messageReplyOption as a CREATE QUERY PARAM
+//     (messages.create query kwarg — NEVER a body field; the Message resource
+//     rejects unknown body fields), typing-marker PATCH-in-place (no delete
+//     tombstone), masked patches (_patch_message @2346 — updateMask names
+//     exactly the shipped fields so unspecified ones can never be cleared),
+//     _call_with_retry bounded create retries (@2538; timeout-classified
+//     outcomes excluded per DEC-046), outbound thread-count bump from the
+//     create-response thread.name (@2619-2634), end-of-turn stranded-typing
+//     retirement (@2775-2810), 403-fatal / 404-skip / 429-counter verdict
+//     ladder
 //
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
+
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
 	BasePlatformAdapter,
@@ -33,6 +50,7 @@ import {
 	ClarifyPendingStore,
 	OneShotPendingStore,
 	resolveEnablement,
+	classifySendError,
 	PLAIN_TEXT_FALLBACK_PREFIX,
 } from "../kit/index.js";
 import type {
@@ -52,6 +70,10 @@ import {
 	GCHAT_MAX_TEXT_LENGTH,
 	GCHAT_PLUGIN_MANIFEST,
 	GCHAT_RATE_LIMIT_WARN_THRESHOLD,
+	GCHAT_RETRY_BASE_DELAY_MS,
+	GCHAT_RETRY_JITTER,
+	GCHAT_RETRY_MAX_ATTEMPTS,
+	GCHAT_RETRY_MAX_DELAY_MS,
 	GCHAT_RETRYABLE_HTTP_STATUSES,
 	validateGchatTrustBoundary,
 } from "./manifest.js";
@@ -59,6 +81,8 @@ import type { GchatTrustBoundary } from "./manifest.js";
 import type { ScopedSecretReader } from "../kit/registration.js";
 import type { DisableReason } from "../kit/lifecycle-state.js";
 import { BoundedSeenSet } from "../../pi_gateway/security/trust/index.js";
+import { TaskCancelledError } from "../../pi_gateway/guards/index.js";
+import type { ProcessingOutcome } from "../../pi_gateway/guards/index.js";
 
 /** The one command registry (07 §1 derivation — mirrors the reference set). */
 export const GCHAT_REGISTRY: CommandRegistry = [
@@ -107,22 +131,53 @@ export interface GchatCaptureWire {
 	transmitRich(chatId: string, content: string): Promise<SendResult>;
 }
 
-/** Chat REST egress seam (_create_message/_patch_message parity). */
+/**
+ * Chat REST egress seam (_create_message/_patch_message parity). `queryParams`
+ * carries REST QUERY parameters — messageReplyOption rides HERE, never inside
+ * the request body (the Message resource rejects unknown body fields).
+ *
+ * `updateMask` on patch mirrors _patch_message (@2346): messages.patch is a
+ * MASKED update — without the query mask the API may CLEAR every field the
+ * body omits, so callers always declare exactly the fields they ship.
+ */
 export interface GchatTransport {
 	createMessage(
 		chatId: string,
 		body: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
+		queryParams?: Record<string, string>,
 	): Promise<GchatApiResponse>;
 	patchMessage(
 		messageName: string,
 		body: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
+		updateMask?: string,
 	): Promise<GchatApiResponse>;
 }
 
-/** SendResult carrying the HTTP status the verdict ladder classifies on. */
-export type GchatApiResponse = SendResult & { status?: number | undefined };
+/**
+ * Attachment-download seam (_download_attachment @1939 parity). Production
+ * binds the two Chat-API edges with bot-SA credentials; fixtures bind seeded
+ * buffers. Both edges resolve to bytes or null — the adapter owns the
+ * THREE-PATH PRIORITY and the SSRF guard:
+ *   path 1: attachmentDataRef.resourceName via media.download (bot path)
+ *   path 2: DRIVE_FILE without resourceName ⇒ SKIP (needs user-OAuth Drive scope)
+ *   path 3: downloadUri ONLY on Google-owned hosts (SSRF guard)
+ */
+export interface GchatAttachmentDownloader {
+	downloadMedia(resourceName: string): Promise<Buffer | null>;
+	fetchUri(downloadUri: string): Promise<Buffer | null>;
+}
+
+/**
+ * SendResult carrying the HTTP status the verdict ladder classifies on, plus
+ * the messages.create response slice the outbound thread-count bump reads
+ * (`thread.name`, _create_message @2619-2634 parity).
+ */
+export type GchatApiResponse = SendResult & {
+	status?: number | undefined;
+	thread?: { name?: string | undefined } | undefined;
+};
 
 export interface GchatAdapterOptions {
 	config?: GchatAdapterConfig | undefined;
@@ -134,6 +189,14 @@ export interface GchatAdapterOptions {
 	/** Conformance-harness rich probe capture (see GchatCaptureWire). */
 	captureWire?: GchatCaptureWire | undefined;
 	dedupCap?: number | undefined;
+	/** Bot-SA attachment download edges (see GchatAttachmentDownloader). */
+	attachmentDownloader?: GchatAttachmentDownloader | undefined;
+	/** Inbound attachment cache root (tests: mkdtemp). */
+	mediaCacheDir?: string | undefined;
+	/** Retry-ladder seams (_call_with_retry parity; tests: deterministic
+	 * no-wait clock + fixed jitter coin). Defaults: setTimeout / Math.random. */
+	retrySleep?: ((ms: number) => Promise<void>) | undefined;
+	retryRng?: (() => number) | undefined;
 }
 
 export type HandlerResponse = {
@@ -153,13 +216,71 @@ export type BearerVerdict =
 				| "unexpected_google_bearer_identity";
 	  };
 
-// ── markdown → Chat dialect (format_message @2403 parity) ───────────────────
+/** _TRUSTED_ATTACHMENT_HOSTS parity (@313) — the SSRF allowlist. */
+const TRUSTED_ATTACHMENT_HOSTS: readonly string[] = [
+	"googleapis.com",
+	"chat.google.com",
+	"drive.google.com",
+	"docs.google.com",
+	"lh3.googleusercontent.com",
+	"lh4.googleusercontent.com",
+	"lh5.googleusercontent.com",
+	"lh6.googleusercontent.com",
+];
+
+/** _is_google_owned_host parity: https + Google-owned host, else reject. */
+export function isGoogleOwnedHost(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "https:") return false;
+		const host = parsed.hostname.toLowerCase();
+		if (!host) return false;
+		return TRUSTED_ATTACHMENT_HOSTS.some(
+			(h) => host === h || host.endsWith(`.${h}`),
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** _mime_for_message_type parity: image→photo, audio/video likewise, else
+ * document (pi IncomingEvent has no separate audio type; voice is the union's
+ * audio carrier — mapped exactly like the other webhook adapters). */
+function mimeToMessageType(
+	mime: string,
+): "text" | "photo" | "voice" | "video" | "document" {
+	if (!mime) return "document";
+	if (mime.startsWith("image/")) return "photo";
+	if (mime.startsWith("audio/")) return "voice";
+	if (mime.startsWith("video/")) return "video";
+	return "document";
+}
+
+/** Attachment cache filename extension from the declared content type. */
+function extensionGuessForMime(mime: string): string {
+	const bare = mime.split(";")[0]?.trim().toLowerCase() ?? "";
+	const table: Record<string, string> = {
+		"image/png": ".png",
+		"image/jpeg": ".jpg",
+		"image/gif": ".gif",
+		"image/webp": ".webp",
+		"video/mp4": ".mp4",
+		"audio/mpeg": ".mp3",
+		"application/pdf": ".pdf",
+	};
+	return table[bare] ?? ".bin";
+}
+
+// ── markdown → Chat dialect (format_message @2403 parity) ───────────────
 
 /** adapter.py:_RETRYABLE_HTTP_STATUSES — the outbound verdict ladder set. */
 const RETRYABLE = GCHAT_RETRYABLE_HTTP_STATUSES;
 
+// Alternation form (not a bare character class): \u200D is a zero-width
+// joiner — inside a class it would match a single joiner char, which biome's
+// noMisleadingCharacterClass rightly flags as misleading. Same semantics.
 const INVISIBLE_RE =
-	/[\u200B\u200C\u200D\u200E\u200F\u2060\uFEFF\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
+	/\u200B|\u200C|\u200D|\u200E|\u200F|\u2060|\uFEFF|[\uFE00-\uFE0F]|[\u{E0100}-\u{E01EF}]/gu;
 
 /**
  * format_message parity: Chat renders `*bold*`, `_italic_`, `~strike~`, and
@@ -522,6 +643,8 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 	private readonly transport: GchatTransport | undefined;
 	private readonly verifier: OidcTokenVerifier | undefined;
 	private readonly captureWire: GchatCaptureWire | undefined;
+	private readonly attachmentDownloader: GchatAttachmentDownloader | undefined;
+	readonly mediaCacheDir: string;
 
 	readonly httpEventsUrl: string;
 	readonly httpEventsAudience: string;
@@ -530,6 +653,13 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 	private readonly dedup: BoundedSeenSet;
 	private readonly lastInboundThread = new Map<string, string>();
 	private readonly lastSenderByChat = new Map<string, string>();
+	/** chat → live typing-marker message name (send_typing/send patch parity).
+	 * Popped by wireSend chunk 0; sentinel-free (the port has no async race). */
+	private readonly typingMarkers = new Map<string, string>();
+	/** chat → orphaned typing-marker names (send_typing race parity): cards
+	 * whose create lost the slot claim to an earlier completion. Reaped to '·'
+	 * by on_processing_complete (@2775-2810 parity). */
+	private readonly orphanTypingMessages = new Map<string, string[]>();
 
 	readonly counters = {
 		accepted: 0,
@@ -559,6 +689,10 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 
 	private readonly cp: EgressChokepoint;
 	private allowAllClickers = true;
+	/** Retry-ladder seams (_call_with_retry @2538 parity): injectable sleep and
+	 * jitter coin so conformance rows drive the ladder deterministically. */
+	private readonly retrySleep: (ms: number) => Promise<void>;
+	private readonly retryRng: () => number;
 	private readonly clarifyArmedSet = new Set<string>();
 	private holding = false;
 	private holdGate: Promise<void> = Promise.resolve();
@@ -576,6 +710,13 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		this.transport = opts.transport;
 		this.verifier = opts.verifier;
 		this.captureWire = opts.captureWire;
+		this.attachmentDownloader = opts.attachmentDownloader;
+		this.retrySleep =
+			opts.retrySleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+		this.retryRng = opts.retryRng ?? (() => Math.random());
+		this.mediaCacheDir =
+			opts.mediaCacheDir ??
+			join(process.cwd(), "platforms", "google_chat", "attachments");
 
 		// HTTP-events config: extra first (Hermes parity), scoped secret second.
 		this.httpEventsUrl = nonEmpty(
@@ -715,12 +856,7 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		const verdict = await this.verifyHttpEventRequest(headers["authorization"]);
 		if (!verdict.ok) {
 			this.counters.authRejected += 1;
-			const status =
-				verdict.reason === "google_chat_http_events_not_configured"
-					? 503
-					: verdict.reason === "unexpected_google_bearer_identity"
-						? 403
-						: 401;
+			const status = bearerRejectStatus(verdict.reason);
 			return { status, contentType: "text/plain", body: verdict.reason };
 		}
 
@@ -799,25 +935,37 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		format: ExtractedPayload["format"],
 	): Promise<void> {
 		try {
-			const event = this.buildMessageEvent(msg, space);
+			const event = await this.buildMessageEvent(msg, space);
 			this.counters.accepted += 1;
 			this.dispatchedEvents.push({
 				messageId: String(msg["name"] ?? ""),
 				text: event.text ?? "",
 			});
 			await this.deliverInbound(event, sessionKeyFor(event));
-		} catch {
-			/* containment parity: one poisoned payload never rejects the batch */
+		} catch (err) {
+			// Containment parity: one poisoned payload never rejects the batch.
+			// A REJECTED delivery means no turn took ownership — any live typing
+			// card for this chat is stranded; retire it now (on_processing_complete
+			// @2775 parity — cancelled turns label '(interrupted)', others
+			// '(no reply)'). Success-path retirement belongs to the turn driver,
+			// which calls the public onProcessingComplete hook.
+			const chatId = String(space["name"] ?? "");
+			if (chatId && this.typingMarkers.has(chatId)) {
+				await this.retireStrandedTypingMarkers(
+					chatId,
+					err instanceof TaskCancelledError ? "cancelled" : "failure",
+				);
+			}
 		}
 		void format;
 	}
 
 	// ── event build (_build_message_event @1813 parity, transport subset) ────
 
-	protected buildMessageEvent(
+	protected async buildMessageEvent(
 		msg: Record<string, unknown>,
 		spaceEnvelope: Record<string, unknown>,
-	): IncomingEvent {
+	): Promise<IncomingEvent> {
 		const space =
 			Object.keys(asRecord(msg["space"])).length > 0
 				? asRecord(msg["space"])
@@ -829,9 +977,9 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		const threadName = String(asRecord(msg["thread"])["name"] ?? "");
 		const sender = asRecord(msg["sender"]);
 		const senderName = String(sender["name"] ?? "");
-		const senderDisplay = String(
-			sender["displayName"] ?? sender["email"] ?? senderName,
-		);
+		// user_name=sender_display parity note: SessionSource has NO userName slot;
+		// the display name rides userIdAlt-adjacent metadata only in Hermes. Kept
+		// out deliberately rather than overwriting chatName (space display name).
 		const senderEmail = String(sender["email"] ?? "");
 
 		if (senderEmail && spaceName) {
@@ -840,10 +988,44 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 
 		const chatType =
 			spaceType === "DIRECT_MESSAGE" || spaceType === "DM" ? "dm" : "group";
-		const text = String(msg["argumentText"] ?? msg["text"] ?? "").trim();
 
-		// Attachments download through Google-owned hosts with SA credentials —
-		// INJECTED seam left unexercised headlessly (probe-computed exclusion).
+		// Slash command (build_message_event @1839 parity): detect msg.slashCommand,
+		// prepend /cmd_{commandId} when argumentText lacks a leading slash, and
+		// mark the event as a COMMAND. Pi's guard lane recognizes commands by the
+		// leading-slash text; the messageType union has no COMMAND member, so the
+		// mapping lands on the normalized text plus the hermes_message_type
+		// metadata stamp (representation divergence — DEC-GCHAT-EXCL note).
+		let text = String(msg["argumentText"] ?? msg["text"] ?? "").trim();
+		const slash = asRecord(msg["slashCommand"]);
+		const isSlash = Object.keys(slash).length > 0;
+		if (isSlash) {
+			const commandId = String(slash["commandId"] ?? "");
+			if (commandId && !text.startsWith("/")) {
+				text = `/cmd_${commandId} ${text}`.trim();
+			}
+		}
+
+		// Attachments walk (@1848 parity): download each via the injected bot-SA
+		// seam, cache under mediaCacheDir, surface media_urls/media_types, and
+		// derive messageType from the FIRST-SEEN mime when no text is present.
+		const mediaUrls: string[] = [];
+		const mediaTypes: string[] = [];
+		let messageTypeName: ReturnType<typeof mimeToMessageType> = "text";
+		for (const att of Array.isArray(msg["attachment"])
+			? (msg["attachment"] as unknown[])
+			: []) {
+			if (att === null || typeof att !== "object") continue;
+			const cached = await this.downloadAttachment(
+				att as Record<string, unknown>,
+			);
+			if (cached === null) continue;
+			mediaUrls.push(cached.path);
+			mediaTypes.push(cached.mime || "application/octet-stream");
+			if (messageTypeName === "text" && !text) {
+				messageTypeName = mimeToMessageType(cached.mime);
+			}
+		}
+		if (isSlash) messageTypeName = "text"; // COMMAND rides the slash text
 
 		// Session-thread routing for DMs: FIRST sight of a thread = main flow
 		// (no thread isolation); later sights = side thread (isolate + reply
@@ -877,11 +1059,74 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 			source.threadId = sessionThreadId;
 		}
 		return {
-			messageType: "text",
+			messageType: messageTypeName,
 			text,
+			...(mediaUrls.length > 0 ? { mediaUrls } : {}),
+			...(mediaTypes.length > 0 ? { mediaTypes } : {}),
 			messageId: String(msg["name"] ?? ""),
 			source,
 		};
+	}
+
+	/**
+	 * _download_attachment parity (@1939): THREE-path priority for bot Service
+	 * Accounts — (1) attachmentDataRef.resourceName via media.download; (2)
+	 * DRIVE_FILE WITHOUT resourceName ⇒ SKIP (needs user-OAuth Drive scope);
+	 * (3) downloadUri ONLY when it targets a Google-owned host (SSRF guard).
+	 * Bytes are cached under mediaCacheDir keyed by attachment name/resource;
+	 * any failure returns null (caller keeps the text-only event).
+	 */
+	private async downloadAttachment(
+		attachment: Record<string, unknown>,
+	): Promise<{ path: string; mime: string } | null> {
+		if (this.attachmentDownloader === undefined) return null;
+		const mime = String(attachment["contentType"] ?? "");
+		const source = String(attachment["source"] ?? "");
+		const name = String(attachment["name"] ?? "");
+		const attachmentDataRef = asRecord(attachment["attachmentDataRef"]);
+		const resourceName = String(attachmentDataRef["resourceName"] ?? "");
+		const downloadUri = String(attachment["downloadUri"] ?? "");
+
+		// DRIVE_FILE tags BOTH drag-and-drop uploads AND Drive-picker shares.
+		// Only short-circuit when the bot path has nothing to use — otherwise
+		// try the bot path first (_download_attachment NOTE parity).
+		if (source === "DRIVE_FILE" && !resourceName) return null;
+
+		let data: Buffer | null = null;
+
+		// Path 1: media.download with attachmentDataRef.resourceName (bot path).
+		if (resourceName) {
+			try {
+				data = await this.attachmentDownloader.downloadMedia(resourceName);
+			} catch {
+				data = null;
+			}
+		}
+
+		// Path 2: downloadUri fallback (rarely works with SA tokens) — SSRF-
+		// guarded: non-Google hosts are REJECTED, never fetched.
+		if (data === null && downloadUri) {
+			if (!isGoogleOwnedHost(downloadUri)) return null;
+			try {
+				data = await this.attachmentDownloader.fetchUri(downloadUri);
+			} catch {
+				return null;
+			}
+		}
+		if (data === null || data.length === 0) return null;
+
+		try {
+			mkdirSync(this.mediaCacheDir, { recursive: true });
+			const safeKey = (name || resourceName || "attachment")
+				.replace(/[^A-Za-z0-9._-]/g, "_")
+				.slice(0, 120);
+			const ext = extensionGuessForMime(mime);
+			const path = join(this.mediaCacheDir, `${safeKey}${ext}`);
+			writeFileSync(path, data);
+			return { path, mime };
+		} catch {
+			return null;
+		}
 	}
 
 	// ── thread resolution (_resolve_thread_id @2482 parity) ──────────────────
@@ -1036,10 +1281,12 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 	}
 
 	/**
-	 * DOOR transport — send() parity: convert to the Chat dialect FIRST
+	 * DOOR transport — send() parity (@2057): convert to the Chat dialect FIRST
 	 * (except the §6.1 fallback envelope, which carries ORIGINAL bytes), then
-	 * ride ONE create call per kit-chunked piece. Thread resolution follows
-	 * _resolve_thread_id; threaded creates carry messageReplyOption data.
+	 * PATCH the tracked typing marker IN PLACE for chunk 0 (sentinel
+	 * bookkeeping; 404 ⇒ fall through to create with the ORIGINAL pre-built
+	 * body) or CREATE when no marker exists. Threaded creates carry
+	 * messageReplyOption as a QUERY PARAM.
 	 */
 	protected override async wireSend(
 		chatId: string,
@@ -1052,45 +1299,62 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		if (!formatted) return { success: false, error: "empty message" };
 
 		const threadId = this.resolveThreadId(undefined, metadata, chatId);
-		const body: Record<string, unknown> = { text: formatted };
-		if (threadId) {
-			body["thread"] = { name: threadId };
-			// _create_message parity: without REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD
-			// Chat silently ignores thread.name and starts a fresh thread.
-			body["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
-		}
+		// POP the tracked marker first (send() @2078 pop parity); any earlier
+		// sentinel is treated as "no real card to patch" — defensive.
+		const typingMsgName = this.typingMarkers.get(chatId);
+		this.typingMarkers.delete(chatId);
+
+		// Built ONCE per send: on the typing-patch path this body is thread-less
+		// (patch inherits the card's thread — immutable on update), and the 404
+		// fallback REUSES IT VERBATIM (send() @2136-2140 parity — Hermes recreates
+		// with the original body; it never re-adds thread.name or the
+		// messageReplyOption query param on that path).
+		const buildBody = (): Record<string, unknown> => {
+			const body: Record<string, unknown> = { text: formatted };
+			if (threadId && !typingMsgName) {
+				// Only set thread on the new-message create path. Patch inherits.
+				body["thread"] = { name: threadId };
+			}
+			return body;
+		};
+		const queryParams = threadId
+			? // _create_message parity: without REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD
+				// Chat silently ignores thread.name and starts a fresh thread.
+				{ messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" }
+			: undefined;
+
 		if (this.transport === undefined) return { success: true };
-		const resp = await this.transport.createMessage(chatId, body, {
-			...metadata,
-		});
-		// Verdict ladder (@2098 parity): 403 ⇒ FATAL chat_forbidden (removed
-		// from space / perms revoked); 429 bumps the per-chat rate counter and
-		// surfaces retryable; retryable-status classes ride SendResult.retryable.
-		if (!resp.success) {
-			const status = resp.status;
-			if (status === 403) {
-				this.lifecycle.markFatal({
-					kind: "config_invalid",
-					detail:
-						"chat_forbidden: Bot lacks access (removed from space or perms revoked)",
-				});
-				return {
-					success: false,
-					error: resp.error ?? "HTTP 403",
-					retryable: false,
-				};
+
+		let resp: GchatApiResponse;
+		if (typingMsgName) {
+			// Chunk 0 PATCHES the marker in place (no delete tombstone).
+			const patchBody = buildBody();
+			resp = await this.patchEgress(typingMsgName, patchBody, {
+				...metadata,
+			});
+			if (!resp.success && resp.status === 404) {
+				// Typing card deleted out from under us — recreate with the ORIGINAL
+				// thread-less body verbatim (send() 404 ladder parity): no thread,
+				// no messageReplyOption — args Hermes never sends on this path.
+				resp = await this.createMessageEgress(
+					chatId,
+					patchBody,
+					{ ...metadata },
+					undefined,
+				);
+			} else if (!resp.success) {
+				return this.classifyEgressFailure(resp, chatId);
 			}
-			if (status === 404) {
-				return { success: false, error: "target not found", retryable: false };
-			}
-			if (status === 429) this.noteRateLimitHit(chatId);
-			return {
-				success: false,
-				error: resp.error ?? `HTTP ${status ?? 0}`,
-				retryable: status !== undefined && RETRYABLE.has(status),
-			};
+		} else {
+			resp = await this.createMessageEgress(
+				chatId,
+				buildBody(),
+				{ ...metadata },
+				queryParams,
+			);
+			if (!resp.success) return this.classifyEgressFailure(resp, chatId);
 		}
-		return resp;
+		return this.classifyEgressSuccess(resp);
 	}
 
 	/**
@@ -1109,7 +1373,7 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 				? `${content.slice(0, GCHAT_MAX_TEXT_LENGTH - 1)}…`
 				: content;
 		if (this.transport === undefined) return { success: true };
-		return this.transport.patchMessage(messageId, { text: capped });
+		return this.patchEgress(messageId, { text: capped });
 	}
 
 	/**
@@ -1127,7 +1391,119 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		return this.captureWire.transmitRich("__rich__", content);
 	}
 
-	/** send_card parity: cardsV2 create with clean failure mapping. */
+	/**
+	 * _patch_message parity (@2346): messages.patch is a MASKED update — the
+	 * mask names exactly the fields the body carries ('text', 'cardsV2',
+	 * comma-joined, default 'text') so unspecified fields can never be cleared;
+	 * the patch body itself never carries thread (immutable on update).
+	 */
+	private async patchEgress(
+		messageName: string,
+		body: Record<string, unknown>,
+		metadata: Record<string, unknown> = {},
+	): Promise<GchatApiResponse> {
+		const transport = this.transport;
+		if (transport === undefined) return { success: true };
+		const maskFields: string[] = [];
+		if ("text" in body) maskFields.push("text");
+		if ("cardsV2" in body) maskFields.push("cardsV2");
+		const updateMask = maskFields.join(",") || "text";
+		const patchBody = Object.fromEntries(
+			Object.entries(body).filter(([k]) => k !== "thread"),
+		);
+		return transport.patchMessage(messageName, patchBody, metadata, updateMask);
+	}
+
+	/**
+	 * _create_message parity (@2584): every outbound create rides the bounded
+	 * retry ladder (_call_with_retry @2538 — up to 3 attempts over retryable
+	 * statuses {429,500,502,503,504} and transport-error classifications with
+	 * jittered exponential backoff; timeout-CLASSIFIED outcomes are NEVER
+	 * retried per DEC-046). On success the response thread.name bumps the
+	 * per-chat thread-count store (@2619-2634) so a future user "Reply in
+	 * thread" on the bot's message resolves as a known SIDE thread instead of
+	 * misclassifying as main flow.
+	 */
+	private async createMessageEgress(
+		chatId: string,
+		body: Record<string, unknown>,
+		metadata: Record<string, unknown>,
+		queryParams: Record<string, string> | undefined,
+	): Promise<GchatApiResponse> {
+		const transport = this.transport;
+		if (transport === undefined) {
+			return { success: false, error: "no transport bound" };
+		}
+		let delayMs = GCHAT_RETRY_BASE_DELAY_MS;
+		let last: GchatApiResponse = {
+			success: false,
+			error: "messages.create failed",
+		};
+		for (let attempt = 1; attempt <= GCHAT_RETRY_MAX_ATTEMPTS; attempt++) {
+			try {
+				last = await transport.createMessage(
+					chatId,
+					body,
+					metadata,
+					queryParams,
+				);
+			} catch (err) {
+				// Transport-level failure (fetch reset, socket loss): modeled as a
+				// status-less result so ONE classifier drives every retry verdict.
+				last = {
+					success: false,
+					error: err instanceof Error ? err.message : String(err),
+				};
+			}
+			if (last.success) {
+				this.noteCreatedThread(chatId, last);
+				return last;
+			}
+			if (
+				!this.shouldRetryCreate(last) ||
+				attempt === GCHAT_RETRY_MAX_ATTEMPTS
+			) {
+				return last;
+			}
+			// Jittered exponential backoff (_call_with_retry @2585-2597 shape):
+			// wait = min(delay + delay*jitter*rng(), MAX_DELAY + JITTER), then
+			// double up to the MAX_DELAY cap.
+			const jitter = delayMs * GCHAT_RETRY_JITTER * this.retryRng();
+			await this.retrySleep(
+				Math.min(
+					delayMs + jitter,
+					GCHAT_RETRY_MAX_DELAY_MS + GCHAT_RETRY_JITTER * 1000,
+				),
+			);
+			delayMs = Math.min(delayMs * 2, GCHAT_RETRY_MAX_DELAY_MS);
+		}
+		return last;
+	}
+
+	/**
+	 * THE one create-retry verdict: retryable HTTP statuses from the manifest
+	 * set, or a transport-error classification on status-less failures.
+	 * Timeout-classified ambiguity NEVER retries (DEC-046 — the message may
+	 * have arrived; blind resend risks double-send).
+	 */
+	private shouldRetryCreate(resp: GchatApiResponse): boolean {
+		const klass = classifySendError(new Error(resp.error ?? ""));
+		if (klass === "timeout") return false;
+		if (resp.status !== undefined) {
+			return RETRYABLE.has(resp.status);
+		}
+		return klass === "network" || klass === "connect-timeout";
+	}
+
+	/** Outbound thread-count bump (_create_message @2619-2634 parity). */
+	private noteCreatedThread(chatId: string, resp: GchatApiResponse): void {
+		const respThread = String(asRecord(resp.thread)["name"] ?? "");
+		if (chatId && respThread) this.markThreadSeen(chatId, respThread);
+	}
+
+	/**
+	 * send_card parity: cardsV2 create with clean failure mapping.
+	 */
 	async sendCard(
 		chatId: string,
 		cardSpec: unknown,
@@ -1145,26 +1521,185 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		if (this.transport === undefined) return { success: true };
 		const threadId = this.resolveThreadId(undefined, metadata, chatId);
 		const body: Record<string, unknown> = { cardsV2: [cardsV2] };
-		if (threadId) {
-			body["thread"] = { name: threadId };
-			body["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
-		}
-		return this.transport.createMessage(chatId, body, { ...(metadata ?? {}) });
+		if (threadId) body["thread"] = { name: threadId };
+		const resp = await this.createMessageEgress(
+			chatId,
+			body,
+			{ ...(metadata ?? {}) },
+			threadId
+				? { messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" }
+				: undefined,
+		);
+		return resp.success ? resp : this.classifyEgressFailure(resp, chatId);
 	}
 
-	/** send_typing parity: a visible marker message tracked for patch-in-place. */
+	/**
+	 * send_typing parity (@2636): a visible "Hermes is thinking…" marker
+	 * message whose name is TRACKED per chat so send() patches it in place.
+	 * A live marker for the chat bails (no second card — the orphan-card fix).
+	 */
 	async sendTyping(
 		chatId: string,
 		metadata?: Metadata | undefined,
 	): Promise<SendResult> {
 		if (this.transport === undefined) return { success: true };
+		// Already have a live card for this chat — bail (source parity).
+		if (this.typingMarkers.has(chatId)) return { success: true };
 		const threadId = this.resolveThreadId(undefined, metadata, chatId);
 		const body: Record<string, unknown> = { text: "Hermes is thinking…" };
-		if (threadId) {
-			body["thread"] = { name: threadId };
-			body["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
+		if (threadId) body["thread"] = { name: threadId };
+		const resp = await this.createMessageEgress(
+			chatId,
+			body,
+			{ ...(metadata ?? {}) },
+			threadId
+				? { messageReplyOption: "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" }
+				: undefined,
+		);
+		if (resp.success && resp.messageId) {
+			// Only overwrite when nothing claimed the slot meanwhile; a lost
+			// claim means OUR card is the orphan — track it for end-of-turn
+			// reaping (send_typing _create_and_record parity, @2711-2721).
+			if (!this.typingMarkers.has(chatId)) {
+				this.typingMarkers.set(chatId, resp.messageId);
+			} else {
+				const orphans = this.orphanTypingMessages.get(chatId) ?? [];
+				orphans.push(resp.messageId);
+				this.orphanTypingMessages.set(chatId, orphans);
+			}
 		}
-		return this.transport.createMessage(chatId, body, { ...(metadata ?? {}) });
+		return resp;
+	}
+
+	/** Live typing-marker probe (observability). */
+	typingMarkerFor(chatId: string): string | undefined {
+		return this.typingMarkers.get(chatId);
+	}
+
+	/** Orphaned typing markers awaiting end-of-turn reaping (observability). */
+	orphanTypingMarkersFor(chatId: string): readonly string[] {
+		return this.orphanTypingMessages.get(chatId) ?? [];
+	}
+
+	/**
+	 * on_processing_complete parity (@2775-2810): retire typing card(s) at the
+	 * end of the message-handling cycle. SUCCESS: send() already consumed the
+	 * slot — nothing to do. FAILURE / CANCELLED: send() may not have run,
+	 * leaving a real message name in the slot; the card is PATCHED to a final
+	 * state ('(interrupted)' when cancelled, else '(no reply)') instead of
+	 * deleted (no tombstone). Race-orphan cards (background creates that lost
+	 * the slot claim) are patched to a single dot so they gracefully retire.
+	 */
+	async onProcessingComplete(
+		event: IncomingEvent,
+		outcome: ProcessingOutcome,
+	): Promise<void> {
+		const chatId = event.source?.chatId;
+		if (!chatId) return;
+		await this.retireStrandedTypingMarkers(chatId, outcome);
+	}
+
+	/** The shared retirement core — every failure is contained (source parity:
+	 * cleanup must never break the processing cycle that called it). */
+	private async retireStrandedTypingMarkers(
+		chatId: string,
+		outcome: ProcessingOutcome,
+	): Promise<void> {
+		try {
+			const current = this.typingMarkers.get(chatId);
+			this.typingMarkers.delete(chatId);
+			if (current !== undefined) {
+				// Real message name still in the slot — send() never ran. Patch
+				// with a benign final state instead of deleting (no tombstone).
+				const label = outcome === "cancelled" ? "(interrupted)" : "(no reply)";
+				try {
+					await this.patchEgress(current, { text: label });
+				} catch {
+					/* swallowed — retirement is best-effort */
+				}
+			}
+			// Reap orphan typing cards (creates that lost a race with send()):
+			// patch each to a single dot so the user doesn't see a second
+			// "Hermes is thinking…" stuck forever beside the real reply.
+			const orphans = this.orphanTypingMessages.get(chatId) ?? [];
+			this.orphanTypingMessages.delete(chatId);
+			for (const orphanId of orphans) {
+				try {
+					await this.patchEgress(orphanId, { text: "·" });
+				} catch {
+					/* swallowed — retirement is best-effort */
+				}
+			}
+		} catch {
+			/* containment parity: cleanup never rejects the caller */
+		}
+	}
+
+	/**
+	 * send_clarify override (@2188 parity): choice buttons render as a clarify
+	 * CARD ({text ≤80+'...', action hermes_clarify, parameters{clarify_id,
+	 * choice}} plus the "Other / type answer" __other__ button) under a
+	 * "Question" header; zero choices and CARD FAILURE both fall back to the
+	 * plain-text question (super().send_clarify parity — the base lane sends
+	 * the bare question through DOOR 1). A single real choice still ships the
+	 * card exactly like Hermes (`if not buttons` stays False — the Other
+	 * escape hatch always rides along).
+	 */
+	async sendClarifyPrompt(
+		chatId: string,
+		question: string,
+		choices: readonly string[],
+		clarifyId: string,
+		sessionKey: string,
+		opts: {
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+		} = {},
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		const plainFallback = (): Promise<SendResult> =>
+			this.send(chatId, `❓ ${question}`, opts.replyToMessageId, {});
+
+		if (choices.length === 0) return plainFallback();
+
+		const buttons: Array<Record<string, unknown>> = [];
+		for (const raw of choices) {
+			const choiceText = String(raw).trim();
+			if (!choiceText) continue;
+			const label =
+				choiceText.length <= 80 ? choiceText : `${choiceText.slice(0, 77)}...`;
+			buttons.push({
+				text: label,
+				action: "hermes_clarify",
+				parameters: { clarify_id: clarifyId, choice: choiceText },
+			});
+		}
+		buttons.push({
+			text: "Other / type answer",
+			action: "hermes_clarify",
+			parameters: { clarify_id: clarifyId, choice: "__other__" },
+		});
+
+		const result = await this.sendCard(
+			chatId,
+			{
+				card_id: `clarify-${clarifyId}`,
+				header: { title: "Question" },
+				sections: [
+					{
+						widgets: [
+							{ type: "text", text: `❓ ${question}` },
+							{ type: "buttons", buttons },
+						],
+					},
+				],
+			},
+			opts.metadata,
+		);
+		// Card failure (builder decline included) falls back to plain text.
+		if (!result.success) return plainFallback();
+		this.clarify.register(clarifyId, sessionKey);
+		return result;
 	}
 
 	/** 429 counter ladder (@2118 parity): warn threshold observable. */
@@ -1174,6 +1709,44 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 		if (hits >= GCHAT_RATE_LIMIT_WARN_THRESHOLD) {
 			this.counters.rateLimitHitsByChatWarned += 1;
 		}
+	}
+
+	/** Success passthrough — kept as a named ladder step for readability. */
+	private classifyEgressSuccess(resp: SendResult): SendResult {
+		return resp;
+	}
+
+	/**
+	 * Verdict ladder (@2098 parity): 403 ⇒ FATAL chat_forbidden (removed from
+	 * space / perms revoked); 429 bumps the per-chat rate counter and surfaces
+	 * retryable; retryable-status classes ride SendResult.retryable.
+	 */
+	private classifyEgressFailure(
+		resp: GchatApiResponse,
+		chatId: string,
+	): SendResult {
+		const status = resp.status;
+		if (status === 403) {
+			this.lifecycle.markFatal({
+				kind: "config_invalid",
+				detail:
+					"chat_forbidden: Bot lacks access (removed from space or perms revoked)",
+			});
+			return {
+				success: false,
+				error: resp.error ?? "HTTP 403",
+				retryable: false,
+			};
+		}
+		if (status === 404) {
+			return { success: false, error: "target not found", retryable: false };
+		}
+		if (status === 429) this.noteRateLimitHit(chatId);
+		return {
+			success: false,
+			error: resp.error ?? `HTTP ${status ?? 0}`,
+			retryable: status !== undefined && RETRYABLE.has(status),
+		};
 	}
 
 	rateLimitHitsOf(chatId: string): number {
@@ -1213,7 +1786,17 @@ export class GoogleChatWebhookAdapter extends BasePlatformAdapter {
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────
+
+/** Auth-reject status mapping (handleHttpEventPost): 503 not-configured,
+ * 403 wrong identity, 401 missing/invalid bearer. */
+function bearerRejectStatus(
+	reason: Extract<BearerVerdict, { ok: false }>["reason"],
+): number {
+	if (reason === "google_chat_http_events_not_configured") return 503;
+	if (reason === "unexpected_google_bearer_identity") return 403;
+	return 401;
+}
 
 function lowerKeys(
 	headers: Record<string, string> | undefined,

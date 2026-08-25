@@ -51,6 +51,8 @@ export interface MakeQQWorldOptions {
 	spawner?: TaskSpawner | undefined;
 	helloIntervalMs?: number | undefined;
 	markdownSupport?: boolean | undefined;
+	/** Local-media byte seam (fixtures inject; production reads the fs). */
+	readFileBytes?: ((path: string) => Buffer) | undefined;
 }
 
 /** Push a C2C_MESSAGE_CREATE dispatch through the fake gateway. */
@@ -88,6 +90,9 @@ export function makeQQWorld(opts: MakeQQWorldOptions = {}): QQWorld {
 		gateway,
 		name: opts.name,
 		markdownSupport: opts.markdownSupport,
+		...(opts.readFileBytes !== undefined
+			? { readFileBytes: opts.readFileBytes }
+			: {}),
 	});
 	// Injected clock: the engine sleeps through THIS clock for ladders/retries.
 	const adapter = subject.adapter as unknown as {
@@ -218,12 +223,10 @@ export function makeRealQQFixture(): WsFixture {
 				{ kind: "ok" },
 			);
 			let settled = false;
-			const sending = engine
-				.deliverText("u_rest", "payload")
-				.then((r) => {
-					settled = true;
-					return r;
-				});
+			const sending = engine.deliverText("u_rest", "payload").then((r) => {
+				settled = true;
+				return r;
+			});
 			// The honor-once retry_after sleep registers BEHIND several real
 			// async hops, so walk the injected clock until the send settles.
 			for (let i = 0; i < 30 && !settled; i++) {

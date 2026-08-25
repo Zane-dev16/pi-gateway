@@ -14,6 +14,20 @@ describe("WhatsApp-flavored markdown conversion", () => {
 		expect(toWhatsappMarkup("_calm_ italic")).toBe("_calm_ italic");
 	});
 
+	it("single-* emphasis converts to _italic_ BEFORE bold (format_message parity)", () => {
+		// *hi* alone would render BOLD on WhatsApp; the italic pass runs first
+		// so standard-Markdown emphasis lands as _hi_.
+		expect(toWhatsappMarkup("*hi* there")).toBe("_hi_ there");
+		expect(toWhatsappMarkup("**bold** and *italic*")).toBe(
+			"*bold* and _italic_",
+		);
+		// Lookarounds: list bullets and bold delimiters never convert.
+		expect(toWhatsappMarkup("* item one\n* item two")).toBe(
+			"* item one\n* item two",
+		);
+		expect(toWhatsappMarkup("***both***")).toBe("**both**");
+	});
+
 	it("headers become bold lines; pre-wrapped bold collapses (Hermes parity)", () => {
 		expect(toWhatsappMarkup("# Title")).toBe("*Title*");
 		// Hermes _header_to_bold strips whole-wrap asterisk pairs only:
@@ -27,6 +41,20 @@ describe("WhatsApp-flavored markdown conversion", () => {
 
 	it("markdown links flatten to 'text (url)'", () => {
 		expect(toWhatsappMarkup("[docs](https://x.y)")).toBe("docs (https://x.y)");
+	});
+
+	it("STEP 0 outbound sanitization: invisible chars stripped, odd spaces normalized (format_message parity)", () => {
+		// U+200B/U+2060/U+2063/U+FEFF removed verbatim.
+		expect(toWhatsappMarkup("a\u200bb\u2060c\u2063d\ufeffe")).toBe("abcde");
+		// U+00A0/U+2003/U+3000 etc. normalize to plain ASCII space.
+		expect(toWhatsappMarkup("x\u00a0y\u2003z\u3000w")).toBe("x y z w");
+		// Emoji joiners (U+200D) are KEPT — only format chars go.
+		expect(toWhatsappMarkup("emoji \u200d joiners kept")).toBe(
+			"emoji \u200d joiners kept",
+		);
+		// Sanitization runs BEFORE protection: dirty bytes inside fences are
+		// cleaned too (Hermes sanitizes before the fence placeholder pass).
+		expect(toWhatsappMarkup("```\na\u200bb\n```")).toBe("```\nab\n```");
 	});
 
 	it("fenced code blocks and inline code survive VERBATIM", () => {

@@ -47,6 +47,7 @@ export interface MmWorld {
 			rootId?: string | undefined;
 			createAt?: number | undefined;
 			postId?: string | undefined;
+			fileIds?: string[] | undefined;
 		},
 	): void;
 }
@@ -379,7 +380,7 @@ export interface MattermostShapeFixture {
 		userIdMentionAccepted: boolean;
 		caseInsensitiveMatch: boolean;
 		freeChannelBypass: boolean;
-		commandBypass: boolean;
+		unmentionedCommandDroppedAtGate: boolean;
 		dmExempt: boolean;
 		whitelistSilentlyDrops: boolean;
 	}>;
@@ -488,23 +489,23 @@ export function makeMattermostShapeFixture(): MattermostShapeFixture {
 			await settleWall();
 
 			await eventually(
-				() =>
-					subject.turns().includes("/status now") &&
-					subject.turns().includes("dm plain text"),
+				() => subject.turns().some((t) => t.includes("dm plain text")),
 				4_000,
 			);
 			await settleWall();
 			const turns = subject.turns();
 			return {
-				unmentionedChannelDropped: !turns.includes("plain chatter"),
+				unmentionedChannelDropped:
+					!turns.includes("plain chatter") &&
+					!turns.includes("/status now"),
 				usernameMentionStripped:
 					turns.some((t) => t.includes("look")) &&
 					turns.every((t) => !t.includes(`@${mm.botUsername}`)),
 				userIdMentionAccepted: turns.some((t) => t.includes("help")),
 				caseInsensitiveMatch: turns.some((t) => t.includes("case")),
 				freeChannelBypass: turns.includes("free-room chatter"),
-				commandBypass: turns.includes("/status now"),
-				dmExempt: turns.includes("dm plain text"),
+				unmentionedCommandDroppedAtGate: !turns.includes("/status now"),
+				dmExempt: turns.some((t) => t.includes("dm plain text")),
 				whitelistSilentlyDrops: !wl.subject
 					.turns()
 					.some((t) => t.includes("not whitelisted")),

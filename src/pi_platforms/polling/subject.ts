@@ -102,8 +102,8 @@ export class PollingSubject implements ConformanceSubject {
 				true,
 				args.metadata ?? {},
 			);
-		this.adapter.editTransmit = (chatId, messageId, content) =>
-			this.wire.transmitEdit(chatId, messageId, content, {});
+		this.adapter.editTransmit = (chatId, messageId, content, metadata) =>
+			this.wire.transmitEdit(chatId, messageId, content, metadata ?? {});
 		this.adapter.lastSendContentReader = (chatId) => {
 			const sends = this.wire.sendsOf(chatId);
 			return sends[sends.length - 1]?.content ?? "";

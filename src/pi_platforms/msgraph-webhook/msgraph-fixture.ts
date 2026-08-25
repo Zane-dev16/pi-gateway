@@ -102,6 +102,10 @@ export class MSGraphFixture {
 		return toFixtureResponse(resp);
 	}
 
+	getHealth(peer = "20.190.160.7"): FixtureResponse {
+		return toFixtureResponse(this.adapter.handleHealthGet(peer));
+	}
+
 	async postRaw(input: {
 		headers?: Record<string, string> | undefined;
 		query?: Record<string, string> | undefined;

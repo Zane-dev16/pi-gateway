@@ -62,6 +62,8 @@ async function holdRunning(): Promise<Record<string, unknown>> {
 				void meta;
 			},
 		},
+		// Hermetic child: the <10ms snapshot still runs, but no detached ps-walk.
+		forensics: { spawnDiagnostic: false },
 	});
 	lifecycle.installSignalHandlers();
 	const result = await lifecycle.startup();
@@ -87,6 +89,48 @@ async function holdRunning(): Promise<Record<string, unknown>> {
 	}
 }
 
+/**
+ * SIGUSR1 drain-first restart contract (run.py:restart_signal_handler parity):
+ * the updater signals SIGUSR1, the gateway drains gracefully and EXITS with
+ * the service-restart code 75 — never opening Node's inspector and never
+ * needing the SIGTERM escalation.
+ */
+async function holdRunningSigusr1(): Promise<Record<string, unknown>> {
+	const { GatewayLifecycle } = await import("../lifecycle.js");
+	const home = String(args["home"]);
+	const lifecycle = new GatewayLifecycle({
+		home,
+		logger: {
+			info() {},
+			warn() {},
+			error(_m, meta) {
+				void meta;
+			},
+		},
+		forensics: { spawnDiagnostic: false },
+	});
+	lifecycle.installSignalHandlers();
+	const result = await lifecycle.startup();
+	signal(String(args["ready-marker"]), {
+		ok: result.ok,
+		pid: process.pid,
+	});
+	if (!result.ok) return { ok: false };
+	const keepAlive = setInterval(() => {}, 60_000);
+	try {
+		process.kill(process.pid, "SIGUSR1");
+		const outcome = await lifecycle.waitShutdown();
+		return {
+			ok: true,
+			klass: outcome.klass,
+			exitCode: outcome.exitCode,
+			persistedStopped: outcome.persistedStopped,
+		};
+	} finally {
+		clearInterval(keepAlive);
+	}
+}
+
 async function holdRuntimeLock(): Promise<Record<string, unknown>> {
 	const { RuntimeLock } = await import("../instance-guard.js");
 	const lock = new RuntimeLock(String(args["home"]));
@@ -100,6 +144,7 @@ async function holdRuntimeLock(): Promise<Record<string, unknown>> {
 
 const SCENARIOS: Record<string, () => Promise<Record<string, unknown>>> = {
 	"hold-running": holdRunning,
+	"hold-running-sigusr1": holdRunningSigusr1,
 	"hold-runtime-lock": holdRuntimeLock,
 };
 
@@ -109,7 +154,10 @@ async function main(): Promise<number> {
 	if (run === undefined) throw new Error(`unknown scenario: ${scenario}`);
 	const result = await run();
 	console.log(`RESULT_JSON ${JSON.stringify(result)}`);
-	return 0;
+	// The process exit code IS part of the supervisor contract (75/78/0/1):
+	// drivers report the recorded drain class's exit status verbatim.
+	const exitCode = result["exitCode"];
+	return typeof exitCode === "number" ? exitCode : 0;
 }
 
 main()

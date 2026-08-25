@@ -214,7 +214,11 @@ export class PollingAdapterCore
 		this.clock = deps.clock ?? real;
 		this.timer = deps.timer ?? real.timer;
 		this.spawn = deps.spawner ?? immediateSpawner();
-		this.longPollTimeoutMs = deps.longPollTimeoutMs ?? 25_000;
+		// tg2-8 (adapter.py:start_polling :2668/:2884): Hermes passes NO timeout
+		// override to start_polling — python-telegram-bot's default timeout=10
+		// governs every getUpdates long-poll. 10 s keeps conflict/reconnect
+		// latency at baseline; the previous 25 s held polls 2.5× longer.
+		this.longPollTimeoutMs = deps.longPollTimeoutMs ?? 10_000;
 		this.secretReader = deps.secretReader;
 		this.tg = deps.wire;
 
@@ -403,6 +407,11 @@ export class PollingAdapterCore
 						offset: this.committedOffset + 1,
 						timeoutMs: this.longPollTimeoutMs,
 						...(dropPendingUpdates ? { dropPendingUpdates: true } : {}),
+						// allowed_updates wire parity (tg-1): platform layers declare
+						// the requested update kinds (telegram ⇒ ALL_TYPES).
+						...(this.allowedUpdatesForPoll() !== undefined
+							? { allowedUpdates: this.allowedUpdatesForPoll() }
+							: {}),
 					});
 					updates = batch.updates;
 				} catch (err) {
@@ -447,6 +456,16 @@ export class PollingAdapterCore
 			if (task.cancelRequested()) return;
 			this.scheduleRecovery(`poll-loop-error: ${brief(err)}`);
 		}
+	}
+
+	/**
+	 * Update kinds this engine requests on EVERY getUpdates call (tg-1 wire
+	 * parity). Undefined ⇒ the family default (server-side default filter).
+	 * Telegram overrides with ALL_TYPES — without it real Telegram never
+	 * delivers message_reaction updates.
+	 */
+	protected allowedUpdatesForPoll(): readonly string[] | undefined {
+		return undefined;
 	}
 
 	private isTransportAlive(generation: number): boolean {
@@ -1099,9 +1118,14 @@ export class PollingAdapterCore
 		chatId: string,
 		messageId: string,
 		content: string,
-		_opts: EditOptions & { finalize: boolean },
+		opts: EditOptions & { finalize: boolean; metadata?: Metadata | undefined },
 	): Promise<SendResult> {
-		const res = await this.editTransmit(chatId, messageId, content);
+		const res = await this.editTransmit(
+			chatId,
+			messageId,
+			content,
+			opts.metadata,
+		);
 		if (!res.success) {
 			const ra =
 				res.retryAfter !== undefined && res.retryAfter !== null
@@ -1114,10 +1138,16 @@ export class PollingAdapterCore
 		return res;
 	}
 
+	/**
+	 * Plugged to the harness wire at subject level. The optional metadata
+	 * carries wire kwargs (telegram finalize edits stamp parse_mode there —
+	 * tg-3); bindings that ignore it keep the raw-content contract.
+	 */
 	editTransmit: (
 		chatId: string,
 		messageId: string,
 		content: string,
+		metadata?: Metadata | undefined,
 	) => Promise<SendResult> = () =>
 		Promise.resolve({ success: false, error: "no wire bound" });
 

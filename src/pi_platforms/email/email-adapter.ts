@@ -17,13 +17,22 @@
 //                       a response arrives even if malformed (#80032); poison
 //                       message never aborts the batch; partial results ARE
 //                       dispatched before failure escalation; snapshot updated
-//                       after EVERY poll.
+//                       after EVERY poll; RFC 2971 IMAP ID issued after EVERY
+//                       login (_send_imap_id — byte-identical vendor identity,
+//                       best-effort/swallowed).
+//   parseFetchedMessage _extract_attachments over parts: image exts are
+//                       magic-byte-checked (non-images SKIPPED), others cache
+//                       as documents.
 //   _dispatch_message   gates in order: self-drop → automated drop → allowlist
-//                       gate (unset + no allow-all ⇒ drop) → authenticated-
+//                       gate (unset + no allow-all ⇒ drop; EMAIL_ALLOW_ALL_USERS
+//                       OR GATEWAY_ALLOW_ALL_USERS opt in) → authenticated-
 //                       sender gate ONLY when allowlist in effect & allow-all
-//                       off (GHSA-rxqh-5572-8m77 fail-closed).
+//                       off (GHSA-rxqh-5572-8m77 fail-closed); attachments
+//                       become event mediaUrls/mediaTypes with DOCUMENT-wins
+//                       typing (image ⇒ PHOTO only while still TEXT).
 //   _send_email         MIMEMultipart with MIMEText PLAIN only; thread context
-//                       Re:/In-Reply-To/References; Message-ID hermes-<hex>;
+//                       Re:/In-Reply-To/References; default subject "Hermes
+//                       Agent"; RFC 2822 local-time Date; Message-ID hermes-<hex>;
 //                       port 465 implicit TLS else STARTTLS; A21 IPv4 ladder.
 //
 // PROPOSED DEC text lives in email-world.ts (polling-row leg mappings).
@@ -63,6 +72,7 @@ import type { AdapterStatusSnapshot } from "../kit/lifecycle-state.js";
 
 import {
 	EMAIL_IMAP_PORT_DEFAULT,
+	EMAIL_IMAP_ID_ARGUMENT,
 	EMAIL_MAX_BODY_CHARS,
 	EMAIL_PLUGIN_MANIFEST,
 	EMAIL_POLL_INTERVAL_MS,
@@ -73,10 +83,13 @@ import {
 import {
 	extractEmailAddress,
 	extractTextBody,
+	extractAttachments,
+	formatRfc2822Date,
 	isAutomatedSender,
 	decodeHeaderValue,
 	verifySenderAuthentication,
 } from "./mime-text.js";
+import type { ExtractedAttachment } from "./mime-text.js";
 import type { PacingClockLike } from "./clock.js";
 import {
 	type FakeImapServer,
@@ -132,6 +145,7 @@ interface ParsedMail {
 	date: string;
 	senderAuthenticated: boolean;
 	authReason: string;
+	attachments: ExtractedAttachment[];
 }
 
 export class EmailAdapter
@@ -366,6 +380,7 @@ export class EmailAdapter
 				throw new Error("unreachable host");
 			}
 			this.imap.login(this.address, this.password);
+			this.sendImapId();
 			this.imap.selectInbox();
 			const snapshot = this.seenSnapshot.get(this.address);
 			if (opts.isReconnect && snapshot !== undefined) {
@@ -477,6 +492,20 @@ export class EmailAdapter
 
 	// ── _fetch_new_messages (executor-thread parity; sync here) ──
 
+	/**
+	 * adapter.py:_send_imap_id — RFC 2971 ID after EVERY login, with the
+	 * BYTE-IDENTICAL vendor identity string (163/NetEase refuse every UID
+	 * SEARCH/FETCH with ``BYE Unsafe Login`` otherwise). Best-effort: any
+	 * rejection is swallowed so non-supporting servers keep working.
+	 */
+	private sendImapId(): void {
+		try {
+			this.imap.id(EMAIL_IMAP_ID_ARGUMENT);
+		} catch {
+			// ID not accepted — never fatal (adapter.py:_send_imap_id).
+		}
+	}
+
 	private fetchNewMessages(): ParsedMail[] {
 		const results: ParsedMail[] = [];
 		try {
@@ -485,6 +514,7 @@ export class EmailAdapter
 				throw new Error("IMAP fetch error: unreachable host");
 			}
 			this.imap.login(this.address, this.password);
+			this.sendImapId();
 			this.imap.selectInbox();
 			const uids = this.imap.uidSearch("UNSEEN");
 			for (const uid of uids) {
@@ -555,6 +585,17 @@ export class EmailAdapter
 				charset: p.charset ?? null,
 			})),
 		);
+		const attachments = extractAttachments(
+			mail.uid,
+			mail.parts.map((p) => ({
+				contentType: p.contentType,
+				disposition: p.disposition,
+				payload: p.payload as Buffer | null,
+				...(p.filename !== undefined && p.filename !== null
+					? { filename: p.filename }
+					: {}),
+			})),
+		);
 
 		return {
 			uid: mail.uid,
@@ -567,6 +608,7 @@ export class EmailAdapter
 			date: mail.date,
 			senderAuthenticated: verdict.authenticated,
 			authReason: verdict.reason,
+			attachments,
 		};
 	}
 
@@ -595,11 +637,17 @@ export class EmailAdapter
 		if (isAutomatedSender(senderAddr, {})) return;
 
 		// 3. Allowlist gate — unset AND no open-access opt-in drops EVERYONE
-		//    (gateway default-deny parity).
+		//    (gateway default-deny parity). Open access opts in via EITHER
+		//    mirror: EMAIL_ALLOW_ALL_USERS or GATEWAY_ALLOW_ALL_USERS
+		//    (adapter.py:_dispatch_message truthy set {true,1,yes}).
+		const flagTruthy = (name: string): boolean =>
+			["true", "1", "yes"].includes(
+				(this.secretReader(name) ?? "").trim().toLowerCase(),
+			);
 		const allowedRaw = (this.secretReader("EMAIL_ALLOWED_USERS") ?? "").trim();
-		const allowAll = ["true", "1", "yes"].includes(
-			(this.secretReader("EMAIL_ALLOW_ALL_USERS") ?? "").trim().toLowerCase(),
-		);
+		const allowAll =
+			flagTruthy("EMAIL_ALLOW_ALL_USERS") ||
+			flagTruthy("GATEWAY_ALLOW_ALL_USERS");
 		if (allowedRaw.length === 0) {
 			if (!allowAll) return;
 		} else {
@@ -633,6 +681,22 @@ export class EmailAdapter
 		}
 		if (text.length === 0) text = "(empty email)";
 
+		// Attachments → media (adapter.py:_dispatch_message): URLs/types ride
+		// the house event shape; DOCUMENT wins over PHOTO for mixed sets (an
+		// image promotes TEXT only while still TEXT).
+		const mediaUrls: string[] = [];
+		const mediaTypes: string[] = [];
+		let messageType: IncomingEvent["messageType"] = "text";
+		for (const att of message.attachments) {
+			mediaUrls.push(att.path);
+			mediaTypes.push(att.mediaType);
+			if (att.kind === "image") {
+				if (messageType === "text") messageType = "photo";
+			} else if (att.kind === "document") {
+				messageType = "document";
+			}
+		}
+
 		// Thread context for reply threading.
 		this.threadContext.set(senderAddr, {
 			subject,
@@ -640,7 +704,7 @@ export class EmailAdapter
 		});
 
 		const event: IncomingEvent = {
-			messageType: "text",
+			messageType,
 			text,
 			source: {
 				platform: "email",
@@ -653,6 +717,8 @@ export class EmailAdapter
 			...(message.inReplyTo.length > 0
 				? { replyToMessageId: message.inReplyTo }
 				: {}),
+			...(mediaUrls.length > 0 ? { mediaUrls } : {}),
+			...(mediaTypes.length > 0 ? { mediaTypes } : {}),
 		};
 		await this.deliverInbound(event, `email:${senderAddr}`);
 	}
@@ -900,9 +966,11 @@ export class EmailAdapter
 
 	// ══════════════════════════════════════════════════════════════════════
 	// SMTP send lane (_send_email): MIME multipart, text/plain part ONLY;
-	// threading headers from thread context; Message-ID hermes-<hex12>@domain;
-	// port 465 implicit TLS else STARTTLS; A21 IPv4 fallback ladder on
-	// connection-class failures (TLS verification errors NOT retried).
+	// threading headers from thread context; default subject "Hermes Agent";
+	// RFC 2822 local-time Date (formatdate localtime=True, clock-pinned);
+	// Message-ID hermes-<hex12>@domain; port 465 implicit TLS else STARTTLS;
+	// A21 IPv4 fallback ladder on connection-class failures (TLS verification
+	// errors NOT retried).
 	// ══════════════════════════════════════════════════════════════════════
 
 	private connectSmtp(ipv4Only = false): void {
@@ -920,7 +988,7 @@ export class EmailAdapter
 		replyToMsgId?: string | undefined,
 	): Promise<string> {
 		const ctx = this.threadContext.get(toAddr) ?? {
-			subject: "pi gateway agent",
+			subject: "Hermes Agent",
 			messageId: "",
 		};
 		let subject = ctx.subject;
@@ -940,6 +1008,9 @@ export class EmailAdapter
 			this.connectSmtp(true); // IPv4-only retry
 		}
 		this.smtp.login(this.address, this.password);
+		// msg["Date"] = formatdate(localtime=True) — epoch pinned via the clock
+		// seam so contracts stay deterministic.
+		const nowMs = this.clock !== undefined ? this.clock.nowMs() : Date.now();
 		this.smtp.sendMessage({
 			from: this.address,
 			to: toAddr,
@@ -949,6 +1020,7 @@ export class EmailAdapter
 				...(originalMsgId !== undefined
 					? { "In-Reply-To": originalMsgId, References: originalMsgId }
 					: {}),
+				Date: formatRfc2822Date(nowMs),
 				"Message-ID": msgId,
 			},
 		});

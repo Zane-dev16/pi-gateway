@@ -33,7 +33,7 @@ import type {
 	MessageHandler,
 } from "../../pi_gateway/guards/index.js";
 import type { ManualScheduler } from "../../pi_gateway/guards/testing/manual-spawner.js";
-import type { FakePlatformWire } from "../conformance/wire.js";
+import { FakePlatformWire } from "../conformance/wire.js";
 import type { ConformanceSubject } from "../conformance/harness.js";
 import { SCHEDULER_SYMBOL } from "../conformance/harness.js";
 
@@ -41,6 +41,8 @@ import {
 	SlackAdapter,
 	SLACK_REGISTRY,
 	type SlackAdapterDeps,
+	type SlackRestExtras,
+	type SlackAuthIdentity,
 } from "./slack-adapter.js";
 import { SLACK_MANIFEST } from "./manifest.js";
 import type { RateBudget } from "../kit/capabilities.js";
@@ -67,10 +69,52 @@ export interface SlackSubjectOptions {
 	firstPingGraceMs?: number | undefined;
 	watchdogIntervalMs?: number | undefined;
 	ladder?: ReconnectLadderOptions | undefined;
+	/** SLACK_REACTIONS override; unset ⇒ env decides (default true). */
+	reactionsEnabled?: boolean | undefined;
+	/** Deterministic auth.test identity override (tests). */
+	authIdentity?: SlackAuthIdentity | undefined;
+}
+
+/**
+ * Capturing wire: adds dedicated audit lanes for the Slack-specific REST
+ * extensions (assistant.threads.setStatus / files_upload_v2 /
+ * conversations.open / reactions.add·remove / auth.test / chat.delete) so
+ * they never pollute send-op accounting.
+ */
+export class SlackCapturingWire extends FakePlatformWire {
+	readonly statusOps: Array<{
+		channelId: string;
+		threadTs: string;
+		status: string;
+	}> = [];
+	readonly uploadOps: Array<{
+		channel: string;
+		filename: string;
+		initialComment: string;
+		threadTs?: string | undefined;
+	}> = [];
+	/** conversations.open calls — resolved D id returned per user target. */
+	readonly dmOpens: Array<{ userId: string; resolvedDmId: string | null }> = [];
+	/** reactions.add/remove ops (per-turn emoji lifecycle audit). */
+	readonly reactionOps: Array<{
+		channelId: string;
+		ts: string;
+		name: string;
+		action: "add" | "remove";
+	}> = [];
+	/** auth.test probes (identity-lane audit). */
+	authTestCalls = 0;
+	/** chat.delete ops (opt-in cleanup_progress lane audit). */
+	readonly deleteOps: Array<{ channel: string; ts: string }> = [];
 }
 
 /** Same markdown-rejection script modeling as the reference subjects. */
-function wrapWire(raw: FakePlatformWire): SlackAdapterDeps["rest"] {
+function wrapWire(
+	raw: FakePlatformWire,
+	opts: { authIdentity?: SlackAuthIdentity | undefined } = {},
+): SlackAdapterDeps["rest"] & SlackRestExtras {
+	const capturing = raw as SlackCapturingWire;
+	const authIdentityOverride = opts.authIdentity;
 	return {
 		transmitSend: async (
 			chatId: string,
@@ -108,10 +152,67 @@ function wrapWire(raw: FakePlatformWire): SlackAdapterDeps["rest"] {
 			content: string,
 			metadata: Metadata,
 		): Promise<SendResult> => raw.transmitRich("__rich__", content, metadata),
+		transmitThreadStatus: async (
+			channelId: string,
+			threadTs: string,
+			status: string,
+		): Promise<void> => {
+			capturing.statusOps.push({ channelId, threadTs, status });
+		},
+		transmitUpload: async (op: {
+			channel: string;
+			filename: string;
+			initialComment: string;
+			threadTs?: string | undefined;
+		}): Promise<SendResult> => {
+			capturing.uploadOps.push(op);
+			return raw.transmitSend(op.channel, op.initialComment, {
+				files_upload_v2: true,
+				filename: op.filename,
+				...(op.threadTs !== undefined ? { thread_ts: op.threadTs } : {}),
+			});
+		},
+		openDirectMessage: async (userId: string): Promise<string | null> => {
+			// conversations.open {users} → channel.id (im:write scope modeled).
+			const resolvedDmId = `D${userId.replace(/^[UW]/, "")}`;
+			capturing.dmOpens.push({ userId, resolvedDmId });
+			return resolvedDmId;
+		},
+		transmitReaction: async (
+			channelId: string,
+			ts: string,
+			name: string,
+			action: "add" | "remove",
+		): Promise<SendResult> => {
+			// reactions.add/reactions.remove {channel,timestamp,name} (:4217/:4233)
+			// — their OWN method class, captured off the send-op accounting.
+			capturing.reactionOps.push({ channelId, ts, name, action });
+			return { success: true };
+		},
+		authTest: async (): Promise<SlackAuthIdentity> => {
+			// client.auth_test :1968 parity — token-derived identity, deterministic.
+			capturing.authTestCalls += 1;
+			if (authIdentityOverride !== undefined) return authIdentityOverride;
+			return {
+				ok: true,
+				userId: "UBOTAUTH0",
+				teamId: "TWORKSPACE0",
+				user: "gateway-bot",
+				team: "Workspace Zero",
+			};
+		},
+		transmitDelete: async (
+			channelId: string,
+			messageId: string,
+		): Promise<SendResult> => {
+			// chat.delete {channel,ts} (:3085) — best-effort lane, always ok on
+			// the fake; failures are modeled by omitting the extra entirely.
+			capturing.deleteOps.push({ channel: channelId, ts: messageId });
+			return { success: true, messageId };
+		},
 		hasScript: (opKind) => raw.hasScript(opKind),
 	};
 }
-
 export class SlackSubject implements ConformanceSubject {
 	readonly name: string;
 	readonly adapter: SlackAdapter;
@@ -138,7 +239,7 @@ export class SlackSubject implements ConformanceSubject {
 		const deps: SlackAdapterDeps = {
 			manifestName: this.name,
 			transport: this.socketServer,
-			rest: wrapWire(opts.wire),
+			rest: wrapWire(opts.wire, { authIdentity: opts.authIdentity }),
 			clock: this.clock,
 			scalarMaxUnits: opts.scalarMaxUnits ?? 64,
 			...(opts.richBlocks !== undefined ? { richBlocks: opts.richBlocks } : {}),
@@ -163,14 +264,11 @@ export class SlackSubject implements ConformanceSubject {
 				? { watchdogIntervalMs: opts.watchdogIntervalMs }
 				: {}),
 			...(opts.ladder !== undefined ? { ladder: opts.ladder } : {}),
+			...(opts.reactionsEnabled !== undefined
+				? { reactionsEnabled: opts.reactionsEnabled }
+				: {}),
 		};
 		this.adapter = new SlackAdapter(deps);
-
-		// Guard wiring mirrors the reference subjects' standard guard: Lane C
-		// clarify intercept resolves BEFORE any turn work; the hold gate models
-		// a BUSY TURN (subject-level state — see holdTurnsForBurst); inline
-		// lanes never block while the old turn unwinds.
-		const subject = this;
 		const adapter = this.adapter;
 
 		const messageHandler: MessageHandler = async (event, ctx) => {
@@ -188,9 +286,9 @@ export class SlackSubject implements ConformanceSubject {
 				text.startsWith("/") ||
 				(ctx.task.cancelRequested() === false && ctx.task.isDone());
 			if (!isInlineDispatch) {
-				while (subject.holding && !ctx.task.cancelRequested()) {
+				while (this.holding && !ctx.task.cancelRequested()) {
 					await Promise.race([
-						subject.holdGate.then(() => undefined),
+						this.holdGate.then(() => undefined),
 						new Promise<void>((r) => setTimeout(r, 1)),
 					]);
 				}
@@ -329,7 +427,17 @@ export class SlackSubject implements ConformanceSubject {
 		return this.adapter as unknown as StreamEgressAdapter;
 	}
 	async armOpenNativeStream(chatId: string, draftId: number): Promise<void> {
-		return this.adapter.armNativeStream(chatId, draftId);
+		// chat.startStream requires an anchor (pre-wire guard parity); the
+		// arming frame carries a deterministic turn identity the way the
+		// production gateway always stamps metadata.thread_id.
+		await this.adapter.sendDraft({
+			chatId,
+			draftId,
+			content: "",
+			metadata: {
+				thread_id: `1700000000.${String(draftId).padStart(6, "0")}`,
+			},
+		});
 	}
 	failNextSeals(n: number): void {
 		this.wire.script(

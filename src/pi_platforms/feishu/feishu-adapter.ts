@@ -29,6 +29,14 @@
 // dedup); VC meeting invites → synthetic DM MessageEvents; Drive comments →
 // gated prompt turns with comment-API delivery.
 
+import {
+	createHash,
+	randomUUID,
+	timingSafeEqual as nodeTimingSafe,
+} from "node:crypto";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { basename, join as pathJoin } from "node:path";
+
 import type {
 	DraftFrameArgs,
 	EditOptions,
@@ -56,7 +64,7 @@ import {
 	type CapabilityManifest,
 	type ScopedSecretReader,
 } from "../kit/index.js";
-import { FormattingLadder, stripMarkdownMarkup } from "../kit/formatting-ladder.js";
+import { FormattingLadder } from "../kit/formatting-ladder.js";
 import { chunkWithFenceCarry, type ChunkPlan } from "../kit/chunking.js";
 import {
 	classifySendError,
@@ -81,11 +89,19 @@ import {
 	FEISHU_REACTION_FAILURE,
 	FEISHU_REACTION_IN_PROGRESS,
 	FEISHU_REPLY_FALLBACK_CODES,
+	FEISHU_SENDER_NAME_TTL_MS,
 	FEISHU_SPLIT_THRESHOLD_UNITS,
 	FEISHU_TEXT_BATCH_DELAY_MS,
 	FEISHU_TEXT_BATCH_MAX_CHARS,
 	FEISHU_TEXT_BATCH_MAX_MESSAGES,
 	FEISHU_TEXT_BATCH_SPLIT_DELAY_MS,
+	FEISHU_WEBHOOK_DEFAULT_HOST,
+	FEISHU_WEBHOOK_DEFAULT_PATH,
+	FEISHU_WEBHOOK_DEFAULT_PORT,
+	FEISHU_WEBHOOK_MAX_BODY_BYTES,
+	FEISHU_WEBHOOK_RATE_LIMIT_MAX,
+	FEISHU_WEBHOOK_RATE_MAX_KEYS,
+	FEISHU_WEBHOOK_RATE_WINDOW_SECONDS,
 	FEISHU_WS_PING_INTERVAL_MS,
 	FEISHU_WS_PING_TIMEOUT_MS,
 	FEISHU_WS_RECONNECT_ATTEMPTS,
@@ -95,6 +111,7 @@ import { CardActionTokenStore, FeishuSeenMessageStore } from "./dedup.js";
 import {
 	buildGenericCardCommandText,
 	buildResolvedApprovalCard,
+	buildResolvedUpdatePromptCard,
 	isInteractiveOperatorAuthorized,
 	parseCardAction,
 } from "./cards.js";
@@ -107,9 +124,17 @@ import type { FeishuConnectionFactory } from "./fake-feishu.js";
 // ── structural REST plane (vendor op level) ────────────────────────────────
 
 export interface FeishuMessageSendOpts {
-	receiveIdType: "chat_id" | "open_id" | "user_id";
+	/** Vendor receive_id_type enum incl. the thread-create leg
+	 * (_build_create_message_request("thread_id", …) :4836). */
+	receiveIdType: "chat_id" | "open_id" | "user_id" | "thread_id";
 	receiveId: string;
-	msgType: "text" | "post";
+	/** Vendor msg_type enum — text/post PLUS the media-bubble types shipped
+	 * after upload (image/file/audio/media; _feishu_send_with_retry callers
+	 * :2297/:4738/:4786/:4802). */
+	msgType: "text" | "post" | "image" | "audio" | "media" | "file";
+	/** The WIRE content string: plain text for the text lane, the JSON-STRING
+	 * post payload ({"zh_cn":{"content":rows}}) for post, or the JSON string
+	 * {image_key}/{file_key} for media bubbles (:4655/:4779/:4825). */
 	content: string;
 	replyToMessageId?: string | undefined;
 	replyInThread?: boolean | undefined;
@@ -144,11 +169,63 @@ export interface FeishuRestPlane {
 		userId: string;
 		name: string;
 	} | null>;
+	/** GET im/v1/messages/:id — reaction routing fetches the reacted-to
+	 * message to verify THIS bot authored it and to recover chat context
+	 * (adapter.py:_handle_reaction_event @2989; sender.id ≙ app id for bot
+	 * messages — peer bots share sender_type="app" but differ on app id). */
+	getMessage(messageId: string): Promise<{
+		senderId: string;
+		chatId: string;
+		chatType: string;
+	} | null>;
 	/** Whether an explicit RICH probe lane is scripted (subject/test seam —
 	 * mirrors the family richScriptedProbe pattern; production faces return
 	 * false, which latches the §10.1 rich tier off without a roundtrip). */
 	richScripted(): boolean;
 	transmitRich(content: string, metadata: Metadata): Promise<SendResult>;
+	/** POST im/v1/images — multipart upload, image_type enum value "message"
+	 * (_FEISHU_IMAGE_UPLOAD_TYPE :203; _build_image_upload_body :5189).
+	 * Returns the uploaded image_key on success. */
+	createImage(opts: {
+		imageType: string;
+		filename: string;
+		image: Uint8Array;
+	}): Promise<SendResult & { imageKey?: string | undefined }>;
+	/** POST im/v1/files — file_type stream|opus|mp4|pdf|doc|xls|ppt routing
+	 * (:203–212/_resolve_outbound_file_routing :5234); duration attached ONLY
+	 * when > 0 (_build_file_upload_body :5206). Returns file_key on success. */
+	createFile(opts: {
+		fileType: string;
+		fileName: string;
+		file: Uint8Array;
+		durationMs?: number | undefined;
+	}): Promise<SendResult & { fileKey?: string | undefined }>;
+	/** GET im/v1/messages/:id/resources?type=image|file (:4001) — inbound
+	 * image/file/audio/media bytes. */
+	getMessageResource(opts: {
+		messageId: string;
+		fileKey: string;
+		resourceType: "image" | "file";
+	}): Promise<{
+		bytes: Uint8Array;
+		contentType: string;
+		filename: string;
+	} | null>;
+	/** GET contact/v3/users/:id — display-name resolution with id-type
+	 * routing open_id/union_id/user_id (:4205 _resolve_sender_name_from_api);
+	 * null on ANY failure (silent — never blocks the pipeline). */
+	resolveUserName(opts: {
+		userId: string;
+		userIdType: "open_id" | "union_id" | "user_id";
+	}): Promise<string | null>;
+	/** GET bot/v3/bots/basic_batch?bot_ids=… (:4257 _fetch_bot_names) — bot
+	 * names divert here because contact/v3 has no bot rows. */
+	resolveBotNames(
+		botIds: readonly string[],
+	): Promise<Record<string, string> | null>;
+	/** GET im/v1/chats/:chat_id (:2424 get_chat_info) — real chat metadata
+	 * for source attribution; null on failure (fallback name = chat id). */
+	getChat(chatId: string): Promise<{ name: string; chatType: string } | null>;
 }
 
 /** Command registry — the five-command conformance registry (family parity). */
@@ -211,6 +288,12 @@ export interface FeishuAdapterDeps {
 
 	/** Persisted dedup state path (temp dir in tests; scoped home otherwise). */
 	dedupStatePath?: string | undefined;
+	/** Inbound image:/file: resource cache root (:4001 download → local
+	 * cached path; whatsapp-cloud mediaCacheDir parity). Absent ⇒ caching
+	 * disabled and scheme refs pass through untouched. */
+	mediaCacheDir?: string | undefined;
+	/** Webhook route path override (FEISHU_WEBHOOK_PATH; rate-key input). */
+	webhookPath?: string | undefined;
 	/** Tuning (manifest defaults; injected-clock determinism in tests). */
 	pingIntervalMs?: number | undefined;
 	pingTimeoutMs?: number | undefined;
@@ -239,8 +322,119 @@ interface PendingBatchEntry {
 	sessionKey: string;
 }
 
+/**
+ * THE markdown decision regex — VERBATIM 13-alternative transcription of
+ * adapter.py:_MARKDOWN_HINT_RE (@168, re.MULTILINE): pipe table (header +
+ * separator pair), ATX headings, bullet/ordered lists, hr rule, fenced code,
+ * inline code, bold, strike, underline (<u>), single-* italic, links, and
+ * blockquotes. Every alternative matters: dropping one silently reclassifies
+ * markdown-shaped bodies as msg_type=text.
+ */
 const MARKDOWN_HINT_RE =
-	/(\n\||^#+ |\n[-*] |\n\d+\. |\n---|\n```|`[^`]+`|\*\*[^*]+\*\*|~~[^~]+~~|\[[^\]]+\]\([^)]+\)|^> )/m;
+	/(^\|.*\|\s*\n\|[-:|\s]+\|)|(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?<\/u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)/m;
+
+// ── post payload construction (module scope; adapter.py :188–190/:580–648) ──
+
+/** _MARKDOWN_LINK_RE :188 — [label](url). */
+const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(([^)]+)\)/g;
+/** _MARKDOWN_FENCE_OPEN_RE :189 — an OPENING fence (language allowed). */
+const MARKDOWN_FENCE_OPEN_RE = /^```([^\n`]*)\s*$/;
+/** _MARKDOWN_FENCE_CLOSE_RE :190 — a BARE closing fence. */
+const MARKDOWN_FENCE_CLOSE_RE = /^```\s*$/;
+
+/** One Feishu post element row entry — tag plus free-form string attrs
+ * ({tag:"md",text} prose rows, {tag:"img",image_key}, {tag:"media",…}). */
+export type FeishuPostElement = { tag: string } & Record<string, string>;
+/** One Feishu post element row ([{tag:"md",text}, …]). */
+export type FeishuPostRow = FeishuPostElement[];
+
+/** Python str.splitlines() boundary set (incl. \x85/\u2028/\u2029). */
+const SPLITLINES_RE = /\r\n|\r|\n|\v|\f|\x1c|\x1d|\x1e|\x85|\u2028|\u2029/;
+
+/**
+ * _build_markdown_post_rows (:604) — build post rows while ISOLATING fenced
+ * code blocks: Feishu's `md` renderer can swallow trailing content when a
+ * fenced block rides inside one large markdown element, so the reply splits
+ * at REAL fence lines (prose before/after stays visible; code keeps a
+ * dedicated row).
+ */
+export function buildMarkdownPostRows(content: string): FeishuPostRow[] {
+	if (!content) return [[{ tag: "md", text: "" }]];
+	if (!content.includes("```")) return [[{ tag: "md", text: content }]];
+
+	const rows: FeishuPostRow[] = [];
+	let current: string[] = [];
+	let inCodeBlock = false;
+
+	const flushCurrent = (): void => {
+		if (current.length === 0) return;
+		const segment = current.join("\n");
+		if (segment.trim() !== "") rows.push([{ tag: "md", text: segment }]);
+		current = [];
+	};
+
+	for (const rawLine of content.split(SPLITLINES_RE)) {
+		const strippedLine = rawLine.trim();
+		const isFence = inCodeBlock
+			? MARKDOWN_FENCE_CLOSE_RE.test(strippedLine)
+			: MARKDOWN_FENCE_OPEN_RE.test(strippedLine);
+
+		if (isFence) {
+			if (!inCodeBlock) flushCurrent();
+			current.push(rawLine);
+			inCodeBlock = !inCodeBlock;
+			if (!inCodeBlock) flushCurrent();
+			continue;
+		}
+		current.push(rawLine);
+	}
+
+	flushCurrent();
+	return rows.length > 0 ? rows : [[{ tag: "md", text: content }]];
+}
+
+/**
+ * _build_markdown_post_payload (:580) — the WIRE content for msg_type=post:
+ * a JSON STRING {"zh_cn":{"content":rows}} (ensure_ascii=False parity —
+ * JSON.stringify never escapes non-ASCII).
+ */
+export function buildMarkdownPostPayload(content: string): string {
+	return JSON.stringify({ zh_cn: { content: buildMarkdownPostRows(content) } });
+}
+
+// ── plain-text stripper (_strip_markdown_to_plain_text :552 + shared
+//    gateway.platforms.helpers.strip_markdown :196) — DOWNGRADE LANES ONLY ──
+
+/**
+ * THE downgrade stripper. Feishu-specific patterns first (CRLF normalise,
+ * link → 'text (url)', blockquote markers, hr rule, strikethrough, <u>),
+ * then the SHARED strip_markdown pass (bold/italic/bold-under/italic-under,
+ * fenced + inline code removal, ATX headings, links, newline collapse,
+ * trim). Order matters: the link REWRITE runs before the link REMOVAL so
+ * rewritten 'text (url)' bodies survive.
+ */
+export function stripFeishuMarkdownToPlainText(text: string): string {
+	let plain = text.replaceAll("\r\n", "\n");
+	plain = plain.replace(
+		MARKDOWN_LINK_RE,
+		(_match: string, label: string, url: string) => `${label} (${url.trim()})`,
+	);
+	plain = plain.replace(/^>\s?/gm, "");
+	plain = plain.replace(/^\s*---+\s*$/gm, "---");
+	plain = plain.replace(/~~([^~\n]+)~~/g, "$1");
+	plain = plain.replace(/<u>([\s\S]*?)<\/u>/g, "$1");
+	// gateway.platforms.helpers.strip_markdown (:196)
+	plain = plain.replace(/\*\*(.+?)\*\*/gs, "$1");
+	plain = plain.replace(/\*(.+?)\*/gs, "$1");
+	plain = plain.replace(/\b__(?![\s_])(.+?)(?<![\s_])__\b/gs, "$1");
+	plain = plain.replace(/\b_(?![\s_])(.+?)(?<![\s_])_\b/gs, "$1");
+	plain = plain.replace(/```[a-zA-Z0-9_+-]*\n?/g, "");
+	plain = plain.replace(/`(.+?)`/g, "$1");
+	plain = plain.replace(/^#{1,6}\s+/gm, "");
+	plain = plain.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+	plain = plain.replace(/\n{3,}/g, "\n\n");
+	return plain.trim();
+}
 
 // ── inbound normalization shape (module scope; one arrival snapshot) ──────
 
@@ -259,6 +453,8 @@ interface NormalizedInbound {
 	mentionsSelf: boolean;
 	rawMentionsAll: boolean;
 	source: SessionSource;
+	/** In-flight resource downloads (media dispatch awaits them). */
+	resourceTask?: Promise<void> | undefined;
 }
 
 export class FeishuAdapter
@@ -273,6 +469,9 @@ export class FeishuAdapter
 	// ── identity / authorization ──────────────────────────────────────────
 	private botOpenId: string;
 	private botUserId: string;
+	/** FEISHU_APP_ID — reaction routing compares GET-message sender ids
+	 * against it (:3009 sender.id ≙ app id for bot-authored messages). */
+	private readonly appId: string;
 	private readonly admins: ReadonlySet<string>;
 	private readonly allowedUsers: ReadonlySet<string>;
 	private readonly groupRules: FeishuAdapterDeps["groupRules"];
@@ -300,6 +499,16 @@ export class FeishuAdapter
 	private readonly pingIntervalMs: number;
 	private readonly pingTimeoutMs: number;
 	private readonly watchdogIntervalMs: number;
+
+	// ── webhook listener surface (FEISHU_WEBHOOK_HOST/PORT/PATH :1650–1658) ─
+	readonly webhookHost: string;
+	readonly webhookPort: number;
+	/** THE configured route path — composite rate-key component (:3562). */
+	readonly webhookPath: string;
+	/** Last composed `{app}:{path}:{ip}` key (rate-limiter observability). */
+	lastWebhookRateKey = "";
+	/** Inbound resource cache root (absent ⇒ caching disabled). */
+	readonly mediaCacheDir: string | undefined;
 
 	// ── inbound pipeline observability ────────────────────────────────────
 	readonly inboundLog: Array<{ eventId: string; eventType: string }> = [];
@@ -335,6 +544,9 @@ export class FeishuAdapter
 	richWireAttempts = 0;
 	private chunkDowngradedToText = false;
 	/** Chunks already downgraded carry plain text — never re-decide. */
+	/** §6.1 plain-fallback leg forces the TEXT lane (parse-failure resend is a
+	 * downgrade path — :2461 format_message semantics, never re-posted). */
+	private forcePlainTextLane = false;
 
 	// ── interactive surfaces (§9; DEC-016 parallel mechanism) ──────────────
 	readonly approvals = new OneShotPendingStore();
@@ -376,6 +588,18 @@ export class FeishuAdapter
 	/** Reaction lifecycle LRU (message_id → reaction_id). */
 	private readonly pendingReactions = new Map<string, string>();
 
+	// ── directory caches (:238/:2424/:4205) ───────────────────────────────
+	/** Sender display names, 10-min TTL ("" cached ⇒ known nameless). */
+	private readonly senderNameCache = new Map<
+		string,
+		{ name: string; expireAtMs: number }
+	>();
+	/** Chat metadata (im/v1/chats/:id), session-lived. */
+	private readonly chatInfoCache = new Map<
+		string,
+		{ name: string; chatType: string }
+	>();
+
 	constructor(deps: FeishuAdapterDeps) {
 		super({
 			manifestName: deps.manifestName ?? "feishu",
@@ -393,6 +617,7 @@ export class FeishuAdapter
 		const ident = deps.botIdentity;
 		this.botOpenId = ident?.openId ?? "";
 		this.botUserId = ident?.userId ?? "";
+		this.appId = deps.secretReader?.(FEISHU_REQUIRED_SECRETS[0]) ?? "";
 		this.admins = deps.admins ?? new Set();
 		this.allowedUsers = deps.allowedUsers ?? new Set();
 		this.groupRules = deps.groupRules;
@@ -407,6 +632,26 @@ export class FeishuAdapter
 		this.pingTimeoutMs = deps.pingTimeoutMs ?? FEISHU_WS_PING_TIMEOUT_MS;
 		this.watchdogIntervalMs =
 			deps.watchdogIntervalMs ?? Math.min(5_000, this.pingIntervalMs);
+		this.mediaCacheDir = deps.mediaCacheDir;
+		this.webhookHost =
+			deps.optionalEnvReader === undefined
+				? FEISHU_WEBHOOK_DEFAULT_HOST
+				: deps.optionalEnvReader("FEISHU_WEBHOOK_HOST")?.trim() ||
+					FEISHU_WEBHOOK_DEFAULT_HOST;
+		const portRaw =
+			deps.optionalEnvReader === undefined
+				? undefined
+				: deps.optionalEnvReader("FEISHU_WEBHOOK_PORT");
+		const portParsed = Number.parseInt(portRaw ?? "", 10);
+		this.webhookPort = Number.isFinite(portParsed)
+			? portParsed
+			: FEISHU_WEBHOOK_DEFAULT_PORT;
+		this.webhookPath =
+			deps.webhookPath?.trim() ||
+			(deps.optionalEnvReader === undefined
+				? ""
+				: (deps.optionalEnvReader("FEISHU_WEBHOOK_PATH")?.trim() ?? "")) ||
+			FEISHU_WEBHOOK_DEFAULT_PATH;
 		this.seenMessages = new FeishuSeenMessageStore({
 			ttlMs: FEISHU_DEDUP_TTL_MS,
 			nowMs: this.clock.nowMs,
@@ -454,17 +699,8 @@ export class FeishuAdapter
 			streamIsMessageForChat: () => false, // NO relay lanes exist on feishu
 			transmitSend: async (chatId, content, metadata) =>
 				this.transmitFeishuMessage(chatId, content, metadata),
-			transmitEdit: async (_chatId, messageId, content, opts) =>
-				this.rest
-					.updateMessage({
-						messageId,
-						msgType: this.pendingPreferPost === true ? "post" : "text",
-						content:
-							this.pendingPreferPost === true
-								? content
-								: stripForPlain(content),
-					})
-					.then((r) => (r.success ? r : opts.finalize ? r : r)),
+			transmitEdit: async (_chatId, messageId, content, _opts) =>
+				this.editMessageDecided(messageId, content),
 			transmitSeal: async () =>
 				// No native stream exists to seal — honest failure, never armed.
 				Promise.resolve({ success: false, error: "no native stream lane" }),
@@ -709,6 +945,18 @@ export class FeishuAdapter
 			case "im.message.receive_v1":
 				await this.onImMessage(eventId, event ?? {});
 				return;
+			case "im.message.reaction.created_v1":
+				await this.onReactionEvent(
+					"im.message.reaction.created_v1",
+					event ?? {},
+				);
+				return;
+			case "im.message.reaction.deleted_v1":
+				await this.onReactionEvent(
+					"im.message.reaction.deleted_v1",
+					event ?? {},
+				);
+				return;
 			case "card.action.trigger":
 				await this.handleCardActionTrigger(eventId, event ?? {});
 				return;
@@ -718,7 +966,13 @@ export class FeishuAdapter
 				return;
 			case "vc.bot.meeting_invited_v1":
 				this.inboundLog.push({ eventId, eventType });
-				await this.onMeetingInvited(event ?? {});
+				// The FULL FRAME rides in — root.header.event_id feeds the
+				// vc_invite:{event_id} dedup key (:131/:159); the bare inner event
+				// never carries it.
+				await this.onMeetingInvited({
+					header: { event_id: eventId },
+					event: event ?? {},
+				});
 				return;
 			default:
 				// Unwired kinds tolerated (read/recall/member events log-only).
@@ -764,13 +1018,73 @@ export class FeishuAdapter
 			eventType: "im.message.receive_v1",
 		});
 
+		// Sender-name cache warm (:4149 _resolve_sender_profile runs for EVERY
+		// inbound message so card-click attribution reads a WARM cache).
+		const nameLookupId =
+			normalized.senderIds.openId || normalized.senderIds.userId;
+		if (nameLookupId !== "") {
+			void this.resolveSenderName(
+				nameLookupId,
+				normalized.senderType !== "user",
+			).catch(() => {});
+		}
+
 		if (
 			normalized.messageType === "text" ||
 			normalized.messageType === "other"
 		) {
 			await this.enqueueTextBatch(normalized);
 		} else {
+			// Inbound image:/file:/audio:/media: refs download to the local
+			// media cache BEFORE dispatch (:4001/:4032); failures keep the
+			// vendor ref (graceful degradation).
+			normalized.resourceTask = this.cacheInboundResources(normalized);
 			await this.enqueueMediaBatch(normalized);
+		}
+	}
+
+	/** Download audit (feishu-2 observability). */
+	readonly resourceCacheLog: Array<{
+		fileKey: string;
+		path: string;
+	}> = [];
+
+	/**
+	 * Fetch every scheme-ref on the event and rewrite it to the cached local
+	 * path (_download_feishu_image :3960 / _download_feishu_message_resource
+	 * :4001). Silent-failure per ref; the vendor ref survives any error.
+	 */
+	private async cacheInboundResources(n: NormalizedInbound): Promise<void> {
+		if (this.mediaCacheDir === undefined || n.mediaUrls.length === 0) return;
+		await mkdir(this.mediaCacheDir, { recursive: true });
+		for (let i = 0; i < n.mediaUrls.length; i++) {
+			const ref = n.mediaUrls[i] ?? "";
+			const colon = ref.indexOf(":");
+			if (colon <= 0) continue;
+			const scheme = ref.slice(0, colon);
+			const fileKey = ref.slice(colon + 1);
+			if (fileKey === "") continue;
+			const resourceType = scheme === "image" ? "image" : "file";
+			try {
+				const res = await this.rest.getMessageResource({
+					messageId: n.messageId,
+					fileKey,
+					resourceType,
+				});
+				if (res === null) continue;
+				const safeBase = safeCacheFilename(
+					res.filename || `${scheme}_${fileKey}`,
+				);
+				const outPath = pathJoin(
+					this.mediaCacheDir,
+					`${safeBase}${safeBase.includes(".") ? "" : extensionForContentType(res.contentType)}`,
+				);
+				await writeFile(outPath, res.bytes);
+				n.mediaUrls[i] = outPath;
+				this.resourceCacheLog.push({ fileKey, path: outPath });
+			} catch {
+				/* silent-failure parity (:4041/:4096) — ref stays vendor-shaped */
+			}
 		}
 	}
 
@@ -1121,10 +1435,14 @@ export class FeishuAdapter
 		this.scheduleTimer(this.mediaBatchDelayMs, () => {
 			const ready = this.pendingMedia.get(sessionKey);
 			this.pendingMedia.delete(sessionKey);
-			if (ready !== undefined)
-				void this.dispatchNormalized(
-					ready,
-					`${this.manifestName}:${ready.chatId}:${ready.source.userId ?? ""}`,
+			if (ready === undefined) return;
+			void Promise.resolve(ready.resourceTask)
+				.catch(() => {})
+				.then(() =>
+					this.dispatchNormalized(
+						ready,
+						`${this.manifestName}:${ready.chatId}:${ready.source.userId ?? ""}`,
+					),
 				);
 		});
 	}
@@ -1181,43 +1499,36 @@ export class FeishuAdapter
 
 		if (parsed.family === "approval") {
 			const approvalId = Number(parsed.approvalId ?? 0);
+			if (!Number.isInteger(approvalId) || approvalId <= 0) return {}; // missing id (:2749)
+			// Hermes branch order (_handle_approval_card_action :2750–2860):
+			// unknown/resolved state → BARE; unauthorized → BARE; chat mismatch →
+			// BARE; only LIVE resolutions answer with a raw replacement card.
 			const state = this.approvalState.get(approvalId);
-			// Chat-mismatch check (:2800) — a click from ANOTHER chat never resolves.
+			if (state === undefined) return {}; // already resolved or unknown (:2753)
+			if (!this.isOperatorAuthorized(operatorOpenId)) return {}; // (:2762)
+			// Chat-mismatch check — a click from ANOTHER chat never resolves.
+			const openChatId = String(context["open_chat_id"] ?? "");
 			if (
-				state !== undefined &&
 				state.chatId !== "" &&
+				openChatId !== "" &&
 				openChatId !== state.chatId
-			) {
-				return { toast: { type: "error", content: "wrong chat" } };
-			}
-			if (!this.isOperatorAuthorized(operatorOpenId)) {
-				return {
-					toast: { type: "error", content: "⛔ You are not authorized." },
-				};
-			}
+			)
+				return {}; // (:2770)
 			const choice = parsed.choice ?? "deny"; // fail-closed (:2791)
 			const popped = this.approvals.pop(approvalId, this.clock.nowMs());
 			if (popped.state !== "live") {
 				// Stale/double tap — corrective notice, NEVER dispatched (:2894).
 				this.resolvedFamilies.push(`ea-stale:${approvalId}`);
-				return {
-					card: buildResolvedApprovalCard(
-						choice,
-						"⌛ Already resolved/expired",
-					),
-				};
+				return {};
 			}
 			this.approvalState.delete(approvalId);
-			const card = buildResolvedApprovalCard(
-				choice,
-				choice === "deny"
-					? "❌ Denied"
-					: choice === "once"
-						? "✅ Approved once"
-						: choice === "session"
-							? "✅ Approved for session"
-							: "✅ Approved permanently",
-			);
+			// Resolved-card attribution reads THE SENDER-NAME CACHE (:2811
+			// `_get_cached_sender_name(open_id) or open_id`) — warmed by ingress
+			// name resolution, never a blocking click-time roundtrip.
+			const userName =
+				this.getCachedSenderName(operatorOpenId) || operatorOpenId;
+			void this.resolveSenderName(operatorOpenId).catch(() => {});
+			const card = buildResolvedApprovalCard(choice, userName);
 			this.resolvedApprovalCards.push({ approvalId, choice, card });
 			this.resolvedFamilies.push(`ea:${popped.sessionKey}`);
 			this.routerResolved.push(`ea:${popped.sessionKey}`);
@@ -1226,28 +1537,20 @@ export class FeishuAdapter
 
 		if (parsed.family === "update_prompt") {
 			const promptId = Number(parsed.updatePromptId ?? 0);
-			if (!this.isOperatorAuthorized(operatorOpenId)) {
-				return {
-					toast: { type: "error", content: "⛔ You are not authorized." },
-				};
-			}
+			if (!Number.isInteger(promptId) || promptId <= 0) return {}; // missing id
+			if (!this.isOperatorAuthorized(operatorOpenId)) return {}; // (:2838)
 			const answer = parsed.answer;
+			if (answer !== "y" && answer !== "n") return {}; // invalid answer (:2831)
 			const popped = this.updatePrompts.pop(promptId, this.clock.nowMs());
-			if (popped.state !== "live" || (answer !== "y" && answer !== "n")) {
-				return {
-					card: buildResolvedApprovalCard(
-						answer === "n" ? "deny" : "always",
-						"⌛ Expired",
-					),
-				};
-			}
+			if (popped.state !== "live") return {}; // stale/expired ⇒ bare (:2823)
 			this.updatePromptAnswers.push({ promptId, answer });
 			this.resolvedFamilies.push(`upd:${promptId}`);
+			// Cache-read attribution parity (:2871).
+			const updUserName =
+				this.getCachedSenderName(operatorOpenId) || operatorOpenId;
+			void this.resolveSenderName(operatorOpenId).catch(() => {});
 			return {
-				card: buildResolvedApprovalCard(
-					answer === "y" ? "always" : "deny",
-					answer === "y" ? "✓ Updating" : "✗ Skipped",
-				),
+				card: buildResolvedUpdatePromptCard(answer, updUserName),
 			};
 		}
 
@@ -1298,11 +1601,15 @@ export class FeishuAdapter
 	// A12 — meeting invites (synthetic DM through both guards)
 	// ══════════════════════════════════════════════════════════════════════
 
-	private readonly vcDedupKeys = new Set<string>();
 	readonly meetingInviteLog: MeetingInviteDispatchRecord[] = [];
 
-	async onMeetingInvited(event: Record<string, unknown>): Promise<void> {
-		const payload = parseMeetingInvitedEvent({ event });
+	private async onMeetingInvited(
+		frame: Record<string, unknown>,
+	): Promise<void> {
+		// The FULL FRAME rides in — root.header.event_id is the
+		// vc_invite:{event_id} dedup key input (:131); the bare inner event
+		// never carries it.
+		const payload = parseMeetingInvitedEvent(frame);
 		if (payload === null) {
 			this.meetingInviteLog.push({
 				outcome: "dropped_malformed",
@@ -1311,14 +1618,20 @@ export class FeishuAdapter
 			});
 			return;
 		}
+		// Dedup FIRST (:150 handle_meeting_invited_event): vc_invite:* keys ride
+		// THE PERSISTED seen-set (adapter._is_duplicate — 24h TTL, 2048 cap,
+		// survives restarts) BEFORE any inviter validation.
 		const key = meetingDedupKey(payload);
-		if (this.vcDedupKeys.has(key)) {
+		if (this.seenMessages.isDuplicate(key)) {
 			this.meetingInviteLog.push({
 				outcome: "dropped_duplicate",
 				key,
 				prompt: "",
 			});
 			return;
+		}
+		if (this.dedupStatePath !== undefined) {
+			this.seenMessages.persist(this.dedupStatePath);
 		}
 		if (payload.inviter.openId === "") {
 			this.meetingInviteLog.push({
@@ -1328,7 +1641,6 @@ export class FeishuAdapter
 			});
 			return;
 		}
-		this.vcDedupKeys.add(key);
 		// Synthetic DM MessageEvent (:175–183) — full guard traversal.
 		const source: SessionSource = {
 			platform: this.manifestName,
@@ -1372,6 +1684,251 @@ export class FeishuAdapter
 	}
 
 	// ══════════════════════════════════════════════════════════════════════
+	// Reaction-command ingress (:2687 _on_reaction_event / :2989
+	// _handle_reaction_event) — human reactions on THIS bot's messages route
+	// as synthetic `reaction:{action}:{emoji}` command turns.
+	// ══════════════════════════════════════════════════════════════════════
+
+	private async onReactionEvent(
+		eventType: string,
+		event: Record<string, unknown>,
+	): Promise<void> {
+		const messageId = String(event["message_id"] ?? "");
+		const operatorType = String(event["operator_type"] ?? "user");
+		// Empty/missing emoji defaults to UNKNOWN (:3023 — synthetic text reads
+		// reaction:added:UNKNOWN, never a trailing colon).
+		const emojiType =
+			String(
+				(asRecord(event["reaction_type"]) as Record<string, unknown>)[
+					"emoji_type"
+				] ?? "",
+			) || "UNKNOWN";
+		// Drop bot/app-origin reactions to break the feedback loop from our own
+		// lifecycle reactions; a HUMAN reacting with the same emoji still
+		// routes through (:2705 loop-break comment).
+		if (operatorType === "bot" || operatorType === "app") return;
+		if (messageId === "") return;
+
+		// Fetch the reacted-to message: only reactions on THIS bot's own
+		// messages become commands (:3009 — GET returns sender.id=app_id for
+		// bot messages; peer bots share sender_type but differ on app id).
+		let target: {
+			senderId: string;
+			chatId: string;
+			chatType: string;
+		} | null = null;
+		try {
+			target = await this.rest.getMessage(messageId);
+		} catch {
+			return; // fetch failure ⇒ no routing (exception guard :3022)
+		}
+		if (target === null) return;
+		const expectedSender = this.appId !== "" ? this.appId : this.botOpenId;
+		if (expectedSender === "" || target.senderId !== expectedSender) return;
+		if (target.chatId === "") return;
+
+		// Chat metadata for the synthetic source (get_chat_info :2424 — cached
+		// silent-failure; fallback name = the raw chat id).
+		const chatInfo = await this.getChatInfo(target.chatId);
+		const action = eventType.includes("created") ? "added" : "removed";
+		const syntheticText = `reaction:${action}:${emojiType}`;
+		const operatorId = asRecord(event["user_id"]);
+		const source: SessionSource = {
+			platform: this.manifestName,
+			chatType: target.chatType === "group" ? "group" : "dm",
+			userId:
+				String(operatorId["open_id"] ?? "") || String(operatorId["id"] ?? ""),
+			chatId: target.chatId,
+			...(chatInfo.name !== target.chatId && chatInfo.name !== ""
+				? { chatName: chatInfo.name }
+				: {}),
+		};
+		this.inboundLog.push({ eventId: messageId, eventType });
+		await this.dispatchIncoming(
+			{
+				messageType: "text",
+				messageId,
+				text: syntheticText,
+				source,
+			},
+			`${this.manifestName}:${target.chatId}:${source.userId}`,
+		);
+	}
+
+	// ══════════════════════════════════════════════════════════════════════
+	// Webhook ingress plane (:3558 _handle_webhook_request) — the
+	// FEISHU_CONNECTION_MODE=webhook HTTP face with its full gate ladder.
+	// ══════════════════════════════════════════════════════════════════════
+
+	/** Composite-key rate buckets ({app}:{path}:{ip} :3660). */
+	private readonly webhookRateCounts = new Map<
+		string,
+		{ count: number; windowStartMs: number }
+	>();
+
+	async handleWebhookPost(input: {
+		headers?: Record<string, string> | undefined;
+		rawBody: Buffer;
+		peer: string;
+	}): Promise<{ status: number; contentType?: string; body?: string }> {
+		const headers = normalizeWebhookHeaders(input.headers);
+
+		// 1. Rate limit — composite key app_id:path:remote_ip (:3562) with the
+		// CONFIGURED webhook path (FEISHU_WEBHOOK_PATH, default /feishu/webhook).
+		const rateKey = `${this.appId}:${this.webhookPath}:${input.peer}`;
+		this.lastWebhookRateKey = rateKey;
+		if (!this.checkWebhookRateLimit(rateKey)) {
+			return { status: 429, body: "Too Many Requests" };
+		}
+
+		// 2. Content-Type guard — Feishu always sends application/json (:3570).
+		const rawContentType: string = headers["content-type"] ?? "";
+		const contentType =
+			rawContentType.split(";")[0]?.trim().toLowerCase() ?? "";
+		if (contentType !== "" && contentType !== "application/json") {
+			return { status: 415, body: "Unsupported Media Type" };
+		}
+
+		// 3/4. Body size guard — declared length then actual bytes (:3577).
+		const declaredRaw = headers["content-length"];
+		if (
+			declaredRaw !== undefined &&
+			/^\d+$/.test(declaredRaw) &&
+			Number(declaredRaw) > FEISHU_WEBHOOK_MAX_BODY_BYTES
+		) {
+			return { status: 413, body: "Request body too large" };
+		}
+		if (input.rawBody.length > FEISHU_WEBHOOK_MAX_BODY_BYTES) {
+			return { status: 413, body: "Request body too large" };
+		}
+
+		// 5. JSON parse (:3613).
+		let payload: Record<string, unknown>;
+		try {
+			const parsed: unknown = JSON.parse(input.rawBody.toString("utf8"));
+			if (
+				parsed === null ||
+				typeof parsed !== "object" ||
+				Array.isArray(parsed)
+			)
+				throw new Error("not an object");
+			payload = parsed as Record<string, unknown>;
+		} catch {
+			return {
+				status: 400,
+				contentType: "application/json",
+				body: JSON.stringify({ code: 400, msg: "invalid json" }),
+			};
+		}
+
+		// 6. Verification token check BEFORE the challenge echo (:3619).
+		const verificationToken =
+			this.optionalEnvReader("FEISHU_VERIFICATION_TOKEN") ?? "";
+		if (verificationToken !== "") {
+			const header = asRecord(payload["header"]);
+			const incomingToken = String(header["token"] ?? payload["token"] ?? "");
+			if (
+				incomingToken === "" ||
+				!timingSafeEqualUtf8(incomingToken, verificationToken)
+			) {
+				return { status: 401, body: "Invalid verification token" };
+			}
+		}
+
+		// 7. URL verification challenge — echo ONLY after token validation
+		// so an unauthenticated request cannot prove endpoint control by
+		// reflecting attacker-supplied data (:3630 comment).
+		if (payload["type"] === "url_verification") {
+			return {
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify({ challenge: payload["challenge"] ?? "" }),
+			};
+		}
+
+		// 8. Timing-safe signature check when encrypt_key is set (:3641):
+		// SHA256(timestamp + nonce + encrypt_key + body).
+		const encryptKey = this.optionalEnvReader("FEISHU_ENCRYPT_KEY") ?? "";
+		if (
+			encryptKey !== "" &&
+			!this.isWebhookSignatureValid(headers, input.rawBody, encryptKey)
+		) {
+			return { status: 401, body: "Invalid signature" };
+		}
+
+		// 9. Encrypted payloads are not supported in webhook mode (:3650).
+		if (payload["encrypt"] !== undefined) {
+			return {
+				status: 400,
+				contentType: "application/json",
+				body: JSON.stringify({
+					code: 400,
+					msg: "encrypted webhook payloads are not supported",
+				}),
+			};
+		}
+
+		// 10. Route through THE SAME frame pipeline as the ws plane (:3660).
+		const header = asRecord(payload["header"]);
+		const eventType = String(header["event_type"] ?? "");
+		await this.onSocketFrame({
+			type: "event",
+			header: {
+				event_id: String(header["event_id"] ?? ""),
+				event_type: eventType,
+			},
+			event: asRecord(payload["event"]),
+		});
+		return {
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({ code: 0, msg: "ok" }),
+		};
+	}
+
+	/** Sliding-window limiter capped at _FEISHU_WEBHOOK_RATE_MAX_KEYS (:3703). */
+	private checkWebhookRateLimit(rateKey: string): boolean {
+		const now = Date.now();
+		const windowMs = FEISHU_WEBHOOK_RATE_WINDOW_SECONDS * 1000;
+		const entry = this.webhookRateCounts.get(rateKey);
+		if (entry !== undefined && now - entry.windowStartMs < windowMs) {
+			entry.count += 1;
+			return entry.count <= FEISHU_WEBHOOK_RATE_LIMIT_MAX;
+		}
+		if (
+			entry === undefined &&
+			this.webhookRateCounts.size >= FEISHU_WEBHOOK_RATE_MAX_KEYS
+		) {
+			for (const [key, e] of [...this.webhookRateCounts]) {
+				if (now - e.windowStartMs >= windowMs)
+					this.webhookRateCounts.delete(key);
+			}
+			if (this.webhookRateCounts.size >= FEISHU_WEBHOOK_RATE_MAX_KEYS) {
+				const oldest = this.webhookRateCounts.keys().next();
+				if (!oldest.done) this.webhookRateCounts.delete(oldest.value);
+			}
+		}
+		this.webhookRateCounts.set(rateKey, { count: 1, windowStartMs: now });
+		return true;
+	}
+
+	/** SHA256(timestamp+nonce+encrypt_key+body), timing-safe compare (:3676). */
+	private isWebhookSignatureValid(
+		headers: Record<string, string>,
+		bodyBytes: Buffer,
+		encryptKey: string,
+	): boolean {
+		const timestamp = headers["x-lark-request-timestamp"] ?? "";
+		const nonce = headers["x-lark-request-nonce"] ?? "";
+		const signature = headers["x-lark-signature"] ?? "";
+		if (timestamp === "" || nonce === "" || signature === "") return false;
+		const computed = createHash("sha256")
+			.update(`${timestamp}${nonce}${encryptKey}${bodyBytes.toString("utf8")}`)
+			.digest("hex");
+		return timingSafeEqualUtf8(computed, signature);
+	}
+
+	// ══════════════════════════════════════════════════════════════════════
 	// Egress doors + feishu send path
 	// ══════════════════════════════════════════════════════════════════════
 
@@ -1406,9 +1963,7 @@ export class FeishuAdapter
 					? {
 							chunks: [content],
 							chunkCount: 1,
-							scaffold: [
-								{ prefixLen: 0, closeAdded: false, labelJoinLen: 0 },
-							],
+							scaffold: [{ prefixLen: 0, closeAdded: false, labelJoinLen: 0 }],
 						}
 					: chunkWithFenceCarry(content, policy);
 			const results: SendResult[] = [];
@@ -1453,9 +2008,37 @@ export class FeishuAdapter
 			return this.wireSend(chatId, DELIVERY_FAILED_NOTICE, metadata);
 		}
 		if (failureClass === "formatting") {
-			return this.wireSend(chatId, plainTextFallbackBody(chunk), metadata);
+			// §6.1 plain fallback: the prefixed body rides the TEXT lane VERBATIM
+			// ({content[:3500]} base parity) — never re-encoded as post.
+			this.forcePlainTextLane = true;
+			try {
+				return this.wireSend(chatId, plainTextFallbackBody(chunk), metadata);
+			} finally {
+				this.forcePlainTextLane = false;
+			}
 		}
 		return outcome;
+	}
+
+	/**
+	 * Vendor addressing (_send_raw_message @4818): strip the
+	 * `feishu_user_id:` prefix when the receive id type is user_id — the raw
+	 * prefixed value is an INVALID receive_id on the vendor wire.
+	 */
+	private resolveReceiveTarget(chatId: string): {
+		receiveIdType: "chat_id" | "open_id" | "user_id" | "thread_id";
+		receiveId: string;
+	} {
+		if (chatId.startsWith("feishu_user_id:"))
+			return {
+				receiveIdType: "user_id",
+				receiveId: chatId.split(":", 2)[1] ?? "",
+			};
+		if (chatId.startsWith("ou_"))
+			return { receiveIdType: "open_id", receiveId: chatId };
+		if (chatId.startsWith("oc_"))
+			return { receiveIdType: "chat_id", receiveId: chatId };
+		return { receiveIdType: "chat_id", receiveId: chatId };
 	}
 
 	private async transmitFeishuMessage(
@@ -1466,7 +2049,9 @@ export class FeishuAdapter
 		const preferPost =
 			this.chunkDowngradedToText === true
 				? false
-				: this.pendingPreferPost === true;
+				: this.forcePlainTextLane === true
+					? false
+					: this.pendingPreferPost === true;
 		const replyTo =
 			metadata["reply_to_message_id"] !== undefined
 				? String(metadata["reply_to_message_id"])
@@ -1476,20 +2061,50 @@ export class FeishuAdapter
 				? String(metadata["thread_id"])
 				: undefined;
 
+		// THE three send legs (_send_raw_message @4818): (1) an effective reply
+		// anchor → the reply API (reply_in_thread rides thread presence);
+		// (2) thread context WITHOUT an anchor → create addressed to THE THREAD
+		// (receive_id_type="thread_id", receive_id=thread_id) so anchored
+		// content lands in the topic, never the main chat; (3) otherwise create
+		// to the chat with vendor prefix handling. Every leg mints a FRESH
+		// uuid4 — the vendor idempotency key must never repeat for distinct
+		// sends (:4833/:4847/:4863 str(uuid.uuid4())).
+		//
+		// Lane content (:2461 format_message / :4637 _build_outbound_payload):
+		// post ships the JSON-STRING fence-split payload; TEXT SHIPS VERBATIM
+		// (format_message returns content.strip()) — stripping happens ONLY on a
+		// post-rejected downgrade (:555).
+		const target = this.resolveReceiveTarget(chatId);
+		const laneContent = (post: boolean): string =>
+			post ? buildMarkdownPostPayload(content) : content.trim();
 		let result = await this.rest.sendMessage({
-			receiveIdType: resolveReceiveIdType(chatId),
-			receiveId: chatId,
+			...(replyTo !== undefined
+				? {
+						receiveIdType: target.receiveIdType,
+						receiveId: target.receiveId,
+						replyToMessageId: replyTo,
+						replyInThread: threadId !== undefined,
+					}
+				: threadId !== undefined
+					? {
+							receiveIdType: "thread_id" as const,
+							receiveId: threadId,
+						}
+					: {
+							receiveIdType: target.receiveIdType,
+							receiveId: target.receiveId,
+						}),
 			msgType: preferPost ? "post" : "text",
-			content: preferPost ? content : stripForPlain(content),
-			replyToMessageId: threadId === undefined ? replyTo : undefined,
-			replyInThread: threadId !== undefined,
-			uuid: `uuid-${Math.abs(hashCode(content))}-${Date.now() % 100000}`,
+			content: laneContent(preferPost),
+			uuid: randomUUID(),
 			metadata,
 		});
 
 		// Post-format rejection → immediate plain downgrade for THIS chunk
 		// (:193 _POST_CONTENT_INVALID_RE handling), sticky for the rest of the
 		// deliver call (chunk boundaries never flip msg_type mid-send #26841).
+		// The retry keeps the SAME reply anchoring (:2003 fallback passes
+		// reply_to through) and a fresh uuid.
 		if (
 			!result.success &&
 			preferPost &&
@@ -1497,17 +2112,33 @@ export class FeishuAdapter
 		) {
 			this.chunkDowngradedToText = true;
 			result = await this.rest.sendMessage({
-				receiveIdType: resolveReceiveIdType(chatId),
-				receiveId: chatId,
+				...(replyTo !== undefined
+					? {
+							receiveIdType: target.receiveIdType,
+							receiveId: target.receiveId,
+							replyToMessageId: replyTo,
+							replyInThread: threadId !== undefined,
+						}
+					: threadId !== undefined
+						? {
+								receiveIdType: "thread_id" as const,
+								receiveId: threadId,
+							}
+						: {
+								receiveIdType: target.receiveIdType,
+								receiveId: target.receiveId,
+							}),
 				msgType: "text",
-				content: stripForPlain(content),
-				uuid: `uuid-${Math.abs(hashCode(content))}-plain`,
+				content: stripFeishuMarkdownToPlainText(content),
+				uuid: randomUUID(),
 			});
 			return result;
 		}
 
 		// Reply target withdrawn/deleted → ONE fresh-create fallback
-		// (:272 _FEISHU_REPLY_FALLBACK_CODES; skipped in threads).
+		// (:272 _FEISHU_REPLY_FALLBACK_CODES). In threads the top-level
+		// fallback is SKIPPED (:5015–5026 — replying into a withdrawn thread
+		// anchor must not mint a new topic); fresh uuid on the fallback leg.
 		if (
 			!result.success &&
 			replyTo !== undefined &&
@@ -1515,11 +2146,11 @@ export class FeishuAdapter
 			hasReplyFallbackCode(String(result.error ?? ""))
 		) {
 			result = await this.rest.sendMessage({
-				receiveIdType: resolveReceiveIdType(chatId),
-				receiveId: chatId,
+				receiveIdType: target.receiveIdType,
+				receiveId: target.receiveId,
 				msgType: preferPost ? "post" : "text",
-				content: preferPost ? content : stripForPlain(content),
-				uuid: `uuid-${Math.abs(hashCode(content))}-fb`,
+				content: laneContent(preferPost),
+				uuid: randomUUID(),
 			});
 		}
 		return result;
@@ -1533,18 +2164,43 @@ export class FeishuAdapter
 		return this.transmitFeishuMessage(chatId, content, metadata);
 	}
 
+	/**
+	 * THE edit leg (edit_message @2015): msg_type is RE-DECIDED from the
+	 * edited content (hint regex; prefer_post does NOT carry over); text ships
+	 * VERBATIM (:2461) and a post-invalid rejection downgrades THAT update to
+	 * the faithful plain-text strip (:555).
+	 */
+	private async editMessageDecided(
+		messageId: string,
+		content: string,
+	): Promise<SendResult> {
+		const preferPost = MARKDOWN_HINT_RE.test(content);
+		const result = await this.rest.updateMessage({
+			messageId,
+			msgType: preferPost ? "post" : "text",
+			content: preferPost ? buildMarkdownPostPayload(content) : content.trim(),
+		});
+		if (
+			!result.success &&
+			preferPost &&
+			String(result.error ?? "").includes(FEISHU_POST_CONTENT_INVALID_MARKER)
+		) {
+			return this.rest.updateMessage({
+				messageId,
+				msgType: "text",
+				content: stripFeishuMarkdownToPlainText(content),
+			});
+		}
+		return result;
+	}
+
 	protected override async wireEdit(
 		_chatId: string,
 		messageId: string,
 		content: string,
 		_opts: EditOptions & { finalize: boolean },
 	): Promise<SendResult> {
-		return this.rest.updateMessage({
-			messageId,
-			msgType: this.pendingPreferPost === true ? "post" : "text",
-			content:
-				this.pendingPreferPost === true ? content : stripForPlain(content),
-		});
+		return this.editMessageDecided(messageId, content);
 	}
 
 	protected override async wireDraft(
@@ -1701,6 +2357,296 @@ export class FeishuAdapter
 		}
 	}
 
+	// ════════════════════════════════════════════════════════════════
+	// Directory resolution (:238 TTL / :2424 get_chat_info / :4149
+	// _resolve_sender_profile / :4205 _resolve_sender_name_from_api /
+	// :4257 _fetch_bot_names) — cached, silent-failure, never blocking.
+	// ════════════════════════════════════════════════════════════════
+
+	/** Cached name only while its TTL is valid ("" ⇒ known nameless). */
+	getCachedSenderName(senderId: string): string | null {
+		if (senderId === "") return null;
+		const cached = this.senderNameCache.get(senderId);
+		if (cached === undefined) return null;
+		if (this.clock.nowMs() < cached.expireAtMs) return cached.name;
+		this.senderNameCache.delete(senderId);
+		return null;
+	}
+
+	private cacheSenderName(senderId: string, name: string): void {
+		this.senderNameCache.set(senderId, {
+			name,
+			expireAtMs: this.clock.nowMs() + FEISHU_SENDER_NAME_TTL_MS,
+		});
+	}
+
+	/**
+	 * Display-name resolution with the Hermes routing shape (:4205): bots
+	 * divert to bot/v3/bots/basic_batch (contact API has no bot rows); humans
+	 * ride contact/v3/users/:id with id-type from the id prefix. Failures are
+	 * SILENT — the pipeline never blocks on name resolution.
+	 */
+	async resolveSenderName(
+		senderId: string,
+		isBot = false,
+	): Promise<string | null> {
+		const trimmed = senderId.trim();
+		if (trimmed === "") return null;
+		const cached = this.getCachedSenderName(trimmed);
+		if (cached !== null) return cached === "" ? null : cached;
+		try {
+			if (isBot) {
+				const names = await this.rest.resolveBotNames([trimmed]);
+				if (names === null) return null;
+				for (const [oid, name] of Object.entries(names)) {
+					this.cacheSenderName(oid, name);
+				}
+				const hit = this.senderNameCache.get(trimmed);
+				return hit !== undefined && hit.name !== "" ? hit.name : null;
+			}
+			const userIdType = trimmed.startsWith("ou_")
+				? ("open_id" as const)
+				: trimmed.startsWith("on_")
+					? ("union_id" as const)
+					: ("user_id" as const);
+			const name = await this.rest.resolveUserName({
+				userId: trimmed,
+				userIdType,
+			});
+			if (name !== null && name.trim() !== "") {
+				this.cacheSenderName(trimmed, name.trim());
+				return name.trim();
+			}
+		} catch {
+			/* silent-failure parity (:4243/:4276) */
+		}
+		return null;
+	}
+
+	/**
+	 * Real chat metadata with a session-lived cache and a fallback of
+	 * {name: chatId, type: "dm"} (:2424 get_chat_info).
+	 */
+	async getChatInfo(chatId: string): Promise<{
+		name: string;
+		chatType: string;
+	}> {
+		const fallback = { name: chatId, chatType: "dm" };
+		if (chatId === "") return fallback;
+		const cached = this.chatInfoCache.get(chatId);
+		if (cached !== undefined) return { ...cached };
+		try {
+			const info = await this.rest.getChat(chatId);
+			if (info === null || info.name === "") return fallback;
+			const resolved = { name: info.name, chatType: info.chatType || "dm" };
+			this.chatInfoCache.set(chatId, resolved);
+			return { ...resolved };
+		} catch {
+			return fallback;
+		}
+	}
+
+	// ════════════════════════════════════════════════════════════════
+	// Outgoing media family (feishu-2) — adapter.py:send_image_file :2297 /
+	// send_voice :2239 / send_document :2258 / send_video :2278 over
+	// _send_uploaded_file_message :4695 and the im/v1 upload endpoints.
+	// ════════════════════════════════════════════════════════════════
+
+	/** Caption rides a post whose content APPENDS the media tag row (:5214). */
+	private buildMediaPostPayload(
+		caption: string,
+		mediaTag: FeishuPostElement,
+	): string {
+		const payload = JSON.parse(buildMarkdownPostPayload(caption)) as {
+			zh_cn: { content: FeishuPostRow[] };
+		};
+		payload.zh_cn.content.push([mediaTag]);
+		return JSON.stringify(payload);
+	}
+
+	/** Local image natively via image.create + msg_type=image (:2297). */
+	async sendImageFile(
+		chatId: string,
+		imagePath: string,
+		opts: {
+			caption?: string | undefined;
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+		} = {},
+	): Promise<SendResult> {
+		let bytes: Buffer;
+		try {
+			bytes = await readFile(imagePath);
+		} catch {
+			return { success: false, error: `Image file not found: ${imagePath}` };
+		}
+		const upload = await this.rest.createImage({
+			imageType: "message", // _FEISHU_IMAGE_UPLOAD_TYPE :203
+			filename: basename(imagePath),
+			image: new Uint8Array(bytes),
+		});
+		if (!upload.success) return upload;
+		if (!upload.imageKey) {
+			return {
+				success: false,
+				error: "Feishu image upload missing image_key",
+			};
+		}
+		const imageKey = upload.imageKey;
+		if (opts.caption !== undefined && opts.caption !== "") {
+			// Caption ⇒ post payload with an appended img row (:2310–2320).
+			const target = this.resolveReceiveTarget(chatId);
+			return this.rest.sendMessage({
+				receiveIdType: target.receiveIdType,
+				receiveId: target.receiveId,
+				...(opts.replyToMessageId !== undefined
+					? { replyToMessageId: opts.replyToMessageId }
+					: {}),
+				msgType: "post",
+				content: this.buildMediaPostPayload(opts.caption, {
+					tag: "img",
+					image_key: imageKey,
+				}),
+				uuid: randomUUID(),
+				...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+			});
+		}
+		const target = this.resolveReceiveTarget(chatId);
+		return this.rest.sendMessage({
+			receiveIdType: target.receiveIdType,
+			receiveId: target.receiveId,
+			...(opts.replyToMessageId !== undefined
+				? { replyToMessageId: opts.replyToMessageId }
+				: {}),
+			msgType: "image",
+			content: JSON.stringify({ image_key: imageKey }),
+			uuid: randomUUID(),
+			...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+		});
+	}
+
+	/** Audio via file.create (opus routing + duration) + msg_type=audio (:2239). */
+	async sendVoice(
+		chatId: string,
+		audioPath: string,
+		opts: {
+			caption?: string | undefined;
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+		} = {},
+	): Promise<SendResult> {
+		return this.sendUploadedFileMessage(chatId, audioPath, {
+			...opts,
+			outboundMessageType: "audio",
+		});
+	}
+
+	/** Document/file attachment via file.create + msg_type=file (:2258). */
+	async sendDocument(
+		chatId: string,
+		filePath: string,
+		opts: {
+			caption?: string | undefined;
+			fileName?: string | undefined;
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+		} = {},
+	): Promise<SendResult> {
+		return this.sendUploadedFileMessage(chatId, filePath, {
+			caption: opts.caption,
+			fileName: opts.fileName,
+			replyToMessageId: opts.replyToMessageId,
+			metadata: opts.metadata,
+			outboundMessageType: "file",
+		});
+	}
+
+	/** Video via file.create (mp4 routing) + msg_type=media (:2278). */
+	async sendVideo(
+		chatId: string,
+		videoPath: string,
+		opts: {
+			caption?: string | undefined;
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+		} = {},
+	): Promise<SendResult> {
+		return this.sendUploadedFileMessage(chatId, videoPath, {
+			...opts,
+			outboundMessageType: "media",
+		});
+	}
+
+	/**
+	 * _send_uploaded_file_message (:4695): route extension → file_type,
+	 * opus carries OGG/Opus duration, upload, then ship the bubble — a
+	 * caption upgrades to a post with the media row (:4738).
+	 */
+	private async sendUploadedFileMessage(
+		chatId: string,
+		filePath: string,
+		opts: {
+			caption?: string | undefined;
+			fileName?: string | undefined;
+			replyToMessageId?: string | undefined;
+			metadata?: Metadata | undefined;
+			outboundMessageType: "audio" | "media" | "file";
+		},
+	): Promise<SendResult> {
+		let bytes: Buffer;
+		try {
+			bytes = await readFile(filePath);
+		} catch {
+			return { success: false, error: `File not found: ${filePath}` };
+		}
+		const displayName = opts.fileName ?? basename(filePath);
+		const { fileType, messageType } = resolveOutboundFileRouting(
+			displayName,
+			opts.outboundMessageType,
+		);
+		const durationMs = fileType === "opus" ? audioDurationMs(bytes) : 0;
+		const upload = await this.rest.createFile({
+			fileType,
+			fileName: displayName,
+			file: new Uint8Array(bytes),
+			...(durationMs > 0 ? { durationMs } : {}),
+		});
+		if (!upload.success) return upload;
+		if (!upload.fileKey) {
+			return { success: false, error: "Feishu file upload missing file_key" };
+		}
+		const fileKey = upload.fileKey;
+		const target = this.resolveReceiveTarget(chatId);
+		if (opts.caption !== undefined && opts.caption !== "") {
+			return this.rest.sendMessage({
+				receiveIdType: target.receiveIdType,
+				receiveId: target.receiveId,
+				...(opts.replyToMessageId !== undefined
+					? { replyToMessageId: opts.replyToMessageId }
+					: {}),
+				msgType: "post",
+				content: this.buildMediaPostPayload(opts.caption, {
+					tag: "media",
+					file_key: fileKey,
+					file_name: displayName,
+				}),
+				uuid: randomUUID(),
+				...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+			});
+		}
+		return this.rest.sendMessage({
+			receiveIdType: target.receiveIdType,
+			receiveId: target.receiveId,
+			...(opts.replyToMessageId !== undefined
+				? { replyToMessageId: opts.replyToMessageId }
+				: {}),
+			msgType: messageType,
+			content: JSON.stringify({ file_key: fileKey }),
+			uuid: randomUUID(),
+			...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+		});
+	}
+
 	// ══════════════════════════════════════════════════════════════════════
 	// Guard wiring (conformance-subject plumbing; family parity)
 	// ══════════════════════════════════════════════════════════════════════
@@ -1842,32 +2788,122 @@ function truthy(raw: string | undefined): boolean {
 	return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-function resolveReceiveIdType(
-	chatId: string,
-): "chat_id" | "open_id" | "user_id" {
-	if (chatId.startsWith("ou_")) return "open_id";
-	if (chatId.startsWith("oc_")) return "chat_id";
-	if (chatId.startsWith("feishu_user_id:")) return "user_id";
-	return "chat_id";
+function normalizeWebhookHeaders(
+	headers: Record<string, string> | undefined,
+): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(headers ?? {})) out[k.toLowerCase()] = v;
+	return out;
+}
+
+/** hmac.compare_digest parity: unequal lengths fail WITHOUT content compare
+ * (node timingSafeEqual throws on length mismatch). */
+function timingSafeEqualUtf8(a: string, b: string): boolean {
+	const ab = Buffer.from(a, "utf8");
+	const bb = Buffer.from(b, "utf8");
+	if (ab.length !== bb.length) return false;
+	return nodeTimingSafe(ab, bb);
+}
+
+/**
+ * _resolve_outbound_file_routing (:5234): extension → (file_type,
+ * msg_type) — ogg/opus ⇒ opus/audio; mp4 family ⇒ mp4/media; known doc
+ * types keep their enum value; everything else rides "stream"/"file".
+ */
+function resolveOutboundFileRouting(
+	filePath: string,
+	requestedMessageType: "audio" | "media" | "file",
+): { fileType: string; messageType: "audio" | "media" | "file" } {
+	const ext = extnameLower(filePath);
+	if (ext === ".ogg" || ext === ".opus")
+		return { fileType: "opus", messageType: "audio" };
+	if (FEISHU_MEDIA_UPLOAD_EXTENSIONS.has(ext))
+		return { fileType: "mp4", messageType: "media" };
+	const docType = FEISHU_DOC_UPLOAD_TYPES.get(ext);
+	if (docType !== undefined) return { fileType: docType, messageType: "file" };
+	// requested_message_type is consulted only for the default leg (:5252).
+	void requestedMessageType;
+	return { fileType: "stream", messageType: "file" }; // _FEISHU_FILE_UPLOAD_TYPE :203
+}
+
+/** _FEISHU_MEDIA_UPLOAD_EXTENSIONS :205. */
+const FEISHU_MEDIA_UPLOAD_EXTENSIONS = new Set([
+	".mp4",
+	".mov",
+	".avi",
+	".m4v",
+]);
+/** _FEISHU_DOC_UPLOAD_TYPES :206–212. */
+const FEISHU_DOC_UPLOAD_TYPES = new Map([
+	[".pdf", "pdf"],
+	[".doc", "doc"],
+	[".docx", "doc"],
+	[".xls", "xls"],
+	[".xlsx", "xls"],
+	[".ppt", "ppt"],
+	[".pptx", "ppt"],
+]);
+
+function extnameLower(filePath: string): string {
+	const base = filePath.split("/").pop() ?? filePath;
+	const dot = base.lastIndexOf(".");
+	return dot <= 0 ? "" : base.slice(dot).toLowerCase();
 }
 
 function hasReplyFallbackCode(errorText: string): boolean {
 	return FEISHU_REPLY_FALLBACK_CODES.some((c) => errorText.includes(String(c)));
 }
 
-/** Deterministic small hash (uuid idempotency keys per :4815 fresh-uuid). */
-function hashCode(text: string): number {
-	let h = 0;
-	for (let i = 0; i < text.length; i++) {
-		h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
-	}
-	return h;
+/** Strip path separators/control chars from a vendor filename before it can
+ * land under the media cache root (whatsapp-cloud MEDIA_ID_SAFE_RE spirit). */
+function safeCacheFilename(filename: string): string {
+	const cleaned = filename.replace(/[^A-Za-z0-9._-]/g, "_");
+	return cleaned === "" || cleaned === "." || cleaned === ".."
+		? "resource"
+		: cleaned;
 }
 
-/** Plain-lane strip: markup removed, whitespace trimmed (:2461 format_message). */
-function stripForPlain(content: string): string {
-	const stripped = stripMarkdownMarkup(content);
-	return stripped.trim();
+/** Extension backfill when the vendor filename carries none. */
+function extensionForContentType(contentType: string): string {
+	const mime = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+	if (mime.startsWith("image/"))
+		return `.${mime.slice("image/".length) || "jpg"}`;
+	if (mime.startsWith("audio/"))
+		return `.${mime.slice("audio/".length) || "ogg"}`;
+	if (mime.startsWith("video/")) return ".mp4";
+	return ".bin";
+}
+
+/**
+ * _get_audio_duration_ms (:4662) — OGG/Opus duration in milliseconds from
+ * the LAST granule position / 48000 Hz sample rate. Pure byte parsing, no
+ * deps; 0 for non-OGG or malformed containers.
+ */
+export function audioDurationMs(data: Uint8Array): number {
+	try {
+		let pos = 0;
+		let lastGranule = 0;
+		while (pos < data.length - 27) {
+			const idx = Buffer.from(data).indexOf("OggS", pos, "latin1");
+			if (idx === -1) break;
+			pos = idx;
+			const granule = Number(
+				Buffer.from(data.buffer, data.byteOffset + pos + 6, 8).readBigUInt64LE(
+					0,
+				),
+			);
+			const numSegments = data[pos + 26] ?? 0;
+			if (granule > 0) lastGranule = granule;
+			let pageSize = numSegments;
+			for (let i = 0; i < numSegments; i++) {
+				pageSize += data[pos + 27 + i] ?? 0;
+			}
+			pos += pageSize;
+		}
+		return lastGranule > 0 ? Math.trunc(lastGranule / 48) : 0; // /48000*1000
+	} catch {
+		return 0;
+	}
 }
 
 export interface MeetingInviteDispatchRecord {
