@@ -83,6 +83,36 @@ in `../09-open-questions.md` (append-only).
 
 ## Log
 
+- STABILITY FIX CLUSTER `photon-r2` (2026-08-25): round-2 findings ph-1..ph-5 applied
+  toward Hermes truth at /tmp/hermes-upstream anchors (plugins/platforms/photon/
+  adapter.py + gateway/platforms/base.py). ph-1: sendClarify renders base.py:send_clarify's
+  fallback BYTE-EXACT — '❓ {question}\n\n  1. A\n  2. B\n\nReply with the number, the option
+  text, or your own answer.' (two-space indent, blank-line framing, reply trailer) and bare
+  '❓ {question}' open-ended; conformance row upgraded from contains() to exact-bytes
+  assertions. ph-2: sendWithRetryPhoton restores the ONE plain-text fall-through resend
+  (_sidecar_send richlink=False markdown=False, adapter.py @2478) for BOTH exhausted retries
+  AND non-network non-timeout non-permanent failures (previously !isNetwork returned as-is);
+  DEC-046 timeout veto preserved verbatim (classified timeouts return as-is, no retry no
+  resend) and permanent classes still never double-send. ph-3: new exported
+  richlinkUrlFromContent mirrors_richlink_url_from_content RECURSION into group items
+  (text/richlink item content), so multi-item group messages arm the 30s preview-suppression
+  window (recordRecentRichlink collapsed to the Hermes_record_recent_richlink signature;
+  call site = candidate ?? text). ph-4: SidecarTransport.call body now OPTIONAL — /probe and
+  the startup /healthz readiness ping ride HEADERS-ONLY POSTs (_probe_once @~1869 /
+  _start_sidecar wait @~1720); FakeSidecarServer records body=undefined for them (watchdog
+  /healthz monitor keeps its JSON body per adapter.py @1109). ph-5: buildSidecarSpawnCommand
+  envVars gain PHOTON_PROJECT_ID/PHOTON_PROJECT_SECRET/PHOTON_SIDECAR_TOKEN (adapter.py
+  @~1629 env assembly, token per @750 scoped-secret-or-token_hex) as REQUIRED spawn-time
+  injected params — the exported child contract can now authenticate a sidecar. Tests:
+  photon-rows conformed (byte-exact clarify render, non-network-resend leg, body-less
+  probe/healthz pins) + NEW rows photon.group-richlink-suppression (group URL arms window,
+  in-window group preview swallowed / out-window dispatched / url-less group arms nothing)
+  and photon.spawn-contract-data (six-key env assembly incl. default port). Suite:
+  photon-rows 5/5 + photon-send-effect 3/3 green ×3 runs; tsc clean for all photon paths;
+  secret gate OK; layering violations confined to sibling buzz cluster artifacts
+  (dbg-ws.test.ts UNPLACED_LAYER), full-suite failures proven independent via git-stash of
+  this cluster's files (buzz/weixin rows fail identically without them).
+
 - STABILITY FIX CLUSTER `telegram-wire-r2` (2026-08-25): round-2 findings tg2-1..tg2-12
   applied toward Hermes truth (adapter.py anchors). tg2-1 "message is not modified"
   edits map to success no-ops on EVERY lane (mid-stream raw / finalize raw / finalize
@@ -96,7 +126,7 @@ in `../09-open-questions.md` (append-only).
   cliOnly rows (60 cap), lazy BotCommandScopeChat(chat_id) once-per-forum-chat
   (:9645), opt-in set_my_short_description status indicator (:4953), DM-topic
   create/load/rename w/ cache + prune (:3759/:3873/:3957); fake gained setMyCommands/
-  setMyShortDescription/createForumTopic/editForumTopic. tg2-4 _thread_kwargs_for_send
+  setMyShortDescription/createForumTopic/editForumTopic. tg2-4_thread_kwargs_for_send
   family ported (:1552): direct_messages_topic_id/telegram_direct_messages_topic_id
   pair with OMITTED message_thread_id, private fallback lanes anchor EVERY chunk from
   telegram_reply_to_message_id, anchor-less sends FAIL LOUD pre-transmit with the exact
@@ -461,7 +491,7 @@ in `../09-open-questions.md` (append-only).
   reply_id,reaction_type:"OK"} (:156/:206). feishu-5: fake records
   POST {reaction_type:{emoji_type}} and DELETE with reaction_id IN THE PATH +
   empty body (:3171/:3203). feishu-6: text lane ships VERBATIM (trim only,
-  format_message :2461); faithful _strip_markdown_to_plain_text port (link→
+  format_message :2461); faithful_strip_markdown_to_plain_text port (link→
   'text (url)', blockquote, hr, <u>, CRLF + shared strip_markdown order) fires
   ONLY on post-rejected downgrade lanes (:555); §6.1 plain fallback forces the
   text lane. feishu-7: empty emoji defaults UNKNOWN (:3023). feishu-8: cached
@@ -473,7 +503,7 @@ in `../09-open-questions.md` (append-only).
   (defaults /feishu/webhook, 127.0.0.1, 8765 :229–231/:1650) and the composite
   rate key rides the CONFIGURED path (:3562; lastWebhookRateKey observable).
   feishu-10: manifest approve_session/approve_always type default (_btn :2077).
-  feishu-11: _parse_user reads ONLY user_name (:99). Suite: feishu.test.ts
+  feishu-11:_parse_user reads ONLY user_name (:99). Suite: feishu.test.ts
   68→96 (+28 contracts), conformance fs rows 6/6 + shared/ws fixtures green;
   tsc clean for all cluster paths; full-suite failures on this shared tree
   confined to OTHER concurrent round-2 clusters' in-flight files (telegram,
@@ -493,7 +523,7 @@ in `../09-open-questions.md` (append-only).
   attachment fallback; INJECTED option defaulting to the documented no-ffmpeg
   passthrough (signal remuxAac precedent; no OS child from this port). wa-5:
   sendSlashConfirm renders the 3-button sc:{once|always|cancel}:{confirm_id} card
-  ('✅ Approve Once'/'🔒 Always'/'❌ Cancel', body *{title}*+message truncated 1024)
+  ('✅ Approve Once'/'🔒 Always'/'❌ Cancel', body _{title}_+message truncated 1024)
   via postInteractive + slashConfirms registration (@~903). wa-6: quoted replies
   hydrate event metadata reply_to_text = quotedTextOf(chatId, replyToId) (@~2067),
   feeding the run-loop '[Replying to: …]' gate. wa-7: outbound `to` = chatId
@@ -570,3 +600,72 @@ in `../09-open-questions.md` (append-only).
   layering + secret gates green. NOTE: shared-tree commit d28d0b3 absorbed most of
   this cluster's file state mid-flight; this commit finalizes it (test contracts +
   formatting).
+
+- Stability round-2 fix cluster `raft-fixes-r2` (2026-08-26): 4 findings,
+  single-owner pass over src/pi_platforms/raft (+conformance/raft-rows) toward
+  Hermes truth at /tmp/hermes-upstream/plugins/platforms/raft/adapter.py anchors.
+  raft-2: the register_hook family is REAL — adapter registers its SEVEN
+  observer producers at construction (adapter.py:register :847-853 parity:
+  on_session_start⇒SessionStart, pre_llm_call⇒UserPromptSubmit with
+  prompt-turn dedup, pre_tool_call⇒PreToolUse, post_tool_call⇒
+  PostToolUse|PostToolUseFailure with the status/error_message-or-result/
+  error_type-or-tool_failure verdict ladder, post_llm_call⇒Stop,
+  on_session_end⇒interrupted/incomplete error Stop + scope forget,
+  on_session_finalize⇒SessionEnd + session forget);_remember/_forget/
+  _is_raft_context ported as instance scope sets (platform stamp re-members);
+  registerHook()/emitActivityHook() are the ctx.register_hook / host-loop
+  drive seams with DEC-014 emit-and-log containment; the wake channel drives
+  its own lane points every turn — connect⇒SessionStart, accepted wake ⇒
+  UserPromptSubmit, completed turn frame ⇒Stop, disconnect⇒SessionEnd — so
+  GET /activity/drain is no longer empty forever. raft-3: eventId is
+  f"hermes-{uuid.uuid4()}" parity `hermes-${randomUUID()}` (was
+  'hermes-raff-'+Math.random hex). raft-4: stableJson is json.dumps(
+  ensure_ascii=False, sort_keys=True) BYTE parity — recursive key sort +
+  Python default separators ', '/': ' (bare JSON.stringify drained compact
+  insertion-ordered bytes); NaN/±Infinity render bare per allow_nan=True.
+  raft-5: malformed JSON on POST /activity acks LITERAL invalid_json BEFORE
+  validation (:652_handle_activity JSONDecodeError parity; empty body
+  included); parseable-but-invalid keeps str(ValueError) verdicts verbatim;
+  counted in activityInvalid. Tests conformed: two rows drain-clear the
+  connect-time SessionStart; NEW delta rows observer-hook-producers-feed-drain
+  (turn feed, uuid shape, dedup, throwing-observer containment),
+  tool-call-producers-mapping (sorted+spaced byte-exact toolInput/toolOutput,
+  failure ladder, interrupted/incomplete/clean ends, foreign-platform silence,
+  finalize-forget), activity-invalid-json-ack. Suite: raft-rows 5/5 blocks
+  green (delta rows 11→14, mutant-detection gate still detects); tsc clean
+  for cluster files; layering/secret gates untouched by this window (residual
+  full-tree failures are sibling clusters' untracked dbg-*/scratch files).
+
+- Stability round-2 fix cluster `a2a-fixes-r2` (2026-08-26): a2a platform
+  moved onto Hermes truth at /tmp/hermes-upstream/plugins/platforms/a2a
+  anchors. a2a-1: sortKeysJson (security.py:sign_push_payload) is
+  json.dumps(payload, sort_keys=True, ensure_ascii=False) BYTE parity —
+  recursive key sort + Python DEFAULT separators ', '/': ' via a dedicated
+  serializer (bare JSON.stringify drained compact bytes, so receivers
+  re-canonicalizing per the documented sorted-keys convention rejected every
+  X-A2A-Signature); string escaping defers to per-string JSON.stringify
+  (identical ESCAPE map), transmitted body stays compact json.dumps(payload)
+  insertion-order parity (adapter.py:1208). a2a-2: buildCard consults
+  A2A_PROVIDER_ORG/A2A_PROVIDER_URL via this.env into card.provider with
+  getenv semantics (UNset ORG ⇒ 'Hermes Agent', SET-but-empty ORG ships '',
+  UNset/empty URL ⇒ card-url fallback; protocol.py:build_agent_card); both
+  added to manifest optionalEnv. a2a-5: constructor/loadServedAgents consult
+  the missing fallback lanes — A2A_AGENT_DESCRIPTION root-description default
+  (env > config.description > reference constant; set-but-empty degrades to
+  the constant at card time via the falsy-description guard),
+  A2A_ADVERTISED_TOOLSETS csv when configured advertised_toolsets is EMPTY
+  (blank entries dropped both lanes; adapter.py:__init__), and the global-
+  config served-agent ladder extra.agents → extra.served_agents (NEW alias)
+  → cfg.a2a_served_agents → cfg.a2a.served_agents with PYTHON `or`
+  fall-through ([]/{} falsy operands) over an INJECTED A2aGlobalConfig
+  snapshot (the port never reads ~/.hermes/config.yaml;
+  adapter.py:_load_served_agents/_load_global_a2a_config). NEW contracts:
+  a2a-config-surface.test.ts 16 rows (separator byte vectors incl.
+  unicode-literal/escape parity, independent receiver-HMAC over hand-written
+  canonical bytes, e2e push signature verified against the literal canonical
+  form of the delivered body, provider env matrix + manifest rows,
+  description/toolset lanes, served-agent ladder incl. falsy fall-through).
+  Suite: a2a-rows 6/6 blocks + a2a-config-surface 16/16 green (push-plane
+  receiver-side verification now exercises spaced separators); tsc clean for
+  cluster files; layering/secret gates green (residual full-tree failures are
+  the sibling qqbot cluster's untracked scratch files — zero a2a overlap).

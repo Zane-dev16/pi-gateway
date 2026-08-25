@@ -73,6 +73,10 @@ import {
 	ERR_METHOD_NOT_FOUND,
 	ERR_PARSE,
 	ERR_RATE_LIMITED,
+	ENV_ADVERTISED_TOOLSETS,
+	ENV_AGENT_DESCRIPTION,
+	ENV_PROVIDER_ORG,
+	ENV_PROVIDER_URL,
 	ERR_TASK_NOT_CANCELABLE,
 	ERR_TASK_NOT_FOUND,
 	ERR_UNAUTHORIZED,
@@ -181,10 +185,31 @@ export interface A2aAdapterConfig {
 	agent_name?: string | undefined;
 	description?: string | undefined;
 	advertised_toolsets?: readonly string[] | undefined;
+	/** adapter.py:extra.agents — preferred served-agent routing table. */
 	agents?:
 		| Record<string, ServedAgentConfig>
 		| readonly ServedAgentConfig[]
 		| undefined;
+	/** adapter.py:extra.served_agents alias (same lane, lower priority). */
+	served_agents?:
+		| Record<string, ServedAgentConfig>
+		| readonly ServedAgentConfig[]
+		| undefined;
+}
+
+/**
+ * hermes_cli.config.load_config() snapshot parity
+ * (adapter.py:_load_global_a2a_config) — INJECTED; the port never reads
+ * ~/.hermes/config.yaml itself. Only the served-agent fallback lanes are
+ * consulted, and only when BOTH extra lanes are absent/empty
+ * (adapter.py:_load_served_agents).
+ */
+export interface A2aGlobalConfig {
+	a2a_served_agents?:
+		| Record<string, ServedAgentConfig>
+		| readonly ServedAgentConfig[]
+		| undefined;
+	a2a?: { served_agents?: A2aGlobalConfig["a2a_served_agents"] } | undefined;
 }
 
 export interface A2aCaptureWire {
@@ -201,6 +226,8 @@ export interface A2aAdapterOptions {
 	config?: A2aAdapterConfig | undefined;
 	/** Scoped env reader (os.getenv parity; NEVER process.env directly). */
 	envReader?: EnvReader | undefined;
+	/** Global hermes-config snapshot for the a2a_served_agents fallback lane. */
+	globalConfig?: A2aGlobalConfig | undefined;
 	nowMs?: (() => number) | undefined;
 	scalarMaxUnits?: number | undefined;
 	captureWire?: A2aCaptureWire | undefined;
@@ -373,6 +400,7 @@ export class A2AAdapter extends BasePlatformAdapter {
 	private readonly captureWire: A2aCaptureWire | undefined;
 	private readonly pushTransport: PushTransport;
 	private readonly secretReader: ScopedSecretReader;
+	private readonly globalConfig: A2aGlobalConfig | undefined;
 
 	// ── per-adapter protocol state (not module-global) ─────────────────────────
 	readonly tasks: TaskStore;
@@ -428,6 +456,7 @@ export class A2AAdapter extends BasePlatformAdapter {
 			// Default transport: NO network — every callback reports failure.
 			postCallback: async () => ({ status: 599 }),
 		};
+		this.globalConfig = opts.globalConfig;
 
 		this.port = Number(config.port ?? A2A_DEFAULT_PORT) || A2A_DEFAULT_PORT;
 		// Bind host: A2A_HOST env first, then extra-config host (04 §4.2
@@ -459,17 +488,29 @@ export class A2AAdapter extends BasePlatformAdapter {
 			});
 		}
 		this.agentName = defaultAgentName(this.env);
-		this.advertisedToolsets = (config.advertised_toolsets ?? [])
-			.map((t) => String(t).trim())
-			.filter((t) => t.length > 0);
+		// adapter.py:__init__ _advertised_toolsets — the configured list wins;
+		// an EMPTY list falls back to the A2A_ADVERTISED_TOOLSETS csv (blank
+		// entries dropped on both lanes).
+		this.advertisedToolsets = resolveAdvertisedToolsets(config, this.env);
 		this.injectedStorageDir = opts.storageDir;
-		this.servedAgents = loadServedAgents(config, {
-			agentName: this.agentName,
-			description: config.description ?? DEFAULT_DESCRIPTION,
-			host: this.host,
-			port: this.port,
-			toolsets: this.advertisedToolsets,
-		});
+		this.servedAgents = loadServedAgents(
+			config,
+			{
+				agentName: this.agentName,
+				// adapter.py:_load_served_agents default_desc — A2A_AGENT_DESCRIPTION
+				// is THE root-agent description lane in the reference; config
+				// .description is this port's extra-config extension (env > YAML,
+				// §4.2 precedence — same ladder as A2A_HOST above).
+				description:
+					this.env(ENV_AGENT_DESCRIPTION) ??
+					config.description ??
+					DEFAULT_DESCRIPTION,
+				host: this.host,
+				port: this.port,
+				toolsets: this.advertisedToolsets,
+			},
+			this.globalConfig,
+		);
 
 		this.tasks = new TaskStore(this.clock);
 		this.turns = new TurnTracker(this.clock);
@@ -927,6 +968,12 @@ export class A2AAdapter extends BasePlatformAdapter {
 			pushNotifications: true,
 			authRequired: !localhostOnly(this.env),
 			tenant: entry.tenant,
+			// protocol.py:build_agent_card provider block — env overrides with
+			// getenv semantics: UNset ORG ⇒ 'Hermes Agent' default (via ??), a
+			// SET-but-empty ORG passes through as ''; UNset or empty URL ⇒ the
+			// card url fallback.
+			providerOrg: this.env(ENV_PROVIDER_ORG),
+			providerUrl: this.env(ENV_PROVIDER_URL) || undefined,
 		});
 	}
 
@@ -1914,10 +1961,48 @@ function maxPingpongLimit(env: import("./security.js").EnvReader): number {
 }
 
 /**
+ * adapter.py:__init__ _advertised_toolsets — configured list first; an EMPTY
+ * configured list falls back to the A2A_ADVERTISED_TOOLSETS csv; blank
+ * entries are dropped on BOTH lanes (list comprehension `if str(t).strip()`).
+ */
+function resolveAdvertisedToolsets(
+	config: A2aAdapterConfig,
+	env: EnvReader,
+): readonly string[] {
+	const configured = (config.advertised_toolsets ?? [])
+		.map((t) => String(t).trim())
+		.filter((t) => t.length > 0);
+	if (configured.length > 0) return configured;
+	return (env(ENV_ADVERTISED_TOOLSETS) ?? "")
+		.split(",")
+		.map((t) => t.trim())
+		.filter((t) => t.length > 0);
+}
+
+/** Python truthiness for the served-agent raw operands (None / [] / {}). */
+function pyTruthy(
+	value:
+		| Record<string, ServedAgentConfig>
+		| readonly ServedAgentConfig[]
+		| undefined,
+): boolean {
+	if (value === undefined || value === null) return false;
+	return Array.isArray(value)
+		? value.length > 0
+		: Object.keys(value).length > 0;
+}
+
+/**
  * adapter.py:_load_served_agents — minimal single-default-agent form plus
  * slug-prefixed entries from extra config. Root/default ALWAYS maps to the
  * live gateway session. Reserved/invalid path segments are SKIPPED with a
  * warning; duplicate tenants are skipped (first wins).
+ *
+ * Raw-source ladder EXACT (adapter.py:_load_served_agents): extra.agents →
+ * extra.served_agents → global cfg.a2a_served_agents → cfg.a2a.served_agents,
+ * where each hop is a PYTHON `or` — an empty dict/list operand FALLS THROUGH
+ * to the next source, and the global lanes fire only when every extra lane
+ * is falsy.
  */
 function loadServedAgents(
 	config: A2aAdapterConfig,
@@ -1928,6 +2013,7 @@ function loadServedAgents(
 		port: number;
 		toolsets: readonly string[];
 	},
+	globalConfig?: A2aGlobalConfig | undefined,
 ): Map<string, ServedAgent> {
 	const agents = new Map<string, ServedAgent>();
 	agents.set("", {
@@ -1943,7 +2029,13 @@ function loadServedAgents(
 	});
 	const warnings: string[] = [];
 	const seenTenants = new Map<string, string>();
-	const raw = config.agents;
+	const raw = pyTruthy(config.agents)
+		? config.agents
+		: pyTruthy(config.served_agents)
+			? config.served_agents
+			: pyTruthy(globalConfig?.a2a_served_agents)
+				? globalConfig?.a2a_served_agents
+				: globalConfig?.a2a?.served_agents;
 	const items: Array<[string, ServedAgentConfig]> = [];
 	if (raw !== undefined && !Array.isArray(raw) && typeof raw === "object") {
 		for (const [key, val] of Object.entries(raw)) {

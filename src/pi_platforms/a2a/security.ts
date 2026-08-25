@@ -218,21 +218,40 @@ export function getPushSecret(env: EnvReader): string {
 	return getBearerToken(env);
 }
 
-/** json.dumps(payload, sort_keys=True, ensure_ascii=False) — sorted-key compact JSON. */
+/**
+ * json.dumps(payload, sort_keys=True, ensure_ascii=False) BYTE-PARITY —
+ * deep-sorted keys, Python DEFAULT separators (', ' between items, ': '
+ * after each key — json.dumps only compacts when separators=(',', ':') is
+ * passed explicitly), non-ASCII kept literal. security.py:sign_push_payload
+ * signs exactly these bytes; receivers that re-canonicalize the body with
+ * Python's json.dumps must reach the same X-A2A-Signature digest, so the
+ * compact JS form would fail verification on every push.
+ *
+ * String escaping defers to JSON.stringify per string: both encoders emit
+ * \" \\ and the \b\t\n\f\r short forms, \u00xx for remaining control chars,
+ * literal UTF-8 otherwise. Numbers keep JS formatting (payloads carry only
+ * strings today; Python float repr is out of surface).
+ */
 export function sortKeysJson(value: unknown): string {
-	return JSON.stringify(sortKeysDeep(value));
-}
-
-function sortKeysDeep(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(sortKeysDeep);
-	if (value !== null && typeof value === "object") {
-		const out: Record<string, unknown> = {};
-		for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-			out[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
-		}
-		return out;
+	if (Array.isArray(value)) {
+		return `[${value.map(sortKeysJson).join(", ")}]`;
 	}
-	return value;
+	if (value !== null && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>)
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+			.map(([key, val]) => `${JSON.stringify(key)}: ${sortKeysJson(val)}`);
+		return `{${entries.join(", ")}}`;
+	}
+	switch (typeof value) {
+		case "string":
+			return JSON.stringify(value);
+		case "number":
+			return Number.isFinite(value) ? JSON.stringify(value) : "null";
+		case "boolean":
+			return value ? "true" : "false";
+		default:
+			return "null"; // undefined has no JSON form (Python would raise)
+	}
 }
 
 /**

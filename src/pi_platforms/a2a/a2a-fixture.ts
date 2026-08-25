@@ -61,6 +61,8 @@ export class RecordingPushTransport implements PushTransport {
 export interface A2aFixtureOptions {
 	env?: Record<string, string> | undefined;
 	config?: import("./a2a-adapter.js").A2aAdapterConfig | undefined;
+	/** Global hermes-config snapshot (a2a_served_agents fallback lane). */
+	globalConfig?: import("./a2a-adapter.js").A2aGlobalConfig | undefined;
 	/** Reply script over the FRAMED inbound text (default raft-parity echo). */
 	replyScript?: ((framedText: string) => string | undefined) | undefined;
 	attachGuard?: boolean | undefined;
@@ -90,6 +92,7 @@ export class A2aFixture {
 		this.replyScript = opts.replyScript;
 		this.adapter = new A2AAdapter({
 			config: opts.config,
+			globalConfig: opts.globalConfig,
 			envReader,
 			nowMs: () => this.clock.nowMs,
 			pushTransport: this.push,

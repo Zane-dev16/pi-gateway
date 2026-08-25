@@ -91,6 +91,23 @@ export const A2A_ACCEPTED_VERSIONS: ReadonlySet<string> = new Set([
 /** Public-URL override (adapter.py:_request_public_url priority 1). */
 export const A2A_PUBLIC_URL_ENV = "A2A_PUBLIC_URL";
 
+/**
+ * Agent Card provider block overrides (protocol.py:build_agent_card):
+ *   provider.organization = os.getenv("A2A_PROVIDER_ORG", "Hermes Agent")
+ *   provider.url          = os.getenv("A2A_PROVIDER_URL", "") or card url
+ * (set-but-empty ORG stays "" — getenv's default applies only when UNset).
+ */
+export const ENV_PROVIDER_ORG = "A2A_PROVIDER_ORG";
+export const ENV_PROVIDER_URL = "A2A_PROVIDER_URL";
+
+/** adapter.py:_load_served_agents default_desc — root agent description. */
+export const ENV_AGENT_DESCRIPTION = "A2A_AGENT_DESCRIPTION";
+/**
+ * adapter.py:__init__ _advertised_toolsets fallback csv — consulted only
+ * when the configured advertised_toolsets list is EMPTY.
+ */
+export const ENV_ADVERTISED_TOOLSETS = "A2A_ADVERTISED_TOOLSETS";
+
 // ── task states / roles / markers (protocol.py head) ────────────────────────
 
 export const STATE_SUBMITTED = "TASK_STATE_SUBMITTED";
@@ -483,6 +500,16 @@ export const A2A_PLUGIN_MANIFEST: PluginManifest = Object.freeze({
 			name: "A2A_HOME_CHANNEL",
 			description:
 				"Task/context id used as the cron / notification delivery target for deliver=a2a.",
+		},
+		{
+			name: ENV_PROVIDER_ORG,
+			description:
+				"Organization advertised in the Agent Card provider block (default 'Hermes Agent'; protocol.py:build_agent_card).",
+		},
+		{
+			name: ENV_PROVIDER_URL,
+			description:
+				"Provider URL advertised in the Agent Card provider block (defaults to the card URL).",
 		},
 	],
 	capabilities: A2A_CAPABILITIES,
