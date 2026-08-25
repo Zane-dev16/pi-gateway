@@ -118,6 +118,8 @@ import {
 	SESSION_EXPIRED_ERRCODE,
 	SESSION_EXPIRED_PAUSE_S,
 	WX_MAX_MESSAGE_LENGTH,
+	LONG_POLL_TIMEOUT_MS,
+	RATE_LIMIT_ERRCODE,
 	TYPING_START,
 	TYPING_STOP,
 	TYPING_TICKET_TTL_S,
@@ -221,6 +223,7 @@ export class WeixinAdapter extends BasePlatformAdapter {
 	private readonly syncStore: WeixinSyncStore;
 	private readonly sleepFn: (ms: number) => Promise<void>;
 	private readonly nowFn: () => number;
+	private readonly readEnv: (key: string) => string | undefined;
 	private readonly sendCapture:
 		| ((
 				chatId: string,
@@ -288,7 +291,8 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		super({
 			manifestName: WEIXIN_PLUGIN_MANIFEST.name,
 			capabilities: WEIXIN_PLUGIN_MANIFEST.capabilities,
-			scalarMaxUnits: opts.scalarMaxUnits ?? 64,
+			// weixin.py:WeixinAdapter.MAX_MESSAGE_LENGTH — the vendor split budget.
+			scalarMaxUnits: opts.scalarMaxUnits ?? WX_MAX_MESSAGE_LENGTH,
 		});
 		this.token = (opts.token ?? "").trim();
 		this.accountId = (opts.accountId ?? "").trim();
@@ -301,6 +305,7 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		this.sleepFn =
 			opts.sleepMs ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
 		this.nowFn = opts.nowMs ?? (() => Date.now());
+		this.readEnv = opts.readEnv ?? ((key) => process.env[key]);
 		this.sendCapture = opts.sendCapture;
 		this.captureHasScriptFn = opts.captureHasScript;
 		this.richProbe = opts.richProbe;
@@ -580,15 +585,21 @@ export class WeixinAdapter extends BasePlatformAdapter {
 					const response = await this.pullOnce();
 					if (response === undefined) continue; // timed-out long poll
 
-					const ret = response["ret"];
-					const errcode = response["errcode"];
+					// Hermes treats a missing/null ret/errcode as NO error ({0, None}).
+					const ret = numericOrUndefined(response["ret"]);
+					const errcode = numericOrUndefined(response["errcode"]);
 					const hasError =
 						(ret !== undefined && ret !== 0) ||
 						(errcode !== undefined && errcode !== 0);
 					if (hasError) {
+						// Stale-session FIRST (weixin.py:_poll_loop :1394): -14 OR the
+						// _is_stale_session_ret signature (-2 + 'unknown error') joins
+						// the session-expired family — never the generic failure ladder.
+						const errmsg = String(response["errmsg"] ?? "");
 						const isSessionExpired =
 							ret === SESSION_EXPIRED_ERRCODE ||
-							errcode === SESSION_EXPIRED_ERRCODE;
+							errcode === SESSION_EXPIRED_ERRCODE ||
+							isStaleSessionRet(ret, errcode, errmsg);
 						if (isSessionExpired) {
 							this.sessionExpiredStreak += 1;
 							this.consecutiveFailures = 0;
@@ -664,16 +675,25 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		}
 	}
 
-	pullTimeoutStreak = 0;
+	/** Adaptive long-poll budget — LONG_POLL_TIMEOUT_MS until the server suggests otherwise. */
+	private longPollBudgetMs = LONG_POLL_TIMEOUT_MS;
 	private pullSeq = 0;
 
+	/** Observability: the CURRENT long-poll budget (server suggestion adopted). */
+	get longPollTimeoutBudgetMs(): number {
+		return this.longPollBudgetMs;
+	}
+
 	/**
-	 * ONE long-poll pull. A HELD server (no messages, hold enabled) blocks
-	 * until release; exceeding DOUBLE the suggested budget counts as a stuck
-	 * probe feeding the escalation ladder (heartbeat-escalation row).
+	 * ONE long-poll pull (weixin.py:_poll_loop/_get_updates parity): the pull
+	 * races the ADAPTIVE budget; exceeding it is a BENIGN empty cycle —
+	 * _get_updates answers {ret:0, msgs:[], get_updates_buf} on TimeoutError,
+	 * so the loop re-probes with ZERO penalty (no recycle, no pause). A settled
+	 * pull ADOPTS the server's suggested longpolling_timeout_ms (:1386) as the
+	 * next budget. The reconnect ladder stays reserved for the -14/stale streak
+	 * (DEC-045) and the exception failure ladder (#79889 recycle).
 	 */
 	private async pullOnce(): Promise<Record<string, unknown> | undefined> {
-		const budgetMs = 70_000; // 2 × LONG_POLL_TIMEOUT_MS
 		let settled = false;
 		const token = ++this.pullSeq;
 		const pull = (async (): Promise<Record<string, unknown>> => {
@@ -692,35 +712,24 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		})();
 		const outcome = await Promise.race([
 			pull,
-			this.sleepFn(budgetMs).then(() => "TIMEOUT" as const),
+			this.sleepFn(this.longPollBudgetMs).then(() => "TIMEOUT" as const),
 		]);
 		if (outcome === "TIMEOUT") {
-			await this.notePollTimeout();
+			// Benign empty cycle (weixin.py:_get_updates TimeoutError leg):
+			// zero penalty — observability marker only.
+			this.pollLog.push("timeout");
 			return undefined;
 		}
-		this.pullTimeoutStreak = 0;
-		return outcome as Record<string, unknown>;
-	}
-
-	/**
-	 * Stuck-probe escalation (heartbeatEscalation family contract): TWO
-	 * consecutive long-poll budgets exceeded ⇒ session recycle (generation
-	 * bump) + BIG-ladder step. Exposed as a seam so fixtures drive the SAME
-	 * escalation decision the budget race exercises.
-	 */
-	async notePollTimeout(): Promise<void> {
-		this.pullTimeoutStreak += 1;
-		this.pollLog.push(`timeout:${this.pullTimeoutStreak}`);
-		if (this.pullTimeoutStreak < 2) return;
-		this.pullTimeoutStreak = 0;
-		this.generation += 1;
-		this.reconnectTriggered = true;
-		await this.sleepFn(BACKOFF_DELAY_SECONDS * 1000);
+		const response = outcome as Record<string, unknown>;
+		const suggested = Number(response["longpolling_timeout_ms"]);
+		if (Number.isInteger(suggested) && suggested > 0) {
+			this.longPollBudgetMs = suggested;
+		}
+		return response;
 	}
 
 	/** Observability: poll-cycle outcomes (row seams). */
 	readonly pollLog: string[] = [];
-	reconnectTriggered = false;
 
 	// ── inbound processing (_process_message parity) ────────────────────────
 
@@ -852,7 +861,17 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		if (this.dmPolicy === "allowlist")
 			return entryMatches(this.allowFrom, principal);
 		if (this.dmPolicy === "pairing") return true;
+		if (this.dmPolicy === "open") return this.openDmOptedIn();
 		return false;
+	}
+
+	/**
+	 * _open_dm_opted_in parity (weixin.py:1539): 'open' admits DMs ONLY behind
+	 * an explicit allow-all opt-in — GATEWAY_ALLOW_ALL_USERS or
+	 * WEIXIN_ALLOW_ALL_USERS ∈ {true,1,yes} (case-insensitive).
+	 */
+	private openDmOptedIn(): boolean {
+		return openDmOptedInto(this.readEnv);
 	}
 
 	// ── rate-limit circuit breaker (weixin.py parity) ───────────────────────
@@ -901,14 +920,27 @@ export class WeixinAdapter extends BasePlatformAdapter {
 	): Promise<SendResult[]> {
 		this.throwIfDisabled();
 		const policy = this.chatLengthPolicyForChat(chatId);
-		const plan = chunkWithFenceCarry(content, policy);
+		// Hermes send() parity (weixin.py:1961): chunks =
+		// _split_text(format_message(content)) — format_message runs
+		// normalize_markdown_blocks + the 120-col copy-friendly wrap, then the
+		// delivery-unit splitter applies the chat budget. An oversized markdown
+		// block overflows through THE kit fence-carry chunker (DEC-047
+		// plan-exact port of base.truncate_message: newline-preferred split
+		// points, fence carry, "(i/n)" indicators) — never mid-line slices.
+		const formatted = wrapCopyFriendlyLines(normalizeMarkdownBlocks(content));
+		const units = splitTextForWeixinDelivery(
+			formatted,
+			policy.maxUnits,
+			false,
+			{
+				overflow: (block) => chunkWithFenceCarry(block, policy).chunks,
+			},
+		);
 		const results: SendResult[] = [];
-		for (let i = 0; i < plan.chunks.length; i++) {
-			results.push(
-				await this.deliverWiredChunk(chatId, plan.chunks[i]!, metadata),
-			);
+		for (let i = 0; i < units.length; i++) {
+			results.push(await this.deliverWiredChunk(chatId, units[i]!, metadata));
 			// Inter-chunk pacing (send_chunk_delay parity).
-			if (i < plan.chunks.length - 1) {
+			if (i < units.length - 1) {
 				await this.sleepFn(SEND_CHUNK_DELAY_S * 1000);
 			}
 		}
@@ -1026,9 +1058,11 @@ export class WeixinAdapter extends BasePlatformAdapter {
 	private richProbeAttempts = 0;
 
 	/**
-	 * _send_text_chunk_locked parity: retries with linear backoff; rate-limit
-	 * (-2) backs off 3× and feeds the breaker; session-expired (-14) retries
-	 * ONCE WITHOUT context_token (degraded fallback keeps cron pushes alive).
+	 * _send_text_chunk_locked parity: generic vendor errors retry with linear
+	 * backoff (delay*(attempt+1), terminal after SEND_CHUNK_RETRIES); rate-limit
+	 * (-2) backs off 3× and feeds the breaker; stale sessions (-14, or -2 +
+	 * 'unknown error') retry ONCE WITHOUT context_token (degraded fallback
+	 * keeps cron pushes alive).
 	 */
 	private async sendChunkWithPlatformSemantics(
 		chatId: string,
@@ -1081,10 +1115,15 @@ export class WeixinAdapter extends BasePlatformAdapter {
 			const ret = resp.ret;
 			const errcode = resp.errcode;
 			if ((ret !== 0 || errcode !== 0) && (ret !== null || errcode !== null)) {
+				// Stale-session FIRST (weixin.py:_send_text_chunk_locked :1847):
+				// -14 OR the _is_stale_session_ret signature (-2 + 'unknown error')
+				// strips context_token and retries tokenless — a dead session, not
+				// a rate limit, so the stale check precedes the -2 branch.
+				const errmsg = String(resp["errmsg"] ?? resp["msg"] ?? "");
 				const isSessionExpired =
 					ret === SESSION_EXPIRED_ERRCODE ||
-					errcode === SESSION_EXPIRED_ERRCODE;
-				const isRateLimited = ret === -2 || errcode === -2;
+					errcode === SESSION_EXPIRED_ERRCODE ||
+					isStaleSessionRet(ret, errcode, errmsg);
 				if (
 					isSessionExpired &&
 					!retriedWithoutToken &&
@@ -1094,9 +1133,11 @@ export class WeixinAdapter extends BasePlatformAdapter {
 					this.contextTokens.delete(chatId);
 					continue; // tokenless retry — NOT counted against attempts
 				}
+				const isRateLimited =
+					ret === RATE_LIMIT_ERRCODE || errcode === RATE_LIMIT_ERRCODE;
 				if (isRateLimited) {
 					lastError = new Error(
-						`iLink sendmessage rate limited: ret=${ret} errcode=${errcode}`,
+						`iLink sendmessage rate limited: ret=${ret} errcode=${errcode} errmsg=${errmsg !== "" ? errmsg : "rate limited"}`,
 					);
 					const opened = this.recordRateLimitEvent();
 					if (opened) {
@@ -1114,10 +1155,16 @@ export class WeixinAdapter extends BasePlatformAdapter {
 					);
 					continue;
 				}
+				// Generic vendor error (wx Hermes :1859): raised INTO the retry loop —
+				// linear backoff SEND_CHUNK_RETRY_DELAY_S*(attempt+1), terminal only
+				// after SEND_CHUNK_RETRIES. Not a timeout case: DEC-046's carve-out
+				// does not apply.
 				lastError = new Error(
-					`iLink sendmessage error: ret=${ret} errcode=${errcode}`,
+					`iLink sendmessage error: ret=${ret} errcode=${errcode} errmsg=${errmsg !== "" ? errmsg : "unknown error"}`,
 				);
-				break; // vendor error codes are terminal for this chunk
+				if (attempt >= SEND_CHUNK_RETRIES) break;
+				await this.sleepFn(SEND_CHUNK_RETRY_DELAY_S * (attempt + 1) * 1000);
+				continue;
 			}
 			// Success.
 			return { success: true, messageId: `wx-${this.nowFn()}` };
@@ -1385,6 +1432,49 @@ export class WeixinAdapter extends BasePlatformAdapter {
 }
 
 // ── module-level helpers ────────────────────────────────────────────────────
+
+/**
+ * Hermes treats a missing/None ret/errcode as no-error; numbers compare
+ * numerically (weixin.py `ret not in {0, None}`).
+ */
+function numericOrUndefined(value: unknown): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	const n = Number(value);
+	return Number.isNaN(n) ? undefined : n;
+}
+
+/**
+ * weixin.py:_is_stale_session_ret parity: ret/errcode -2 with errmsg
+ * 'unknown error' is a STALE-SESSION signal (same family as errcode -14),
+ * never a genuine rate limit. Branched BEFORE rate-limit handling at both
+ * sites (poll :1394 / send :1847).
+ */
+export function isStaleSessionRet(
+	ret: number | null | undefined,
+	errcode: number | null | undefined,
+	errmsg: unknown,
+): boolean {
+	if (ret !== RATE_LIMIT_ERRCODE && errcode !== RATE_LIMIT_ERRCODE) {
+		return false;
+	}
+	return String(errmsg ?? "").toLowerCase() === "unknown error";
+}
+
+/** _open_dm_opted_in env keys (weixin.py:1539), gateway-scope first. */
+const OPEN_DM_ENV_KEYS = [
+	"GATEWAY_ALLOW_ALL_USERS",
+	"WEIXIN_ALLOW_ALL_USERS",
+] as const;
+
+function openDmOptedInto(
+	readEnv: (key: string) => string | undefined,
+): boolean {
+	for (const key of OPEN_DM_ENV_KEYS) {
+		const value = (readEnv(key) ?? "").toLowerCase();
+		if (value === "true" || value === "1" || value === "yes") return true;
+	}
+	return false;
+}
 
 function entryMatches(entries: readonly string[], target: string): boolean {
 	const normalizedTarget = target.trim().toLowerCase();

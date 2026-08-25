@@ -38,6 +38,8 @@ export interface WXSubjectOptions {
 	withSecret?: boolean | undefined;
 	token?: string | undefined;
 	nowMs?: (() => number) | undefined;
+	/** Intake policy passthrough (default pairing, Hermes __init__ parity). */
+	dmPolicy?: string | undefined;
 }
 
 class MemorySyncStore implements WeixinSyncStore {
@@ -71,6 +73,7 @@ export class WeixinSubject implements ConformanceSubject {
 		this.adapter = new WeixinAdapter({
 			scalarMaxUnits: 64, // harness-scale budget mirrors reference subjects
 			token,
+			...(opts.dmPolicy !== undefined ? { dmPolicy: opts.dmPolicy } : {}),
 			server: this.server,
 			syncStore: new MemorySyncStore(),
 			spawner: opts.spawner,
@@ -82,8 +85,7 @@ export class WeixinSubject implements ConformanceSubject {
 			captureHasScript: () => this.wire.hasScript("send"),
 			// §10.1 tier-1 rich probe rides the SAME capture wire; unscripted
 			// probes answer the capability-error shape WITHOUT a roundtrip.
-			richProbe: (content) =>
-				this.wire.transmitRich("__rich__", content, {}),
+			richProbe: (content) => this.wire.transmitRich("__rich__", content, {}),
 			richHasScript: () => this.wire.hasScript("rich"),
 		});
 		// Guard ALWAYS attached: with the row-supplied ManualScheduler when one

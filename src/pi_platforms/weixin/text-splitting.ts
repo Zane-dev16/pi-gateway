@@ -159,8 +159,7 @@ export function splitDeliveryUnits(content: string): string[] {
 				}
 				continue;
 			}
-			const isContinuation =
-				current.length > 0 && /^[\t ]/.test(rawLine);
+			const isContinuation = current.length > 0 && /^[\t ]/.test(rawLine);
 			if (isContinuation) {
 				current.push(line);
 				continue;
@@ -203,10 +202,18 @@ export function shouldSplitShortChatBlock(block: string): boolean {
 	return lines.every((l) => looksLikeChattyLine(l));
 }
 
-/** Greedy pack of blocks under a length budget with hard overflow splits. */
+/** Greedy pack of blocks under a length budget.
+ *
+ * Hermes anchor (_pack_markdown_blocks_for_weixin): a block that ALONE exceeds
+ * the budget goes to the OVERFLOW callable — base.py truncate_message, the
+ * newline-preferred fence-carrying chunker with "(i/n)" indicators — never a
+ * mid-line hard slice. Callers that omit `overflow` keep the legacy
+ * slice-per-maxLength fallback (pure data contracts in tests).
+ */
 export function packMarkdownBlocks(
 	content: string,
 	maxLength: number,
+	overflow?: ((block: string) => string[]) | undefined,
 ): string[] {
 	if (content.length <= maxLength) return [content];
 	const packed: string[] = [];
@@ -217,8 +224,12 @@ export function packMarkdownBlocks(
 				packed.push(current.trimEnd());
 				current = "";
 			}
-			for (let i = 0; i < block.length; i += maxLength) {
-				packed.push(block.slice(i, i + maxLength));
+			if (overflow !== undefined) {
+				packed.push(...overflow(block));
+			} else {
+				for (let i = 0; i < block.length; i += maxLength) {
+					packed.push(block.slice(i, i + maxLength));
+				}
 			}
 			continue;
 		}
@@ -244,17 +255,20 @@ export function splitTextForWeixinDelivery(
 	content: string,
 	maxLength: number,
 	splitPerLine = false,
+	opts?: { overflow?: ((block: string) => string[]) | undefined } | undefined,
 ): string[] {
+	const overflow = opts?.overflow;
 	if (!content) return [];
 	if (splitPerLine) {
-		if (content.length <= maxLength && !content.includes("\n")) return [content];
+		if (content.length <= maxLength && !content.includes("\n"))
+			return [content];
 		const chunks: string[] = [];
 		for (const unit of splitDeliveryUnits(content)) {
 			if (unit.length <= maxLength) {
 				chunks.push(unit);
 				continue;
 			}
-			chunks.push(...packMarkdownBlocks(unit, maxLength));
+			chunks.push(...packMarkdownBlocks(unit, maxLength, overflow));
 		}
 		const filtered = chunks.filter((c) => c !== "");
 		return filtered.length > 0 ? filtered : [content];
@@ -266,6 +280,6 @@ export function splitTextForWeixinDelivery(
 		}
 		return [content];
 	}
-	const packed = packMarkdownBlocks(content, maxLength);
+	const packed = packMarkdownBlocks(content, maxLength, overflow);
 	return packed.length > 0 ? packed : [content];
 }

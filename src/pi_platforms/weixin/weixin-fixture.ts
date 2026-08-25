@@ -16,8 +16,11 @@
 //     pauses verbatim (600s, Hermes parity), a REPEAT recycles the poll
 //     session (generation bump = fresh long-poll request; nothing buffered
 //     client-side is dropped since sync_buf persists), exhaustion goes FATAL.
-//   - heartbeat-escalation → TWO consecutive long-poll probes exceeding the
-//     budget (server HELD) escalate: generation bump + big-ladder step.
+//   - heartbeat-escalation → a long-poll TIMEOUT is BENIGN (weixin.py
+//     _get_updates answers an empty cycle on TimeoutError — zero penalty);
+//     the reconnect ladder escalates on TWO consecutive stuck SESSION probes
+//     (the -14/stale streak per DEC-045: strike 1 pauses 600s, strike 2
+//     recycles the poll session).
 
 import { FakePlatformWire } from "../conformance/wire.js";
 import type { PollingFixture } from "../conformance/shapes.js";
@@ -51,7 +54,9 @@ function memoryStore(bufs: string[]) {
 }
 
 /** A full wx world: subject + engine + fake server + injected clock. */
-export function makeWXWorld(opts: { name?: string | undefined } = {}): WXWorld {
+export function makeWXWorld(
+	opts: { name?: string | undefined; dmPolicy?: string | undefined } = {},
+): WXWorld {
 	const clock = new ManualClock();
 	const server = new FakeILinkServer();
 	const wire = new FakePlatformWire();
@@ -60,6 +65,7 @@ export function makeWXWorld(opts: { name?: string | undefined } = {}): WXWorld {
 		server,
 		name: opts.name,
 		nowMs: clock.nowMs, // circuit/dedup windows under the INJECTED clock
+		...(opts.dmPolicy !== undefined ? { dmPolicy: opts.dmPolicy } : {}),
 	});
 	const adapter = subject.adapter as unknown as {
 		sleepFn: (ms: number) => Promise<void>;
@@ -207,7 +213,8 @@ export function makeRealWXFixture(): PollingFixture {
 				// Fresh long-poll request abandons the stale server session; the
 				// PERSISTED sync_buf means nothing client-side is dropped.
 				dropPendingUpdatesOnRestart: true,
-				fatalAfterExhaustion: engine.lifecycle.statusSnapshot().state === "fatal",
+				fatalAfterExhaustion:
+					engine.lifecycle.statusSnapshot().state === "fatal",
 			};
 		},
 
@@ -217,34 +224,48 @@ export function makeRealWXFixture(): PollingFixture {
 			await world.connectAndAwaitLive();
 			const genBefore = engine.generation;
 
-			// Server HOLDS the long poll: each live probe exceeds its budget
-			// under the injected clock (the budget race feeds the SAME
-			// escalation seam the adapter's pullOnce invokes).
+			// Vendor truth leg 1 (weixin.py:_get_updates TimeoutError): a long-poll
+			// probe exceeding its budget is a BENIGN empty cycle — zero penalty,
+			// immediate re-probe, no recycle, no pause. The server HOLDS the poll;
+			// the budget race records the overrun and just continues.
 			server.holdUpdates();
-			for (let i = 0; i < 40 && engine.pullTimeoutStreak < 1; i++) {
-				await world.clock.advance(5_000); // stuck probe #1
+			for (let i = 0; i < 40 && !engine.pollLog.includes("timeout"); i++) {
+				await world.clock.advance(40_000); // over-budget probe → benign timeout
 			}
-			if (engine.pullTimeoutStreak < 1) {
-				throw new Error("first stuck probe never recorded");
+			if (!engine.pollLog.includes("timeout")) {
+				throw new Error("budget overrun never recorded (benign cycle)");
 			}
-			const genMid = engine.generation;
-			for (let i = 0; i < 60 && engine.generation === genMid; i++) {
-				await world.clock.advance(5_000); // stuck probe #2 → ESCALATE
-			}
-			if (engine.generation <= genMid) {
+			if (engine.generation !== genBefore) {
 				throw new Error(
-					`escalation did not recycle the poll session (gen=${engine.generation})`,
+					`benign poll timeout escalated (gen=${engine.generation}) — Hermes truth: zero penalty`,
 				);
 			}
 
-			server.releaseUpdates(); // recovery path: messages flow again
+			// Leg 2 (DEC-045 ladder — the reconnect ladder IS the -14/stale streak):
+			// TWO consecutive stuck SESSION probes escalate — strike 1 pauses 600s
+			// (verbatim Hermes pause), strike 2 recycles the poll session
+			// (generation bump = fresh long-poll request).
+			server.releaseUpdates();
+			server.scriptGetUpdates({ kind: "code", ret: -14 });
+			await driveClock(world.clock, 601_000, 25_000); // strike 1 → 600s pause
+			await eventually(() => engine.sessionExpiredStreak >= 1, 4_000);
+			server.scriptGetUpdates({ kind: "code", ret: -14 });
+			await driveClock(world.clock, 603_000, 25_000); // strike 2 → ESCALATE
+			if (engine.generation <= genBefore) {
+				throw new Error(
+					`two stuck session probes did not feed the reconnect ladder (gen=${engine.generation})`,
+				);
+			}
+
+			// Recovery path: messages flow again after the recycle.
 			server.pushMessage(textMessage("hb-1", "u_wx", "after-escalation"));
-			await pumpClock(
-				world.clock,
-				() =>
-					world.subject.turns().some((t) => t.includes("after-escalation")),
+			await pumpClock(world.clock, () =>
+				world.subject.turns().some((t) => t.includes("after-escalation")),
 			);
-			return { stuckProbes: 2, reconnectTriggered: engine.reconnectTriggered };
+			return {
+				stuckProbes: 2,
+				reconnectTriggered: engine.generation > genBefore,
+			};
 		},
 	};
 }

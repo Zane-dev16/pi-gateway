@@ -669,3 +669,51 @@ in `../09-open-questions.md` (append-only).
   receiver-side verification now exercises spaced separators); tsc clean for
   cluster files; layering/secret gates green (residual full-tree failures are
   the sibling qqbot cluster's untracked scratch files — zero a2a overlap).
+- Stability round-2 fix cluster `weixin-r2` (2026-08-26): weixin adapter moved onto Hermes
+  truth at /tmp/hermes-upstream/gateway/platforms/weixin.py anchors (all seven findings; no
+  DEC deltas — every change converges toward reference behavior). wx-1: generic vendor send
+  errors (ret/errcode ∉ {0,-14,-2}) retry inside _send_text_chunk_locked parity with linear
+  backoff SEND_CHUNK_RETRY_DELAY_S*(attempt+1), terminal only after SEND_CHUNK_RETRIES=4
+  (Hermes raises into the retry loop :1859+); NOT a timeout class so DEC-046's carve-out is
+  untouched; errmsg now rides the error strings (rate-limit msg = Hermes shape too).
+  wx-2: ported _is_stale_session_ret (ret/errcode -2 + errmsg 'unknown error' ⇒ stale
+  session) as exported adapter helper, branched BEFORE rate-limit handling at BOTH sites —
+  poll (:1394): joins the -14 family (DEC-045 ladder: 600s pause → strike-2 recycle(gen
+  bump); plain -2 keeps the failure ladder), send (:1847): strips context_token + evicts the
+  token store entry and retries tokenless ONCE without feeding the breaker. Fake face gained
+  scripted errmsg on sendmessage. wx-3: pullOnce budget is now ADAPTIVE — LONG_POLL_TIMEOUT_MS
+  default, server longpolling_timeout_ms adopted on every settled response (:1386,
+  observable via longPollTimeoutBudgetMs getter); an over-budget probe is a BENIGN empty
+  cycle (_get_updates TimeoutError leg answers ret:0/empty with ZERO penalty — pollLog
+  'timeout' marker only); the timeout-streak recycle (notePollTimeout/pullTimeoutStreak/
+  reconnectTriggered) is REMOVED — reconnect escalation stays reserved for the -14/stale
+  streak (DEC-045). heartbeatEscalation fixture re-realized in vendor truth: benign-hold leg
+  proves zero-penalty overrun, then TWO stuck session probes drive strike1-pause/strike2-
+  recycle with post-recycle message flow. wx-4: WX_MAX_MESSAGE_LENGTH=2000 manifest constant
+  (WeixinAdapter.MAX_MESSAGE_LENGTH) is now the DEFAULT scalarMaxUnits (was ??64);
+  explicit injection still wins (subject harness keeps its 64-char scale). wx-5:
+  deliverText routes Hermes send() truth (:1961 chunks=_split_text(format_message(content))):
+  normalizeMarkdownBlocks + wrapCopyFriendlyLines(120-col) THEN splitTextForWeixinDelivery
+  at the chat budget — chatty bubbles ship unlabeled; an oversized markdown block overflows
+  through THE kit fence-carry chunker (DEC-047 plan-exact base.truncate_message port:
+  newline-preferred/space-fallback boundaries, fence carry, "(i/n)") via a new optional
+  overflow hook on packMarkdownBlocks/splitTextForWeixinDelivery (legacy hard-slice kept for
+  pure data contracts). Shared egress.chunk-flood row passes UNMODIFIED against the new
+  pipeline (labels are vendor overflow truth, not kit-only artifacts). wx-6:
+  outboundMediaKind classifies by mime-PREFIX matching (extension→mime surface mirroring
+  mimetypes.guess_type): image/*→image mid_size, video/*→video beyond the old fixed list
+  (.svg/.tiff/.ico/.heif/.avif/.m4v/.3gp…), .silk→voice override, everything else MEDIA_FILE;
+  force_file_attachment gates ONLY the silk leg (vendor ORDER — forced images still IMAGE).
+  wx-7: dmPolicy 'open' now resolves through openDmOptedIn (_open_dm_opted_in :1539):
+  GATEWAY_ALLOW_ALL_USERS or WEIXIN_ALLOW_ALL_USERS ∈ {true,1,yes} case-insensitive via a
+  readEnv seam (production process.env); pairing/disabled/allowlist semantics untouched.
+  Harness conformed without weakening shared contracts: WXSubjectOptions/makeWXWorld gained
+  dmPolicy passthrough. Mid-session hazard absorbed: a concurrent cluster's tree-wide commit
+  (3c37c13 sweep) transiently clobbered this file set mid-edit — state rebuilt from stash@{0},
+  re-applied, verified byte-coherent (manifest/fake-ilink legs had already landed in that
+  commit; ilink-transport/vendor-tests remain untracked census files, added by THIS commit).
+  Suite: weixin vendor-contracts 16→33 (+wx-1 retry/backoff ladder ×2, wx-2 poll/send stale ×3,
+  wx-3 adaptive-budget/benign-timeout ×2, wx-4 default budget ×2, wx-5 format/bubbles/overflow/
+  wrap ×4, wx-6 mime-prefix ×2, wx-7 opt-in gates ×3); weixin-rows 8/8 incl. full-catalog merge
+  gate + transport rows; tsc clean for cluster scope. Residual full-tree failures confined to
+  sibling clusters' in-flight files (qqbot attachments/dbg2, signal engine — zero weixin imports).
