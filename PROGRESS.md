@@ -869,3 +869,42 @@ in `../09-open-questions.md` (append-only).
   tree's uncommitted qqbot baseline (recovered byte-exact from dangling WIP commit
   b47129d) and an over-broad `git add -A` sweep committed partial qqbot fixture state
   under the telegram-r2 commit; this cluster's own commit is scoped to its paths only.
+
+- Stability round-2 fix cluster `bluebubbles-r2` (2026-08-26): 4 findings,
+  single-owner pass over src/pi_platforms/bluebubbles (+conformance/
+  bluebubbles-rows) toward Hermes truth at /tmp/hermes-upstream/gateway/
+  platforms/bluebubbles.py anchors. sigbb-1 (HIGH): _handle_webhook's inbound
+  attachment loop ported into handleWebhookPost (@~961-995) — EVERY
+  record['attachments'] guid downloads through the existing downloadAttachment
+  transport leg plus the classification/persistence legs (@~820-878): image/*
+  rides CLOSED BB_IMAGE_EXT_OVERRIDES (fallback .jpg) under img_{hex12}, audio/*
+  rides CLOSED BB_AUDIO_EXT_OVERRIDES (fallback .mp3) under audio_{hex12},
+  everything else keeps transferName (file_{hex8} default) under doc_{uuid12}_;
+  media_urls/media_types ride the dispatched event with the photo/voice/video/
+  document matrix INCLUDING the empty-mime-but-.caf-uti voice quirk and the
+  multi-attachment PHOTO preference; attachment-only messages backfill
+  text='(attachment)' so they DISPATCH instead of answering 400 (mediaCacheDir
+  option with lazy mkdir — signal/teams precedent — fixture injects mkdtemp
+  isolation and rmSyncs on dispose). sigbb-5: getChatInfo added (@~779) over the
+  REST seam — resolveChatGuid ladder then GET /api/v1/chat/{quoted-guid}?
+  with=participants resolving displayName→chatIdentifier→target with trimmed
+  participant addresses; unresolved targets/REST failures keep trivial
+  {name,type}; ';+;' raw targets report groups; fake server gained the route +
+  seedChatInfo/chatInfoCalls capture. sigbb-6: BlueBubblesRestClient.post and
+  apiPost payloads OPTIONAL; sendTyping/markRead post BODYLESS (httpx post
+  without json= @~733/@~749) — fake captures bodylessPostCalls and the receipts
+  row asserts exact bodyless path sets across the full private_api×helper 2×2
+  gate matrix plus the ingress fire-and-forget receipt. sigbb-7: sendText loop
+  RETURNS immediately after createChatForHandle (send @~563) — ONE chat/new POST
+  carrying the FIRST paragraph; multi-paragraph sends to unresolved address-like
+  targets no longer re-post chat/new per chunk (resolveForSend/postMessageText
+  extracted; postResolvedBubble shares them, delivery-door behavior unchanged).
+  Rows: shape-delta catalog 10→12 (+transport.bluebubbles.inbound-attachments:
+  byte-exact cached round trip, closed-map extensions, caf quirk, caption
+  retention, failed-download skip ⇒ still-400; +transport.bluebubbles.chat-info:
+  seam/quote/participants/fallback/group rows); dispatchedEvents probe gained
+  messageType/mediaUrls/mediaTypes observability. Suite: bluebubbles files +
+  conformance rows 16/16 ×3 repeat runs (34-row full-catalog gate green);
+  tsc clean for cluster scope; full-tree failures confined to sibling clusters'
+  in-flight ntfy/ws/email files (zero cross-imports; kit/ and pi_gateway/
+  untouched). Commit scoped to cluster paths only.

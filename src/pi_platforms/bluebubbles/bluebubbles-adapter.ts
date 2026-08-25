@@ -37,14 +37,16 @@
 // (production wires HTTP; conformance supplies FakeBlueBubblesServer), and the
 // egress door mirrors every user-visible chunk onto the subject-supplied
 // CAPTURE wire (FakePlatformWire) so shared rows observe bubbles with zero
-// sockets. The attachment TRANSPORT legs ARE ported (_send_attachment @~470
-// multipart upload + _download_attachment @~610 byte fetch); only the local-FS
-// media-cache PERSISTENCE stays upstream — mime→ext classification rides the
-// closed historical override maps kept as manifest data (BB_*_EXT_OVERRIDES).
+// sockets. The attachment legs ARE ported end-to-end: outbound (_send_
+// attachment @~470 multipart upload), inbound transport (_download_attachment
+// @~610 byte fetch) AND the webhook media-cache persistence/classification
+// loop (@~961-995 — image/audio closed override maps ride as manifest data,
+// documents keep their transferName under the doc_{uuid12}_ prefix).
 
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, extname, join } from "node:path";
 
 import {
 	BasePlatformAdapter,
@@ -80,11 +82,13 @@ import {
 	type ChatLengthPolicy,
 } from "../kit/index.js";
 import {
+	BB_AUDIO_EXT_OVERRIDES,
 	BB_DEFAULT_MENTION_PATTERNS,
 	BB_DEFAULT_WEBHOOK_HOST,
 	BB_DEFAULT_WEBHOOK_PATH,
 	BB_DEFAULT_WEBHOOK_PORT,
 	BB_GUID_CACHE_SIZE,
+	BB_IMAGE_EXT_OVERRIDES,
 	BB_MAX_TEXT_LENGTH,
 	BB_MESSAGE_EVENTS,
 	BB_SUPPORTS_MESSAGE_EDITING,
@@ -136,6 +140,14 @@ export interface BlueBubblesConfig {
 	guid_cache_size?: number | undefined;
 }
 
+/** One cached inbound attachment (webhook media loop classification result). */
+export interface BlueBubblesCachedAttachment {
+	/** Local media-cache path (media_urls entry). */
+	path: string;
+	/** Resolved file extension including the dot ('' for documents without one). */
+	ext: string;
+}
+
 /** One multipart upload part (_send_attachment `files=` shape). */
 export interface BlueBubblesMultipartFile {
 	/** Form field carrying the bytes ('attachment' in the vendor request). */
@@ -159,9 +171,14 @@ export interface BlueBubblesMultipartResponse {
 /** REST seam the adapter drives (path-shaped like the httpx calls). */
 export interface BlueBubblesRestClient {
 	get(path: string): Promise<{ status: number; data?: unknown }>;
+	/**
+	 * POST with an OPTIONAL JSON body: send_typing/mark_read post with NO body
+	 * at all upstream (`self.client.post(url, timeout=5)` — no json= kwarg,
+	 * bluebubbles.py @~733), so the payload argument is omitted entirely there.
+	 */
 	post(
 		path: string,
-		payload: Record<string, unknown>,
+		payload?: Record<string, unknown> | undefined,
 	): Promise<{ status: number; data?: unknown }>;
 	del(path: string): Promise<{ status: number; data?: unknown }>;
 	/**
@@ -185,6 +202,12 @@ export interface BlueBubblesAdapterOptions {
 	nowMs?: (() => number) | undefined;
 	scalarMaxUnits?: number | undefined;
 	spawner?: TaskSpawner | undefined;
+	/**
+	 * Inbound attachment bytes land here (signal/teams precedent; tests:
+	 * mkdtemp). Only created lazily on the first cached download — a webhook
+	 * plane that never sees attachments writes nothing.
+	 */
+	mediaCacheDir?: string | undefined;
 	/**
 	 * Conformance-harness egress CAPTURE wire (msgraph pattern): production
 	 * construction leaves it unset and wireSend still drives the REST engine;
@@ -235,6 +258,8 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	/** Compiled group wake words (helpers.compile_mention_patterns parity). */
 	readonly mentionPatterns: readonly RegExp[];
 	readonly guidCacheSize: number;
+	/** Inbound attachment cache root (lazy-mkdir on first cached download). */
+	readonly mediaCacheDir: string;
 
 	private readonly restClient: BlueBubblesRestClient;
 	private readonly nowFn: () => number;
@@ -270,6 +295,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		messageId: string;
 		text: string;
 		source: IncomingEvent["source"];
+		/** Present IFF the webhook carried downloadable attachments. */
+		messageType?: IncomingEvent["messageType"] | undefined;
+		mediaUrls?: string[] | undefined;
+		mediaTypes?: string[] | undefined;
 	}> = [];
 	readonly turnLog: string[] = [];
 	readonly replyLog: string[] = [];
@@ -370,6 +399,9 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			1,
 			Number(config.guid_cache_size ?? BB_GUID_CACHE_SIZE),
 		);
+		this.mediaCacheDir =
+			opts.mediaCacheDir ??
+			join(process.cwd(), "platforms", "bluebubbles", "media");
 
 		// DEC-017: an incomplete trust boundary is a CONSTRUCTION-TIME error.
 		this.trustBoundary = declareBlueBubblesTrustBoundary();
@@ -478,9 +510,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		return res;
 	}
 
+	/** raise_for_status parity: non-2xx throws (caller ladders handle it). */
 	private async apiPost(
 		path: string,
-		payload: Record<string, unknown>,
+		payload?: Record<string, unknown> | undefined,
 	): Promise<{ status: number; data?: unknown }> {
 		const res = await this.restClient.post(path, payload);
 		if (res.status < 200 || res.status >= 300) {
@@ -782,38 +815,56 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		}
 		let last: SendResult = { success: true };
 		for (const chunk of chunks) {
-			// Address-like targets MAY create a fresh DM — but ONLY when the
-			// server has private_api enabled (else fail, never guess).
-			last = await this.postResolvedBubble(chatId, chunk, replyTo);
+			// Resolve INSIDE the chunk loop (source order): a failed resolve for an
+			// address-like target under private_api creates the chat with THIS
+			// chunk and RETURNS immediately — one chat/new POST total; remaining
+			// paragraphs are never retried against the still-unresolved target
+			// (send @~563 `return await self._create_chat_for_handle(...)`).
+			const verdict = await this.resolveForSend(chatId);
+			if (verdict.kind === "create") {
+				return await this.createChatForHandle(chatId, chunk);
+			}
+			if (verdict.kind === "missing") {
+				return {
+					success: false,
+					error: `BlueBubbles chat not found for target: ${chatId}`,
+				};
+			}
+			last = await this.postMessageText(verdict.guid, chunk, replyTo);
 			if (!last.success) return last;
 		}
 		return last;
 	}
 
 	/**
-	 * One REST bubble against a RESOLVED target: GUID resolve (raw ';;'
-	 * passthrough / LRU-cached strict match) → create-chat fallback for
-	 * address-like targets under private_api → POST /api/v1/message/text with
-	 * the private-api reply enrichment matrix.
+	 * THE send() resolve step (@~555): resolved GUID → 'resolved'; unresolved
+	 * address-like target under private_api → 'create'; anything else →
+	 * 'missing' (never guess-create without private_api).
 	 */
-	private async postResolvedBubble(
+	private async resolveForSend(
 		chatId: string,
+	): Promise<
+		| { kind: "resolved"; guid: string }
+		| { kind: "create" }
+		| { kind: "missing" }
+	> {
+		const guid = await this.resolveChatGuid(chatId);
+		if (guid !== null) return { kind: "resolved", guid };
+		if (
+			this.privateApiEnabled &&
+			(chatId.includes("@") || /^\+\d/.test(chatId))
+		) {
+			return { kind: "create" };
+		}
+		return { kind: "missing" };
+	}
+
+	/** ONE /api/v1/message/text POST with the private-api reply enrichment matrix. */
+	private async postMessageText(
+		guid: string,
 		message: string,
 		replyTo?: string | undefined,
 	): Promise<SendResult> {
-		const guid = await this.resolveChatGuid(chatId);
-		if (!guid) {
-			if (
-				this.privateApiEnabled &&
-				(chatId.includes("@") || /^\+\d/.test(chatId))
-			) {
-				return await this.createChatForHandle(chatId, message);
-			}
-			return {
-				success: false,
-				error: `BlueBubbles chat not found for target: ${chatId}`,
-			};
-		}
 		const payload: Record<string, unknown> = {
 			chatGuid: guid,
 			tempGuid: this.nextTempGuid(),
@@ -837,6 +888,30 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		} catch (exc) {
 			return { success: false, error: errorMessage(exc) };
 		}
+	}
+
+	/**
+	 * One REST bubble against a RESOLVED target: GUID resolve (raw ';;'
+	 * passthrough / LRU-cached strict match) → create-chat fallback for
+	 * address-like targets under private_api → POST /api/v1/message/text with
+	 * the private-api reply enrichment matrix.
+	 */
+	private async postResolvedBubble(
+		chatId: string,
+		message: string,
+		replyTo?: string | undefined,
+	): Promise<SendResult> {
+		const verdict = await this.resolveForSend(chatId);
+		if (verdict.kind === "create") {
+			return await this.createChatForHandle(chatId, message);
+		}
+		if (verdict.kind === "missing") {
+			return {
+				success: false,
+				error: `BlueBubbles chat not found for target: ${chatId}`,
+			};
+		}
+		return this.postMessageText(verdict.guid, message, replyTo);
 	}
 
 	private nextTempGuid(): string {
@@ -928,8 +1003,9 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	 * _download_attachment TRANSPORT leg (@~610): GET /api/v1/attachment/
 	 * {quoted-guid}/download and hand back the raw bytes, or null on ANY
 	 * failure (source logs a warning and returns None). Mime→ext classification
-	 * and local media-cache persistence stay upstream — the closed historical
-	 * override tables ride as BB_*_EXT_OVERRIDES manifest data.
+	 * and local media-cache persistence ride cacheInboundAttachment below —
+	 * the closed historical override tables stay BB_*_EXT_OVERRIDES manifest
+	 * data.
 	 */
 	async downloadAttachment(attGuid: string): Promise<Uint8Array | null> {
 		try {
@@ -943,6 +1019,58 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 				);
 			}
 			return res.bytes;
+		} catch (exc) {
+			this.logger?.warn?.(
+				`[bluebubbles] failed to download attachment ${attGuid}: ${errorMessage(exc)}`,
+			);
+			return null;
+		}
+	}
+
+	/**
+	 * _download_attachment CLASSIFICATION + PERSISTENCE legs (@~820-878 parity):
+	 * the transport bytes classify by the attachment's lowercased mimeType —
+	 * image/* rides the CLOSED BB_IMAGE_EXT_OVERRIDES map (fallback .jpg),
+	 * audio/* rides CLOSED BB_AUDIO_EXT_OVERRIDES (fallback .mp3), everything
+	 * else lands under its transferName (file_{hex8} default) with the doc_
+	 * {uuid12}_ prefix — then persist into the media cache dir. Returns the
+	 * cached PATH or null on ANY failure; download failures warn inside
+	 * downloadAttachment, persistence failures warn here (source returns None
+	 * through the same try/except).
+	 */
+	private async cacheInboundAttachment(
+		attGuid: string,
+		mime: string,
+		transferName: string,
+	): Promise<BlueBubblesCachedAttachment | null> {
+		try {
+			const bytes = await this.downloadAttachment(attGuid);
+			if (bytes === null) return null;
+			mkdirSync(this.mediaCacheDir, { recursive: true });
+			const hex12 = () => randomUUID().replaceAll("-", "").slice(0, 12);
+			if (mime.startsWith("image/")) {
+				// Closed historical map: unlisted image mimes fall to .jpg WITHOUT
+				// consulting mimetypes (use_defaults/use_mimetypes=False parity).
+				const ext = BB_IMAGE_EXT_OVERRIDES[mime] ?? ".jpg";
+				const path = join(this.mediaCacheDir, `img_${hex12()}${ext}`);
+				writeFileSync(path, bytes);
+				return { path, ext };
+			}
+			if (mime.startsWith("audio/")) {
+				// Closed historical map: x-caf→.mp3, mp4/aac→.m4a, fallback .mp3.
+				const ext = BB_AUDIO_EXT_OVERRIDES[mime] ?? ".mp3";
+				const path = join(this.mediaCacheDir, `audio_${hex12()}${ext}`);
+				writeFileSync(path, bytes);
+				return { path, ext };
+			}
+			// Videos, documents, and everything else: transferName wins, sanitized
+			// to its basename (cache_document_from_bytes Path(filename).name).
+			const rawName =
+				transferName || `file_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+			const safeName = basename(rawName) || "document";
+			const path = join(this.mediaCacheDir, `doc_${hex12()}_${safeName}`);
+			writeFileSync(path, bytes);
+			return { path, ext: extname(safeName) };
 		} catch (exc) {
 			this.logger?.warn?.(
 				`[bluebubbles] failed to download attachment ${attGuid}: ${errorMessage(exc)}`,
@@ -1005,9 +1133,9 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		try {
 			const guid = await this.resolveChatGuid(chatId);
 			if (guid) {
+				// NO body — the source posts without the json= kwarg (@~733).
 				await this.restClient.post(
 					`/api/v1/chat/${encodeURIComponent(guid)}/typing`,
-					{},
 				);
 			}
 		} catch {
@@ -1034,9 +1162,9 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		try {
 			const guid = await this.resolveChatGuid(chatId);
 			if (guid) {
+				// NO body — the source posts without the json= kwarg (@~749).
 				await this.restClient.post(
 					`/api/v1/chat/${encodeURIComponent(guid)}/read`,
-					{},
 				);
 				return true;
 			}
@@ -1044,6 +1172,62 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 			/* fallthrough (source bare except) */
 		}
 		return false;
+	}
+
+	// ── chat info (get_chat_info @~779 parity) ───────────────────────────────
+
+	/**
+	 * get_chat_info parity: group detection rides ';+;' in the RAW target;
+	 * resolution goes through the normal chat-GUID ladder; a resolved GUID
+	 * GETs /api/v1/chat/{quoted-guid}?with=participants and the display name
+	 * resolves displayName → chatIdentifier → the raw target, participant
+	 * addresses ride along when present. ANY failure (unresolved target,
+	 * non-2xx, malformed payload) keeps the trivial {name: chat_id, type} info
+	 * (source bare-except parity).
+	 */
+	async getChatInfo(chatId: string): Promise<{
+		name: string;
+		type: "group" | "dm";
+		participants?: string[];
+	}> {
+		const isGroup = (chatId ?? "").includes(";+;");
+		const info: {
+			name: string;
+			type: "group" | "dm";
+			participants?: string[];
+		} = {
+			name: chatId,
+			type: isGroup ? "group" : "dm",
+		};
+		try {
+			const guid = await this.resolveChatGuid(chatId);
+			if (guid !== null) {
+				const res = await this.apiGet(
+					`/api/v1/chat/${pyQuote(guid)}?with=participants`,
+				);
+				const data = asRecord(res.data);
+				// displayName → chatIdentifier → chat_id (`or`-chain parity).
+				info.name =
+					firstTruthy(
+						stringOrEmpty(data["displayName"]),
+						stringOrEmpty(data["chatIdentifier"]),
+						chatId,
+					) ?? chatId;
+				const participants: string[] = [];
+				const rawParticipants = Array.isArray(data["participants"])
+					? data["participants"]
+					: [];
+				for (const raw of rawParticipants) {
+					// (p.get("address") or "").strip() truthiness parity.
+					const addr = stringOrNull(asRecord(raw)["address"]);
+					if (addr !== null) participants.push(addr);
+				}
+				if (participants.length > 0) info.participants = participants;
+			}
+		} catch {
+			/* swallowed (source bare except) — trivial info stands */
+		}
+		return info;
 	}
 
 	// ── format_message (@~600 parity) ─────────────────────────────────────────
@@ -1085,8 +1269,10 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 	 * — EMPTY carrier values fall through to the next position) → body cap →
 	 * JSON-or-form parse → event filter (EMPTY event type FALLS THROUGH, only a
 	 * PRESENT non-message type acks) → record extraction → isFromMe/tapback
-	 * drops → text/chat/sender chains (chats[0].guid fallback for v1.9+
-	 * payloads) → missing-fields 400 → group detection → mention gating →
+	 * drops → text extraction → INBOUND ATTACHMENT downloads + mime
+	 * classification ('(attachment)' text fallback) → chat/sender chains
+	 * (v1.9+ chats[0].guid payload fallback) → missing-fields 400 → group
+	 * detection → mention gating →
 	 * dispatch + fire-and-forget read receipt. Always answers.
 	 */
 	async handleWebhookPost(input: {
@@ -1181,12 +1367,67 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 		}
 
 		// 7. Text extraction chain.
-		const text =
+		let text =
 			firstTruthy(
 				stringOrNull(record["text"]),
 				stringOrNull(record["message"]),
 				stringOrNull(record["body"]),
 			) ?? "";
+
+		// 7.5 Inbound attachment handling (@~961-995 parity): EVERY attachment
+		// guid downloads through the _download_attachment legs and classifies —
+		// image/*→photo, audio/* (or a .caf uti)→voice, video/*→video, else
+		// document; cached paths ride media_urls with their mimes. Multiple
+		// attachments prefer PHOTO when ANY image is present, and an
+		// attachment-only message backfills text='(attachment)' so it dispatches
+		// instead of hitting the missing-fields 400 below.
+		const attachments = Array.isArray(record["attachments"])
+			? record["attachments"]
+			: [];
+		const mediaUrls: string[] = [];
+		const mediaTypes: string[] = [];
+		let messageType: IncomingEvent["messageType"] = "text";
+		for (const attRaw of attachments) {
+			const att = asRecord(attRaw);
+			const attGuid = att["guid"];
+			if (typeof attGuid !== "string" || attGuid.length === 0) continue;
+			const mime =
+				typeof att["mimeType"] === "string"
+					? att["mimeType"].toLowerCase()
+					: "";
+			const transferName =
+				typeof att["transferName"] === "string" ? att["transferName"] : "";
+			const cached = await this.cacheInboundAttachment(
+				attGuid,
+				mime,
+				transferName,
+			);
+			if (cached === null) continue;
+			mediaUrls.push(cached.path);
+			mediaTypes.push(mime);
+			if (mime.startsWith("image/")) {
+				messageType = "photo";
+			} else if (
+				mime.startsWith("audio/") ||
+				(typeof att["uti"] === "string" && att["uti"].endsWith("caf"))
+			) {
+				messageType = "voice";
+			} else if (mime.startsWith("video/")) {
+				messageType = "video";
+			} else {
+				messageType = "document";
+			}
+		}
+		// With multiple attachments, prefer PHOTO if any images are present.
+		if (mediaUrls.length > 1) {
+			const mimePrefixes = new Set(
+				mediaTypes.map((m) => m.split("/")[0] ?? ""),
+			);
+			if (mimePrefixes.has("image")) messageType = "photo";
+		}
+		if (!text && mediaUrls.length > 0) {
+			text = "(attachment)";
+		}
 
 		// 8. Chat-GUID chain — v1.9+ payloads omit top-level chatGuid; the chat
 		// GUID hides under data.chats[0].guid instead.
@@ -1285,16 +1526,21 @@ export class BlueBubblesAdapter extends BasePlatformAdapter {
 				: {}),
 		};
 		const event: IncomingEvent = {
-			messageType: "text",
+			messageType,
 			text: dispatchText,
 			...(messageId !== undefined ? { messageId } : {}),
 			...(replyToMessageId !== undefined ? { replyToMessageId } : {}),
+			...(mediaUrls.length > 0 ? { mediaUrls } : {}),
+			...(mediaTypes.length > 0 ? { mediaTypes } : {}),
 			source,
 		};
 		this.dispatchedEvents.push({
 			messageId: event.messageId ?? "",
 			text: dispatchText,
 			source: event.source,
+			...(messageType !== "text" ? { messageType } : {}),
+			...(mediaUrls.length > 0 ? { mediaUrls: [...mediaUrls] } : {}),
+			...(mediaTypes.length > 0 ? { mediaTypes: [...mediaTypes] } : {}),
 		});
 		this.counters.dispatched += 1;
 		const sessionKey = sessionChatId;

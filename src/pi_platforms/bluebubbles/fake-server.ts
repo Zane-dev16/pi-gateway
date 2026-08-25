@@ -14,6 +14,7 @@
 //   POST /api/v1/message/attachment      (_send_attachment multipart upload —
 //                                         captured AND stored by guid)
 //   GET  /api/v1/attachment/{guid}/download  (_download_attachment bytes)
+//   GET  /api/v1/chat/{guid}?with=participants  (get_chat_info seam)
 //   POST/DEL /api/v1/chat/{guid}/typing  (typing indicators — captured)
 //   POST /api/v1/chat/{guid}/read        (read receipts — captured)
 //
@@ -49,6 +50,13 @@ export interface FakeBlueBubblesServerOptions {
 	messageTextError?: string | undefined;
 }
 
+/** One GET /api/v1/chat/{guid}?with=participants body (getChatInfo seam). */
+export interface FakeBBChatInfo {
+	displayName?: string | undefined;
+	chatIdentifier?: string | undefined;
+	participants?: Array<{ address?: string }> | undefined;
+}
+
 /** One captured multipart upload (fields + file part as received). */
 export interface FakeBBAttachmentUpload {
 	fields: Record<string, string>;
@@ -68,7 +76,7 @@ interface WebhookEntry {
 
 interface CapturedCall {
 	path: string;
-	payload: Record<string, unknown>;
+	payload?: Record<string, unknown> | undefined;
 }
 
 export class FakeBlueBubblesServer implements BlueBubblesRestClient {
@@ -87,6 +95,10 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 	readonly typingCalls: string[] = [];
 	readonly stopTypingCalls: string[] = [];
 	readonly readCalls: string[] = [];
+	/** POSTs that arrived with NO body (send_typing/mark_read parity). */
+	readonly bodylessPostCalls: string[] = [];
+	/** Chat guids whose ?with=participants info was requested, in order. */
+	readonly chatInfoCalls: string[] = [];
 	/** Multipart uploads in arrival order (fields + part bytes). */
 	readonly attachmentUploadCalls: FakeBBAttachmentUpload[] = [];
 	/** Attachment guids whose /download bytes were requested, in order. */
@@ -102,6 +114,8 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 	private scriptedAttachmentEnvelopes: Array<Record<string, unknown>> = [];
 	/** Uploaded bytes by returned attachment guid (serves /download). */
 	private readonly storedAttachments = new Map<string, Uint8Array>();
+	/** Scripted chat-info bodies by guid (serves /chat/{guid}?with=participants). */
+	private readonly chatInfos = new Map<string, FakeBBChatInfo>();
 
 	constructor(opts: FakeBlueBubblesServerOptions = {}) {
 		this.privateApi = opts.privateApi ?? true;
@@ -134,6 +148,16 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 		this.chats.push(chat);
 	}
 
+	/** Script the chat-info body served for one guid (getChatInfo seam). */
+	seedChatInfo(guid: string, info: FakeBBChatInfo): void {
+		this.chatInfos.set(guid, { ...info });
+	}
+
+	/** Serve /download bytes for an inbound attachment guid WITHOUT an upload. */
+	seedAttachmentBytes(guid: string, bytes: Uint8Array): void {
+		this.storedAttachments.set(guid, bytes);
+	}
+
 	seedWebhook(entry: { url: string; events?: string[] }): number {
 		const id = this.webhookSeq++;
 		this.webhooks.push({
@@ -160,6 +184,8 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 		this.readCalls.length = 0;
 		this.attachmentUploadCalls.length = 0;
 		this.attachmentDownloadCalls.length = 0;
+		this.bodylessPostCalls.length = 0;
+		this.chatInfoCalls.length = 0;
 	}
 
 	// ── BlueBubblesRestClient seam ─────────────────────────────────────────────
@@ -183,13 +209,32 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 		if (route === "/api/v1/webhook") {
 			return { status: 200, data: this.webhooks.map((w) => ({ ...w })) };
 		}
+		// GET /api/v1/chat/{guid}?with=participants (get_chat_info @~779).
+		const chatInfo = /^\/api\/v1\/chat\/([^/]+)$/.exec(route);
+		if (chatInfo !== null) {
+			const guid = decodeURIComponent(chatInfo[1] ?? "");
+			this.chatInfoCalls.push(guid);
+			const info = this.chatInfos.get(guid);
+			if (info === undefined) {
+				// raise_for_status ladder upstream swallows into the trivial info.
+				return { status: 404 };
+			}
+			return { status: 200, data: { ...info } };
+		}
 		throw new Error(`fake-bluebubbles: unexpected GET ${path}`);
 	}
 
 	async post(
 		path: string,
-		payload: Record<string, unknown>,
+		payload?: Record<string, unknown> | undefined,
 	): Promise<{ status: number; data?: unknown }> {
+		if (payload === undefined) {
+			// send_typing/mark_read post with NO json= body upstream (@~733/@~749)
+			// — capture the wire shape so rows can assert bodylessness.
+			this.bodylessPostCalls.push(
+				decodeURIComponent(path.split("?")[0] ?? path),
+			);
+		}
 		const route = path.split("?")[0] ?? path;
 		if (route === "/api/v1/message/text") {
 			this.messageTextCalls.push({ path, payload });
@@ -212,8 +257,8 @@ export class FakeBlueBubblesServer implements BlueBubblesRestClient {
 			const id = this.webhookSeq++;
 			this.webhooks.push({
 				id,
-				url: String(payload["url"] ?? ""),
-				events: Array.isArray(payload["events"])
+				url: String(payload?.["url"] ?? ""),
+				events: Array.isArray(payload?.["events"])
 					? (payload["events"] as string[]).map(String)
 					: [],
 			});
