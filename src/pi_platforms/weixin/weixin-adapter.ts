@@ -3,21 +3,43 @@
 //
 // Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
 //   weixin.py:WeixinAdapter.__init__   — policies, timings, circuit params
-//   weixin.py:_poll_loop               — long-poll cycle, -14 pause, failure
-//                                        ladder (2s / 30s), session recycle
+//   weixin.py:_poll_loop               — long-poll cycle, -14/stale pause,
+//                                        failure ladder (2s / 30s), recycle
+//   weixin.py:_get_updates             — long-poll timeout ⇒ BENIGN empty
+//                                        cycle; server longpolling_timeout_ms
+//                                        adopted as the next budget (:1386)
+//   weixin.py:_is_stale_session_ret    — ret/errcode -2 + 'unknown error' is
+//                                        a STALE SESSION (same family as -14),
+//                                        branched BEFORE rate-limit handling
+//                                        at both sites (poll :1394 / send :1847)
 //   weixin.py:_process_message         — dedup (id + content fingerprint),
 //                                        chat-type guess, intake ACLs,
 //                                        context_token store, media collect
 //   weixin.py:_enqueue_text_event/_flush_text_batch — debounce batching
 //   weixin.py:_record_rate_limit_event — circuit breaker (threshold/window/open)
-//   weixin.py:_send_text_chunk_locked  — per-chunk retries, rate-limit 3x
-//                                        backoff, -14 tokenless single retry
-//   weixin.py:_split_text_for_weixin_delivery — delivery splitter (text-splitting.ts)
+//   weixin.py:_send_text_chunk_locked  — per-chunk retries: generic vendor
+//                                        errors retry linearly
+//                                        delay*(attempt+1) up to 4 retries,
+//                                        rate-limit (-2) backs off 3×, session-
+//                                        expired (-14/stale) tokenless single retry
+//   weixin.py:send → _split_text(format_message(…)) — egress text ships as
+//                                        format_message parity (copy-friendly
+//                                        wrap over normalized blocks) split by
+//                                        the delivery-unit splitter (MAX_MESSAGE_LENGTH=2000)
+//   weixin.py:_api_post/_headers/_base_info — EVERY outgoing POST merges
+//     {channel_version:"2.2.0"} base_info and carries the full iLink header
+//     plane (ilink-transport.ts; asserted on every fake-face call)
+//   weixin.py:_send_file — outbound media: getuploadurl → ECB ciphertext CDN
+//     POST (octet-stream, x-encrypted-param) → sendmessage media item with
+//     aes_key=base64(hex) (ilink-transport item builders + wire-crypto ECB)
+//   weixin.py send_typing/stop_typing/_ensure_typing_ticket — turn-scoped
+//     indicator signals on getConfig-refreshed tickets (stuck-indicator guard)
+//   weixin.py:qr_login — account linking: get_bot_qrcode then a get_qrcode_status
+//     poll loop (wait/scaned/scaned_but_redirect/expired≤3/confirmed)
 //
 // Probe-computed exclusions (documented honestly, never faked green):
-//   • CDN media download/decrypt (novac2c AES-CBC blobs) — media items surface
-//     attachment-info lines; the AES-128-ECB wire crypto ships as contracts in
-//     wire-crypto.ts without a network plane.
+//   • INBOUND CDN media download/decrypt (novac2c blobs) — media items surface
+//     attachment-info lines. OUTBOUND media ships (sendFile above).
 
 import type {
 	Metadata,
@@ -43,17 +65,42 @@ import {
 	sendWithRetry,
 	type ClickAuthorizer,
 } from "../kit/index.js";
+import { createHash } from "node:crypto";
 import type { ChatLengthPolicy } from "../kit/length-policy.js";
 import { BoundedSeenSet } from "../../pi_gateway/security/trust/replay-seen-set.js";
+import { aes128EcbEncrypt, aesPaddedSize } from "./wire-crypto.js";
+import {
+	baseInfo,
+	buildILinkGetHeaders,
+	buildILinkPostHeaders,
+	buildOutboundMediaItem,
+	CDN_UPLOAD_HEADERS,
+	cdnUploadUrl,
+	aesKeyForApi,
+	defaultRandomBytes,
+	mediaTypeForKind,
+	outboundMediaKind,
+	type RandomBytesFn,
+} from "./ilink-transport.js";
 import {
 	BACKOFF_DELAY_SECONDS,
+	EP_GET_BOT_QR,
+	EP_GET_CONFIG,
+	EP_GET_QR_STATUS,
 	EP_GET_UPDATES,
-	ILINK_APP_ID,
-	ILINK_APP_CLIENT_VERSION,
+	EP_GET_UPLOAD_URL,
+	EP_SEND_MESSAGE,
+	EP_SEND_TYPING,
+	ILINK_BASE_URL,
+	ITEM_FILE,
 	ITEM_IMAGE,
 	ITEM_TEXT,
 	ITEM_VIDEO,
 	ITEM_VOICE,
+	QR_DEFAULT_BOT_TYPE,
+	QR_LOGIN_TIMEOUT_S,
+	QR_MAX_EXPIRED_REFRESHES,
+	QR_POLL_INTERVAL_S,
 	MAX_CONSECUTIVE_FAILURES,
 	MESSAGE_DEDUP_TTL_SECONDS,
 	MSG_TYPE_USER,
@@ -70,14 +117,26 @@ import {
 	TEXT_BATCH_SPLIT_DELAY_S,
 	SESSION_EXPIRED_ERRCODE,
 	SESSION_EXPIRED_PAUSE_S,
+	WX_MAX_MESSAGE_LENGTH,
+	TYPING_START,
+	TYPING_STOP,
 	TYPING_TICKET_TTL_S,
+	MSG_TYPE_BOT,
+	MSG_STATE_FINISH,
+	WEIXIN_CDN_BASE_URL,
 	WEIXIN_PLUGIN_MANIFEST,
 	WEIXIN_RATE_BUDGET,
 } from "./manifest.js";
-import { splitTextForWeixinDelivery } from "./text-splitting.js";
-import type { FakeILinkServer, ILinkMessage } from "./fake-ilink.js";
-
-const ITEM_FILE = 4;
+import {
+	normalizeMarkdownBlocks,
+	wrapCopyFriendlyLines,
+	splitTextForWeixinDelivery,
+} from "./text-splitting.js";
+import type {
+	FakeILinkServer,
+	ILinkMessage,
+	ILinkPostResponse,
+} from "./fake-ilink.js";
 
 export interface WeixinSyncStore {
 	load(accountId: string): string;
@@ -92,19 +151,49 @@ export interface WeixinAdapterOptions {
 	allowFrom?: readonly string[] | undefined;
 	groupAllowFrom?: readonly string[] | undefined;
 	scalarMaxUnits?: number | undefined;
+	/** Env-read seam for the open-DM opt-ins (production: process.env). */
+	readEnv?: ((key: string) => string | undefined) | undefined;
 	server: FakeILinkServer;
 	syncStore: WeixinSyncStore;
 	sleepMs?: ((ms: number) => Promise<void>) | undefined;
 	nowMs?: (() => number) | undefined;
 	spawner?: TaskSpawner | undefined;
 	/** Scripted egress capture (fixture seam; production: absent). */
-	sendCapture?: ((chatId: string, content: string, metadata: Metadata) => Promise<SendResult>) | undefined;
+	sendCapture?:
+		| ((
+				chatId: string,
+				content: string,
+				metadata: Metadata,
+		  ) => Promise<SendResult>)
+		| undefined;
 	/** Whether a send script was deliberately programmed (probe gating). */
 	captureHasScript?: (() => boolean) | undefined;
 	/** Scripted §10.1 tier-1 rich probe (fixture seam; production: absent). */
 	richProbe?: ((content: string) => Promise<SendResult>) | undefined;
 	/** Whether a rich script was deliberately programmed (probe gating). */
 	richHasScript?: (() => boolean) | undefined;
+	/** CSPRNG seam for filekeys/aes keys/uins (fixtures may inject determinism). */
+	randomBytesFn?: RandomBytesFn | undefined;
+}
+
+export interface SendFileOptions {
+	filename: string;
+	plaintext: Buffer;
+	/** _outbound_media_builder force_file_attachment parity. */
+	forceFileAttachment?: boolean | undefined;
+	caption?: string | undefined;
+}
+
+export interface QrLoginOptions {
+	botType?: string | undefined;
+	timeoutSeconds?: number | undefined;
+}
+
+export interface QrLoginCredentials {
+	account_id: string;
+	token: string;
+	base_url: string;
+	user_id: string;
 }
 
 interface TextBatch {
@@ -132,12 +221,19 @@ export class WeixinAdapter extends BasePlatformAdapter {
 	private readonly syncStore: WeixinSyncStore;
 	private readonly sleepFn: (ms: number) => Promise<void>;
 	private readonly nowFn: () => number;
-	private readonly sendCapture: ((chatId: string, content: string, metadata: Metadata) => Promise<SendResult>) | undefined;
+	private readonly sendCapture:
+		| ((
+				chatId: string,
+				content: string,
+				metadata: Metadata,
+		  ) => Promise<SendResult>)
+		| undefined;
 	private readonly captureHasScriptFn: (() => boolean) | undefined;
 	private readonly richProbe:
 		| ((content: string) => Promise<SendResult>)
 		| undefined;
 	private readonly richHasScriptFn: (() => boolean) | undefined;
+	private readonly rng: RandomBytesFn;
 
 	private syncBuf = "";
 	running = false;
@@ -209,6 +305,7 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		this.captureHasScriptFn = opts.captureHasScript;
 		this.richProbe = opts.richProbe;
 		this.richHasScriptFn = opts.richHasScript;
+		this.rng = opts.randomBytesFn ?? defaultRandomBytes;
 
 		if (this.token === "") {
 			// Loud disable parity: connect() refuses without the bot token.
@@ -339,7 +436,45 @@ export class WeixinAdapter extends BasePlatformAdapter {
 			...(event.metadata ?? {}),
 			gateway_session_key: sessionKey,
 		};
-		await this.handleIngress(event, sessionKey);
+		// Turn-scoped typing indicator (weixin.py send_typing → turn →
+		// stop_typing parity): bracket EVERY dispatched turn so the WeChat
+		// client never shows a stuck indicator.
+		const chatId = String(event.source?.chatId ?? "");
+		this.sendTypingIndicator(chatId);
+		try {
+			await this.handleIngress(event, sessionKey);
+		} finally {
+			this.stopTypingIndicator(chatId);
+		}
+	}
+
+	/**
+	 * Typing signal plane (weixin.py send_typing/stop_typing parity): POSTs
+	 * ilink/bot/sendtyping {ilink_user_id, typing_ticket, status:TYPING_START|STOP}
+	 * on a getConfig-refreshed ticket. Failures are debug-grade and NEVER
+	 * propagate into the turn (Hermes swallows them identically).
+	 */
+	private signalTyping(chatId: string, status: number): void {
+		if (chatId === "") return;
+		try {
+			const ticket = this.typingTicketFor(chatId);
+			if (ticket === null) return; // no ticket ⇒ silent no-op (vendor parity)
+			this.ilinkPost(EP_SEND_TYPING, {
+				ilink_user_id: chatId,
+				typing_ticket: ticket,
+				status,
+			});
+		} catch {
+			// debug-grade: an indicator failure never breaks the turn
+		}
+	}
+
+	sendTypingIndicator(chatId: string): void {
+		this.signalTyping(chatId, TYPING_START);
+	}
+
+	stopTypingIndicator(chatId: string): void {
+		this.signalTyping(chatId, TYPING_STOP);
 	}
 
 	setClickerAuthorization(allow: boolean): void {
@@ -359,7 +494,56 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		return undefined;
 	}
 
-	// ── connection lifecycle ─────────────────────────────────────────────────
+	// ── iLink transport plane (weixin.py:_api_post/_api_get parity) ───────────
+
+	/**
+	 * ONE outgoing-POST builder: merges {channel_version} base_info into the
+	 * payload and carries Hermes' exact header plane. Every iLink POST the
+	 * adapter issues routes through here — the seam records both verbatim.
+	 */
+	private ilinkPostRequest(
+		endpoint: string,
+		payload: Record<string, unknown>,
+	): {
+		endpoint: string;
+		payload: Record<string, unknown>;
+		headers: Record<string, string>;
+	} {
+		const merged = { ...payload, base_info: baseInfo() };
+		const bodyByteLength = Buffer.byteLength(JSON.stringify(merged), "utf8");
+		return {
+			endpoint,
+			payload: merged,
+			headers: buildILinkPostHeaders(
+				this.token === "" ? undefined : this.token,
+				bodyByteLength,
+				this.rng,
+			),
+		};
+	}
+
+	private ilinkPost(
+		endpoint: string,
+		payload: Record<string, unknown>,
+	): ILinkPostResponse {
+		return this.server.post(this.ilinkPostRequest(endpoint, payload));
+	}
+
+	/** _api_get parity: app-identity headers ONLY (never Bearer/body auth). */
+	private ilinkGet(
+		baseUrl: string,
+		endpoint: string,
+		query: Record<string, string>,
+	): Record<string, unknown> {
+		return this.server.getILink({
+			baseUrl,
+			endpoint,
+			query,
+			headers: buildILinkGetHeaders(),
+		});
+	}
+
+	// ── connection lifecycle ────────────────────────────────────────────────
 
 	async connect(opts: { isReconnect: boolean }): Promise<boolean> {
 		if (this.token === "") {
@@ -493,8 +677,15 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		let settled = false;
 		const token = ++this.pullSeq;
 		const pull = (async (): Promise<Record<string, unknown>> => {
-			const result = await this.server.pullAsync(this.syncBuf, () =>
-				this.pullSeq !== token,
+			// getupdates rides the SAME _api_post request shape as every other
+			// outgoing POST (base_info + header plane recorded by the seam).
+			const req = this.ilinkPostRequest(EP_GET_UPDATES, {
+				get_updates_buf: this.syncBuf,
+			});
+			const result = await this.server.pullAsync(
+				this.syncBuf,
+				() => this.pullSeq !== token,
+				{ payload: req.payload, headers: req.headers },
 			);
 			settled = true;
 			return result as Record<string, unknown>;
@@ -874,13 +1065,13 @@ export class WeixinAdapter extends BasePlatformAdapter {
 			const contextToken = retriedWithoutToken
 				? undefined
 				: this.contextTokens.get(chatId);
-			const resp = this.server.sendMessage({
+			const resp = this.ilinkPost(EP_SEND_MESSAGE, {
 				msg: {
 					from_user_id: "",
 					to_user_id: chatId,
 					client_id: `hermes-weixin-${attempt}-${this.nowFn()}`,
-					message_type: 2, // MSG_TYPE_BOT
-					message_state: 2, // MSG_STATE_FINISH
+					message_type: MSG_TYPE_BOT,
+					message_state: MSG_STATE_FINISH,
 					item_list: [{ type: ITEM_TEXT, text_item: { text: chunk } }],
 					...(contextToken !== undefined
 						? { context_token: contextToken }
@@ -943,12 +1134,12 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		content: string,
 		metadata: Metadata,
 	): Promise<SendResult> {
-		const resp = this.server.sendMessage({
+		const resp = this.ilinkPost(EP_SEND_MESSAGE, {
 			msg: {
 				to_user_id: chatId,
 				client_id: `hermes-weixin-final-${this.nowFn()}`,
-				message_type: 2,
-				message_state: 2,
+				message_type: MSG_TYPE_BOT,
+				message_state: MSG_STATE_FINISH,
 				item_list: [{ type: ITEM_TEXT, text_item: { text: content } }],
 			},
 		});
@@ -963,6 +1154,201 @@ export class WeixinAdapter extends BasePlatformAdapter {
 		return { success: true };
 	}
 
+	// ── outbound media (weixin.py:_send_file parity) ─────────────────────────
+
+	/**
+	 * _send_file parity: getuploadurl → ECB ciphertext CDN POST (octet-stream,
+	 * reads x-encrypted-param) → sendmessage media item. Byte-specific vendor
+	 * rules honored: filesize is the PKCS#7-padded size, aeskey rides as hex,
+	 * and the sendmessage item carries aes_key = base64(HEX STRING) — never
+	 * base64(raw bytes). An optional caption precedes the media item as its own
+	 * text message (vendor order). Failures never throw; they return SendResult.
+	 */
+	async sendFile(chatId: string, opts: SendFileOptions): Promise<SendResult> {
+		try {
+			const kind = outboundMediaKind(
+				opts.filename,
+				opts.forceFileAttachment === true,
+			);
+			const plaintext = opts.plaintext;
+			const filekey = this.rng(16).toString("hex"); // secrets.token_hex(16)
+			const aesKey = this.rng(16); // secrets.token_bytes(16)
+			const rawsize = plaintext.length;
+			const rawfilemd5 = createHash("md5").update(plaintext).digest("hex");
+
+			const uploadResp = this.ilinkPost(EP_GET_UPLOAD_URL, {
+				filekey,
+				media_type: mediaTypeForKind(kind),
+				to_user_id: chatId,
+				rawsize,
+				rawfilemd5,
+				filesize: aesPaddedSize(rawsize),
+				no_need_thumb: true,
+				aeskey: aesKey.toString("hex"),
+			});
+			if (Number(uploadResp.ret) !== 0 || Number(uploadResp.errcode) !== 0) {
+				return {
+					success: false,
+					error: `iLink getuploadurl error: ret=${uploadResp.ret} errcode=${uploadResp.errcode}`,
+					retryable: true,
+				};
+			}
+			const uploadParam = String(uploadResp["upload_param"] ?? "");
+			const uploadFullUrl = String(uploadResp["upload_full_url"] ?? "");
+			// Prefer upload_full_url (direct CDN); fall back to the constructed
+			// CDN URL from upload_param — both legs POST (the old PUT 404s).
+			let uploadUrl: string;
+			if (uploadFullUrl !== "") uploadUrl = uploadFullUrl;
+			else if (uploadParam !== "") {
+				uploadUrl = cdnUploadUrl(WEIXIN_CDN_BASE_URL, uploadParam, filekey);
+			} else {
+				return {
+					success: false,
+					error: `getUploadUrl returned neither upload_param nor upload_full_url`,
+				};
+			}
+
+			const ciphertext = aes128EcbEncrypt(plaintext, aesKey);
+			const cdnResp = this.server.cdnUpload(uploadUrl, ciphertext, {
+				...CDN_UPLOAD_HEADERS,
+			});
+			if (cdnResp.status !== 200) {
+				return { success: false, error: `CDN upload HTTP ${cdnResp.status}` };
+			}
+			const encryptedQueryParam = cdnResp.headers["x-encrypted-param"];
+			if (encryptedQueryParam === undefined || encryptedQueryParam === "") {
+				return {
+					success: false,
+					error: "CDN upload missing x-encrypted-param header",
+				};
+			}
+
+			const contextToken = this.contextTokens.get(chatId);
+			const mediaClientId = `hermes-weixin-${this.rng(12).toString("hex")}`;
+
+			if (opts.caption !== undefined && opts.caption.trim() !== "") {
+				this.ilinkPost(EP_SEND_MESSAGE, {
+					msg: {
+						from_user_id: "",
+						to_user_id: chatId,
+						client_id: `hermes-weixin-${this.rng(12).toString("hex")}`,
+						message_type: MSG_TYPE_BOT,
+						message_state: MSG_STATE_FINISH,
+						item_list: [
+							{
+								type: ITEM_TEXT,
+								text_item: {
+									// format_message parity: copy-friendly wrap.
+									text: wrapCopyFriendlyLines(
+										normalizeMarkdownBlocks(opts.caption),
+									),
+								},
+							},
+						],
+						...(contextToken !== undefined
+							? { context_token: contextToken }
+							: {}),
+					},
+				});
+			}
+
+			const mediaItem = buildOutboundMediaItem(kind, {
+				encryptQueryParam: encryptedQueryParam,
+				aesKeyApi: aesKeyForApi(aesKey.toString("hex")),
+				ciphertextSize: ciphertext.length,
+				plaintextSize: rawsize,
+				filename: opts.filename,
+				rawfilemd5,
+			});
+			const resp = this.ilinkPost(EP_SEND_MESSAGE, {
+				msg: {
+					from_user_id: "",
+					to_user_id: chatId,
+					client_id: mediaClientId,
+					message_type: MSG_TYPE_BOT,
+					message_state: MSG_STATE_FINISH,
+					item_list: [mediaItem],
+					...(contextToken !== undefined
+						? { context_token: contextToken }
+						: {}),
+				},
+			});
+			if (Number(resp.ret) !== 0 || Number(resp.errcode) !== 0) {
+				return {
+					success: false,
+					error: `iLink sendmessage error: ret=${resp.ret} errcode=${resp.errcode}`,
+					retryable: true,
+				};
+			}
+			return { success: true, messageId: mediaClientId };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	// ── QR account linking (weixin.py:qr_login parity) ────────────────────
+
+	/**
+	 * qr_login parity: GET ilink/bot/get_bot_qrcode?bot_type=… then poll GET
+	 * ilink/bot/get_qrcode_status?qrcode=… until confirmed / deadline.
+	 * wait keeps polling; scaned_but_redirect repoints subsequent polls at the
+	 * redirect host; expired refetches a NEW qrcode up to three times before
+	 * giving up; confirmed yields credentials (incomplete payload fails closed).
+	 * Headless port: no terminal rendering/persistence — the caller owns what
+	 * happens with the credential dict.
+	 */
+	async qrLogin(opts: QrLoginOptions = {}): Promise<QrLoginCredentials | null> {
+		const botType = opts.botType ?? QR_DEFAULT_BOT_TYPE;
+		const timeoutMs = (opts.timeoutSeconds ?? QR_LOGIN_TIMEOUT_S) * 1000;
+		const fetchQr = (): string => {
+			const resp = this.ilinkGet(ILINK_BASE_URL, EP_GET_BOT_QR, {
+				bot_type: botType,
+			});
+			return String(resp["qrcode"] ?? "");
+		};
+
+		let qrcodeValue = fetchQr();
+		if (qrcodeValue === "") return null; // QR response missing qrcode
+		let currentBaseUrl = ILINK_BASE_URL;
+		let refreshCount = 0;
+		const deadline = this.nowFn() + timeoutMs;
+
+		while (this.nowFn() < deadline) {
+			const statusResp = this.ilinkGet(currentBaseUrl, EP_GET_QR_STATUS, {
+				qrcode: qrcodeValue,
+			});
+			const status = String(statusResp["status"] ?? "wait");
+			if (status === "confirmed") {
+				const accountId = String(statusResp["ilink_bot_id"] ?? "");
+				const token = String(statusResp["bot_token"] ?? "");
+				const baseUrl = String(statusResp["baseurl"] ?? "") || ILINK_BASE_URL;
+				const userId = String(statusResp["ilink_user_id"] ?? "");
+				if (accountId === "" || token === "") return null;
+				return {
+					account_id: accountId,
+					token,
+					base_url: baseUrl,
+					user_id: userId,
+				};
+			}
+			if (status === "scaned_but_redirect") {
+				const host = String(statusResp["redirect_host"] ?? "");
+				if (host !== "") currentBaseUrl = `https://${host}`;
+			} else if (status === "expired") {
+				refreshCount += 1;
+				if (refreshCount > QR_MAX_EXPIRED_REFRESHES) return null;
+				qrcodeValue = fetchQr();
+				if (qrcodeValue === "") return null;
+			}
+			// wait / scaned / redirect-repoint / refreshed all poll again next cycle.
+			await this.sleepFn(QR_POLL_INTERVAL_S * 1000);
+		}
+		return null;
+	}
+
 	// ── typing tickets (TypingTicketCache + getConfig refresh parity) ───────
 
 	typingTicketFor(userId: string): string | null {
@@ -974,7 +1360,7 @@ export class WeixinAdapter extends BasePlatformAdapter {
 			this.typingTickets.delete(userId);
 		}
 		const contextToken = this.contextTokens.get(userId);
-		const resp = this.server.getConfig({
+		const resp = this.ilinkPost(EP_GET_CONFIG, {
 			ilink_user_id: userId,
 			...(contextToken !== undefined ? { context_token: contextToken } : {}),
 		});
@@ -1113,8 +1499,3 @@ const WX_REGISTRY: CommandRegistry = [
 	{ name: "approve", busyPolicy: "dispatch" as const },
 	{ name: "status", busyPolicy: "dispatch" as const },
 ];
-
-// Re-export for fixtures (EP constant used in logs).
-void EP_GET_UPDATES;
-void ILINK_APP_ID;
-void ILINK_APP_CLIENT_VERSION;

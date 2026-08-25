@@ -129,9 +129,15 @@ in `../09-open-questions.md` (append-only).
   formatting-ladder lane only — door-lane finals bypass the ladder by architecture
   (chokepoint transmitSend binds wireSend directly); extending rich to door finals
   would touch core chokepoint topology and is flagged for a follow-up round.
-  Area suites GREEN (telegram+polling+rows+stream-consumer 91/91); scoped-commit
-  protection applied mid-flight after a concurrent `git stash` reset wiped the shared
-  tree (stash popped, all clusters' work restored).
+  Area suites GREEN (telegram+polling+rows+stream-consumer 91/91); commit
+  `3c37c13` applied mid-flight after a concurrent `git stash` reset wiped the shared
+  tree (stash popped cleanly, zero conflicts). NOTE: the shared index had been
+  fully staged pre-stash, so that commit necessarily carries every cluster's
+  in-flight tree state under this cluster's message — attribution is per-PROGRESS
+  entry, not per-commit boundary. Full suite at commit time: 2563 passed / 47
+  failed, ALL failures inside OTHER clusters' mid-flight areas (weixin x20,
+  qqbot x12, webhook-conformance x2, plus gchat-file-level); telegram/polling/
+  streaming/conformance-telegram ZERO failures; layering + secret gates green.
 
 - STABILITY FIX CLUSTER `msgraph-webhook-r2` (2026-08-25): round-2 findings
   msgraph-1/2/3 applied toward Hermes truth (/tmp/hermes-upstream
