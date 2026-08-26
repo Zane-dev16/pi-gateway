@@ -12,8 +12,13 @@
 //   gateway/run.py:_queue_depth                       → queueDepth
 //   gateway/run.py:_queue_or_replace_pending_event    → queueOrReplacePendingEvent (#28503)
 //   gateway/run.py:_dispatch_busy_slash_command       → dispatchBusySlashCommand
-//   gateway/run.py:_handle_message (HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS)
-//                                                     → Telegram TEXT follow-up grace ahead of the interrupt demotion
+//   gateway/run.py:_handle_message HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS
+//                                                     → follow-up grace
+//   gateway/run.py:_handle_message staleness eviction (~17208,
+//     HERMES_AGENT_TIMEOUT idle/age sweep)            → maybeEvictStaleRunningAgent
+//   gateway/run.py:_check_slash_access (~17282 fast-path / ~17507 cold path)
+//                                                     → slash-access gate
+//                                                     (guards/slash-access.ts)
 
 import type { IncomingEvent, PendingSlotMap } from "./events.js";
 import {
@@ -28,6 +33,7 @@ import {
 	shouldBypassActiveSession,
 } from "./busy-policy.js";
 import { mergePendingEvent } from "./events.js";
+import { type SlashAccessPolicy, checkSlashAccess } from "./slash-access.js";
 
 /** run.py:_BUSY_QUEUE_MAX_PENDING. */
 export const BUSY_QUEUE_MAX_PENDING = 32;
@@ -43,6 +49,67 @@ export const TELEGRAM_FOLLOWUP_GRACE_SECONDS_ENV =
 
 /** run.py default "3.0". */
 export const DEFAULT_FOLLOWUP_GRACE_SECONDS = 3.0;
+
+/** run.py env bridge: `float(os.getenv("HERMES_AGENT_TIMEOUT", 1800))`. */
+export const AGENT_TIMEOUT_SECONDS_ENV = "HERMES_AGENT_TIMEOUT";
+
+/** run.py `_float_env("HERMES_AGENT_TIMEOUT", 1800)` default. */
+export const DEFAULT_AGENT_TIMEOUT_SECONDS = 1800;
+
+/**
+ * Env parsing for the staleness-eviction timeout. Same fail-safe posture as
+ * the follow-up grace: Python float() would raise into the busy path; a
+ * messaging gate must not die on a bad env var, so garbage falls back to the
+ * 1800s default. Values ≤ 0 DISABLE eviction entirely (parity: both eviction
+ * clauses key on ``_raw_stale_timeout > 0``).
+ */
+export function resolveAgentTimeoutSeconds(
+	env: Record<string, string | undefined> = process.env,
+): number {
+	const raw = (env[AGENT_TIMEOUT_SECONDS_ENV] ?? "").trim();
+	if (raw === "") return DEFAULT_AGENT_TIMEOUT_SECONDS;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : DEFAULT_AGENT_TIMEOUT_SECONDS;
+}
+
+/**
+ * run.py `_wall_ttl` — extreme wall-clock age bound: max(10× timeout, 7200s),
+ * or ∞ when the timeout is disabled. Catches entries whose agent object was
+ * lost while still reporting activity.
+ */
+export function staleRunningAgentWallTtlSeconds(
+	timeoutSeconds: number,
+): number {
+	return timeoutSeconds > 0
+		? Math.max(timeoutSeconds * 10, 7200)
+		: Number.POSITIVE_INFINITY;
+}
+
+/** Inputs of the run.py staleness predicate (seconds). */
+export interface StaleRunningEntryInputs {
+	/** now − turn.started_ts. */
+	ageSeconds: number;
+	/** get_activity_summary().seconds_since_activity (∞ when unknowable). */
+	idleSeconds: number;
+	/** HERMES_AGENT_TIMEOUT (≤0 disables). */
+	timeoutSeconds: number;
+}
+
+/**
+ * run.py staleness predicate (~17208): evict a REAL (non-sentinel) entry when
+ * the agent has been IDLE beyond the inactivity timeout, OR when wall-clock
+ * age exceeds max(10× timeout, 7200s). A disabled timeout (≤0) disables both
+ * clauses — nothing ever evicts. The pending-sentinel exclusion lives at the
+ * call site (run.py guards `_stale_agent is not _AGENT_PENDING_SENTINEL`).
+ */
+export function isStaleRunningEntry(inputs: StaleRunningEntryInputs): boolean {
+	const wallTtl = staleRunningAgentWallTtlSeconds(inputs.timeoutSeconds);
+	return (
+		(inputs.timeoutSeconds > 0 &&
+			inputs.idleSeconds >= inputs.timeoutSeconds) ||
+		inputs.ageSeconds > wallTtl
+	);
+}
 
 /**
  * Env parsing for the grace value. Deviation note: Python float() would raise
@@ -112,6 +179,44 @@ export interface RunnerBusyOptions {
 	env?: Record<string, string | undefined>;
 	/** Injected clock (ms) for the grace window — tests assert timing with it. */
 	now?: () => number;
+	/**
+	 * Explicit staleness-eviction timeout override; default resolves
+	 * HERMES_AGENT_TIMEOUT from `env`. Values ≤ 0 disable eviction.
+	 */
+	agentTimeoutSeconds?: number;
+	/**
+	 * run.py:_invalidate_session_run_generation seam — fired on stale eviction
+	 * so an in-flight async run for the OLD generation cannot clobber newer
+	 * state during its unwind.
+	 */
+	invalidateRunGeneration?: (sessionKey: string, reason: string) => void;
+	/**
+	 * run.py:_release_running_agent_state seam — pops ALL per-running-agent
+	 * state for the key (turn state only: agent/started_ts/lease/busy_ack;
+	 * queued pending events and cross-turn state have their own lifecycles).
+	 */
+	releaseRunningAgentState?: (sessionKey: string) => void;
+	/**
+	 * run.py:_check_slash_access config binding — resolve the slash-access
+	 * policy (gateway/slash_access.py:policy_for_source parity) for THIS
+	 * event's platform+scope. Absent ⇒ gating disabled everywhere
+	 * (backward-compat: no admin list ⇒ every allowed user keeps commands).
+	 */
+	slashAccessPolicyOf?: (event: IncomingEvent) => SlashAccessPolicy;
+}
+
+/** Per-key running-turn bookkeeping (run.py session-state turn slice). */
+interface RunningTurnRecord {
+	/** turn.started_ts parity — wall-clock ms of run start. */
+	startedAtMs: number;
+	/** get_activity_summary last-activity parity; defaults to run start. */
+	lastActivityAtMs: number;
+	/**
+	 * _AGENT_PENDING_SENTINEL parity: a just-placed async-setup placeholder
+	 * has no activity tracker yet — it must NEVER be evicted by the idle sweep
+	 * or the setup path races itself.
+	 */
+	pendingSentinel: boolean;
 }
 
 /**
@@ -130,10 +235,20 @@ export class RunnerBusyGuard {
 	private readonly steerFn: ((text: string) => boolean) | null;
 	/** session_key → overflow tail (conversation.queued_events parity). */
 	private readonly overflow = new Map<string, IncomingEvent[]>();
-	/** session_key → wall-clock ms timestamp of the current turn's start. */
-	private readonly turnStartedAtMs = new Map<string, number>();
+	/** session_key → running-turn record (_peek_session_state(...).turn parity). */
+	private readonly runningTurns = new Map<string, RunningTurnRecord>();
 	private readonly followupGraceSeconds: number;
 	private readonly nowFn: () => number;
+	private readonly agentTimeoutSeconds: number;
+	private readonly invalidateRunGenerationFn:
+		| ((sessionKey: string, reason: string) => void)
+		| null;
+	private readonly releaseRunningAgentStateFn:
+		| ((sessionKey: string) => void)
+		| null;
+	private readonly slashAccessPolicyOf:
+		| ((event: IncomingEvent) => SlashAccessPolicy)
+		| null;
 
 	constructor(options: RunnerBusyOptions) {
 		this.lookup = buildCommandLookup(options.registry);
@@ -146,6 +261,11 @@ export class RunnerBusyGuard {
 		this.followupGraceSeconds =
 			options.followupGraceSeconds ?? resolveFollowupGraceSeconds(options.env);
 		this.nowFn = options.now ?? (() => Date.now());
+		this.agentTimeoutSeconds =
+			options.agentTimeoutSeconds ?? resolveAgentTimeoutSeconds(options.env);
+		this.invalidateRunGenerationFn = options.invalidateRunGeneration ?? null;
+		this.releaseRunningAgentStateFn = options.releaseRunningAgentState ?? null;
+		this.slashAccessPolicyOf = options.slashAccessPolicyOf ?? null;
 		this.maxPending =
 			options.maxPending !== undefined && options.maxPending > 0
 				? options.maxPending
@@ -232,25 +352,110 @@ export class RunnerBusyGuard {
 		this.slots.delete(sessionKey);
 	}
 
-	// -- turn-start tracking for the follow-up grace window -------------------
+	// -- turn-start tracking (grace window + staleness eviction) --------------
 
 	/**
 	 * The runner loop records run start here so the busy ladder can apply the
 	 * Telegram TEXT follow-up grace (run.py reads _peek_session_state(...).
-	 * turn.started_ts at the same decision point).
+	 * turn.started_ts at the same decision point) AND the staleness eviction
+	 * can age the entry. Records a REAL agent binding (not the pending
+	 * sentinel); activity defaults to run start — a fresh run is active now.
 	 */
 	markTurnStarted(sessionKey: string, startedAtMs?: number): void {
-		this.turnStartedAtMs.set(sessionKey, startedAtMs ?? this.nowFn());
+		const startedAt = startedAtMs ?? this.nowFn();
+		this.runningTurns.set(sessionKey, {
+			startedAtMs: startedAt,
+			lastActivityAtMs: startedAt,
+			pendingSentinel: false,
+		});
+	}
+
+	/**
+	 * run.py _AGENT_PENDING_SENTINEL placement parity: the async setup phase
+	 * marks the slot BEFORE the real agent exists. Sentinel entries are never
+	 * idle-evicted (they carry no activity tracker yet — the sweep would race
+	 * the setup path) and report no start for the grace window.
+	 */
+	markPendingTurnStart(sessionKey: string, startedAtMs?: number): void {
+		const now = startedAtMs ?? this.nowFn();
+		this.runningTurns.set(sessionKey, {
+			startedAtMs: now,
+			lastActivityAtMs: now,
+			pendingSentinel: true,
+		});
+	}
+
+	/**
+	 * get_activity_summary producer seam: the runner loop records agent
+	 * activity (model call / tool event) here; idleness for the eviction sweep
+	 * measures from THIS stamp, not from run start.
+	 */
+	markAgentActivity(sessionKey: string, atMs?: number): void {
+		const record = this.runningTurns.get(sessionKey);
+		if (record === undefined || record.pendingSentinel) return;
+		record.lastActivityAtMs = atMs ?? this.nowFn();
 	}
 
 	/** Turn finished/cleaned up — the grace window closes. */
 	markTurnFinished(sessionKey: string): void {
-		this.turnStartedAtMs.delete(sessionKey);
+		this.runningTurns.delete(sessionKey);
 	}
 
 	/** Test/diagnostic probe. */
 	turnStartOf(sessionKey: string): number | undefined {
-		return this.turnStartedAtMs.get(sessionKey);
+		return this.runningTurns.get(sessionKey)?.startedAtMs;
+	}
+
+	// -- staleness eviction (run.py ~17208) -----------------------------------
+
+	/** True when a non-sentinel running-turn record exists for the key. */
+	hasRunningTurn(sessionKey: string): boolean {
+		const record = this.runningTurns.get(sessionKey);
+		return record !== undefined && !record.pendingSentinel;
+	}
+
+	/**
+	 * run.py:_handle_message staleness eviction (~17208): detect leaked locks
+	 * from hung/crashed handlers. With inactivity-based timeout, ACTIVE tasks
+	 * can run for hours, so wall-clock age alone isn't sufficient — evict only
+	 * when the agent has been IDLE ≥ HERMES_AGENT_TIMEOUT (default 1800s), or
+	 * when wall age exceeds max(10× timeout, 7200s). Pending sentinels are
+	 * NEVER evicted. A disabled timeout (≤0) disables eviction entirely.
+	 *
+	 * On evict: warn, INVALIDATE the session's run generation (an in-flight
+	 * async unwind must not clobber newer state), RELEASE the running-agent
+	 * state, and drop the local record — follow-ups stop queueing behind the
+	 * dead guard and the arrival takes the COLD path instead.
+	 *
+	 * Returns true when an entry was evicted.
+	 */
+	maybeEvictStaleRunningAgent(sessionKey: string): boolean {
+		const record = this.runningTurns.get(sessionKey);
+		if (record === undefined || record.pendingSentinel) return false;
+		const nowMs = this.nowFn();
+		const ageSeconds = (nowMs - record.startedAtMs) / 1000;
+		const idleSeconds = (nowMs - record.lastActivityAtMs) / 1000;
+		if (
+			!isStaleRunningEntry({
+				ageSeconds,
+				idleSeconds,
+				timeoutSeconds: this.agentTimeoutSeconds,
+			})
+		) {
+			return false;
+		}
+		this.onWarning(
+			`Evicting stale _running_agents entry for ${sessionKey} ` +
+				`(age: ${Math.round(ageSeconds)}s, idle: ${formatIdle(idleSeconds)}s, ` +
+				`timeout: ${Math.round(this.agentTimeoutSeconds)}s)`,
+		);
+		this.invalidateRunGenerationFn?.(
+			sessionKey,
+			"stale_running_agent_eviction",
+		);
+		this.releaseRunningAgentStateFn?.(sessionKey);
+		this.runningTurns.delete(sessionKey);
+		return true;
 	}
 
 	/** True when a Telegram TEXT arrival lands inside the post-start grace. */
@@ -259,7 +464,7 @@ export class RunnerBusyGuard {
 		if (event.messageType !== "text") return false;
 		const platform = event.source?.platform;
 		if (platform !== "telegram") return false;
-		const startedAt = this.turnStartedAtMs.get(sessionKey);
+		const startedAt = this.runningTurns.get(sessionKey)?.startedAtMs;
 		if (startedAt === undefined) return false; // parity: falsy started_ts ⇒ skip
 		return this.nowFn() - startedAt <= this.followupGraceSeconds * 1000;
 	}
@@ -303,17 +508,23 @@ export class RunnerBusyGuard {
 	 * taken. mode==="interrupt" demotes to queue here (subagent/compression
 	 * demotion lives in the runner loop, Phase 1 scope item 4's loop half).
 	 *
-	 * AHEAD of that ladder sits the Telegram TEXT follow-up grace
-	 * (run.py:_handle_message, HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS block):
-	 * arrivals within grace seconds of RUN START queue without interrupting —
-	 * even in interrupt mode, and even in steer mode (parity: the grace branch
-	 * enqueues in queue-mode and merges into the head slot otherwise, it never
-	 * steers). Grace dispositions report "queued".
+	 * AHEAD of that ladder sit, in run.py arrival order: the staleness eviction
+	 * (~17208 — a hung-but-live guard releases its session and the arrival is
+	 * reported "evicted": treat it as a COLD/fresh turn, never queue it behind
+	 * the dead entry) and the Telegram TEXT follow-up grace
+	 * (HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS block): arrivals within grace
+	 * seconds of RUN START queue without interrupting — even in interrupt mode,
+	 * and even in steer mode (parity: the grace branch enqueues in queue-mode
+	 * and merges into the head slot otherwise, it never steers). Grace
+	 * dispositions report "queued".
 	 */
 	handlePlainTextFollowUp(
 		sessionKey: string,
 		event: IncomingEvent,
-	): "steered" | "queued" {
+	): "steered" | "queued" | "evicted" {
+		if (this.maybeEvictStaleRunningAgent(sessionKey)) {
+			return "evicted"; // session released — caller takes the cold path
+		}
 		if (this.withinFollowupGrace(sessionKey, event)) {
 			// Parity of the grace branch's queue/merge split:
 			if (this.busyInputMode === "queue") {
@@ -341,17 +552,34 @@ export class RunnerBusyGuard {
 
 	/**
 	 * run.py:_dispatch_busy_slash_command — resolve and EXECUTE a recognized
-	 * slash command while the agent runs. Resolution order: pre-gate → special
-	 * busy_handler → policy-dispatch plain handler → catch-all reject.
-	 * Unknown commands return null (caller queues them as text).
+	 * slash command while the agent runs. Resolution order: staleness sweep →
+	 * pre-gate → SLASH-ACCESS GATE (run.py ~17282 — every non-pregate
+	 * recognized command, including /stop and /approve, so an in-flight agent
+	 * can't be used to bypass admin/user gating) → special busy_handler →
+	 * policy-dispatch plain handler → catch-all reject. Unknown commands
+	 * return null (caller queues them as text).
+	 *
+	 * null ALSO when the arrival itself triggered a stale eviction: the entry
+	 * was just released, so there is no mid-run context left to dispatch into
+	 * — the caller must treat the event as a COLD arrival.
 	 */
 	async dispatchBusySlashCommand(
 		rawName: string,
 		event: IncomingEvent,
 		sessionKey: string,
 	): Promise<string | null> {
+		if (this.maybeEvictStaleRunningAgent(sessionKey)) return null;
+
 		const resolved = resolveBusyDispatch(this.lookup, rawName);
 		if (resolved === null) return null; // unknown "/foo" → queues as text
+
+		// run.py ~17282: the access gate sits BETWEEN the status/context
+		// pre-gate and busy dispatch. /help and /whoami pass under the
+		// always-allowed floor inside checkSlashAccess.
+		if (resolved.kind !== "pregate") {
+			const denied = this.deniedSlashReply(event, resolved.cmd.name);
+			if (denied !== null) return denied;
+		}
 
 		switch (resolved.kind) {
 			case "pregate": {
@@ -395,12 +623,62 @@ export class RunnerBusyGuard {
 		}
 		return catchAllBusyRejectText(resolved.cmd.name);
 	}
+
+	/**
+	 * run.py:_check_slash_access COLD-path call site (~17507): gate a command
+	 * before built-in dispatch when NO agent is running. The known-command
+	 * precondition lives here (parity of `is_gateway_known_command(canonical)`):
+	 * unknown names are plain text and are NEVER gated. Pass the RAW typed name
+	 * or an alias — resolution goes through the same registry lookup the busy
+	 * path uses, so gating always keys on the CANONICAL row name. Quick-command
+	 * sinks (#44727) reuse this with their raw typed names once they exist.
+	 */
+	checkColdPathSlashAccess(
+		event: IncomingEvent,
+		rawOrCanonicalName: string,
+	): string | null {
+		const cmd = resolveCommand(this.lookup, rawOrCanonicalName);
+		if (cmd === null) return null;
+		return this.deniedSlashReply(event, cmd.name);
+	}
+
+	/**
+	 * run.py:_check_slash_access core bound to THIS guard's config seam:
+	 * resolve the scope policy for the event, deny non-admins outside
+	 * user_allowed_commands (floor /help,/whoami), log the denial, return the
+	 * BYTE-STABLE text. Gating disabled ⇒ null without touching the resolver.
+	 */
+	private deniedSlashReply(
+		event: IncomingEvent,
+		canonicalCmd: string,
+	): string | null {
+		const policyOf = this.slashAccessPolicyOf;
+		if (policyOf === null) return null;
+		const denied = checkSlashAccess(
+			policyOf(event),
+			event.source?.userId ?? null,
+			canonicalCmd,
+		);
+		if (denied !== null) {
+			this.onWarning(
+				`Slash command /${canonicalCmd} denied for ` +
+					`${event.source?.platform ?? "?"}:${event.source?.userId ?? ""} ` +
+					`(not admin, not in user_allowed_commands)`,
+			);
+		}
+		return denied;
+	}
 }
 
 function orNull(value: string | null | undefined): string | null {
 	return typeof value === "string" && value.length > 0
 		? value
 		: (value ?? null);
+}
+
+/** run.py "%s" idle formatting: ∞ stays readable instead of "Infinity". */
+function formatIdle(idleSeconds: number): string {
+	return Number.isFinite(idleSeconds) ? String(Math.round(idleSeconds)) : "∞";
 }
 
 /** Metadata keys that must match before head-slot merges are allowed. */

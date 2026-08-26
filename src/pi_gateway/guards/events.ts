@@ -9,6 +9,10 @@
 // Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
 //   gateway/platforms/base.py:MessageEvent.is_command / get_command /
 //     get_command_args                      → isCommand / getCommand / getCommandArgs
+//   gateway/platforms/base.py:_PLAINTEXT_GATEWAY_RESTART_PATTERNS /
+//     base.py:coerce_plaintext_gateway_command
+//                                           → PLAINTEXT_GATEWAY_RESTART_PATTERNS /
+//                                             coercePlaintextGatewayCommand (intake)
 //   gateway/platforms/base.py:_merge_caption → mergeCaption
 //   gateway/platforms/base.py:merge_pending_message_event
 //                                            → mergePendingEvent (§3.1 table)
@@ -91,6 +95,43 @@ export function getCommandArgs(event: IncomingEvent): string | null {
 		.replaceAll("\u2014\u2014", "--")
 		.replaceAll("\u2014", "--")
 		.replaceAll("\u2013", "-");
+}
+
+/**
+ * base.py:_PLAINTEXT_GATEWAY_RESTART_PATTERNS — the EXACT restart-style DM
+ * phrases that coerce to /restart. Anchored both ends, punctuation/space tail
+ * tolerated, case-insensitive; deliberately NARROW (group chats keep
+ * natural-language semantics).
+ */
+export const PLAINTEXT_GATEWAY_RESTART_PATTERNS: readonly RegExp[] = [
+	/^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$/i,
+	/^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$/i,
+	/^(?:please\s+)?restart\s+hermes[.!?\s]*$/i,
+];
+
+/**
+ * base.py:coerce_plaintext_gateway_command — rewrite a tiny set of DM
+ * plaintext admin phrases into "/restart" (IN PLACE on event.text) so
+ * high-impact operational phrases never reach the LLM/tool path, where they
+ * can trigger a self-restart from inside the running agent and wedge the
+ * gateway in draining while it waits for that same agent. Runs at message
+ * intake BEFORE command classification (base.py handle_message entry).
+ *
+ * Scope is intentionally narrow: TEXT events only, non-slash text only,
+ * chat_type === "dm" ONLY (strict — "private"/"direct" do NOT coerce here,
+ * matching the Python `!= "dm"` check), exact phrase matches only.
+ */
+export function coercePlaintextGatewayCommand(event: IncomingEvent): void {
+	if (event.messageType !== "text") return;
+	const text = (event.text ?? "").trim();
+	if (text === "" || text.startsWith("/")) return;
+	if (event.source?.chatType !== "dm") return;
+	for (const pattern of PLAINTEXT_GATEWAY_RESTART_PATTERNS) {
+		if (pattern.test(text)) {
+			event.text = "/restart";
+			return;
+		}
+	}
 }
 
 /**

@@ -175,6 +175,10 @@ export interface BusyDispatch {
 
 /**
  * run.py:_dispatch_busy_slash_command resolution ORDER (§5.4):
+ *   0. staleness sweep + SLASH-ACCESS GATE (run.py ~17282 — enforced by the
+ *      CALLER between pregate and everything else; see guards/slash-access.ts
+ *      and RunnerBusyGuard.dispatchBusySlashCommand — this pure resolver has
+ *      no event/userId to gate with),
  *   1. pre-gate (/status, /context),
  *   2. busy_handler special (mid-run variant differs from normal handler);
  *      a non-special handler key carrying known reject text rejects with it,

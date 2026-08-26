@@ -806,7 +806,7 @@ in `../09-open-questions.md` (append-only).
   pure data contracts). Shared egress.chunk-flood row passes UNMODIFIED against the new
   pipeline (labels are vendor overflow truth, not kit-only artifacts). wx-6:
   outboundMediaKind classifies by mime-PREFIX matching (extension→mime surface mirroring
-  mimetypes.guess_type): image/*→image mid_size, video/*→video beyond the old fixed list
+  mimetypes.guess_type): image/_→image mid_size, video/_→video beyond the old fixed list
   (.svg/.tiff/.ico/.heif/.avif/.m4v/.3gp…), .silk→voice override, everything else MEDIA_FILE;
   force_file_attachment gates ONLY the silk leg (vendor ORDER — forced images still IMAGE).
   wx-7: dmPolicy 'open' now resolves through openDmOptedIn (_open_dm_opted_in :1539):
@@ -1049,7 +1049,7 @@ in `../09-open-questions.md` (append-only).
   mandatory label). ircsms-2: parseIrcMessage pushes trailing bug-for-bug `if trailing:`
   (adapter.py:104) — "PRIVMSG botnick :" yields params=[botnick] and the <2-param PRIVMSG
   gate DROPS it, instead of text="" passing DM gates toward an empty dispatch; pinned by
-  a conforming parse test beside the existing _parse_irc_message parity cases. ircsms-4:
+  a conforming parse test beside the existing_parse_irc_message parity cases. ircsms-4:
   the Twilio REST wire contract is now EXPRESSED AND RECORDED — SmsRestTransport.
   postMessages carries url + authorization; SmsAdapter.wireSend composes ONCE per send
   (outside the chunk loop) `{TWILIO_API_BASE}/{account_sid}/Messages.json` +
@@ -1171,3 +1171,106 @@ in `../09-open-questions.md` (append-only).
   to ANOTHER concurrent cluster's in-flight resolution/pi_state files
   (zero imports from this cluster's modules; those files were being edited
   mid-run by the sibling agent), verified unrelated to this change.
+
+- Stability round-2 fix cluster `obligations-resume-r2` (2026-08-26): obligations scheduler moved onto
+  Hermes truth at /tmp/hermes-upstream anchors; 1 finding, zero new DECs (the change REMOVES a divergence
+  from source — DEC-026 satisfied by construction; complements DEC-053 without amending it). obl-1: after
+  ObligationRetryScheduler.tick claims rows, each claimed session key now goes through a new injected
+  clearResumePending hook BEFORE driveClaimed — bug-for-bug parity of run.py:_claim_pending_obligations
+  clearing resume_pending for EVERY claimed row up front (#91969): a session with a claimed obligation
+  already produced its answer, so boot-resume scheduling must never re-run (re-pay) that turn regardless
+  of how long redelivery takes. Per-key best-effort exactly like Hermes: empty keys skipped
+  (`if not session_key: continue`), each clear individually awaited + isolated so one failing store key
+  neither blocks remaining keys nor any send; tick stays never-throwing best-effort. Hook covers BOTH
+  claim paths (sweepRecoverable dead-owner + claimDueRetries backoff-due) since pi claims where Hermes
+  sweeps once. Lifecycle drain's clearResumePending stays pre-drain only — claim-time complement, not a
+  replacement; absent hook ⇒ prior behavior byte-identical (option is additive, all existing constructions
+  valid). NEW contracts in scheduler.test.ts ("claim-time resume-clear parity (#91969)"): exact
+  clear-before-first-send interleaving across both claim paths via a shared event journal; throwing-key
+  isolation (later keys still clear AND every claimed row still drives to delivered); empty-session-key
+  skip-but-deliver; no-claims ⇒ hook never invoked. Tests assert CONFORMING behavior only; no contracts
+  weakened. Suite this window: obligations 41/41 (37+4); whole-tree runs showed only rotating mid-flight
+  failures/tsc noise in SIBLING clusters' actively-edited files (delivery-router/runner/agent-cache/
+  slash-access — all `M` from parallel fix clusters, verified independent of this scope; converged within
+  their own windows); tsc errors mentioning obligations: 0.
+
+- Stability round-2 fix cluster `telegram-topic-bindings` (2026-08-26): ported the Telegram DM
+  topic-bindings subsystem onto Hermes truth (/tmp/hermes-upstream). pi_state: NEW telegram-topics.ts —
+  `telegram_dm_topic_mode` + `telegram_dm_topic_bindings` side tables created ONLY by the explicit
+  version-gated migration walk (`applyTelegramTopicMigration`, state_meta 'telegram_dm_topic_schema_version',
+  v1→v2 row-preserving rebuild when the session_id FK lacks ON DELETE CASCADE; startup reconcile NEVER
+  creates them, reads on absent tables degrade to false/[]/0 without migrating — hermes_state.py:
+  apply_telegram_topic_migration family incl. enable/disable/is_enabled per-(chat,user) mode rows,
+  bind with one-topic-per-session ValueError parity + linked_at preservation, newest-first list for a chat,
+  by-session reverse lookup, #31501 prune that flips mode off with the LAST binding in one txn); full
+  surface exposed on StateStore. pi_gateway/resolution: NEW telegram-topic-recovery.ts —
+  recoverTelegramTopicThreadId (run.py:_recover_telegram_topic_thread_id matrix: telegram+dm+mode gates,
+  lobby = ''/'1' only, non-lobby unknown thread ids NEVER rewritten #31086, newest-first same-user scan)
+  + TELEGRAM_GENERAL_TOPIC_IDS + telegramTopicGuardHooks factory over StateStore. guards/l1-adapter-guard:
+  handleMessage now runs the optional topicThreadRecovery+rebuildSessionKey hook pair BEFORE any keying/
+  expected-key matching (base.py:_apply_topic_recovery ahead of build_session_key): telegram-DM-only gate,
+  hook failure degrades to original key with warning, rewrite replaces event.source and RE-DERIVES the
+  session key so internally-routed stale-key events drop loudly ("after route recovery" parity) and idle/
+  busy lanes all route under the recovered lane key; pair is inert unless BOTH hooks installed. Plumbing:
+  BasePlatformAdapter.attachGuard opts + PollingAdapterCore.attachStandardGuard opts. Tests: pi_state
+  telegram-topics.test.ts (10) incl. v1→v2 rebuild + FK-cascade proof + no-table read degradation;
+  telegram-topics-two-process.test.ts (2, heavy-process project) — migration waits out a HELD BEGIN
+  IMMEDIATE via the contended-write ladder then lands converged schema, and two racing migrators converge
+  with exactly-one schema/version stamp; resolution telegram-topic-recovery.test.ts (8, real-store matrix);
+  guards l1-topic-recovery.test.ts (10) — lane-key routing, identity preservation on no-op/#31086, group
+  gate, post-recovery drop, hook-failure degradation, busy-lobby vs bound-lane isolation. Scoped suites:
+  guards/ + resolution/ + pi_state/ = 329+28 files green; tsc clean for all cluster files (residual tsc
+  errors confined to SIBLING clusters' uncommitted plaintext-coercion/slash-access test files).
+
+- Stability round-2 fix cluster `slash-access-and-busy-r2` (2026-08-26): 3 findings
+  (core-routing-10/11/12), single-owner pass over src/pi_gateway/guards toward
+  Hermes truth at /tmp/hermes-upstream anchors. core-routing-10 (HIGH): ported
+  gateway/slash_access.py whole — new guards/slash-access.ts with
+  SlashAccessPolicy (+isAdmin/canRun), _coerce_id_list/_coerce_command_list,
+  scope dm/direct/private/"" vs group, per-scope keys (group_allow_admin_from/
+  group_user_allowed_commands never cross-scope for ADMINS; dm commands fall
+  back to group list), policy_for_source over Map/record platform tables +
+  PlatformConfig {extra} wrappers, disabled-when-no-admin-list backward-compat;
+  byte-stable denial text (⛔ prefix, sorted ≤12-entry preview + …, floor
+  {help,whoami} implicit) lives ONLY here. Gate wired BETWEEN pregate and
+  dispatch on BOTH sites: run.py ~17282 fast-path inside
+  RunnerBusyGuard.dispatchBusySlashCommand (pregate status/context answer
+  pre-gate; every other resolved row — incl. /stop,/model,/approve control
+  plane — gates before special/plain/reject execution; aliases gate under the
+  CANONICAL name; unknown "/foo" never gated) via optional slashAccessPolicyOf
+  seam, and run.py ~17507 cold path as RunnerBusyGuard.checkColdPathSlashAccess
+  (known-command precondition inside; NO pregate exemption on cold — Hermes
+  parity). Denials log the run.py line shape via onWarning. core-routing-11:
+  base.py coerce_plaintext_gateway_command + _PLAINTEXT_GATEWAY_RESTART_PATTERNS
+  (3 anchored regexes) ported into guards/events.ts; wired at L1
+  AdapterSessionGuard.handleMessage ENTRY (before topic recovery/key
+  derivation/classification) when allow_gateway_control — DM-only STRICT
+  (chat_type === "dm"), TEXT-only, non-slash only → event.text="/restart" in
+  place, so busy-session phrases now take the COMMAND bypass lane instead of
+  becoming an LLM turn (self-restart wedge guard); groups/private/direct and
+  control-disabled events keep natural-language semantics. core-routing-12:
+  run.py ~17208 staleness eviction ported into RunnerBusyGuard — runningTurns
+  records (started/lastActivity/pendingSentinel), markPendingTurnStart sentinel
+  placement (never evicted — async-setup race guard), markAgentActivity
+  producer seam (get_activity_summary parity), HERMES_AGENT_TIMEOUT env bridge
+  (default 1800s, garbage fails safe like the grace bridge, ≤0 disables),
+  wall TTL max(10×t,7200)s, isStaleRunningEntry pure predicate (idle≥t OR
+  age>wallTtl); maybeEvictStaleRunningAgent fires at BOTH busy entries in run.py
+  arrival order: warns Hermes-shaped, invalidates run generation
+  ("stale_running_agent_eviction") + releases running-agent state via option
+  seams, drops local record; handlePlainTextFollowUp returns new "evicted"
+  disposition (caller takes cold path, nothing queued/steered);
+  dispatchBusySlashCommand returns null on eviction (no mid-run dispatch into a
+  dead entry). New behavior suites: slash-access.test.ts (32: coercion matrix,
+  scopes/fallback, Map+record resolution, floor/membership, byte-stable denials
+  incl. cap/ellipsis, fast+cold site wiring, alias-canonical gating, no-resolver
+  backward-compat), plaintext-coercion.test.ts (29: phrase matrix ±, strict-dm/
+  text/slash/control narrowing, L1 intake wiring proving bypass-lane dispatch),
+  stale-eviction.test.ts (18: env bridge, predicate boundaries incl.
+  equality/strict->/disabled, sweep callbacks+local release, sentinel exclusion,
+  live-turn transparency, ladder/dispatch integration). Suite: guards+
+  commands 255/255 ×repeat; full-tree vitest green EXCEPT sibling cluster's
+  in-flight streaming/gateway-stream-consumer.test.ts (zero imports from this
+  cluster; tsc errors likewise confined to that file + pi_agent_core/
+  pi_embedded/pi_state siblings mid-edit); tsc clean + layering OK + secret-
+  scope OK for all cluster files. Commit scoped to cluster paths only.

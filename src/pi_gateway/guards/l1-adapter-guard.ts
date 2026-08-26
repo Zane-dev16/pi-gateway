@@ -32,6 +32,7 @@
 
 import type { CommandRegistry } from "./busy-policy.js";
 import {
+	coercePlaintextGatewayCommand,
 	getCommand,
 	isCommand,
 	type IncomingEvent,
@@ -39,6 +40,7 @@ import {
 	type TextDebounceState,
 	canMergeTextDebounceEvents,
 } from "./events.js";
+import type { SessionSource } from "../resolution/session-key.js";
 import {
 	buildCommandLookup,
 	isInterruptThenDispatch,
@@ -150,6 +152,21 @@ export interface AdapterGuardDeps {
 		event: IncomingEvent,
 		sessionKey: string,
 	) => Promise<boolean>;
+	/**
+	 * Telegram DM topic-recovery hook (base.py:set_topic_recovery_fn — the
+	 * runner installs run.py:_recover_telegram_topic_thread_id). Called with
+	 * event.source BEFORE any keying/matching; a non-null return rewrites
+	 * source.threadId so a lobby-shaped DM reply (''/General "1") pins to the
+	 * user's last-active topic lane. Absent ⇒ hook disabled.
+	 */
+	topicThreadRecovery?: (source: SessionSource) => string | null | undefined;
+	/**
+	 * Key rebuilder applied to the REWRITTEN source after a recovery hit
+	 * (build_session_key parity: Hermes derives the session key AFTER the
+	 * rewrite, so routing follows the recovered lane). Required together with
+	 * topicThreadRecovery; without it a rewrite cannot move the key.
+	 */
+	rebuildSessionKey?: (source: SessionSource) => string;
 }
 
 function defaultSchedule(delayMs: number, fn: () => void): () => void {
@@ -224,6 +241,12 @@ export class AdapterSessionGuard {
 	private readonly busySessionHandler:
 		| ((event: IncomingEvent, sessionKey: string) => Promise<boolean>)
 		| null;
+	private readonly topicThreadRecovery:
+		| ((source: SessionSource) => string | null | undefined)
+		| null;
+	private readonly rebuildSessionKey:
+		| ((source: SessionSource) => string)
+		| null;
 
 	constructor(deps: AdapterGuardDeps) {
 		this.lookup = buildCommandLookup(deps.registry);
@@ -241,6 +264,17 @@ export class AdapterSessionGuard {
 		this.busyTextMode = deps.busyTextMode ?? "interrupt";
 		this.hasPendingClarify = deps.hasPendingClarify ?? null;
 		this.busySessionHandler = deps.busySessionHandler ?? null;
+		// The pair is only meaningful together (rewrite + re-key).
+		this.topicThreadRecovery =
+			deps.topicThreadRecovery !== undefined &&
+			deps.rebuildSessionKey !== undefined
+				? deps.topicThreadRecovery
+				: null;
+		this.rebuildSessionKey =
+			deps.topicThreadRecovery !== undefined &&
+			deps.rebuildSessionKey !== undefined
+				? deps.rebuildSessionKey
+				: null;
 	}
 
 	// -- observability --------------------------------------------------------
@@ -427,6 +461,20 @@ export class AdapterSessionGuard {
 	 * (§3); idle input sync-installs and spawns.
 	 */
 	async handleMessage(event: IncomingEvent, sessionKey: string): Promise<void> {
+		// base.py handle_message entry (base.py:6137 call shape): coerce exact DM
+		// restart phrases to "/restart" FIRST — before topic recovery, key
+		// derivation, or any classification — so a self-restart ask can never
+		// ride the LLM path inside a running turn.
+		if (allowsControl(event)) {
+			coercePlaintextGatewayCommand(event);
+		}
+
+		// base.py runs Telegram DM topic recovery BEFORE deriving/using any key
+		// (base.py:_apply_topic_recovery ahead of build_session_key): a
+		// lobby-shaped reply (''/General "1") must pin to the user's bound lane
+		// or history splits across session keys.
+		sessionKey = this.applyPreKeyTopicRecovery(event, sessionKey);
+
 		// Internally routed events carry the key they were forged for; a
 		// mismatch means misrouting — drop loudly rather than cross transcripts.
 		const expectedKey = String(
@@ -502,6 +550,41 @@ export class AdapterSessionGuard {
 		// before the task starts cannot also pass the check (grammY
 		// sequentialize pattern — set the guard synchronously, not in the task).
 		this.startSessionProcessing(event, sessionKey);
+	}
+
+	/**
+	 * base.py:_apply_topic_recovery — rewrite event.source.threadId in place
+	 * when the recovery hook returns one, then RE-DERIVE the session key from
+	 * the rewritten source. Runs ONLY for telegram DM arrivals (the exact
+	 * base.py needs_topic_recovery gate: group/forum/channel traffic never
+	 * touches the store-backed hook); hook failures degrade to the original
+	 * key. A no-rewrite result keeps both the source object and the key
+	 * untouched (identity preserved, parity of dataclasses.replace skipping).
+	 */
+	private applyPreKeyTopicRecovery(
+		event: IncomingEvent,
+		sessionKey: string,
+	): string {
+		const recover = this.topicThreadRecovery;
+		const rebuild = this.rebuildSessionKey;
+		if (recover === null || rebuild === null) return sessionKey;
+		const source = event.source;
+		if (source === undefined || source === null) return sessionKey;
+		if (source.platform !== "telegram" || source.chatType !== "dm") {
+			return sessionKey;
+		}
+		let recovered: string | null | undefined;
+		try {
+			recovered = recover(source);
+		} catch (err) {
+			this.onWarning(`Topic recovery hook failed: ${String(err)}`);
+			return sessionKey;
+		}
+		if (recovered === null || recovered === undefined) return sessionKey;
+		const currentThreadId = String(source.threadId ?? "");
+		if (String(recovered) === currentThreadId) return sessionKey;
+		event.source = { ...source, threadId: String(recovered) };
+		return rebuild(event.source);
 	}
 
 	/** Inline dispatch shared by Lane B / Lane C: run handler, send reply. */

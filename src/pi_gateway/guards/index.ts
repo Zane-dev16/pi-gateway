@@ -19,10 +19,13 @@ export {
 	type TurnContext,
 } from "./l1-adapter-guard.js";
 
-// L1/L2 shared event shapes (§3.1 merge table, debounce identity).
+// L1/L2 shared event shapes (§3.1 merge table, debounce identity, intake
+// coercion).
 export {
 	allowsGatewayControl,
 	canMergeTextDebounceEvents,
+	coercePlaintextGatewayCommand,
+	PLAINTEXT_GATEWAY_RESTART_PATTERNS,
 	getCommand,
 	getCommandArgs,
 	isCommand,
@@ -55,16 +58,45 @@ export {
 	type CommandRegistry,
 } from "./busy-policy.js";
 
-// L2 — runner-side FIFO overflow + busy dispatch execution (#28503, cap 32).
+// L2 — runner-side FIFO overflow + busy dispatch execution (#28503, cap 32)
+// + staleness eviction (run.py ~17208) + slash-access gate sites.
 export {
+	AGENT_TIMEOUT_SECONDS_ENV,
 	BUSY_QUEUE_MAX_PENDING,
+	DEFAULT_AGENT_TIMEOUT_SECONDS,
 	RunnerBusyGuard,
 	type BusyInputMode,
+	isStaleRunningEntry,
 	type PendingSlotView,
 	type PlainHandler,
+	resolveAgentTimeoutSeconds,
+	staleRunningAgentWallTtlSeconds,
 	type RunnerBusyOptions,
 	type SpecialHandler,
+	type StaleRunningEntryInputs,
 } from "./runner-busy.js";
+
+// L2 — slash-command access control (gap-audit R14; gateway/slash_access.py
+// port; byte-stable denial text lives here ONLY).
+export {
+	ALWAYS_ALLOWED_USER_COMMANDS,
+	SLASH_ACCESS_DISABLED,
+	type SlashAccessPolicy,
+	type SlashAccessSourceLike,
+	type SlashAccessGatewayConfigLike,
+	isSlashAdmin,
+	canRunSlashCommand,
+	coerceIdSet,
+	coerceCommandSet,
+	scopeForChatType,
+	keysForScope,
+	platformExtraOf,
+	policyFromExtra,
+	policyForSource,
+	slashAccessDenialText,
+	checkSlashAccess,
+	checkSourceSlashAccess,
+} from "./slash-access.js";
 
 // Layer 1 of the turn lease (DEC-004, 03 §7) — in-process registry.
 export {
