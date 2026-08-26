@@ -28,6 +28,14 @@ import {
 	type InitStoreOptions,
 } from "./reconcile.js";
 import {
+	clearLoopRow,
+	listActiveLoopRows,
+	type LoopState,
+	loadLoopRow,
+	migrateLoopRowToSession,
+	saveLoopRow,
+} from "./loops.js";
+import {
 	applyTelegramTopicMigration,
 	bindTelegramTopic,
 	type BindTelegramTopicArgs,
@@ -292,14 +300,47 @@ export class StateStore {
 		return updateTokenCounts(this.db, sessionId, delta);
 	}
 
+	// -- /loop rows (state_meta `loop:<session_id>`; loops.py persistence half)
+
+	/** Load one session's loop row, or null when absent/unparseable. */
+	loadLoop(sessionId: string): LoopState | null {
+		return loadLoopRow(this.db, sessionId);
+	}
+
+	/** Persist a loop row (no-op for empty session ids). */
+	saveLoop(
+		sessionId: string,
+		state: LoopState,
+		opts?: ExecuteWriteOptions,
+	): Promise<void> {
+		return saveLoopRow(this.db, sessionId, state, opts);
+	}
+
+	/** Mark a loop cleared (audit-preserving); false when no live row. */
+	clearLoop(sessionId: string, opts?: ExecuteWriteOptions): Promise<boolean> {
+		return clearLoopRow(this.db, sessionId, opts);
+	}
+
+	/** [(sessionId, state)] for every ACTIVE loop row ([] on DB failure). */
+	listActiveLoops(): Array<[string, LoopState]> {
+		return listActiveLoopRows(this.db);
+	}
+
+	/** Carry a loop onto a continuation session (#33618); best-effort. */
+	migrateLoopToSession(
+		oldSessionId: string,
+		newSessionId: string,
+		reason = "",
+	): Promise<boolean> {
+		return migrateLoopRowToSession(this.db, oldSessionId, newSessionId, reason);
+	}
+
 	// -- telegram DM topic bindings (explicit opt-in migration; 02 §2 side tables)
 	// SessionDB surface parity: hermes_state.py:apply_telegram_topic_migration
 	// family. Startup reconcile NEVER creates these tables — only an explicit
 	// enable/bind does; readers degrade to false/[]/undefined until then.
 
-	applyTelegramTopicMigration(
-		opts?: TelegramTopicWriteOptions,
-	): Promise<void> {
+	applyTelegramTopicMigration(opts?: TelegramTopicWriteOptions): Promise<void> {
 		return applyTelegramTopicMigration(this.db, opts);
 	}
 
