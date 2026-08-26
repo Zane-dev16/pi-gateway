@@ -1357,3 +1357,38 @@ in `../09-open-questions.md` (append-only).
   flushedDbIdx fail-closed cursor) — co-edited green at commit time. Commit
   scoped to cluster paths (+ those shared files); pi_state/index.ts left
   uncommitted (concurrent telegram-topics barrel line, file still in flight).
+
+- Stability round-2 fix cluster `agent-cache-evictability` (2026-08-26): secops-13 —
+  pressure shedding is no longer purely positional; Hermes truth ported at
+  /tmp/hermes-upstream anchors (no DEC delta needed: pure convergence). agent-cache.ts:
+  shedPressure threads an isEvictable predicate (constructor default + call-site
+  override, plan_pressure_evictions' is_evictable parameter) — candidates failing it
+  are passed over WITHOUT consuming the per-pass budget or being substituted; when no
+  candidate is evictable the cache stays over budget ("a skipped eviction costs
+  memory, a wrong one costs the user their conversation"). enforceBounds' LRU
+  ENTRY-CAP stage gains the weaker isCapEvictable gate (_enforce_agent_cache_cap
+  parity): ONLY the first `excess` snapshot positions are considered, held slots stay
+  without substitution, cache may sit over cap until the next insert. New exported
+  transcriptPersistenceCaughtUp (agent_cache_pressure.py parity): duck-typed
+  fail-closed read of a flushed-through marker vs the live transcript length.
+  runner.ts owns the closures exactly as GatewayRunner._sweep_agent_cache_under_pressure
+  builds _is_evictable: pressure gate = !isTurnActive && transcriptPersistenceCaughtUp;
+  cap gate = !isTurnActive only (reference consults no persistence predicate there).
+  CachedHostSession gains flushedDbIdx (`_last_flushed_db_idx` lifecycle parity):
+  stamped to live length at build (rebuilt-from-durable ⇒ caught up), reset to null at
+  turn start (_init_cached_agent_for_turn cursor-reset parity — covers the post-inflight
+  window between prompt() resolving and the assistant-row append), advanced ONLY on the
+  fully successful assistant append (flush-on-success parity); lease-lost refusals,
+  errored cycles (no final payload) and thrown writes leave it null ⇒ un-evictable
+  until a later turn succeeds. New public diagnostics: runner.isCached(). Tests:
+  agent-cache.test.ts +14 unit rows (gate threading/skip-without-counting/all-blocked/
+  override precedence/insert-time arming/protect-precedence, fail-closed duck-typing
+  table, cap-window semantics incl. positional regression); NEW
+  agent-cache-evictability.test.ts 4 runner-level behavior contracts driving the REAL
+  host loop against a 1-byte budget: finalized⇒sheds, errored⇒refuses-to-shed
+  (over-bound tolerated), mid-turn⇒never-shed-until-persisted (deferred faux factory),
+  cap-path held-slot survival. Shared-file note: tracked-file hunks landed via
+  cacfa9b's tree sweep (co-committed with resolution-state-r2); spec file committed as
+  67006ac. pi_agent_core 8 files/101 green; family tsc/layering/secrets clean; full
+  suite green modulo one sibling heavy-process flake (delegation/two-process SIGKILL
+  teardown timing, passes isolated).
