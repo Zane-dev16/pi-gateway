@@ -298,6 +298,92 @@ async function leaseContender(): Promise<Record<string, unknown>> {
 	};
 }
 
+/**
+ * Telegram-topic migration contention scenarios (fix cluster
+ * "telegram-topic-bindings"): the EXPLICIT schema migration must survive
+ * two-process writer contention via the contended-write ladder.
+ *
+ *   topic-mig-hold — open the REAL state.db (production init), hold BEGIN
+ *                    IMMEDIATE across marker handshakes, commit on release.
+ *   topic-mig-run  — openDatabase only (init would block on a held lock),
+ *                    then run applyTelegramTopicMigration through the ladder
+ *                    and report the converged schema facts.
+ */
+async function openRealStateDb(
+	path: string,
+	busyTimeoutMs?: number,
+): Promise<import("better-sqlite3").Database> {
+	const { openDatabase } = await import("../wal.js");
+	const openOpts: { path: string; busyTimeoutMs?: number } = { path };
+	if (busyTimeoutMs !== undefined) openOpts.busyTimeoutMs = busyTimeoutMs;
+	const opened = await openDatabase(openOpts);
+	return opened.db;
+}
+
+async function topicMigHold(): Promise<Record<string, unknown>> {
+	const { initStore } = await import("../reconcile.js");
+	const db = await openRealStateDb(String(args["db"]));
+	initStore(db); // full production startup before taking the write lock
+	db.exec("BEGIN IMMEDIATE");
+	signal(String(args["hold-marker"]));
+	await waitForMarker(String(args["release-marker"]));
+	db.exec("COMMIT");
+	db.close();
+	return { ok: true };
+}
+
+async function topicMigRun(): Promise<Record<string, unknown>> {
+	const telegramTopics = await import("../telegram-topics.js");
+	const db = await openRealStateDb(
+		String(args["db"]),
+		Number(args["busy-timeout-ms"] ?? 300),
+	);
+	try {
+		if (args["go-marker"] !== undefined) {
+			await waitForMarker(String(args["go-marker"]));
+		}
+		await telegramTopics.applyTelegramTopicMigration(db, {
+			patienceMs: Number(args["patience-ms"] ?? 30_000),
+		});
+		const versionRow = db
+			.prepare("SELECT value FROM state_meta WHERE key = ?")
+			.get(telegramTopics.TELEGRAM_TOPIC_SCHEMA_VERSION_KEY) as
+			| { value: string }
+			| undefined;
+		const tables = (
+			db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'telegram_dm%' ORDER BY name",
+				)
+				.all() as Array<{ name: string }>
+		).map((r) => r.name);
+		const indexes = (
+			db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_telegram_dm%' ORDER BY name",
+				)
+				.all() as Array<{ name: string }>
+		).map((r) => r.name);
+		const fk = db
+			.prepare("PRAGMA foreign_key_list('telegram_dm_topic_bindings')")
+			.all() as Array<Record<string, unknown>>;
+		const sessionsFk = fk.find((r) => String(r["table"]) === "sessions");
+		const integrity = db.prepare("PRAGMA integrity_check").get() as Record<
+			string,
+			unknown
+		>;
+		return {
+			version: versionRow?.value ?? null,
+			tables,
+			indexes,
+			sessionsFkOnDelete: sessionsFk ? String(sessionsFk["on_delete"]) : null,
+			integrity: integrity["integrity_check"] ?? null,
+		};
+	} finally {
+		db.close();
+	}
+}
+
 const SCENARIOS: Record<string, () => Promise<Record<string, unknown>>> = {
 	"hold-write": holdWrite,
 	"contend-write": contendWrite,
@@ -307,6 +393,8 @@ const SCENARIOS: Record<string, () => Promise<Record<string, unknown>>> = {
 	"blocking-begin": blockingBegin,
 	"lease-holder": leaseHolder,
 	"lease-contender": leaseContender,
+	"topic-mig-hold": topicMigHold,
+	"topic-mig-run": topicMigRun,
 };
 
 async function main(): Promise<number> {

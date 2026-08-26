@@ -472,7 +472,7 @@ export class A2AAdapter extends BasePlatformAdapter {
 		);
 		this.host = bind.host;
 
-		// Bind-safety escalation (proposed DEC text in manifest.ts): Hermes
+		// Bind-safety escalation (DEC-064, text formerly proposed in manifest.ts): Hermes
 		// answers an operator-requested non-loopback bind with NO configured
 		// credential by WARNING and downgrading to 127.0.0.1. The kit expresses
 		// the same refusal LOUDLY at construction (msgraph precedent: refusal
@@ -1135,7 +1135,7 @@ export class A2AAdapter extends BasePlatformAdapter {
 		// Cross-profile forwarding EXCLUDED: the reference would spawn a
 		// `hermes chat` child for local:false agents; the port never spawns
 		// OS children, so a non-local routed agent completes FAILED with a
-		// deterministic notice (proposed DEC text in the report).
+		// deterministic notice (DEC-064 scope boundary).
 		if (!agent.local) {
 			const msg = `[a2a] agent '${slug}' is not locally servable in this deployment`;
 			this.tasks.complete(taskId, STATE_FAILED, msg);

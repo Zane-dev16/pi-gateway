@@ -20,6 +20,13 @@
 //     bounded drop-oldest queue (cap 500), closed field vocabulary, safe-
 //     scalar charset, per-field 4096 cap with truncation flags, drain
 //     endpoint resetting the drop counter
+//   - the register_hook family ports adapter.py:register's SEVEN observer
+//     producers (SessionStart / UserPromptSubmit / PreToolUse /
+//     PostToolUse|Failure / Stop / interrupted-Stop / SessionEnd): each maps
+//     its host-loop kwargs onto makeActivityEvent verbatim and auto-fills
+//     the queue every turn; connect/acceptWake/turn-frame/disconnect drive
+//     the lane points the wake channel owns, emitActivityHook() is the
+//     host-loop drive seam, all observer emissions are emit-and-log
 //   - the raft CLI bridge is an EXTERNAL child process — the port NEVER
 //     spawns OS children; the command shape is exported as pure data
 //     (buildBridgeSpawnCommand) and connect() runs in wake-only mode exactly
@@ -28,7 +35,7 @@
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import {
 	BasePlatformAdapter,
@@ -136,6 +143,18 @@ export function durationMsOrNull(value: unknown): number | null {
 	return duration >= 0 ? duration : null;
 }
 
+/** Python truthiness for kwargs `or`-chains (`error_message or result`). */
+function pythonTruthy(value: unknown): boolean {
+	if (value === null || value === undefined || value === false) return false;
+	if (typeof value === "number") return value !== 0;
+	if (typeof value === "string") return value.length > 0;
+	if (Array.isArray(value)) return value.length > 0;
+	if (typeof value === "object") {
+		return Object.keys(value as Record<string, unknown>).length > 0;
+	}
+	return true;
+}
+
 function contentStringOf(
 	value: unknown,
 ): { text: string; truncated: boolean } | null {
@@ -157,9 +176,54 @@ function contentStringOf(
 	return { text, truncated: false };
 }
 
-/** json.dumps(sort_keys=True) parity for activity content rendering. */
+/**
+ * json.dumps(value, ensure_ascii=False, sort_keys=True) BYTE parity
+ * (adapter.py:_content_string :278-analog). Keys sort RECURSIVELY and the
+ * separators are Python's defaults (', ' / ': ') — a bare JSON.stringify
+ * drains compact insertion-ordered bytes ('{"b":1,"a":2}') where Hermes
+ * drains sorted+spaced ('{"a": 2, "b": 1}').
+ *
+ * Rendering notes: non-ASCII stays literal (ensure_ascii=False ≙ JSON.stringify
+ * default); NaN/±Infinity render BARE like Python's allow_nan=True default,
+ * never "null"; values without a json.dumps realization throw so the caller's
+ * try/except maps onto the None path exactly.
+ */
 export function stableJson(value: unknown): string {
-	return JSON.stringify(value, null, 0);
+	return pythonJsonStringify(value);
+}
+
+function pythonJsonStringify(value: unknown): string {
+	if (value === null) return "null";
+	switch (typeof value) {
+		case "string":
+			return JSON.stringify(value);
+		case "number":
+			if (Number.isNaN(value)) return "NaN";
+			if (value === Number.POSITIVE_INFINITY) return "Infinity";
+			if (value === Number.NEGATIVE_INFINITY) return "-Infinity";
+			return String(value);
+		case "boolean":
+			return value ? "true" : "false";
+		case "object":
+			break;
+		default:
+			// undefined / function / symbol — json.dumps raises TypeError.
+			throw new TypeError(`unserializable value of type ${typeof value}`);
+	}
+	if (Array.isArray(value)) {
+		const items = value.map((item) => pythonJsonStringify(item));
+		return `[${items.join(", ")}]`;
+	}
+	// Python sorts str keys by code point; JS default sort compares UTF-16
+	// code units — identical ordering for BMP keys (astral-key divergence is
+	// outside the vendor envelope).
+	const record = value as Record<string, unknown>;
+	const body = Object.keys(record)
+		.sort()
+		.map(
+			(key) => `${JSON.stringify(key)}: ${pythonJsonStringify(record[key])}`,
+		);
+	return `{${body.join(", ")}}`;
 }
 
 /** adapter.py:_make_activity_event — outbound telemetry event construction. */
@@ -178,8 +242,8 @@ export function makeActivityEvent(opts: {
 	const status = opts.status === "error" ? "error" : ("ok" as const);
 	const event: Record<string, unknown> = {
 		schema: RAFT_ACTIVITY_EVENT_SCHEMA,
-		eventId:
-			opts.eventId ?? `hermes-raff-${Math.random().toString(16).slice(2)}`,
+		// f"hermes-{uuid.uuid4()}" parity — a REAL UUID body, not hex slop.
+		eventId: opts.eventId ?? `hermes-${randomUUID()}`,
 		sessionId: safeScalar(opts.sessionId) ?? "unknown",
 		hookEventName: opts.hookEventName,
 		status,
@@ -212,6 +276,25 @@ export function makeActivityEvent(opts: {
 	if (truncated) event["truncated"] = true;
 	return event;
 }
+
+/** adapter.py:register(ctx) — the seven ctx.register_hook event names. */
+export const RAFT_ACTIVITY_HOOK_NAMES = [
+	"on_session_start",
+	"pre_llm_call",
+	"pre_tool_call",
+	"post_tool_call",
+	"post_llm_call",
+	"on_session_end",
+	"on_session_finalize",
+] as const;
+
+export type RaftActivityHookName = (typeof RAFT_ACTIVITY_HOOK_NAMES)[number];
+
+/** Host-loop kwargs payload (session_id, turn_id, tool_name, args, …). */
+export type RaftHookKwargs = Record<string, unknown>;
+
+/** Observer handler: emit-and-log — return values and throws are discarded. */
+export type RaftHookHandler = (kwargs: RaftHookKwargs) => unknown;
 
 /**
  * adapter.py:_validate_activity_event — RESULT-shaped validation (never a
@@ -448,6 +531,13 @@ export class RaftAdapter extends BasePlatformAdapter {
 	private connectedOnce = false;
 	private bridgeSpawned = false;
 
+	// ── observer-hook plane (adapter.py:register register_hook family) ─────
+	private readonly hookHandlers = new Map<string, RaftHookHandler[]>();
+	// _RAFT_SESSION_IDS / _RAFT_TURN_IDS / _RAFT_PROMPT_TURN_IDS analogs.
+	private readonly raftSessionIds = new Set<string>();
+	private readonly raftTurnIds = new Set<string>();
+	private readonly raftPromptTurnIds = new Set<string>();
+
 	constructor(opts: RaftAdapterOptions = {}) {
 		const config = opts.config ?? {};
 		super({
@@ -527,6 +617,21 @@ export class RaftAdapter extends BasePlatformAdapter {
 			},
 			onPickerNav: async (parsed) => ({ answerText: `nav:${parsed.family}` }),
 		});
+
+		// adapter.py:register — the SEVEN observer-hook producers. Each mirrors
+		// its _on_* anchor's kwargs→makeActivityEvent mapping verbatim so the
+		// activity queue auto-fills every turn instead of relying on external
+		// callers of reportActivity(). Registration is additive; observer
+		// handlers are emit-and-log (DEC-014) and never block the pipeline.
+		this.registerHook("on_session_start", (kw) => this.onSessionStartHook(kw));
+		this.registerHook("pre_llm_call", (kw) => this.onPreLlmCallHook(kw));
+		this.registerHook("pre_tool_call", (kw) => this.onPreToolCallHook(kw));
+		this.registerHook("post_tool_call", (kw) => this.onPostToolCallHook(kw));
+		this.registerHook("post_llm_call", (kw) => this.onPostLlmCallHook(kw));
+		this.registerHook("on_session_end", (kw) => this.onSessionEndHook(kw));
+		this.registerHook("on_session_finalize", (kw) =>
+			this.onSessionFinalizeHook(kw),
+		);
 	}
 
 	get clientToken(): string | undefined {
@@ -572,10 +677,25 @@ export class RaftAdapter extends BasePlatformAdapter {
 			this.configuredToken = this.tokenHexFn();
 		}
 		this.connectedOnce = true;
+		// Host-loop on_session_start analog: the bridge session IS this
+		// adapter's runtime session, so its start opens the telemetry lane.
+		this.emitActivityHook("on_session_start", {
+			platform: "raft",
+			session_id: this.runtimeSession,
+		});
 		return true;
 	}
 
 	override async disconnect(): Promise<void> {
+		// Host-loop on_session_finalize analog: pairs the connect-time
+		// SessionStart and forgets the session scope (only for a session that
+		// actually started — a never-connected adapter owns no session).
+		if (this.connectedOnce) {
+			this.emitActivityHook("on_session_finalize", {
+				platform: "raft",
+				session_id: this.runtimeSession,
+			});
+		}
 		this.connectedOnce = false;
 	}
 
@@ -721,9 +841,12 @@ export class RaftAdapter extends BasePlatformAdapter {
 			};
 		}
 
-		const verdict = validateActivityEvent(
-			this.parseActivityJson(input.rawBody),
-		);
+		const parsed = this.parseActivityJson(input.rawBody);
+		if (!parsed.ok) {
+			this.counters.activityInvalid += 1;
+			return { status: 400, body: { ok: false, error: "invalid_json" } };
+		}
+		const verdict = validateActivityEvent(parsed.value);
 		if (!verdict.ok) {
 			this.counters.activityInvalid += 1;
 			return { status: 400, body: { ok: false, error: verdict.error } };
@@ -760,6 +883,213 @@ export class RaftAdapter extends BasePlatformAdapter {
 		if (!verdict.ok) return false;
 		this.activityQueue.push(verdict.event);
 		return true;
+	}
+
+	// ── observer-hook plane (_report_activity / ctx.register_hook family) ────
+
+	/**
+	 * ctx.register_hook parity: additive observer registration under a
+	 * hook-event name. Unknown names are stored anyway (forward-compat —
+	 * plugins.py:register_middleware stores unknown kinds with a warning).
+	 */
+	registerHook(hookName: string, handler: RaftHookHandler): void {
+		const list = this.hookHandlers.get(hookName);
+		if (list === undefined) this.hookHandlers.set(hookName, [handler]);
+		else list.push(handler);
+	}
+
+	/**
+	 * Host-loop drive seam: fire every handler registered under the hook name
+	 * with the loop's kwargs payload. Observer semantics (DEC-014): return
+	 * values are discarded and a throwing/rejecting registrant is logged and
+	 * skipped — a lifecycle emission can NEVER break the pipeline.
+	 */
+	emitActivityHook(hookName: string, kwargs: RaftHookKwargs = {}): void {
+		const handlers = this.hookHandlers.get(hookName);
+		if (handlers === undefined) return;
+		for (const handler of [...handlers]) {
+			try {
+				const result = handler(kwargs);
+				if (
+					result !== null &&
+					result !== undefined &&
+					typeof (result as { then?: unknown }).then === "function"
+				) {
+					void (result as Promise<unknown>).catch((err: unknown) => {
+						this.logger?.debug?.(
+							`[raft] observer hook '${hookName}' rejected: ${String(err)}`,
+						);
+					});
+				}
+			} catch (err) {
+				this.logger?.debug?.(
+					`[raft] observer hook '${hookName}' failed: ${String(err)}`,
+				);
+			}
+		}
+	}
+
+	// adapter.py:_remember_raft_context
+	private rememberRaftContext(sessionId: unknown, turnId?: unknown): void {
+		const session = safeScalar(sessionId);
+		if (session !== null) this.raftSessionIds.add(session);
+		const turn = safeScalar(turnId);
+		if (turn !== null) this.raftTurnIds.add(turn);
+	}
+
+	// adapter.py:_forget_raft_context
+	private forgetRaftContext(
+		sessionId: unknown,
+		turnId?: unknown,
+		forgetSession = false,
+	): void {
+		const turn = safeScalar(turnId);
+		if (turn !== null) {
+			this.raftTurnIds.delete(turn);
+			this.raftPromptTurnIds.delete(turn);
+		}
+		if (forgetSession) {
+			const session = safeScalar(sessionId);
+			if (session !== null) this.raftSessionIds.delete(session);
+		}
+	}
+
+	// adapter.py:_is_raft_context — platform stamp re-members; otherwise the
+	// kwargs must fall inside a remembered raft session/turn scope.
+	private isRaftContext(kwargs: RaftHookKwargs): boolean {
+		if (safeScalar(kwargs["platform"]) === "raft") {
+			this.rememberRaftContext(kwargs["session_id"], kwargs["turn_id"]);
+			return true;
+		}
+		const session = safeScalar(kwargs["session_id"]);
+		const turn = safeScalar(kwargs["turn_id"]);
+		return (
+			(turn !== null && this.raftTurnIds.has(turn)) ||
+			(session !== null && this.raftSessionIds.has(session))
+		);
+	}
+
+	// ── the seven producers (each mirrors its _on_* anchor verbatim) ──────────
+
+	/** _on_session_start — SessionStart (+ RAFT_PROFILE passthrough lane). */
+	private onSessionStartHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		// Hermes registers RAFT_PROFILE env passthrough here; the scoped secret
+		// reader IS the passthrough lane on this port — probe it eagerly so an
+		// unreadable profile surface degrades at session start, never mid-turn.
+		try {
+			this.secretReader("RAFT_PROFILE");
+		} catch {
+			/* debug-only: passthrough probing never blocks the session */
+		}
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName: "SessionStart",
+				sessionId: kwargs["session_id"],
+			}),
+		);
+	}
+
+	/** _on_pre_llm_call — UserPromptSubmit, deduped per prompt turn. */
+	private onPreLlmCallHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		const turn = safeScalar(kwargs["turn_id"]);
+		if (turn !== null) {
+			if (this.raftPromptTurnIds.has(turn)) return;
+			this.raftPromptTurnIds.add(turn);
+		}
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName: "UserPromptSubmit",
+				sessionId: kwargs["session_id"],
+			}),
+		);
+	}
+
+	/** _on_pre_tool_call — PreToolUse with args rendered through stableJson. */
+	private onPreToolCallHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName: "PreToolUse",
+				sessionId: kwargs["session_id"],
+				toolName: kwargs["tool_name"],
+				toolInput: kwargs["args"],
+			}),
+		);
+	}
+
+	/** _on_post_tool_call — PostToolUse | PostToolUseFailure verdict ladder. */
+	private onPostToolCallHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		const status =
+			kwargs["status"] === "error" ||
+			kwargs["status"] === "blocked" ||
+			pythonTruthy(kwargs["error_type"])
+				? ("error" as const)
+				: ("ok" as const);
+		const errorClass = pythonTruthy(kwargs["error_type"])
+			? kwargs["error_type"]
+			: status === "error"
+				? "tool_failure"
+				: undefined;
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName:
+					status === "error" ? "PostToolUseFailure" : "PostToolUse",
+				sessionId: kwargs["session_id"],
+				status,
+				toolName: kwargs["tool_name"],
+				toolInput: kwargs["args"],
+				// error_message or result — Python truthiness, not nullishness.
+				toolOutput: pythonTruthy(kwargs["error_message"])
+					? kwargs["error_message"]
+					: kwargs["result"],
+				errorClass,
+				durationMs: kwargs["duration_ms"],
+			}),
+		);
+	}
+
+	/** _on_post_llm_call — Stop, one per completed LLM turn frame. */
+	private onPostLlmCallHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName: "Stop",
+				sessionId: kwargs["session_id"],
+			}),
+		);
+	}
+
+	/** _on_session_end — interrupted/incomplete ⇒ Stop(error); scope forget. */
+	private onSessionEndHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		const interrupted = pythonTruthy(kwargs["interrupted"]);
+		// Python `completed is False` — strict, undefined is NOT incomplete.
+		if (interrupted || kwargs["completed"] === false) {
+			this.reportActivity(
+				makeActivityEvent({
+					hookEventName: "Stop",
+					sessionId: kwargs["session_id"],
+					status: "error",
+					errorClass: interrupted ? "interrupted" : "incomplete",
+				}),
+			);
+		}
+		this.forgetRaftContext(kwargs["session_id"], kwargs["turn_id"]);
+	}
+
+	/** _on_session_finalize — SessionEnd + full session forget. */
+	private onSessionFinalizeHook(kwargs: RaftHookKwargs): void {
+		if (!this.isRaftContext(kwargs)) return;
+		this.reportActivity(
+			makeActivityEvent({
+				hookEventName: "SessionEnd",
+				sessionId: kwargs["session_id"],
+			}),
+		);
+		this.forgetRaftContext(kwargs["session_id"], kwargs["turn_id"], true);
 	}
 
 	// ── token + wake acceptance ───────────────────────────────────────────────
@@ -818,6 +1148,13 @@ export class RaftAdapter extends BasePlatformAdapter {
 		} catch {
 			return false;
 		}
+		// Host-loop pre_llm_call analog: the wake prompt was submitted
+		// downstream — turn-scoped so UserPromptSubmit lands once per delivery.
+		this.emitActivityHook("pre_llm_call", {
+			platform: "raft",
+			session_id: this.runtimeSession,
+			turn_id: messageId,
+		});
 		return true;
 	}
 
@@ -852,6 +1189,13 @@ export class RaftAdapter extends BasePlatformAdapter {
 					ctx.throwIfCancelled();
 					const reply = `reply:${text}`;
 					this.replyLog.push(reply);
+					// Host-loop post_llm_call analog: one completed wake-lane turn
+					// frame ⇒ one Stop (clarify-intercepted captures emit nothing).
+					this.emitActivityHook("post_llm_call", {
+						platform: "raft",
+						session_id: this.runtimeSession,
+						turn_id: event.messageId,
+					});
 					return reply;
 				},
 				sendReply: async (_chatId, text) => {
@@ -953,15 +1297,22 @@ export class RaftAdapter extends BasePlatformAdapter {
 		}
 	}
 
-	/** Activity-plane parse: malformed JSON maps to the vendor error string. */
-	private parseActivityJson(rawBody: Buffer): unknown {
-		// Unparseable bodies become `null`, which validateActivityEvent rejects
-		// as "must be an object" ⇒ 400 — a malformed POST never escapes as an
-		// uncaught SyntaxError (parity with parseJsonBody above).
+	/**
+	 * Activity-plane parse stage (adapter.py:_handle_activity): a
+	 * JSONDecodeError maps to the LITERAL invalid_json ack BEFORE validation —
+	 * never the generic must-be-an-object verdict. json.loads("") fails the
+	 * same way, so an empty body acks invalid_json too.
+	 */
+	private parseActivityJson(
+		rawBody: Buffer,
+	): { ok: true; value: unknown } | { ok: false } {
 		try {
-			return JSON.parse(rawBody.toString("utf8")) as unknown;
+			return {
+				ok: true,
+				value: JSON.parse(rawBody.toString("utf8")) as unknown,
+			};
 		} catch {
-			return null;
+			return { ok: false };
 		}
 	}
 

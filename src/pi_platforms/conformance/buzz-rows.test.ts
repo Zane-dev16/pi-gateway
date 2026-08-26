@@ -23,6 +23,7 @@
 //      ITS OWN named row alone while every other row passes.
 
 import { describe, expect, it } from "vitest";
+import { homedir } from "node:os";
 
 import { ManualScheduler } from "../../pi_gateway/guards/testing/manual-spawner.js";
 import { FakePlatformWire } from "./wire.js";
@@ -39,6 +40,7 @@ import {
 import {
 	makeBuzzWorld,
 	makeRealBuzzFixture,
+	eventually,
 	ALICE,
 	BOB,
 	MAIN_CHANNEL,
@@ -46,6 +48,12 @@ import {
 	type BuzzWorld,
 } from "../buzz/buzz-world.js";
 import { FakeBuzzCli } from "../buzz/cli-wire.js";
+import type { BuzzCliExecutor } from "../buzz/cli-wire.js";
+import {
+	FakeBuzzRelay,
+	ManualBuzzTiming,
+	verifyAuthEvent,
+} from "../buzz/relay-wire.js";
 import {
 	BuzzAdapter,
 	cliErrorMessage,
@@ -73,6 +81,11 @@ import {
 	FIXED_PUBKEY_HEX,
 	GENERATOR_X_HEX,
 } from "../buzz/vectors.js";
+import {
+	BUZZ_AUTH_EVENT_KIND,
+	BUZZ_CLI_TIMEOUT_S,
+	BUZZ_WS_AUTH_TIMEOUT_S,
+} from "../buzz/manifest.js";
 
 // ── shared-row harness ──────────────────────────────────────────────────────
 
@@ -163,6 +176,36 @@ function bech32EncodeNsec(data5: number[]): string {
 	return (
 		"nsec1" + [...data5, ...checksum].map((d) => BECH32_CHARSET[d]).join("")
 	);
+}
+
+const FAKE_RELAY_WS_URL = "wss://fake.buzz.example"; // FIXTURE_BUZZ_RELAY upgraded
+
+/** Wire an engine's live NIP-42 transport onto an in-memory relay + manual clock. */
+function wireLiveTransport(
+	world: BuzzWorld,
+	relay: FakeBuzzRelay,
+	timing: ManualBuzzTiming,
+): void {
+	world.engine.relaySocketFactory = relay.factory();
+	world.engine.timing = timing;
+}
+
+/** Drain the manual scheduler until a WS-driven condition materializes. */
+async function drainUntil(
+	fx: DeltaEngine,
+	predicate: () => boolean,
+): Promise<void> {
+	for (let i = 0; i < 250; i += 1) {
+		await fx.scheduler.runToEnd();
+		if (predicate()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 4));
+	}
+	throw new Error("drainUntil: condition not met");
+}
+
+/** Let every in-flight dispatch chain land (post-commit negative asserts). */
+async function settleTicks(fx: DeltaEngine, ticks = 60): Promise<void> {
+	for (let i = 0; i < ticks; i += 1) await fx.scheduler.runToEnd();
 }
 
 function convertBits8to5(bytes: number[], pad = true): number[] {
@@ -347,7 +390,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				expect(normalizeUserRef(`${ALICE}00`)).toBeNull(); // 66 chars
 				expect(normalizeUserRef(tampered)).toBeNull();
 
-				// resolveCliPath chain: configured-existing → PATH → ~/bin/buzz → "".
+				// resolveCliPath chain: configured-existing → PATH → ~/bin/buzz
+				// (EXPANDED — adapter.py Path.home()/"bin"/"buzz" parity; a literal
+				// tilde argv[0] would be unusable to the OS) → "".
 				expect(resolveCliPath("/bin/buzz", { fileExists: () => true })).toBe(
 					"/bin/buzz",
 				);
@@ -360,9 +405,22 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 						fileExists: () => false,
 					}),
 				).toBe("/usr/bin/buzz");
+				const homeFallback = `${homedir()}/bin/buzz`;
+				// The probe receives the EXPANDED path…
+				const probed: string[] = [];
 				expect(
-					resolveCliPath("", { fileExists: (p) => p === "~/bin/buzz" }),
-				).toBe("~/bin/buzz");
+					resolveCliPath("", {
+						fileExists: (p) => {
+							probed.push(p);
+							return p === homeFallback;
+						},
+					}),
+				).toBe(homeFallback);
+				expect(probed).toEqual([homeFallback]); // never "~/bin/buzz"
+				// …and the RETURN VALUE is expanded (usable argv[0]).
+				expect(resolveCliPath("", { fileExists: () => true })).toBe(
+					homeFallback,
+				);
 				expect(resolveCliPath("", {})).toBe("");
 			},
 		),
@@ -483,7 +541,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				expect(parseJsonList('[1,"two",null]')).toEqual([]);
 				expect(parseJsonList('{"a":1}')).toEqual([]);
 				expect(parseJsonList("")).toEqual([]);
-				expect(parseJsonList('[{"id":"e1"},42,"x",null]')).toEqual([{ id: "e1" }]);
+				expect(parseJsonList('[{"id":"e1"},42,"x",null]')).toEqual([
+					{ id: "e1" },
+				]);
 			},
 		),
 
@@ -508,7 +568,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 					pathProbes: { fileExists: () => true },
 					secretReader: enabledSecrets({ BUZZ_RELAY_URL: "" }),
 				});
-				await expect(noRelay.connect({ isReconnect: false })).resolves.toBe(false);
+				await expect(noRelay.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
 				expect(noRelay.fatalEvents[0]?.code).toBe("config_missing");
 				expect(noRelay.fatalEvents[0]?.retryable).toBe(false);
 				expect(noRelay.fatalEvents[0]?.detail).toContain("BUZZ_RELAY_URL");
@@ -517,7 +579,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				const noCli = new BuzzAdapter({
 					secretReader: enabledSecrets({}),
 				});
-				await expect(noCli.connect({ isReconnect: false })).resolves.toBe(false);
+				await expect(noCli.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
 				expect(noCli.fatalEvents[0]?.code).toBe("cli_missing");
 				expect(noCli.fatalEvents[0]?.retryable).toBe(false);
 
@@ -527,16 +591,18 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 					pathProbes: { fileExists: () => true },
 					secretReader: enabledSecrets({ BUZZ_PRIVATE_KEY: "" }),
 				});
-				await expect(noKey.connect({ isReconnect: false })).resolves.toBe(false);
+				await expect(noKey.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
 				expect(noKey.fatalEvents[0]?.code).toBe("config_missing");
 				expect(noKey.fatalEvents[0]?.detail).toContain("BUZZ_PRIVATE_KEY");
 
 				// 4. Profile fetch failure: retryable ⇔ exit code 2.
 				const world = makeBuzzWorld({ name: "buzz-refusal-profile" });
 				world.cli.scriptError("denied", "key not a member", 2);
-				await expect(world.engine.connect({ isReconnect: false })).resolves.toBe(
-					false,
-				);
+				await expect(
+					world.engine.connect({ isReconnect: false }),
+				).resolves.toBe(false);
 				expect(world.engine.fatalEvents[0]?.code).toBe("connect_failed");
 				expect(world.engine.fatalEvents[0]?.retryable).toBe(true);
 				expect(world.engine.fatalEvents[0]?.detail).toContain(
@@ -557,7 +623,6 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				expect(emptyProfile.engine.fatalEvents[0]?.retryable).toBe(true);
 			},
 		),
-
 
 		mk(
 			"transport.buzz.sweep-semantics",
@@ -599,9 +664,10 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				expect(world.subject.turns()).toContain("real chat");
 
 				// Fetch limit + inclusive watermark ride the messages-get argv.
-				const lastGet = cli.calls
-					.filter((c) => c.args[0] === "messages" && c.args[1] === "get")
-					.at(-1)?.args ?? [];
+				const lastGet =
+					cli.calls
+						.filter((c) => c.args[0] === "messages" && c.args[1] === "get")
+						.at(-1)?.args ?? [];
 				expect(lastGet).toContain("--limit");
 				expect(lastGet[lastGet.indexOf("--limit") + 1]).toBe("50");
 				expect(lastGet).toContain("--since");
@@ -622,7 +688,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				await engine.pollSweep();
 				await fx.scheduler.runToEnd();
 				expect(world.subject.turns()).not.toContain("stale beyond watermark");
-				expect(world.engine.inboundEventLog.some((e) => e.text === "fresh after")).toBe(true);
+				expect(
+					world.engine.inboundEventLog.some((e) => e.text === "fresh after"),
+				).toBe(true);
 
 				// Dedupe: the same event processed twice commits + dispatches once.
 				const state = engine.channelState.get(MAIN_CHANNEL)!;
@@ -658,7 +726,6 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				expect(state.seen.has("evict-0504")).toBe(true); // newest retained
 			},
 		),
-
 
 		mk(
 			"transport.buzz.gating-matrix",
@@ -780,7 +847,6 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 			},
 		),
 
-
 		mk(
 			"transport.buzz.transport-mode-resolution",
 			"buzz transport-mode resolution: auto/websocket/poll accepted (case-folded), junk resolves to AUTO; websocket-required with an unavailable handshake fails connect FATAL ws_auth_failed (retryable) and disconnects; auto FALLS BACK TO POLL; a successful WS start flips lastTransportUsed without the poll loop; transport=poll NEVER attempts the WS",
@@ -817,9 +883,9 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 					executor: wsCli.executor(),
 					wsStarter: async () => false,
 				});
-				await expect(
-					wsRequired.connect({ isReconnect: false }),
-				).resolves.toBe(false);
+				await expect(wsRequired.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
 				expect(wsRequired.fatalEvents[0]?.code).toBe("ws_auth_failed");
 				expect(wsRequired.fatalEvents[0]?.retryable).toBe(true);
 				expect(wsRequired.connectedOnce).toBe(false);
@@ -852,11 +918,12 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 					throw new Error("WS must not be attempted with transport=poll");
 				};
 				// No executor wired ⇒ the identity step fails AFTER no WS attempt.
-				await expect(pollOnly.connect({ isReconnect: false })).resolves.toBe(false);
+				await expect(pollOnly.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
 				expect(pollOnly.lastTransportUsed).toBeNull();
 			},
 		),
-
 
 		mk(
 			"transport.buzz.send-command-shapes",
@@ -887,27 +954,36 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				]);
 				expect(sendCalls[0]?.input).toBe("hello channel");
 
-
 				// DM send: SAME shape, different target.
 				const dmOk = await engine.send(DM_CHANNEL, "psst dm");
-								expect(dmOk.success).toBe(true);
+				expect(dmOk.success).toBe(true);
 				const dmCall = cli.calls
 					.filter((c) => c.args[0] === "messages" && c.args[1] === "send")
 					.find((c) => c.args.includes(DM_CHANNEL));
-								expect(dmCall?.input).toBe("psst dm");
+				expect(dmCall?.input).toBe("psst dm");
 				expect(
 					dmCall?.args.filter((a) => a !== MAIN_CHANNEL && a !== DM_CHANNEL),
 				).toEqual(["messages", "send", "--channel", "--content", "-"]);
 
 				// Reply targets ride METADATA through the kit door (thread_id is the
 				// reference key; reply_to_message_id the kit-standard one).
-				const replyMeta = await engine.send(MAIN_CHANNEL, "meta reply", undefined, {
-					thread_id: "t1",
-				});
+				const replyMeta = await engine.send(
+					MAIN_CHANNEL,
+					"meta reply",
+					undefined,
+					{
+						thread_id: "t1",
+					},
+				);
 				expect(replyMeta.success).toBe(true);
-				const replyKit = await engine.send(MAIN_CHANNEL, "kit reply", undefined, {
-					reply_to_message_id: "r9",
-				});
+				const replyKit = await engine.send(
+					MAIN_CHANNEL,
+					"kit reply",
+					undefined,
+					{
+						reply_to_message_id: "r9",
+					},
+				);
 				expect(replyKit.success).toBe(true);
 				const replyArgs = cli.calls
 					.filter((c) => c.args.includes("--reply-to"))
@@ -1044,7 +1120,6 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 			},
 		),
 
-
 		mk(
 			"transport.buzz.ack-window-commit-first",
 			"buzz ACK WINDOW (complement leg, SOURCE-PINNED): a crash BETWEEN the seen-commit and dispatch leaves the event CONSUMED-but-undelivered — later sweeps NEVER redispatch it (at-most-once downstream), while the uncommitted remainder of the batch flows normally on recovery",
@@ -1083,6 +1158,499 @@ function buzzDeltaRows(newEngine: () => DeltaEngine): ConformanceRow[] {
 				const turns = world.subject.turns();
 				expect(turns).not.toContain("c1"); // NEVER redispatched — at-most-once
 				expect(turns.filter((t) => t === "c2").length).toBe(1); // uncommitted tail flows once
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-live-handshake-subscription",
+			"buzz LIVE NIP-42 WebSocket (real loop over the injected relay medium): connect authenticates within the ready window — the relay receives ONE signed kind-22242 AUTH event answering ITS challenge (independently BIP-340-VERIFIED: id recompute + signature + challenge/relay tags), then EXACT subscription filters {'kinds':[9],'#h':[ch],'since':watermark−1} per watched channel plus membership {'kinds':[44100],'#p':[selfPubkey]}; the verifier's tamper matrix refuses wrong challenge/relay/id/sig",
+			async (fx) => {
+				const { world, engine, cli } = fx;
+				const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+				wireLiveTransport(world, relay, new ManualBuzzTiming());
+
+				// Seed a REAL watermark so the REQ since pins watermark−1 exactly.
+				cli.advanceClock(5);
+				const seeded = cli.pushEvent(MAIN_CHANNEL, {
+					pubkey: ALICE,
+					content: "@PiBot history",
+				});
+				expect(seeded.created_at).toBe(cli.nowSeconds);
+
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+				expect(engine.lastTransportUsed).toBe("websocket");
+				expect(engine.pollLoopActive).toBe(false);
+				expect(engine.wsActive).toBe(true);
+				expect(relay.connectAttempts).toBe(1);
+
+				// ONE auth event, VERIFIED independently by the fake relay.
+				expect(relay.authEvents.length).toBe(1);
+				const recorded = relay.authEvents[0]!;
+				expect(recorded.accepted).toBe(true);
+				expect(recorded.challenge).toBe("challenge-1");
+				expect(recorded.event["kind"]).toBe(BUZZ_AUTH_EVENT_KIND);
+				expect(recorded.event["pubkey"]).toBe(FIXED_PUBKEY_HEX);
+				const tags = recorded.event["tags"] as string[][];
+				expect(tags).toContainEqual(["relay", FAKE_RELAY_WS_URL]);
+				expect(tags).toContainEqual(["challenge", "challenge-1"]);
+
+				// Subscription filters: chat + membership, EXACT since math.
+				expect(relay.reqFilters).toEqual([
+					{
+						subscriptionId: "hermes-buzz-0",
+						filter: {
+							kinds: [9],
+							"#h": [MAIN_CHANNEL],
+							since: cli.nowSeconds - 1,
+						},
+					},
+					{
+						subscriptionId: "hermes-buzz-membership",
+						filter: {
+							kinds: [44100],
+							"#p": [FIXED_PUBKEY_HEX],
+							since: cli.nowSeconds - 1,
+						},
+					},
+				]);
+
+				// The acceptance gate is REAL cryptography — tamper matrix.
+				const probe = buildAuthEvent({
+					privateKey: FIXED_NSEC,
+					challenge: "c1",
+					relayUrl: "wss://r",
+					createdAt: 12_345,
+					auxHex: FIXED_AUX_HEX,
+				});
+				expect(verifyAuthEvent(probe, "c1", "wss://r").ok).toBe(true);
+				expect(verifyAuthEvent(probe, "other", "wss://r")).toEqual({
+					ok: false,
+					reason: "missing challenge tag",
+				});
+				expect(verifyAuthEvent(probe, "c1", "wss://other")).toEqual({
+					ok: false,
+					reason: "missing relay tag",
+				});
+				expect(
+					verifyAuthEvent({ ...probe, id: "00".repeat(32) }, "c1", "wss://r"),
+				).toEqual({
+					ok: false,
+					reason: "id does not match the event serialization",
+				});
+				const flippedSig = probe.sig.endsWith("0")
+					? `${probe.sig.slice(0, -1)}1`
+					: `${probe.sig.slice(0, -1)}0`;
+				expect(
+					verifyAuthEvent({ ...probe, sig: flippedSig }, "c1", "wss://r"),
+				).toEqual({ ok: false, reason: "signature verification failed" });
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-event-routing-dedupe",
+			"buzz LIVE WS EVENT routing shares THE poll-plane pipeline: kind-9 frames dispatch exactly once through dedupe+mention gating (replayed ids suppressed, unmentioned channel text gated out), malformed/non-list/NOTICE frames are contained non-fatally, and the loop stays live throughout",
+			async (fx) => {
+				const { world, engine, cli } = fx;
+				const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+				wireLiveTransport(world, relay, new ManualBuzzTiming());
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+				const createdAt = () => cli.nowSeconds;
+
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt900001",
+						kind: 9,
+						pubkey: ALICE,
+						content: "@PiBot push1",
+						created_at: createdAt(),
+						tags: [],
+					},
+				]);
+				await drainUntil(fx, () => world.subject.turns().includes("push1"));
+
+				// Replayed id → suppressed by the SHARED seen-set.
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt900001",
+						kind: 9,
+						pubkey: ALICE,
+						content: "@PiBot push1",
+						created_at: createdAt(),
+						tags: [],
+					},
+				]);
+				await drainUntil(fx, () => true); // settle ticks
+				expect(world.subject.turns().filter((t) => t === "push1").length).toBe(
+					1,
+				);
+
+				// Unmentioned channel text gated OUT (require_mention default).
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt900004",
+						kind: 9,
+						pubkey: ALICE,
+						content: "casual chat",
+						created_at: createdAt(),
+						tags: [],
+					},
+				]);
+				await drainUntil(fx, () =>
+					engine.channelState.get(MAIN_CHANNEL)!.seen.has("evt900004"),
+				);
+				expect(world.subject.turns()).not.toContain("casual chat");
+
+				// Malformed / non-list / empty frames and NOTICE are contained.
+				relay.push("not-json{");
+				relay.push([1, 2, 3]);
+				relay.push([]);
+				relay.push(["NOTICE", "relay maintenance"]);
+				await drainUntil(fx, () => true); // settle ticks
+				expect(engine.wsActive).toBe(true);
+				expect(relay.authEvents.length).toBe(1); // no re-auth happened
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-kind-filter-parity",
+			"buzz LIVE WS KIND FILTER (detector row): over the WebSocket lane — exactly like polls — non-kind-9 frames are COMMITTED-but-never-dispatched (commit-first parity) while a kind-9 control dispatches through the same subscription",
+			async (fx) => {
+				const { world, engine, cli } = fx;
+				const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+				wireLiveTransport(world, relay, new ManualBuzzTiming());
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+
+				// Positive control: kind 9 dispatches on the WS lane.
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt910001",
+						kind: 9,
+						pubkey: ALICE,
+						content: "@PiBot kindnine",
+						created_at: cli.nowSeconds,
+						tags: [],
+					},
+				]);
+				await drainUntil(fx, () => world.subject.turns().includes("kindnine"));
+
+				// THE LIE DETECTOR: housekeeping kinds never dispatch.
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt910002",
+						kind: 7,
+						pubkey: ALICE,
+						content: "@PiBot housekeeping",
+						created_at: cli.nowSeconds,
+						tags: [],
+					},
+				]);
+				await drainUntil(fx, () =>
+					engine.channelState.get(MAIN_CHANNEL)!.seen.has("evt910002"),
+				);
+				// Settle past the commit: a filter-defeating dispatch lands a few
+				// ticks AFTER the seen-commit — let it land so the detector lies
+				// nowhere.
+				await settleTicks(fx);
+				expect(world.subject.turns()).not.toContain("housekeeping");
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-closed-reconnect-backoff",
+			"buzz LIVE WS resilience (_websocket_loop backoff): CLOSED/clean closes drive bounded redial — backoff sleeps 1→2 while dials fail, RESETS to 1 after a successful re-authentication (next failure sleeps 1 again), and delivery resumes exactly-once through the resumed subscription",
+			async (fx) => {
+				const { world, engine, cli } = fx;
+				const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+				const timing = new ManualBuzzTiming();
+				wireLiveTransport(world, relay, timing);
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				); // dial 1
+
+				// Two refused dials exercise the 1→2 ladder…
+				relay.refuseNextConnections(2);
+				relay.closeCurrent(); // clean close → immediate redial (refused)
+				await eventually(() => engine.wsBackoffSleeps[0] === 1);
+				timing.fire(1);
+				await eventually(() => engine.wsBackoffSleeps[1] === 2);
+				timing.fire(2);
+				// …dial 4 succeeds; backoff RESETS to the start value.
+				await eventually(() => engine.wsActive && relay.connectAttempts >= 4);
+				expect(relay.connectAttempts).toBe(4);
+
+				// RESET PROOF: the next failure sleeps 1 again (not 4).
+				relay.refuseNextConnections(1);
+				relay.closeCurrent();
+				await eventually(() => engine.wsBackoffSleeps.length >= 3);
+				expect(engine.wsBackoffSleeps.at(-1)).toBe(1);
+				timing.fire(1);
+				await eventually(() => engine.wsActive); // dial 6 reconnects
+
+				// Delivery resumes exactly-once post-reconnect.
+				cli.advanceClock(1);
+				relay.push([
+					"EVENT",
+					"hermes-buzz-0",
+					{
+						id: "evt900101",
+						kind: 9,
+						pubkey: ALICE,
+						content: "@PiBot resume1",
+						created_at: cli.nowSeconds,
+						tags: [],
+					},
+				]);
+				await drainUntil(
+					fx,
+					() =>
+						world.subject.turns().filter((t) => t === "resume1").length === 1,
+				);
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-membership-live-dm-discovery",
+			"buzz LIVE WS membership lane (kind 44100): a p-tagged membership event bumps _membership_since, triggers CLI DM rediscovery MID-SUBSCRIPTION, subscribes the new conversation as hermes-buzz-dm-N with {'kinds':[9],'#h':[dm],'since':now−1} (fresh watermark), and its chat traffic dispatches WITHOUT a mention (DM semantics)",
+			async (fx) => {
+				const { world, engine, cli } = fx;
+				const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+				wireLiveTransport(world, relay, new ManualBuzzTiming());
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+
+				const NEW_DM = "dm-mid-run-42";
+				cli.addDm(NEW_DM); // the CLI side materializes the conversation
+				cli.advanceClock(10);
+				const memCreatedAt = cli.nowSeconds;
+				relay.push([
+					"EVENT",
+					"hermes-buzz-membership",
+					{
+						id: "mem000042",
+						kind: 44100,
+						pubkey: ALICE,
+						content: "",
+						created_at: memCreatedAt,
+						tags: [["p", FIXED_PUBKEY_HEX]],
+					},
+				]);
+
+				await eventually(() =>
+					relay.reqFilters.some((r) => r.subscriptionId === "hermes-buzz-dm-2"),
+				); // subs held hermes-buzz-0 + membership ⇒ index 2
+				expect(engine.membershipSince).toBe(memCreatedAt);
+				const dmReq = relay.reqFilters.find(
+					(r) => r.subscriptionId === "hermes-buzz-dm-2",
+				)!;
+				expect(dmReq.filter).toEqual({
+					kinds: [9],
+					"#h": [NEW_DM],
+					since: cli.nowSeconds - 1, // fresh watermark = now−1
+				});
+				expect(engine.channelState.get(NEW_DM)?.chatType).toBe("dm");
+
+				// Fresh conversation dispatches FROM ITS BEGINNING, mention-free.
+				relay.push([
+					"EVENT",
+					"hermes-buzz-dm-2",
+					{
+						id: "evt900201",
+						kind: 9,
+						pubkey: ALICE,
+						content: "no mention needed",
+						created_at: cli.nowSeconds,
+						tags: [["p", FIXED_PUBKEY_HEX]],
+					},
+				]);
+				await drainUntil(fx, () =>
+					world.subject.turns().includes("no mention needed"),
+				);
+			},
+		),
+
+		mk(
+			"transport.buzz.ws-auth-failure-ladder",
+			"buzz LIVE WS auth ladder: a NOTICE-instead-of-challenge relay fails authentication into the backoff park and RECOVERS when the relay heals (auto); a relay that NEVER authenticates hits the ready window (20+5s) — pinned websocket-required fails FATAL ws_auth_failed (retryable) while auto falls back to POLL with the loop torn down",
+			async () => {
+				// Ladder legs run on BARE engines so the transport mode is PINNED
+				// exactly like the mode-resolution row pins its fixtures.
+				const mkLadderEngine = (transport: "auto" | "websocket") => {
+					const cli = new FakeBuzzCli({
+						relayUrl: FIXTURE_BUZZ_RELAY,
+						selfPubkey: FIXED_PUBKEY_HEX,
+						selfDisplayName: "PiBot",
+					});
+					cli.addChannel(MAIN_CHANNEL, "General", "the main room");
+					const relay = new FakeBuzzRelay({ url: FAKE_RELAY_WS_URL });
+					const timing = new ManualBuzzTiming();
+					const engine = new BuzzAdapter({
+						config: { cli_path: "/bin/buzz", transport },
+						pathProbes: { fileExists: () => true },
+						secretReader: (k) =>
+							k === "BUZZ_PRIVATE_KEY"
+								? FIXTURE_BUZZ_NSEC
+								: k === "BUZZ_RELAY_URL"
+									? FIXTURE_BUZZ_RELAY
+									: undefined,
+						executor: cli.executor(),
+						nowMs: () => cli.nowSeconds * 1000,
+						timing,
+					});
+					engine.relaySocketFactory = relay.factory();
+					engine.timing = timing;
+					return { engine, relay, timing };
+				};
+				// Leg A: transient auth outage recovers on the next dial.
+				{
+					const { engine, relay, timing } = mkLadderEngine("auto");
+					relay.authMode = "notice";
+					const connecting = engine.connect({ isReconnect: false });
+					await eventually(() => engine.wsBackoffSleeps[0] === 1);
+					relay.authMode = "nip42";
+					timing.fire(1);
+					await expect(connecting).resolves.toBe(true);
+					expect(engine.lastTransportUsed).toBe("websocket");
+					expect(engine.fatalEvents).toEqual([]);
+					expect(relay.connectAttempts).toBe(2);
+				}
+				// Leg B: never authenticates + pinned websocket ⇒ fatal retryable.
+				{
+					const { engine, relay, timing } = mkLadderEngine("websocket");
+					relay.authMode = "silent";
+					const connecting = engine.connect({ isReconnect: false });
+					await eventually(() => relay.connectAttempts >= 1);
+					timing.fire(BUZZ_WS_AUTH_TIMEOUT_S + 5); // the ready window
+					await expect(connecting).resolves.toBe(false);
+					expect(engine.fatalEvents[0]?.code).toBe("ws_auth_failed");
+					expect(engine.fatalEvents[0]?.retryable).toBe(true);
+					expect(engine.connectedOnce).toBe(false);
+					expect(engine.wsActive).toBe(false);
+					expect(relay.connectAttempts).toBe(1); // loop torn down, no redials
+				}
+				// Leg C: never authenticates + auto ⇒ source-truth POLL fallback.
+				{
+					const { engine, relay, timing } = mkLadderEngine("auto");
+					relay.authMode = "silent";
+					const connecting = engine.connect({ isReconnect: false });
+					await eventually(() => relay.connectAttempts >= 1);
+					timing.fire(BUZZ_WS_AUTH_TIMEOUT_S + 5);
+					await expect(connecting).resolves.toBe(true);
+					expect(engine.lastTransportUsed).toBe("poll");
+					expect(engine.pollLoopActive).toBe(true);
+					expect(engine.wsActive).toBe(false);
+				}
+			},
+		),
+
+		mk(
+			"transport.buzz.cli-executor-timeout-race",
+			'buzz CLI KILL-PARITY (_exec_buzz asyncio.wait_for): runCli races the executor against BUZZ_CLI_TIMEOUT_S=30 returning EXACTLY rc124 {"error":"timeout","message":"buzz <sub> timed out after 30s"}; the deadline ABORTS the invocation signal for cooperative executors, hung calls are contained (pollFailures++, sweep survives), fast calls pass through untouched, and loser timers never hold the event loop',
+			async () => {
+				const cli = new FakeBuzzCli({
+					relayUrl: FIXTURE_BUZZ_RELAY,
+					selfPubkey: FIXED_PUBKEY_HEX,
+					selfDisplayName: "PiBot",
+				});
+				cli.addChannel(MAIN_CHANNEL, "General", "the main room");
+				const inner = cli.executor();
+				const timing = new ManualBuzzTiming();
+				let hangTarget: "none" | "messages-get" | "users-get" = "none";
+				const releaseFns: Array<() => void> = [];
+				const capturedSignals: AbortSignal[] = [];
+				const maybeHanging: BuzzCliExecutor = async (args, call) => {
+					if (
+						(hangTarget === "messages-get" &&
+							args[0] === "messages" &&
+							args[1] === "get") ||
+						(hangTarget === "users-get" && args[0] === "users")
+					) {
+						capturedSignals.push(call.signal as AbortSignal);
+						return new Promise((resolve) => {
+							releaseFns.push(() =>
+								resolve({ code: 0, stdout: "[]", stderr: "" }),
+							);
+						});
+					}
+					return inner(args, call);
+				};
+				const engine = new BuzzAdapter({
+					config: { cli_path: "/bin/buzz" },
+					pathProbes: { fileExists: () => true },
+					secretReader: (k) =>
+						k === "BUZZ_PRIVATE_KEY"
+							? FIXTURE_BUZZ_NSEC
+							: k === "BUZZ_RELAY_URL"
+								? FIXTURE_BUZZ_RELAY
+								: undefined,
+					executor: maybeHanging,
+					nowMs: () => cli.nowSeconds * 1000,
+					timing,
+				});
+				// Normal calls pass straight through (identity/list/seed succeed).
+				await expect(engine.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+				expect(capturedSignals.length).toBe(0);
+				expect(timing.pendingSeconds()).toEqual([]); // deadline timers released
+
+				// A HUNG messages get: the 30s deadline wins with kill-parity bytes…
+				hangTarget = "messages-get";
+				cli.advanceClock(1);
+				cli.pushEvent(MAIN_CHANNEL, {
+					pubkey: ALICE,
+					content: "@PiBot during-hang",
+				});
+				const sweep = engine.pollSweep();
+				await eventually(() => capturedSignals.length >= 1);
+				expect(timing.pendingSeconds()).toEqual([BUZZ_CLI_TIMEOUT_S]);
+				timing.fire(BUZZ_CLI_TIMEOUT_S);
+				await sweep;
+				expect(engine.pollFailures).toBe(1);
+				expect(engine.lastCliError).toBe(
+					`timeout: buzz messages timed out after ${BUZZ_CLI_TIMEOUT_S}s (exit 124)`,
+				);
+				expect(capturedSignals[0]?.aborted).toBe(true); // cooperative kill
+				releaseFns.splice(0).forEach((release) => release()); // abandoned call settles harmlessly
+
+				// …and the DIRECT contract bytes, on any hung subcommand.
+				hangTarget = "users-get";
+				const hungCall = engine.runCli(["users", "get"]);
+				await eventually(() => capturedSignals.length >= 2);
+				timing.fire(BUZZ_CLI_TIMEOUT_S);
+				await expect(hungCall).resolves.toEqual({
+					code: 124,
+					stdout: "",
+					stderr: JSON.stringify({
+						error: "timeout",
+						message: `buzz users timed out after ${BUZZ_CLI_TIMEOUT_S}s`,
+					}),
+				});
+				hangTarget = "none";
+				releaseFns.splice(0).forEach((release) => release());
+
+				// Loop survives; fast calls unaffected; constant is manifest data.
+				expect(BUZZ_CLI_TIMEOUT_S).toBe(30);
+				expect(engine.pollLoopActive).toBe(true);
+				const res = await engine.runCli(["channels", "list"]);
+				expect(res.code).toBe(0);
+				expect(timing.pendingSeconds()).toEqual([]); // no timer leaked
 			},
 		),
 	];
@@ -1189,18 +1757,27 @@ describe("buzz conformance (04 §8 merge gate)", () => {
 		}
 
 		const rows = buzzDeltaRows(mutantEngine);
-		const target = rows.find((r) => r.id === "transport.buzz.sweep-semantics");
-		expect(target).toBeDefined();
-		const mutantReport = await runConformanceSuite({
-			subjectName: "mutant-buzz-kind-filter",
-			shape: "polling",
-			rows: [target as ConformanceRow],
-		});
-		expect(mutantReport.failed).toBe(1);
-		expect(mutantReport.rows[0]?.pass).toBe(false);
+		// TWO detectors pin the kind filter — one per inbound transport lane
+		// (poll sweep + live WebSocket routing share handleEvent, so the same
+		// lie trips whichever lane a row drives).
+		const DETECTOR_IDS = new Set<string>([
+			"transport.buzz.sweep-semantics",
+			"transport.buzz.ws-kind-filter-parity",
+		]);
+		for (const detectorId of DETECTOR_IDS) {
+			const target = rows.find((r) => r.id === detectorId);
+			expect(target).toBeDefined();
+			const mutantReport = await runConformanceSuite({
+				subjectName: `mutant-buzz-kind-filter:${detectorId}`,
+				shape: "polling",
+				rows: [target as ConformanceRow],
+			});
+			expect(mutantReport.failed).toBe(1);
+			expect(mutantReport.rows[0]?.pass).toBe(false);
+		}
 
 		// Sanity: the OTHER delta rows still pass on their own fresh engines.
-		const others = rows.filter((r) => r.id !== target?.id);
+		const others = rows.filter((r) => !DETECTOR_IDS.has(r.id as string));
 		const otherReport = await runConformanceSuite({
 			subjectName: "mutant-buzz-others",
 			shape: "polling",

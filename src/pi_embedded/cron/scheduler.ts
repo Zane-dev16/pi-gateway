@@ -131,6 +131,15 @@ export interface CronSchedulerOptions {
 export interface CronServiceHandle {
 	name: "cron";
 	stop(): Promise<void>;
+	/**
+	 * Live count of in-flight cron job executions — the gateway shutdown
+	 * drain's wait input (#60432; cron/scheduler.py:get_running_job_ids
+	 * parity). A run counts from dispatch until it fully settles (claim →
+	 * tool work → mark → deliver), so the drain can hold teardown open on
+	 * its OWN budget instead of killing the run mid-flight (#82161 — a
+	 * killed run is a permanent jobs.json failure nobody is waiting on).
+	 */
+	inflightCount(): number;
 }
 
 /** Fastest-activity composite: min idle across probes (any liveness counts). */
@@ -164,6 +173,8 @@ export class CronScheduler {
 	private loopPromise: Promise<void> | null = null;
 	private pendingSleepResolvers: Array<() => void> = [];
 	private consecutiveFailures = 0;
+	/** Job ids currently executing end-to-end (dispatch → settle). */
+	private readonly inflightJobIds = new Set<string>();
 
 	constructor(options: CronSchedulerOptions) {
 		this.store = options.store;
@@ -190,7 +201,25 @@ export class CronScheduler {
 
 	/** Structural service handle for the lifecycle services list. */
 	handle(): CronServiceHandle {
-		return { name: "cron", stop: () => this.stop() };
+		return {
+			name: "cron",
+			stop: () => this.stop(),
+			inflightCount: () => this.inflightJobIds.size,
+		};
+	}
+
+	/**
+	 * Snapshot of in-flight job ids (get_running_job_ids shape parity): a job
+	 * is a member from dispatch into runDueJob until it settles — the ENTIRE
+	 * run, tool calls and delivery included, not just the dispatch instant.
+	 */
+	get runningJobs(): readonly string[] {
+		return [...this.inflightJobIds];
+	}
+
+	/** Drain-input count (#60432): jobs mid-run right now. */
+	get inflightJobCount(): number {
+		return this.inflightJobIds.size;
 	}
 
 	/**
@@ -236,6 +265,18 @@ export class CronScheduler {
 
 	/** One due job end-to-end: claim → monitor → mark → deliver. */
 	private async runDueJob(entry: DueJob): Promise<CronRunReport> {
+		// In-flight registration spans the WHOLE run — dispatch until full
+		// settlement — so the shutdown drain sees claim attempts, tool work,
+		// marking AND delivery as active work (#60432).
+		this.inflightJobIds.add(entry.job.id);
+		try {
+			return await this.runDueJobRegistered(entry);
+		} finally {
+			this.inflightJobIds.delete(entry.job.id);
+		}
+	}
+
+	private async runDueJobRegistered(entry: DueJob): Promise<CronRunReport> {
 		const jobId = entry.job.id;
 		const nowSec = this.clock.nowSeconds();
 		const claimed = await this.store.claimJobForFire(jobId, { now: nowSec });

@@ -5,6 +5,9 @@
 // (must pass) AND against deliberate single-sanitizer mutants (MUST FAIL).
 
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	SANITIZER_CONTRACTS,
@@ -16,8 +19,9 @@ import {
 	formatRfc2822Date,
 	type SanitizerImpls,
 } from "./mime-text.js";
-import { FakeImapServer } from "./fake-mail-servers.js";
+import { FakeImapServer, FakeSmtpServer } from "./fake-mail-servers.js";
 import { EMAIL_IMAP_ID_ARGUMENT, EMAIL_PLUGIN_MANIFEST } from "./manifest.js";
+import { EmailAdapter } from "./email-adapter.js";
 import { ALICE, makeEmailWorld } from "./email-world.js";
 import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
 
@@ -489,5 +493,520 @@ describe("attachment extraction primitives (adapter.py:_extract_attachments)", (
 		const rendered = formatRfc2822Date(fixedMs);
 		expect(rendered).toMatch(/^Wed, 05 Nov 2025 06:07:08 [+-]\d{4}$/u);
 		expect(new Date(rendered).getTime()).toBe(fixedMs);
+	});
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// Stability round-2 fix cluster email-r2 — contracts pinned to Hermes truth
+// (plugins/platforms/email/adapter.py anchors cited per test).
+// ══════════════════════════════════════════════════════════════════════
+
+function adapterWithEnv(env: Record<string, string | undefined>): EmailAdapter {
+	return new EmailAdapter({
+		imap: new FakeImapServer(),
+		smtp: new FakeSmtpServer(),
+		secretReader: (key) => env[key],
+	});
+}
+
+const BASE_ENV: Record<string, string | undefined> = {
+	EMAIL_ADDRESS: "agent@fake.example",
+	EMAIL_PASSWORD: "pw",
+	EMAIL_IMAP_HOST: "imap.fake.example",
+	EMAIL_SMTP_HOST: "smtp.fake.example",
+};
+
+describe("email-r2: smtp.quit after every lane + connect test (eml-1, adapter.py :771/:1194/:1320/:1398/:1466)", () => {
+	it("connect test and every send tear the SMTP session down — zero leaked sessions", async () => {
+		const w = makeEmailWorld({ name: "em-r2-quit" });
+		await w.connectAndAwaitLive();
+		// Connect-test finally already quit its probe session.
+		expect(w.smtp.quitCalls).toBeGreaterThanOrEqual(1);
+		expect(w.smtp.leakedSessions).toBe(0);
+
+		await w.engine.sendEmail(ALICE, "one");
+		await w.engine.sendEmail(ALICE, "two");
+		expect(w.smtp.leakedSessions).toBe(0); // per-send teardown held
+	});
+
+	it("a raising quit is chased by close — delivery unaffected (finally parity)", async () => {
+		const w = makeEmailWorld({ name: "em-r2-quit-fail" });
+		await w.connectAndAwaitLive();
+		w.smtp.quitFailuresArmed = 1;
+		await w.engine.sendEmail(ALICE, "quit-hostile body");
+		expect(w.smtp.sent[w.smtp.sent.length - 1]?.bodyText).toBe(
+			"quit-hostile body",
+		);
+		expect(w.smtp.closeCalls).toBeGreaterThanOrEqual(1);
+		expect(w.smtp.leakedSessions).toBe(0);
+	});
+
+	it("the connect-test quits even when login throws; typed auth death still classified", async () => {
+		const w = makeEmailWorld({ name: "em-r2-quit-auth" });
+		w.smtp.authBad = true;
+		try {
+			await w.connectAndAwaitLive();
+			throw new Error("expected connect to fail");
+		} catch (err) {
+			expect(String((err as Error).message)).toContain("not live");
+		}
+		expect(w.subject.lifecycleSnapshot().detail).toContain("email_auth_error");
+		expect(w.smtp.quitCalls).toBe(1); // finally ran despite the throw
+		expect(w.smtp.leakedSessions).toBe(0);
+	});
+});
+
+describe("email-r2: outbound document/image lanes (eml-2, adapter.py :1204-1386)", () => {
+	it("sendDocument attaches ONE MIMEBase('application','octet-stream') base64 part preserving bytes", async () => {
+		const w = makeEmailWorld({ name: "em-r2-doc" });
+		await w.connectAndAwaitLive();
+		const dir = mkdtempSync(join(tmpdir(), "email-r2-doc-"));
+		try {
+			const docPath = join(dir, "report.pdf");
+			const bytes = Buffer.from("%PDF-1.4 attachment-bytes-éè");
+			writeFileSync(docPath, bytes);
+			const result = await w.engine.sendDocument("bob@example.com", docPath);
+			expect(result.success).toBe(true);
+			const sent = w.smtp.sent[w.smtp.sent.length - 1];
+			expect(sent?.subject).toBe("Re: Hermes Agent");
+			expect(sent?.attachments).toHaveLength(1);
+			const att = sent?.attachments[0];
+			expect(att?.contentType).toBe("application/octet-stream");
+			expect(att?.filename).toBe("report.pdf");
+			expect(
+				Buffer.from(att?.payloadBase64 ?? "", "base64").equals(bytes),
+			).toBe(true);
+			expect(w.smtp.leakedSessions).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("sendMultipleImages batches local files into ONE mail; remote URLs link in the body; missing files skip", async () => {
+		const w = makeEmailWorld({ name: "em-r2-multi" });
+		await w.connectAndAwaitLive();
+		const dir = mkdtempSync(join(tmpdir(), "email-r2-multi-"));
+		try {
+			const aPath = join(dir, "a.png");
+			const bPath = join(dir, "b.png");
+			const aBytes = Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+				Buffer.from("aaa"),
+			]);
+			writeFileSync(aPath, aBytes);
+			writeFileSync(bPath, Buffer.from("GIF89a-b-bytes"));
+
+			const result = await w.engine.sendMultipleImages("bob@example.com", [
+				`file://${aPath}`, // Hermes run.py wire format
+				bPath, // pi post-stream bare-path format
+				"https://cdn.example/cat.png", // remote → body link
+				join(dir, "missing.png"), // missing → warn+skip
+			]);
+			expect(result[0]?.success).toBe(true);
+			const sent = w.smtp.sent[w.smtp.sent.length - 1];
+			expect(sent?.attachments).toHaveLength(2);
+			expect(sent?.attachments.map((a) => a.filename)).toEqual([
+				"a.png",
+				"b.png",
+			]);
+			for (const att of sent?.attachments ?? []) {
+				expect(att.contentType).toBe("application/octet-stream");
+			}
+			expect(
+				Buffer.from(sent?.attachments[0]?.payloadBase64 ?? "", "base64").equals(
+					aBytes,
+				),
+			).toBe(true);
+			expect(sent?.bodyText).toBe("Image: https://cdn.example/cat.png");
+			expect(sent?.to).toBe("bob@example.com");
+			expect(w.smtp.leakedSessions).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("sendDocument of an unreadable path fails gracefully with an error result", async () => {
+		const w = makeEmailWorld({ name: "em-r2-doc-miss" });
+		await w.connectAndAwaitLive();
+		const result = await w.engine.sendDocument(
+			"bob@example.com",
+			"/nonexistent/email-r2/missing.bin",
+		);
+		expect(result.success).toBe(false);
+		expect(result.error?.length ?? 0).toBeGreaterThan(0);
+		expect(w.smtp.sent).toHaveLength(0); // nothing half-sent
+	});
+
+	it("sendImage links the image URL into a plain body (send_image parity)", async () => {
+		const w = makeEmailWorld({ name: "em-r2-image" });
+		await w.connectAndAwaitLive();
+		await w.engine.sendImage(
+			"bob@example.com",
+			"https://cdn.example/x.png",
+			"look at this",
+		);
+		const sent = w.wire.sendsOf("bob@example.com");
+		expect(sent).toHaveLength(1); // door-1 lane (Hermes self.send parity)
+		expect(sent[0]?.content).toContain("look at this");
+		expect(sent[0]?.content).toContain("Image: https://cdn.example/x.png");
+	});
+});
+
+describe("email-r2: skip_attachments operator opt-out (eml-3, adapter.py :565/:969)", () => {
+	it("configured short-circuit drops attachment/inline parts from dispatch entirely", async () => {
+		const w = makeEmailWorld({ name: "em-r2-skipatt", skipAttachments: true });
+		await w.connectAndAwaitLive();
+		const captured: IncomingEvent[] = [];
+		const inner = w.engine.deliverInbound.bind(w.engine);
+		w.engine.deliverInbound = async (event, key) => {
+			captured.push(structuredClone(event));
+			await inner(event, key);
+		};
+		w.imap.deliver({
+			from: ALICE,
+			textBody: "clean body",
+			subject: "sa",
+			attachments: [
+				{
+					filename: "evil.exe",
+					contentType: "application/x-msdownload",
+					payload: Buffer.from("MZ"),
+				},
+			],
+		});
+		await w.runCycles(1);
+		await eventually(() =>
+			w.subject.turns().some((t) => t.includes("clean body")),
+		);
+		const evt = captured[captured.length - 1];
+		expect(evt?.messageType).toBe("text"); // no PHOTO promotion
+		expect(evt?.mediaUrls).toBeUndefined();
+		expect(evt?.mediaTypes).toBeUndefined();
+	});
+
+	it("default stays extract-everything when unset", async () => {
+		const w = makeEmailWorld({ name: "em-r2-keepatt" });
+		await w.connectAndAwaitLive();
+		const captured: IncomingEvent[] = [];
+		const inner = w.engine.deliverInbound.bind(w.engine);
+		w.engine.deliverInbound = async (event, key) => {
+			captured.push(structuredClone(event));
+			await inner(event, key);
+		};
+		w.imap.deliver({
+			from: ALICE,
+			textBody: "with docs",
+			subject: "ka",
+			attachments: [
+				{
+					filename: "notes.txt",
+					contentType: "text/plain",
+					disposition: "attachment",
+					payload: Buffer.from("hi"),
+				},
+			],
+		});
+		await w.runCycles(1);
+		await eventually(() =>
+			w.subject.turns().some((t) => t.includes("with docs")),
+		);
+		expect(captured[captured.length - 1]?.mediaUrls).toHaveLength(1);
+	});
+});
+
+describe("email-r2: IMAP teardown outside the failing try (eml-4, adapter.py _close_imap :115/:744/:919)", () => {
+	it("an armed logout abort cannot fail a fully-successful fetch or spur escalation", async () => {
+		const w = makeEmailWorld({ name: "em-r2-logout" });
+		await w.connectAndAwaitLive();
+		w.imap.deliver({
+			from: ALICE,
+			textBody: "survives logout",
+			subject: "lo1",
+		});
+		w.imap.logoutAborts = true; // EVERY logout raises IMAP4.abort
+		await w.runCycles(1);
+		await eventually(() =>
+			w.subject.turns().some((t) => t.includes("survives logout")),
+		);
+		// Pre-fix: logout INSIDE the failing try marked this fetch failed and
+		// escalated a reconnect. Vendor truth: partial success is success.
+		expect(w.engine.escalationLog).toEqual([]);
+		expect(w.subject.lifecycleSnapshot().state).not.toBe("fatal");
+	});
+
+	it("reconnect survives armed logout aborts too (_close_imap eats everything)", async () => {
+		const w = makeEmailWorld({ name: "em-r2-logout-reconn" });
+		await w.connectAndAwaitLive();
+		w.engine.disconnect();
+		w.imap.logoutAborts = true;
+		expect(await w.engine.connect({ isReconnect: true })).toBe(true);
+		expect(w.engine.isConnected).toBe(true);
+	});
+});
+
+describe("email-r2: scripted Message-ID/In-Reply-To thread through (eml-5)", () => {
+	it("parseFetchedMessage consumes ACTUAL headers for threading; replies cite them", async () => {
+		const w = makeEmailWorld({ name: "em-r2-msgid" });
+		await w.connectAndAwaitLive();
+		w.imap.deliver({
+			from: ALICE,
+			textBody: "parent body",
+			subject: "thread",
+			headers: {
+				"Message-ID": "<real-parent@mx.example>",
+				"In-Reply-To": "<grandparent@mx.example>",
+			},
+		});
+		await w.runCycles(1);
+		await eventually(() =>
+			w.subject.turns().some((t) => t.includes("parent body")),
+		);
+		await w.engine.sendEmail(ALICE, "threaded reply");
+		const sent = w.smtp.sent[w.smtp.sent.length - 1];
+		expect(sent?.headers["In-Reply-To"]).toBe("<real-parent@mx.example>");
+		expect(sent?.headers["References"]).toBe("<real-parent@mx.example>");
+	});
+
+	it("synthesized <fake-{uid}> ID remains ONLY the fallback for header-less mail", async () => {
+		const imap = new FakeImapServer();
+		const uid = imap.deliver({
+			from: ALICE,
+			textBody: "anon",
+			subject: "anon",
+		});
+		imap.login("u", "p");
+		imap.selectInbox();
+		const record = imap.uidFetchRfc822(uid);
+		expect(record.messageId).toBe(`<fake-${uid}@mx.fake.example>`);
+		expect(record.inReplyTo).toBe("");
+	});
+});
+
+describe("email-r2: blank numeric env values are unset (eml-6, adapter.py _esecret_int :78-86)", () => {
+	it("blank/whitespace ports and poll interval fall back to defaults — never port 0 or 0ms", () => {
+		const blank = adapterWithEnv({
+			...BASE_ENV,
+			EMAIL_IMAP_PORT: "",
+			EMAIL_SMTP_PORT: "   ",
+			EMAIL_POLL_INTERVAL: "\t ",
+		});
+		expect(blank.imapPort).toBe(993);
+		expect(blank.smtpPort).toBe(587);
+		expect(blank.pollIntervalMs).toBe(15_000);
+	});
+
+	it("garbage values fall back; valid integers (trimmed) parse", () => {
+		const garbage = adapterWithEnv({
+			...BASE_ENV,
+			EMAIL_IMAP_PORT: "abc",
+			EMAIL_POLL_INTERVAL: "soon",
+		});
+		expect(garbage.imapPort).toBe(993);
+		expect(garbage.pollIntervalMs).toBe(15_000);
+
+		const valid = adapterWithEnv({
+			...BASE_ENV,
+			EMAIL_IMAP_PORT: "10993",
+			EMAIL_SMTP_PORT: " 1465 ",
+			EMAIL_POLL_INTERVAL: "30",
+		});
+		expect(valid.imapPort).toBe(10993);
+		expect(valid.smtpPort).toBe(1465);
+		expect(valid.pollIntervalMs).toBe(30_000);
+	});
+});
+
+describe("email-r2: repeated Authentication-Results instances (eml-7, GHSA-rxqh get_all parity)", () => {
+	it("StoredMail preserves duplicates in wire order; collapsed view keeps dict(msg.items()) semantics", async () => {
+		const imap = new FakeImapServer();
+		const uid = imap.deliver({
+			from: ALICE,
+			textBody: "ar dup",
+			subject: "dup",
+			headers: {
+				"Authentication-Results": [
+					"attacker.example; dmarc=pass header.from=example.com",
+					"mx.fake.example; dmarc=fail policy.dmarc=reject",
+				],
+			},
+		});
+		imap.login("u", "p");
+		imap.selectInbox();
+		const record = imap.uidFetchRfc822(uid);
+		const arInstances = record.headerList.filter(
+			([k]) => k.toLowerCase() === "authentication-results",
+		);
+		expect(arInstances).toHaveLength(2); // BOTH survive — first-instance trust representable
+		expect(arInstances[0]?.[1]).toContain("attacker.example");
+		// Collapsed Record = Python dict(msg.items()): LAST instance wins.
+		expect(record.headers["Authentication-Results"]).toContain(
+			"mx.fake.example",
+		);
+	});
+
+	it("unpinned verdict trusts the FIRST instance; authserv-id pin skips injected ones", async () => {
+		// Unpinned: first-instance trust — the receiving server PREPENDS.
+		const unpinned = makeEmailWorld({
+			name: "em-r2-ar-first",
+			requireAuthenticatedSender: true,
+		});
+		await unpinned.connectAndAwaitLive();
+		unpinned.imap.deliver({
+			from: ALICE,
+			textBody: "first instance wins",
+			subject: "ar-first",
+			headers: {
+				"Authentication-Results": [
+					"attacker.example; dmarc=pass header.from=example.com",
+					"mx.fake.example; dmarc=fail policy.dmarc=reject",
+				],
+			},
+		});
+		await unpinned.runCycles(1);
+		await eventually(() =>
+			unpinned.subject.turns().some((t) => t.includes("first instance wins")),
+		);
+
+		// Pinned to the operator's server: the attacker's first instance is
+		// skipped and the genuine dmarc=fail decides — fail-closed.
+		const pinned = makeEmailWorld({
+			name: "em-r2-ar-pin",
+			requireAuthenticatedSender: true,
+			authservId: "mx.fake.example",
+		});
+		await pinned.connectAndAwaitLive();
+		pinned.imap.deliver({
+			from: ALICE,
+			textBody: "pin rejects injected",
+			subject: "ar-pin",
+			headers: {
+				"Authentication-Results": [
+					"attacker.example; dmarc=pass header.from=example.com",
+					"mx.fake.example; dmarc=fail policy.dmarc=reject",
+				],
+			},
+		});
+		await pinned.runCycles(1);
+		await new Promise<void>((r) => setTimeout(r, 60));
+		expect(
+			pinned.subject.turns().some((t) => t.includes("pin rejects injected")),
+		).toBe(false);
+
+		// Same pin ACCEPTS when the genuine instance passes.
+		pinned.imap.deliver({
+			from: ALICE,
+			textBody: "pin accepts genuine",
+			subject: "ar-pass",
+			headers: {
+				"Authentication-Results": [
+					"attacker.example; dmarc=pass header.from=evil.test",
+					"mx.fake.example; dmarc=pass header.from=example.com",
+				],
+			},
+		});
+		await pinned.runCycles(1);
+		await eventually(() =>
+			pinned.subject.turns().some((t) => t.includes("pin accepts genuine")),
+		);
+	});
+});
+
+describe("email-r2: connect() rides the A21 ladder (eml-8, adapter.py _connect_smtp :630-648)", () => {
+	it("v6-blackhole connect recovers onto IPv4 during the connection TEST itself", async () => {
+		const w = makeEmailWorld({ name: "em-r2-connect-ladder" });
+		w.smtp.resolverCandidates = [
+			{ family: 6, host: "2001:db8::bad", reachable: false },
+			{ family: 4, host: "192.0.2.10", reachable: true },
+		];
+		await w.connectAndAwaitLive(); // pre-fix: fatal email_smtp_connect_error
+		expect(w.smtp.lastCandidateFamily).toBe(4);
+		expect(w.smtp.leakedSessions).toBe(0);
+	});
+
+	it("exhausted resolution retries IPv4-only ONCE inside connect before classifying retryable", async () => {
+		const w = makeEmailWorld({ name: "em-r2-connect-dead" });
+		w.smtp.resolverCandidates = [
+			{ family: 6, host: "2001:db8::bad", reachable: false },
+		];
+		const ok = await w.engine.connect({ isReconnect: false });
+		expect(ok).toBe(false);
+		expect(w.engine.fatalCodes[0]?.code).toBe("email_smtp_connect_error");
+		expect(w.engine.fatalCodes[0]?.retryable).toBe(true);
+		// TWO attempts = the ladder ran inside connect (single shot would be 1).
+		expect(w.smtp.connectCalls).toBe(2);
+		expect(w.smtp.leakedSessions).toBe(0);
+	});
+});
+
+describe("email-r2: full-body SMTP send (eml-9, adapter.py _send_email MIMEText(body))", () => {
+	it("no SMTP-lane slice — bodies beyond the 50000 metadata cap ship whole", async () => {
+		const w = makeEmailWorld({ name: "em-r2-fullbody" });
+		await w.connectAndAwaitLive();
+		const big = "x".repeat(60_000);
+		await w.engine.sendEmail(ALICE, big);
+		expect(w.smtp.sent[w.smtp.sent.length - 1]?.bodyText).toBe(big);
+	});
+
+	it("the 50000 budget lives in deliverText policy chunking only", async () => {
+		const w = makeEmailWorld({ name: "em-r2-policy-cap" });
+		await w.connectAndAwaitLive();
+		const results = await w.subject.deliverLongText(
+			ALICE,
+			"word ".repeat(12_500),
+		);
+		expect(results.length).toBeGreaterThan(1); // chunked upstream
+		for (const r of results) expect(r.success).toBe(true);
+		const joined = w.smtp.sent
+			.slice(-results.length)
+			.map((r) => r.bodyText)
+			.join(" ");
+		for (const word of ["alpha-marker-absent"]) {
+			expect(joined.includes(word)).toBe(false);
+		}
+	});
+});
+
+describe("email-r2: EMAIL_AUTHSERV_ID secret fallback (eml-10, adapter.py :591-592)", () => {
+	it("config extra wins over the scoped secret; secret strips+lowercases", () => {
+		const viaEnv = adapterWithEnv({
+			...BASE_ENV,
+			EMAIL_AUTHSERV_ID: " MX.Fake.Example ",
+		});
+		expect(viaEnv.authservId).toBe("mx.fake.example");
+
+		const bothSet = makeEmailWorld({
+			name: "em-r2-authserv-both",
+			authservId: "Config.Example",
+			emailAuthservIdEnv: "env.example",
+		});
+		expect(bothSet.engine.authservId).toBe("config.example");
+
+		const neither = makeEmailWorld({ name: "em-r2-authserv-none" });
+		expect(neither.engine.authservId).toBe("");
+	});
+
+	it("an env-configured pin defends against an injected first A-R instance", async () => {
+		const w = makeEmailWorld({
+			name: "em-r2-authserv-gate",
+			requireAuthenticatedSender: true,
+			emailAuthservIdEnv: "mx.fake.example",
+		});
+		await w.connectAndAwaitLive();
+		w.imap.deliver({
+			from: ALICE,
+			textBody: "env pin holds",
+			subject: "env-pin",
+			headers: {
+				"Authentication-Results": [
+					"attacker.example; dmarc=pass header.from=example.com",
+					"mx.fake.example; dmarc=fail policy.dmarc=reject",
+				],
+			},
+		});
+		await w.runCycles(1);
+		await new Promise<void>((r) => setTimeout(r, 60));
+		expect(w.subject.turns().some((t) => t.includes("env pin holds"))).toBe(
+			false,
+		);
 	});
 });

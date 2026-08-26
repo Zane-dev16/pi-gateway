@@ -18,7 +18,11 @@ export * from "./watchdog.js";
 export * from "./restore-gate.js";
 export * from "./boot-recovery.js";
 export * from "./lifecycle.js";
-export type { FailedPlatformQueue } from "./reconnect-watcher.js";
+export type {
+	FailedPlatformInfo,
+	FailedPlatformQueue,
+	ReconnectHooks,
+} from "./reconnect-watcher.js";
 export {
 	createReconnectWatcherService,
 	reconnectBackoffDelayMs,

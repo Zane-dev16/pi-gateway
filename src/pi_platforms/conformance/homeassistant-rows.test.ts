@@ -56,6 +56,7 @@ import type { ConformanceSubject } from "./harness.js";
 
 import {
 	formatStateChange,
+	HA_SEND_TRUNCATES,
 	HA_WS_HEARTBEAT_MS,
 	type HaWatchConfig,
 } from "../homeassistant/manifest.js";
@@ -100,13 +101,29 @@ const STREAMING_ROW_IDS: readonly string[] = [
 	"streaming.failed-seal-still-delivers",
 ];
 
+/**
+ * Kit LOSSLESS-split family — encodes the base fence-carry splitter (full
+ * output preserved as labeled pieces). Hermes' HomeAssistantAdapter.send
+ * issues ONE persistent_notification/create POST with message=content[:4096]
+ * (adapter.py:send :424-432) — full output is NOT preserved and per-chat
+ * budget pairs don't exist on this source (fixed vendor cap). Excluded BY
+ * THE PROBE from the manifest datum (HA_SEND_TRUNCATES), never a hardcoded
+ * skip; transport.ha.rest-send-shape rows the conforming single-POST truth.
+ */
+const LOSSLESS_SPLIT_ROW_IDS: readonly string[] = [
+	"egress.chunk-flood",
+	"egress.per-chat-length-pair",
+];
+
 function computeApplicability(): {
 	streamsSupported: boolean;
 	excludedIds: string[];
 } {
 	const probe = makeSubject();
 	const streamsSupported = probe.adapter.supportsDraftStreaming() === true;
-	return { streamsSupported, excludedIds: [...STREAMING_ROW_IDS] };
+	const excludedIds = [...STREAMING_ROW_IDS];
+	if (HA_SEND_TRUNCATES) excludedIds.push(...LOSSLESS_SPLIT_ROW_IDS);
+	return { streamsSupported, excludedIds };
 }
 
 // ── real-engine world (fixture substrate) ───────────────────────────────────
@@ -826,10 +843,10 @@ function haDeltaRows(): ConformanceRow[] {
 			"transport.ha.rest-send-shape",
 			"ha: REST send shape — POST persistent_notification/create records {title:'Hermes Agent', message≤4096} + Bearer header; truncation at 4096; ≥300 maps to the CONSTRUCTED 'HTTP {status}: {body}' failure; timeout-classified failure is honest and never retried; success carries a 12-hex messageId",
 			async () => {
-				// Harness budget raised above the vendor cap so deliverLongText
-				// does NOT pre-split: the truncation observed here is the ADAPTER's
-				// own content[:MAX_MESSAGE_LENGTH] cut.
-				const w = makeEngineWorld("ha-rest-send", { scalarMaxUnits: 8192 });
+				// deliverText NEVER pre-splits (splitsLongMessages=false): any
+				// harness budget is inert; truncation to content[:4096] happens
+				// at the adapter's own content[:MAX_MESSAGE_LENGTH] door.
+				const w = makeEngineWorld("ha-rest-send");
 
 				// Success shape: path + Bearer header + verbatim title/message.
 				const ok = await w.subject.sendThroughDoor1("chat-rest", "hello ha");
@@ -855,6 +872,22 @@ function haDeltaRows(): ConformanceRow[] {
 				const truncRecord =
 					w.server.restRequests[w.server.restRequests.length - 1];
 				expect(truncRecord?.payload.message.length).toBe(4096);
+
+				// deliverLongText path: oversized content STILL ships as ONE
+				// create POST truncated to content[:4096] with the byte-exact
+				// title (splitsLongMessages=false ⇒ no chunk lane exists).
+				const postsBeforeLong = w.server.restRequests.length;
+				const longResults = await w.subject.deliverLongText(
+					"chat-long",
+					"z".repeat(5000),
+				);
+				expect(longResults).toHaveLength(1);
+				expect(longResults[0]?.success).toBe(true);
+				expect(w.server.restRequests.length).toBe(postsBeforeLong + 1);
+				const longRecord =
+					w.server.restRequests[w.server.restRequests.length - 1];
+				expect(longRecord?.payload.message).toBe("z".repeat(4096));
+				expect(longRecord?.payload.title).toBe("Hermes Agent");
 
 				// ≥300 maps to the constructed vendor error text.
 				w.server.scriptRest({
@@ -916,20 +949,21 @@ function haDeltaRows(): ConformanceRow[] {
 // ── suite wiring ─────────────────────────────────────────────────────────────
 
 describe("conformance suite — Home Assistant census port (shape: ws)", () => {
-	it("applicability is COMPUTED from capability data (streaming family excluded iff the no-edit probe closes)", () => {
+	it("applicability is COMPUTED from capability data (streaming family excluded iff the no-edit probe closes; lossless-split family excluded iff the single-POST lane truncates)", () => {
 		const { streamsSupported, excludedIds } = computeApplicability();
 		expect(streamsSupported).toBe(false); // HA_SUPPORTS_MESSAGE_EDITING=false parity
-		expect(excludedIds).toEqual(STREAMING_ROW_IDS);
+		expect(excludedIds).toEqual([
+			...STREAMING_ROW_IDS,
+			...LOSSLESS_SPLIT_ROW_IDS,
+		]);
 	});
 
 	it("passes EVERY applicable shared row against the Home Assistant subject", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const rows = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
-		// Nothing else may be silently dropped — exclusions are EXACT.
-		expect(all.length - rows.length).toBe(streamsSupported ? 0 : 3);
+		const { excludedIds } = computeApplicability();
+		// Nothing may be silently dropped — exclusions are EXACT and probe-driven.
+		const rows = all.filter((r) => !excludedIds.includes(r.id));
+		expect(all.length - rows.length).toBe(excludedIds.length);
 
 		const report = await runConformanceSuite({
 			subjectName: "homeassistant",
@@ -938,7 +972,9 @@ describe("conformance suite — Home Assistant census port (shape: ws)", () => {
 		});
 		if (report.failed > 0) console.error(formatReport(report));
 		expect(report.failed).toBe(0);
-		expect(report.passed).toBeGreaterThanOrEqual(20);
+		// 23 catalog rows minus the FIVE probe-driven exclusions (3 streaming
+		// passive + 2 lossless-split truncating).
+		expect(report.passed).toBeGreaterThanOrEqual(18);
 	});
 
 	it("passes ALL FIVE inherited ws transport rows against the REAL engine fixture (documented leg mappings)", async () => {
@@ -975,10 +1011,8 @@ describe("conformance suite — Home Assistant census port (shape: ws)", () => {
 
 	it("FULL applicable catalog is GREEN — merge-gate semantics hold (allApplicablePassed, zero deferred)", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const shared = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
+		const { excludedIds } = computeApplicability();
+		const shared = all.filter((r) => !excludedIds.includes(r.id));
 
 		const transport = makeWsRows(makeHaWsFixture());
 		const suppliedTransportRowIds = new Set(transport.map((r) => r.id));

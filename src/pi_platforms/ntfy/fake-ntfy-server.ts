@@ -1,9 +1,14 @@
 // pi_platforms/ntfy/fake-ntfy-server — the IN-PROCESS fake ntfy server
 // (04 §8: headless, NO external network). Vendor wire shapes only:
 //
-//   - subscribe(topic): returns a stream handle; the adapter awaits
-//     nextEvent() which yields {event:"message"| "keepalive", ...} records.
-//     Keepalives arrive on the 55s vendor cadence (clock-driven).
+//   - subscribe(topic, authHeaders): models the {server}/{topic}/json stream
+//     GET (adapter.py:_run_stream :233-234 / _consume_stream) as a MODELED
+//     RESPONSE OUTCOME, never a thrown error string: the server VALIDATES the
+//     presented Authorization header before admitting a reader and refuses
+//     with the vendor STATUS CODE otherwise (401 token mismatch · 404 unknown
+//     topic); admitted readers get a stream handle whose nextEvent() yields
+//     {event:"message"| "keepalive", ...} records. Keepalives arrive on the
+//     55s vendor cadence (clock-driven).
 //   - publish(topic, body, headers): captures POSTs; scripted statuses
 //     (200 with JSON id · 401 · 404 · 500); request log exposes headers so
 //     X-Tags/X-Markdown/Authorization contracts assert as DATA.
@@ -35,6 +40,15 @@ export interface PublishResponse {
 	jsonId?: string | undefined;
 	body?: string | undefined;
 }
+
+/**
+ * The modeled outcome of one {server}/{topic}/json stream GET. Fatality on
+ * the adapter side derives from `status` ALONE (adapter.py:_consume_stream
+ * :240-262 checks response.status_code) — never from error strings.
+ */
+export type NtfySubscribeOutcome =
+	| { kind: "subscribed"; stream: FakeNtfyStream }
+	| { kind: "refused"; status: number; body: string };
 
 let eventSeq = 0;
 
@@ -116,19 +130,30 @@ export class FakeNtfyServer {
 	/** Scripted publish responses consumed FIFO; exhausted ⇒ 200 + fresh id. */
 	private readonly script: PublishResponse[] = [];
 
-	authRejectMode = false;
+	/**
+	 * Token-protected topic scenario: when set, subscribers MUST present this
+	 * EXACT Authorization header value or are refused with status 401 BEFORE a
+	 * reader is admitted (vendor auth semantics — no knob short-circuit).
+	 */
+	requiredAuthHeader: string | null = null;
 	topicNotFound = false;
 	streams: FakeNtfyStream[] = [];
 	dropped = false;
+	/** Every stream GET attempt: topic + the PRESENTED auth headers. */
+	readonly subscribeLog: Array<{
+		topic: string;
+		authHeaders: Record<string, string>;
+	}> = [];
 
 	nowMs: () => number = () => Date.now();
 
 	reset(): void {
 		this.published.length = 0;
 		this.script.length = 0;
-		this.authRejectMode = false;
+		this.requiredAuthHeader = null;
 		this.topicNotFound = false;
 		this.dropped = false;
+		this.subscribeLog.length = 0;
 		for (const s of this.streams) s.close();
 		this.streams = [];
 	}
@@ -137,13 +162,25 @@ export class FakeNtfyServer {
 		this.script.push(...responses);
 	}
 
-	subscribe(topic: string): FakeNtfyStream {
-		if (this.authRejectMode) throw new Error("401 Unauthorized");
-		if (this.topicNotFound) throw new Error("404 Not Found");
+	subscribe(
+		topic: string,
+		authHeaders: Record<string, string> = {},
+	): NtfySubscribeOutcome {
+		this.subscribeLog.push({ topic, authHeaders });
+		// Validate credentials BEFORE admitting any reader (vendor semantics:
+		// the response STATUS drives fatality downstream).
+		if (this.requiredAuthHeader !== null) {
+			if (authHeaders.Authorization !== this.requiredAuthHeader) {
+				return { kind: "refused", status: 401, body: "401 Unauthorized" };
+			}
+		}
+		if (this.topicNotFound) {
+			return { kind: "refused", status: 404, body: "404 Not Found" };
+		}
 		const stream = new FakeNtfyStream(topic, this.nowMs);
 		if (!this.dropped) this.streams.push(stream);
 		else stream.close();
-		return stream;
+		return { kind: "subscribed", stream };
 	}
 
 	publish(

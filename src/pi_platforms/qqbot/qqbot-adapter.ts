@@ -265,7 +265,13 @@ const defaultByteFetch: QQByteFetch = async (req) => {
 	let url = req.url;
 	for (let hop = 0; ; hop++) {
 		await assertSafeMediaUrl(url);
-		const target = new URL(url);
+		let target: URL;
+		try {
+			target = new URL(url);
+		} catch {
+			// Unreachable: assertSafeMediaUrl parsed + gated this same string.
+			throw new Error(`Blocked unsafe media URL: ${url.slice(0, 80)}`);
+		}
 		const transport = target.protocol === "https:" ? httpsRequest : httpRequest;
 		const res = await new Promise<{
 			status: number;
@@ -1064,6 +1070,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 				intents: QQ_IDENTIFY_INTENTS,
 				shard: [0, 1],
 				properties: {
+					// DEC-060 branding tokens (Hermes: macOS/hermes-agent/hermes-agent).
 					$os: "linux",
 					$browser: "pi-gateway",
 					$device: "pi-gateway",
@@ -2531,16 +2538,6 @@ function isVoiceContentType(contentType: string, filename: string): boolean {
 		".flac",
 	];
 	return voiceExtensions.some((ext) => fn.endsWith(ext));
-}
-
-/** Cached-image extension (adapter.py ext_for_mime fallback ".jpg" shape). */
-function imageExtensionFor(contentType: string): string {
-	const ct = contentType.toLowerCase();
-	if (ct.includes("png")) return ".png";
-	if (ct.includes("gif")) return ".gif";
-	if (ct.includes("webp")) return ".webp";
-	if (ct.includes("bmp")) return ".bmp";
-	return ".jpg";
 }
 
 /** Sanitized cache filename (cache_document_from_bytes Path(...).name shape). */

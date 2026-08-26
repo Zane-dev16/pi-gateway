@@ -38,6 +38,8 @@ export interface NtfySubjectOptions {
 	spawner?: TaskSpawner | undefined;
 	scheduler?: ManualScheduler | undefined;
 	scalarMaxUnits?: number | undefined;
+	/** Config-lane token (fixture seam for token-protected topic rows). */
+	token?: string | undefined;
 	withSecret?: boolean | undefined;
 	declaredDraftStreaming?: boolean | undefined;
 	/** Test seam for the X-Markdown datum (world dual-path leg). */
@@ -65,6 +67,7 @@ export class NtfySubject implements ConformanceSubject {
 			clock: this.clock,
 			...(opts.spawner !== undefined ? { spawner: opts.spawner } : {}),
 			scalarMaxUnits: opts.scalarMaxUnits ?? 64,
+			...(opts.token !== undefined ? { config: { token: opts.token } } : {}),
 			manifestName: this.name,
 			...(opts.declaredDraftStreaming !== undefined
 				? { declaredDraftStreaming: opts.declaredDraftStreaming }
@@ -95,11 +98,7 @@ export class NtfySubject implements ConformanceSubject {
 				typeof metadata["ntfy_target_chat_id"] === "string"
 					? (metadata["ntfy_target_chat_id"] as string)
 					: topic;
-			const result = await rawWire.transmitSend(
-				logicalChatId,
-				body,
-				metadata,
-			);
+			const result = await rawWire.transmitSend(logicalChatId, body, metadata);
 			if (!result.success) return result;
 			// Mirror onto the fake HTTP surface so header contracts observe
 			// exactly what shipped (X-Tags/X-Markdown/Authorization).

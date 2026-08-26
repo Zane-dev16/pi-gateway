@@ -56,6 +56,7 @@ import type {
 } from "../../pi_gateway/guards/index.js";
 import { immediateSpawner } from "../../pi_gateway/guards/index.js";
 import type { GatewayTask } from "../../pi_gateway/guards/index.js";
+import type { SessionSource } from "../../pi_gateway/resolution/session-key.js";
 import { AdapterDisabledError } from "../kit/lifecycle-state.js";
 import type { FakeTelegramServer, FakeUpdate } from "./fake-server.js";
 import {
@@ -926,7 +927,17 @@ export class PollingAdapterCore
 	// Guard wiring + egress doors
 	// ══════════════════════════════════════════════════════════════════════
 
-	attachStandardGuard(spawner?: TaskSpawner): void {
+	attachStandardGuard(
+		spawner?: TaskSpawner,
+		opts: {
+			/** Telegram DM topic-recovery hook (run.py:_recover_telegram_topic_thread_id). */
+			topicThreadRecovery?: (
+				source: SessionSource,
+			) => string | null | undefined;
+			/** Key rebuilder applied after a recovery rewrite (build_session_key parity). */
+			rebuildSessionKey?: (source: SessionSource) => string;
+		} = {},
+	): void {
 		this.attachGuard(
 			{
 				registry: POLLING_REGISTRY,
@@ -965,6 +976,12 @@ export class PollingAdapterCore
 			{
 				spawner,
 				hasPendingClarify: (key) => this.clarifyArmedSet.has(key),
+				...(opts.topicThreadRecovery !== undefined
+					? { topicThreadRecovery: opts.topicThreadRecovery }
+					: {}),
+				...(opts.rebuildSessionKey !== undefined
+					? { rebuildSessionKey: opts.rebuildSessionKey }
+					: {}),
 			},
 		);
 	}

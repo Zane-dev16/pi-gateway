@@ -1392,3 +1392,204 @@ in `../09-open-questions.md` (append-only).
   67006ac. pi_agent_core 8 files/101 green; family tsc/layering/secrets clean; full
   suite green modulo one sibling heavy-process flake (delegation/two-process SIGKILL
   teardown timing, passes isolated).
+
+- Stability round-2 fix cluster `streaming-consumer-r2` (2026-08-26): 6 findings in
+  pi_gateway/streaming — the production GatewayStreamConsumer egress ledger, all
+  ported from /tmp/hermes-upstream gateway/stream_consumer.py at cited anchors.
+  stream-egress-1 (HIGH): stripMediaDirectivesForDisplay now runs at EVERY
+  emission boundary — edit-path frames + finalize edits/sends + sealed overflow
+  pieces + commentary (`_clean_for_display` parity) — AND before every
+  comparison: partial-silence-marker hold-back, turn-final disposition gate,
+  deliveredFinalMatches/hasDeliveredText normalization, recorded payloads
+  (`_record_turn_final_payload` normalize = clean+fence+trim). Raw MEDIA:/
+  `[[audio_as_voice]]` directives can no longer reach chats or mask a silence
+  marker from either gate. stream-egress-3: ensureClosedCodeFences ported (odd
+  ``` appends fence; complete-fence-region exclusion then odd standalone `
+  appends backtick) into flushCurrent/segment-finalize/finalize/fallback-
+  continuation/seal-head composition; DRAFT frames deliberately stay UNfenced
+  (documented divergence: pi invariant-1 hard prefix-stability would disable the
+  draft lane on mid-block ticks where Hermes tolerates connector whole-snapshot
+  re-append) plus sendDraftFrame gains the `_frame_text==_last_sent_text`no-op
+  skip so forced flushes never re-emit an unchanged snapshot. stream-egress-2:
+  commentary queues FIFO through DeltaQueue (`onCommentary` ingress;
+  ConsumerSink.sendCommentary renamed onCommentary with contract doc,
+  defaultRenderMessageEvent updated) and the drain path force-flushes buffered
+  prose first, then wraps sendCommentary in finalizeSegment resets
+  (_reset_segment_state around _send_commentary; relay native-stream shape keeps
+  ONE cumulative stream, no reset). stream-egress-4: injected runStillCurrent()
+  probed at loop top AND after every wake-up (a reset landing while parked wins
+  over the dequeued batch); abandonStream seals open native streams via new
+  optional adapter.abandonOpenDraft seam (fake records), retracts edit-path
+  previews best-effort, sets NO delivery flags. stream-egress-7: _FLUSH-barrier
+  queue item + flushPendingSync(timeoutMs=5000):Promise<boolean> — barrier forces
+  delivery past interval/threshold gates, closes the segment, settles the worker
+  before interactive prompts; run() finally-sweep wakes leftover waiters.
+  stream-egress-9: deliveredFinalMatches tri-state — payload-less split delivery
+  returns false (#78541 legacy-trust refusal), empty target null, recorded
+  mismatch falls back to hasDeliveredText over deliveredSegmentTexts/
+  deliveredCommentaryTexts + visiblePrefix (#14238/#65919). Tests:
+  gateway-stream-consumer.test.ts +20 behavior contracts across both fake shapes
+  (mutation-style for media leak/commentary-jump/stale-edit/split-trust/prompt-
+  ordering), fake-adapters waitForCount type-guard overload + failSends +
+  abandons recording; stream-events.test.ts conformed to onCommentary sink.
+  streaming 98/98; FULL SUITE 2950/2950 green ×2 runs; tsc exit 0 repo-wide.
+
+- Stability round-2 fix cluster `shutdown-drain-r2` (2026-08-26): 1 finding
+  (structure-8, MISSING_BEHAVIOR) in pi_gateway/lifecycle — cron drain moved out
+  of stop_ingress onto Hermes truth at /tmp/hermes-upstream anchors; zero new
+  DECs (the change REMOVES a divergence — resolveCronDrainBudget had zero call
+  sites since its Phase-5 landing). structure-8: stop_ingress now stops ADAPTERS
+  ONLY. The cron ticker keeps running through the whole drain while the engine's
+  awaitActiveTurns folds in-flight ticks into the wait on their OWN budget —
+  run.py:_drain_active_agents(timeout, cron_timeout) two-budget loop parity
+  (#82161/#60432): chat turns keep restart_drain_timeout=0 semantics (grace
+  default 0), in-flight runs get resolveCronDrainBudget(grace_s, floor_s,
+  {watchdogDelayS=resolveShutdownWatchdogDelayMs(graceMs), elapsedS}) with the
+  new DEFAULT_CRON_DRAIN_TIMEOUT_MS=30_000 floor (agent.cron_drain_timeout
+  default 30s parity) + opts.cronDrainTimeoutMs override; expiry ⇒ drain
+  timed_out (clean-shutdown receipt suppressed). Cron handle exposes the drain
+  input: ServiceHandle.inflightCount?: () => number (structural mirror in
+  EmbeddedServiceHandle + stage-entry mapping), backed by CronScheduler
+  inflightJobIds registered across the ENTIRE run (dispatch→claim→tool→mark→
+  deliver; get_running_job_ids parity) and surfaced as runningJobs/
+  inflightJobCount getters. AFTER executeDrain completes (watchdog disarmed —
+  Hermes joins post-wait_for_shutdown), joinEmbeddedServicesPostDrain stops
+  cron tickers FIRST then watchers, each cooperatively bounded at
+  CRON_SHUTDOWN_DRAIN_TIMEOUT_MS=65_000 (_CRON_SHUTDOWN_DRAIN_TIMEOUT=65.0
+  parity): breach logs the exact dropped-delivery warning (#58818) and gives up
+  daemon-thread style — never a hanging exit; raising stops are isolated from
+  the recorded outcome. Watchdog/forensics consistency: the budget clamp input
+  is the actually-armed leash so the extension can never overrun it (leash −
+  elapsed − CRON_DRAIN_CLEANUP_RESERVE_S ceiling; huge floors clamp to ~50s),
+  the watchdog snapshot gains cron_jobs (active_cron_jobs @ run.py:14874
+  parity), and the 65s join deliberately sits OUTSIDE the leash exactly like
+  Hermes. NEW contracts: scheduler in-flight visibility ×2 (mid-run +
+  claim-lost stale run visible through handle AND getters, released only on
+  full settlement incl. delivery tail), stage-entry mapping row, lifecycle ×6 —
+  adapters-stop-in-stop_ingress vs cron/watcher post-persist ordering, own-
+  budget wait at grace 0 (clean receipt written), budget expiry ⇒ timedOut +
+  marker suppressed + join still runs, 600s floor clamped to ≤50s under fake
+  timers with the 60s watchdog never firing, wedged ticker join gives up at
+  65s with warning, raising stop isolated; watchdog dump carries cron_jobs=1
+  and fires at exactly grace+60s despite the huge floor. Suite: lifecycle+
+  embedded slices 223+524 green; heavy-process 128/128; FULL TREE vitest
+  2957/2957 across 232 files (both projects); tsc exit 0 repo-wide; secrets
+  clean; layering clean for cluster files (pre-existing UNPLACED_LAYER
+  entrypoints/gateway-run.ts violation belongs to another cluster's untracked
+  work, present on stashed tree).
+
+- Stability round-3 fix cluster `loop-wakeup` (2026-08-26): 1 finding
+  (structure-9, MEDIUM MISSING_BEHAVIOR), single-owner port of the /loop
+  subsystem onto Hermes truth (/tmp/hermes-upstream hermes_cli/loops.py +
+  gateway/run.py:_loop_wakeup_watcher + gateway/slash_commands.py:
+  _handle_loop_command/_busy_loop_command). The frozen registry shipped /loop
+  with nothing behind it; the registered command no longer silently no-ops.
+  pi_state: NEW loops.ts — persisted loop rows in state_meta keyed
+  `loop:<session_id>` (hermes_cli/loops.py persistence half): LoopState codec
+  with snake_case BYTE-FORMAT PARITY so Hermes rows round-trip verbatim,
+  tolerant decode where Python truthiness/int()/float() coercion chains are
+  mirrored and garbage numerics THROW ⇒ corrupt rows degrade to absent (never
+  resurrect partial loops), load/save/clear (audit-preserving status=cleared),
+  listMetaPrefix with LIKE-wildcard ESCAPE parity + listActiveLoopRows,
+  migrateLoopRowToSession (#33618 rotation carry — copy to child + archive
+  parent cleared, exactly one active row per conversation); full surface on
+  StateStore. pi_embedded/loop-wakeup: NEW module — manager.ts ports LoopManager
+  whole (set/pause/resume/clear/markDone; is_due/fire_tick claim with
+  provisional next-due schedule; abandon_tick rollback; completeTick arms IN
+  HERMES ORDER: LOOP_COMPLETE own-line marker → --until judge fail-open
+  [injected seam, absent judge = ImportError arm "judge unavailable"] → --times
+  cap → max_ticks backstop PAUSE (recoverable) → reschedule from turn end;
+  self-paced digest backoff ×2-to-ceiling/floor-on-change with timestamp-strip
+  sha256 digests; Python round-half-even format_interval; parse_loop_args incl.
+  every-sugar/--times-before---until pull; dispatch_loop_command byte-stable
+  outputs; routeFromSource capture; run.py:_busy_loop_command mid-run control
+  guard + byte-exact set-reject text); watcher.ts ports _loop_wakeup_watcher —
+  supervised stage-8 scan every 15s after a 5s startup delay over active rows
+  with deferrals in run.py ARRIVAL ORDER: awaiting/due-time skip, CLI/TUI-owned
+  empty-route silent skip, adapter-missing one-time debug warn per session
+  (injected adapterFor seam), busy routing-key skip (_running_agents membership
+  parity via isSessionKeyBusy seam — production composes
+  RunnerBusyGuard.hasRunningTurn; stays due, retries next scan), active-/goal
+  owns-idle-boundary skip (goal_blocks_loop_tick injected seam), fresh is_due
+  re-read arm, fireTick → internal IncomingEvent through the NORMAL synthetic-
+  message ingress (DEC-022 push lane: metadata.gateway_session_key =
+  buildSessionKey(route-rebuilt source); derivation failure fails CLOSED stays-
+  due — pi's L1 ingress requires the explicit key) → slash-command wakeups
+  completeTick("") immediately post-dispatch (no post-turn hook path exists for
+  command dispatch), dispatcher throw ⇒ warn + abandon_tick (provisional
+  schedule stands — retry lands one cadence later, never a tight failure loop);
+  stage-entry.ts DEC-040 optional-stage wiring ("loop-wakeup-watcher",
+  construction inside start(), stoppable-handle join). Tests: pi_state/
+  loops.test.ts (21) + manager.test.ts (72) + watcher.test.ts (16): byte-format
+  round-trips, coercion/corruption matrices, all five completeTick arms incl.
+  marker own-line discipline + judge fail-open, self-paced backoff ceiling,
+  byte-stable status/dispatch texts, every watcher deferral row, slash
+  immediate-complete, abandon-and-retry-after-provisional-schedule, supervised
+  start/stop determinism on the injected clock, stage-entry degrade contract.
+  Cluster suites 109/109; FULL TREE vitest 3075/3075 across 236 files (both
+  projects); layering OK + secret-scope OK; tsc clean for all cluster files
+  (residual tsc errors confined to SIBLING cluster's untracked src/entrypoints/
+  gateway-run driver files, zero imports from this cluster).
+
+- Stability round fix cluster `composition-root` (2026-08-26): structure-7 HIGH finding closed — 'pi gateway run'
+  exists. NEW entrypoints layer (`src/entrypoints/`, rank 6 above pi_server in scripts/check-layering.mjs — the
+  literal top row of 01 §5.3; DEC-058 logged pre-implementation). gateway-run.ts composes GatewayLifecycle and
+  binds, in run.py:start_gateway order: cron ticker stage-7 entry (owned wrapper closes the jobs store at teardown,
+  releasing the jobs-file lock), embedded-extensions discovery + optional handoff/delegation/kanban watchers +
+  extra sibling entries + lifecycle.reconnectWatcherService as stage-8 entries, stage-9 AdapterEntry objects
+  DERIVED FROM pi_platforms PluginManifest requiresEnv gates (first missing scoped secret ⇒ LOUD disable with
+  secret name in the error line; factory throw ⇒ loud disable; refused connect ⇒ retryable into the failed-platform
+  queue feeding the supervised reconnect watcher) — production callers for registerAdapter previously absent;
+  installSignalHandlers() before parking; drain class → process exit code (0/75/1); early abort ⇒ dispose.
+  PluginContext registration runs lazily INSIDE stage 9 (token locks only ever grabbed AFTER the runtime-lock
+  claim) via dynamic kit import that degrades LOUDLY to a local manifest enablement walk on bare strip-only
+  runners (loadBuiltinCommandRegistry posture) — so the module itself stays strip-safe for real-child-process
+  drivers; census hosting builders live in platform-hosting.ts (telegram/ntfy/home-assistant real manifests +
+  register helpers). REAL drain overlays: flushDeliveryObligations = DeliveryLedger.prune before closeDatabase;
+  releaseLeases = sweep of THIS process's session_turn_leases rows (extractHolderPid match, foreign rows
+  untouched); notify/activeSessionKeys = drain-start snapshot of non-expired lease conversations (Hermes
+  _drain_active_agents snapshot parity) driving an injected shutdownNoticeSender per key while adapters are still
+  connected + #7536 restart-failure counting post-closeDatabase; boot sends = dead-owned pending-obligation
+  redelivery through an injected DeliverySender filtered to CONNECTED platforms only (absent platforms never spend
+  an attempt; pending rows redeliver PLAIN — crash-ambiguity parity) via ObligationRetryScheduler one-shot tick so
+  #91969 claim-time resume-clearing rides along. RESIDUALS loud-not-faked (DEC-058(3)): durable resume-pending
+  marks await the runner session-store (engine defaults stand), recovery/suspension hooks pass through only when a
+  host wires them, cron/handoff/delegation/kanban register only when hosting input exists. Tests: gateway-run.test.ts
+  9 contracts (full-stack zero-degradation startup w/ derived handle disconnect through stopIngress; missing-secret
+  adapter_disabled line carrying DRIVER_TOKEN; refused-connect queueing; self-vs-foreign lease sweep; retention GC
+  pre-close + restart-failure counts from live leases; notify per-key + loud no-transport warning; redelivery plain
+  content delivered + no-deliverable skip spending NO attempt; lost runtime-lock race ⇒ ran=false exit 1);
+  gateway-run.two-process.test.ts — real child runs runGateway end-to-end (cron+extensions+reconnect-watcher+adapter
+  entry+overlays, real signal handlers): marker-before-SIGTERM planned stop ⇒ exit 0, gateway_state=stopped, PID file
+  released, .clean_shutdown receipt written, adapter disconnected via stop_ingress handle, child-pid lease swept while
+  the foreign row survives. Suite: entrypoints 10/10; FULL TREE vitest 3075/3076 across 237 files — sole failure
+  delegation/two-process SIGKILL-close window reproduced at pristine HEAD via git worktree (2/2 failing there;
+  DEC-041 real-child-process class, environmental on this host, zero imports from this cluster); layering OK
+  (+entrypoints row) + secret-scope OK; tsc clean tree-wide (0 errors).
+
+- XREF campaign CLOSE-OUT (2026-08-26): verdict STABLE — reports/XREF-REPORT.md written.
+  326 findings → 306 fixed / 2 dismissed / 13 DEC-ratified / 5 documented defers.
+  Gates on tree of record: tsc clean, layering OK, secret-scope OK, FULL vitest
+  3076/3076 × 237 files TWICE consecutively (DEC-041). Kept-item decisions logged
+  as DEC-059..064 in ../09-open-questions.md (numbers 055..058 were consumed by
+  implementer clusters; provenance noted in the log); "proposed DEC" comments
+  swept to logged ids across raft/a2a/irc/ntfy/HA/wa-cloud/qqbot; dead code
+  removed (qqbot imageExtensionFor, ntfy write-only streamTask), qqbot byte-fetch
+  URL parse guard made explicit, fixer scratch .tmp-dbg/ deleted. Residuals:
+  tg-11/12/13 + discord-8 defers await their own DECs; personal-text-7 partially
+  closed by the nthaha-10 standalone-sender seam; upstream-sync re-audit owed on
+  XREF-BASELINE §3 drift regions.
+
+## Cross-reference conformity campaign (2026-08-26)
+
+- `hermes_conformity_xref` workflow vs upstream nousresearch/hermes-agent:
+  9 audit axes (telegram-wire flagship) -> 326 findings -> 306 fixed / 2
+  dismissed / 13 DEC-ratified (DEC-055..064 logged incl. verifier sweep of
+  implementer DECs) / 5 documented low defers (tg-11/12/13, discord-8).
+  VERDICT: STABLE — zero open high/med unjustified divergences.
+  Suite 2152 -> 3076 tests @237 files, green twice consecutively on tree of
+  record; independent orchestrator rerun green (one known pre-existing
+  token-lock SIGKILL environmental flake, reproduced at pristine HEAD via
+  worktree). High fixes verified end-to-end: transformContext pre-call repair,
+  stripMediaDirectivesForDisplay at every emission+comparison boundary,
+  gchat updateMask computation. Full ledger: reports/XREF-REPORT.md.

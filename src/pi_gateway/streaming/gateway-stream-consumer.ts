@@ -28,7 +28,33 @@
 //   - gateway/stream_consumer.py:_filter_and_accumulate/
 //       _strip_orphan_close_tags/_flush_think_buffer
 //       → consumer-side think-block scrubber behind onDelta
-//   - gateway/stream_consumer.py:delivered_final_matches
+//   - gateway/stream_consumer.py:delivered_final_matches + has_delivered_text
+//       (tri-state reconciliation; payload-less split delivery refuses legacy
+//       trust #78541; fallback matching over segment/commentary records)
+//   - gateway/stream_consumer.py:_clean_for_display
+//       → outbound/media-grammar.ts:stripMediaDirectivesForDisplay applied at
+//       EVERY emission boundary (frames, finals, commentary) and before every
+//       silence/delivered-payload comparison — raw MEDIA:/[[audio_as_voice]]
+//       directives never reach chats
+//   - gateway/stream_consumer.py:ensure_closed_code_fences
+//       → fence-balancing on persistent-surface composition (edit-path frames,
+//       finalize, fallback continuation); draft frames stay UNfenced to keep
+//       hard prefix stability (pi invariant 1 is stricter than Hermes, which
+//       tolerates connector-side whole-snapshot re-append)
+//   - gateway/stream_consumer.py:on_commentary + run() commentary branch
+//       (_reset_segment_state around _send_commentary)
+//       → commentary enqueues FIFO through DeltaQueue behind deltas; the drain
+//       path delivers buffered prose, resets segment state around the send so
+//       post-commentary prose opens a NEW bubble below
+//   - gateway/stream_consumer.py:__init__ run_still_current + run()
+//       early-abandon/_abandon_native_stream → injected staleness probe checked
+//       each drain iteration; stale runs stop editing and best-effort seal or
+//       retract the preview so post-/new or post-/stop deltas never edit into a
+//       fresh session
+//   - gateway/stream_consumer.py:flush_pending_sync/_FLUSH sentinel + run()
+//       barrier handling → flush-barrier queue item + flushPendingSync(timeout)
+//       blocking the worker until buffered prose delivers before interactive
+//       prompts
 //   - gateway/run.py:_interim_metadata                (commentary = interim lane)
 //
 // The four invariants (04 §5) this class enforces:
@@ -57,6 +83,7 @@ import {
 	type ResponseLane,
 	type SilenceAgentResult,
 } from "../outbound/response-filters.js";
+import { stripMediaDirectivesForDisplay } from "../outbound/media-grammar.js";
 import { segmentByOffsets } from "../outbound/segmentation.js";
 
 /** Observable evidence that a draft frame mutated previously-emitted content. */
@@ -111,6 +138,14 @@ export interface StreamConsumerConfig {
 	 * fresh continuation send instead of failing every flush forever.
 	 */
 	messageLimit?: number | undefined;
+	/**
+	 * Session-staleness probe (stream_consumer.py:__init__ run_still_current).
+	 * Checked at the top of EVERY drain iteration; when it returns false (the
+	 * session was reset by /new or /stop) the drain loop stops editing, seals
+	 * or retracts the preview best-effort, and returns — stale deltas never
+	 * edit into a fresh session. Defaults to "always current".
+	 */
+	runStillCurrent?: (() => boolean) | undefined;
 	log?: StreamLogger | undefined;
 	/** Injected clock for editIntervalMs decisions (flake discipline). */
 	now?: (() => number) | undefined;
@@ -126,12 +161,15 @@ interface ResolvedConfig {
 	requiresEditFinalize: boolean;
 	lane: ResponseLane;
 	messageLimit: number;
+	runStillCurrent: () => boolean;
 	now: () => number;
 }
 
 type QueueItem =
 	| { kind: "delta"; text: string }
 	| { kind: "segment-break" }
+	| { kind: "commentary"; text: string }
+	| { kind: "flush"; settle: () => void }
 	| { kind: "final-text"; text: string }
 	| { kind: "done" };
 
@@ -251,6 +289,36 @@ function stripOrphanCloseTags(text: string): string {
 }
 
 /**
+ * Append a closing fence/backtick when markers are orphaned. Port of
+ * stream_consumer.py:ensure_closed_code_fences: output truncated mid-code-
+ * block (finish_reason="length") leaves an unclosed ``` which renders the
+ * ENTIRE remainder as one code block on Discord/Slack/Matrix; an orphaned
+ * single backtick does the same for inline code.
+ *
+ * Triple-backtick: odd ``` count appends a closing fence on its own line (a
+ * stray extra fence costs a brief empty block — far cheaper than the whole
+ * message becoming one). Inline: after stripping complete ```…``` regions
+ * (and any trailing unclosed ```), an odd standalone ` count appends a
+ * closing backtick.
+ */
+export function ensureClosedCodeFences(text: string): string {
+	if (!text) return text;
+	// Step 1: balance triple-backtick code-block fences.
+	if ((text.split("```").length - 1) % 2 === 1) {
+		text = `${text.replace(/\n+$/, "")}\n\`\`\``;
+	}
+	// Step 2: balance standalone inline-code backticks OUTSIDE complete fence
+	// regions (their internal backticks must not pollute the count).
+	const withoutFences = text
+		.replace(/```[\s\S]*?```/g, "")
+		.replace(/```[^`]*$/, "");
+	if ((withoutFences.split("`").length - 1) % 2 === 1) {
+		text += "`";
+	}
+	return text;
+}
+
+/**
  * Length-aware splitter for overflow chunks (se-9): delegates to the ONE
  * offset-safe segmentation primitive (outbound/segmentation.ts) so protected
  * spans (fenced code, inline code, quotes) are never cut. Never returns an
@@ -289,6 +357,10 @@ export class GatewayStreamConsumer {
 	private deliveredSegmentTexts: string[] = [];
 	private deliveredCommentaryTexts: string[] = [];
 	private deliveredFinalText: string | null = null;
+
+	/** Live flushPendingSync waiters; settled by the drain loop or the run()
+	 * exit sweep (stream_consumer.py:_signal_flush/finally parity). */
+	private readonly pendingFlushSettles = new Set<() => void>();
 
 	// Think-block scrubber state (_in_think_block/_think_buffer parity).
 	private inThinkBlock = false;
@@ -340,6 +412,7 @@ export class GatewayStreamConsumer {
 				(config?.requiresEditFinalize ?? adapter.requiresEditFinalize) === true,
 			lane: config?.lane ?? "interactive",
 			messageLimit: config?.messageLimit ?? 0,
+			runStillCurrent: config?.runStillCurrent ?? (() => true),
 			now: config?.now ?? (() => Date.now()),
 		};
 		this.log = config?.log;
@@ -401,6 +474,61 @@ export class GatewayStreamConsumer {
 	}
 
 	/**
+	 * Thread-safe commentary ingress (stream_consumer.py:on_commentary). The
+	 * text ENQUEUES FIFO behind any pending deltas — it must never jump the
+	 * queue with a direct send, which would reorder interim beats against
+	 * buffered prose. Post-finish stragglers are dropped like deltas.
+	 */
+	onCommentary(text: string): void {
+		if (!text) return;
+		this.queue.push({ kind: "commentary", text });
+	}
+
+	/**
+	 * Block the calling (agent-worker) context until everything queued BEFORE
+	 * this point has been finalized and delivered to the platform. Port of
+	 * stream_consumer.py:flush_pending_sync: enqueues a flush-barrier item
+	 * (_FLUSH sentinel parity) behind pending deltas/commentary/segment
+	 * breaks; the drain loop delivers the buffered segment, then settles the
+	 * barrier. Needed before sending a blocking interactive prompt so the
+	 * prompt lands BELOW its buffered explanation instead of racing ahead of
+	 * it. Resolves true when the barrier was consumed within `timeoutMs`
+	 * (default 5000), false on timeout or run exit before consumption — the
+	 * caller continues either way, never hangs.
+	 */
+	flushPendingSync(timeoutMs = 5000): Promise<boolean> {
+		const budget = Math.max(0, timeoutMs);
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			const settle = (): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.pendingFlushSettles.delete(settle);
+				resolve(true);
+			};
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				this.pendingFlushSettles.delete(settle);
+				resolve(false);
+			}, budget);
+			(timer as unknown as { unref?: () => void }).unref?.();
+			this.pendingFlushSettles.add(settle);
+			// A closed queue drops the item; the run-exit sweep below settles
+			// registered waiters so the caller wakes immediately.
+			this.queue.push({ kind: "flush", settle });
+		});
+	}
+
+	/** Settle every live flush waiter (run-exit safety net; finally parity). */
+	private settleAllFlushes(): void {
+		const waiters = [...this.pendingFlushSettles];
+		this.pendingFlushSettles.clear();
+		for (const settle of waiters) settle();
+	}
+
+	/**
 	 * Signal completion. `finalText`, when provided, is the AUTHORITATIVE
 	 * completed final_response — including post-stream augmentation the
 	 * accumulator never saw — and is absorbed EXACTLY ONCE (latch below).
@@ -455,13 +583,78 @@ export class GatewayStreamConsumer {
 
 	/**
 	 * Whether the recorded turn-final payload reconciles with `finalText`.
-	 * Port of stream_consumer.py:delivered_final_matches (null = nothing was
-	 * recorded — legacy-trust rules apply upstream).
+	 * Tri-state port of stream_consumer.py:delivered_final_matches:
+	 *   - true  — the recorded payload, a delivered segment/commentary, or the
+	 *     visible prefix matches; suppressing the normal final send is safe.
+	 *   - false — a turn-final delivery was recorded but demonstrably differs,
+	 *     OR this was a payload-less split delivery (#78541: the flag alone
+	 *     must never suppress the normal final send).
+	 *   - null  — nothing comparable was recorded on a non-split path; legacy
+	 *     flag-trusting rules apply upstream.
+	 * Both sides normalize identically (display-clean + fence-close + trim) so
+	 * raw payloads reconcile against what actually reached the screen.
 	 */
 	deliveredFinalMatches(finalText: string): boolean | null {
-		const delivered = this.deliveredFinalText;
-		if (delivered === null) return null;
-		return delivered.trim() === finalText.trim();
+		const target = this.normalizeDelivered(finalText ?? "");
+		if (target === "") return null;
+		if (this.deliveredFinalText === null) {
+			// Payload-less split delivery must NOT inherit legacy trust (#78541
+			// — that combination swallowed complete replies after an early
+			// multi-message delivery).
+			if (this.splitDeliveryInternal) return false;
+			return null;
+		}
+		if (this.deliveredFinalText === target) return true;
+		// A segment break / commentary may have delivered the text earlier in
+		// the turn under a different record (has_delivered_text parity).
+		if (this.hasDeliveredText(finalText)) return true;
+		return false;
+	}
+
+	/**
+	 * Whether `text` already reached the user as visible chat content. Port of
+	 * stream_consumer.py:has_delivered_text: checks the visible prefix and
+	 * every recorded segment/commentary text (records survive segment resets
+	 * precisely so this reconciliation keeps working — #65919 review).
+	 */
+	hasDeliveredText(text: string): boolean {
+		const target = this.cleanForDisplay(text ?? "").trim();
+		if (target === "") return false;
+		if (this.visiblePrefix().trim() === target) return true;
+		return [
+			...this.deliveredCommentaryTexts,
+			...this.deliveredSegmentTexts,
+		].some((sent) => sent.trim() === target);
+	}
+
+	/** Visible text already shown in the streamed message (_visible_prefix). */
+	private visiblePrefix(): string {
+		let prefix = this.lastSentText;
+		const { cursor } = this.cfg;
+		if (cursor.length > 0 && prefix.endsWith(cursor)) {
+			prefix = prefix.slice(0, -cursor.length);
+		}
+		return this.cleanForDisplay(prefix);
+	}
+
+	/** Display-side directive stripper (_clean_for_display parity). MEDIA:
+	 * tags / [[audio_as_voice]] / [[as_document]] directives are meant for the
+	 * adapter's post-processing — the files deliver separately, and the raw
+	 * directives must never reach chats. */
+	private cleanForDisplay(text: string): string {
+		return stripMediaDirectivesForDisplay(text);
+	}
+
+	/** Outgoing persistent-surface composition: display-clean THEN fence-
+	 * close (stream_consumer.py:_send_or_edit composition order). Draft frames
+	 * deliberately use cleanForDisplay ONLY — see composeDraftFrame. */
+	private displayReady(text: string): string {
+		return ensureClosedCodeFences(this.cleanForDisplay(text));
+	}
+
+	/** Recorded-payload normalization (_record_turn_final_payload parity). */
+	private normalizeDelivered(text: string): string {
+		return this.displayReady(text).trim();
 	}
 
 	/** Disposition computed at finalizeTurn for observability/tests (se-1). */
@@ -478,45 +671,83 @@ export class GatewayStreamConsumer {
 
 	async run(): Promise<void> {
 		this.resolveDraftStreaming();
-		for (;;) {
-			const batch = await this.queue.nextBatch();
-			if (batch === null) break; // closed without DONE (abandoned run)
-			let dirty = false;
-			for (const item of batch) {
-				switch (item.kind) {
-					case "delta": {
-						// _filter_and_accumulate parity (se-12): buffer through the
-						// think-block state machine so reasoning tags never display.
-						this.filterAndAccumulate(item.text);
-						dirty = true;
-						break;
-					}
-					case "segment-break": {
-						await this.finalizeSegment();
-						break;
-					}
-					case "final-text": {
-						this.adoptAuthoritativeFinal(item.text);
-						break;
-					}
-					case "done": {
-						this.gotDone = true;
-						break;
-					}
+		try {
+			for (;;) {
+				// Session-staleness guard (stream_consumer.py:run — abandon the
+				// stream early when the session was reset, e.g. /new or /stop,
+				// so stale deltas are never edited/delivered after the user has
+				// already moved on).
+				if (!this.cfg.runStillCurrent()) {
+					await this.abandonStream();
+					return;
 				}
-				if (this.gotDone) break;
+				const batch = await this.queue.nextBatch();
+				if (batch === null) break; // closed without DONE (abandoned run)
+				// Re-check staleness WITH the wake-up: a session reset that landed
+				// while the drain was parked must win over the freshly dequeued
+				// batch — stale deltas are dropped, never delivered.
+				if (!this.cfg.runStillCurrent()) {
+					await this.abandonStream();
+					return;
+				}
+				let dirty = false;
+				for (const item of batch) {
+					switch (item.kind) {
+						case "delta": {
+							// _filter_and_accumulate parity (se-12): buffer through the
+							// think-block state machine so reasoning tags never display.
+							this.filterAndAccumulate(item.text);
+							dirty = true;
+							break;
+						}
+						case "segment-break": {
+							await this.finalizeSegment();
+							break;
+						}
+						case "commentary": {
+							await this.deliverCommentary(item.text);
+							break;
+						}
+						case "flush": {
+							// _FLUSH barrier: deliver everything buffered BEFORE the
+							// marker (forced — interval/threshold gates do not apply),
+							// close the segment like a tool boundary, then wake the
+							// blocked worker so its interactive prompt lands BELOW the
+							// buffered prose (flush_pending_sync ordering contract).
+							await this.flushCurrent();
+							await this.finalizeSegment();
+							item.settle();
+							break;
+						}
+						case "final-text": {
+							this.adoptAuthoritativeFinal(item.text);
+							break;
+						}
+						case "done": {
+							this.gotDone = true;
+							break;
+						}
+					}
+					if (this.gotDone) break;
+				}
+				if (this.gotDone) {
+					// Flush any held-back partial-tag buffer on stream end so trailing
+					// text waiting on a possible open tag is not lost (_flush_think_buffer).
+					this.flushThinkBuffer();
+					await this.finalizeTurn();
+					return;
+				}
+				if (dirty && this.shouldFlushNow()) {
+					this.lastFlushAt = this.nowMs();
+					await this.flushCurrent();
+				}
 			}
-			if (this.gotDone) {
-				// Flush any held-back partial-tag buffer on stream end so trailing
-				// text waiting on a possible open tag is not lost (_flush_think_buffer).
-				this.flushThinkBuffer();
-				await this.finalizeTurn();
-				return;
-			}
-			if (dirty && this.shouldFlushNow()) {
-				this.lastFlushAt = this.nowMs();
-				await this.flushCurrent();
-			}
+		} finally {
+			// Safety net: if run() exits while a flush barrier is still queued or
+			// was pushed but can never be consumed (abandoned/stale run), wake the
+			// waiters now instead of letting them stall the full timeout
+			// (stream_consumer.py:run finally-block parity).
+			this.settleAllFlushes();
 		}
 	}
 
@@ -537,10 +768,14 @@ export class GatewayStreamConsumer {
 		// Hold-back mid-stream flushes while the buffer could STILL resolve to
 		// an intentional-silence marker (stream_consumer.py:run — without this a
 		// partial marker like "NO"→"NO_REPLY" would flash onto the screen on an
-		// interval tick before got_done suppresses it). Only defers display:
+		// interval tick before got_done suppresses it). Compared against the
+		// DISPLAY-CLEANED buffer: a MEDIA: directive must not mask a marker that
+		// would be visible after cleaning. Only defers display:
 		// got_done always resolves the buffer, so genuine prose that merely
 		// starts marker-like is never lost.
-		return !isPartialSilenceMarker(this.stripCursor(this.accumulated));
+		return !isPartialSilenceMarker(
+			this.cleanForDisplay(this.stripCursor(this.accumulated)),
+		);
 	}
 
 	// ── frame emission (_send_or_edit + _send_draft_frame) ────────────────
@@ -559,7 +794,7 @@ export class GatewayStreamConsumer {
 			// draft lane; traffic reroutes through the edit-based path below
 			// (graceful degradation, 04 §5 verified behaviors).
 		}
-		const frame = this.stripCursor(this.accumulated);
+		const frame = this.displayReady(this.stripCursor(this.accumulated));
 		if (!frame.trim() || frame === this.lastSentText) return;
 		if (this.messageId === null) {
 			// First send of the edit-based preview. NOTE: this send goes through
@@ -627,9 +862,12 @@ export class GatewayStreamConsumer {
 		parent: string | undefined,
 		opts: { final: boolean },
 	): Promise<string | null> {
+		// _send_new_chunk parity: sealed chunks are display-cleaned at the
+		// emission boundary (fence-balancing stays the splitter's job).
+		const text = this.cleanForDisplay(piece);
 		const res = await this.adapter.send(
 			this.chatId,
-			piece,
+			text,
 			parent,
 			this.metadataForSend({
 				final: opts.final,
@@ -703,6 +941,10 @@ export class GatewayStreamConsumer {
 	 */
 	private async sendDraftFrame(text: string): Promise<boolean> {
 		if (!this.useDraftStreaming || this.draftId === null) return false;
+		// No-op skip: identical to the last frame we sent (_send_or_edit draft
+		// branch parity) — forced flushes from commentary/barrier delivery must
+		// not re-emit an unchanged cumulative snapshot.
+		if (text === this.lastSentText) return true;
 		if (this.lastSentText !== "" && !text.startsWith(this.lastSentText)) {
 			this.prefixViolations.push({
 				kind: "non_prefix_frame",
@@ -728,10 +970,20 @@ export class GatewayStreamConsumer {
 		return true;
 	}
 
-	/** Composition-time draft-frame build (composeFrame seam + cursor strip). */
+	/**
+	 * Composition-time draft-frame build (composeFrame seam + display-clean +
+	 * cursor strip). Media directives are stripped from EVERY frame, but draft
+	 * frames stay UNFENCED: appending a closing ``` to a mid-code-block frame
+	 * would make frame N not a prefix of frame N+1 and trip the hard prefix-
+	 * stability guard (invariant 1) — Hermes tolerates that via connector-side
+	 * whole-snapshot re-append; pi disables the lane instead. Native streams
+	 * render unclosed fences progressively; the finalize path fence-closes the
+	 * real final message (_pre_fence_text parity, generalized to both draft
+	 * shapes for pi's stricter invariant).
+	 */
 	private composeDraftFrame(): string {
 		const raw = this.cfg.composeFrame?.(this.accumulated) ?? this.accumulated;
-		return this.stripCursor(raw);
+		return this.stripCursor(this.cleanForDisplay(raw));
 	}
 
 	private stripCursor(text: string): string {
@@ -754,7 +1006,7 @@ export class GatewayStreamConsumer {
 		// fresh segment whole. Edit-path adapters finalize the segment as a
 		// real message first.
 		if (!this.streamIsMessage() && this.messageId !== null) {
-			const frame = this.stripCursor(this.accumulated);
+			const frame = this.displayReady(this.stripCursor(this.accumulated));
 			if (frame.trim() !== "" && frame !== this.lastSentText) {
 				await this.adapter.editMessage(this.chatId, this.messageId, frame, {
 					finalize: true,
@@ -819,8 +1071,12 @@ export class GatewayStreamConsumer {
 	private async finalizeTurn(): Promise<void> {
 		// Only the finalize path may transform the real final — and the
 		// authoritative payload rides INSIDE the seal/final edit verbatim
-		// (invariants 1+2; live finding #11).
-		const finalText = this.stripCursor(this.accumulated);
+		// (invariants 1+2; live finding #11). The DISPLAY form is display-
+		// cleaned first (media directives never reach chats, including in the
+		// silence gate below — _is_intentional_silence_response(
+		// _clean_for_display(...)) parity); fence-closing happens per delivered
+		// piece further down (_send_or_edit composition order).
+		const finalText = this.cleanForDisplay(this.stripCursor(this.accumulated));
 		if (finalText.trim() === "") return;
 
 		// (se-1) Turn-final delivery-disposition gate (gateway/run.py per-lane
@@ -846,8 +1102,11 @@ export class GatewayStreamConsumer {
 		if (this.messageId !== null) {
 			// Already-on-screen preview: skip a verbatim finalize edit unless the
 			// content changed — UNLESS the adapter REQUIRES_EDIT_FINALIZE (checked
-			// `is True`), which forces the redundant edit through.
-			if (tail === this.lastSentText && !this.cfg.requiresEditFinalize) {
+			// `is True`), which forces the redundant edit through. Comparison uses
+			// the fence-closed form: lastSentText always stores exactly what was
+			// emitted (already fenced on the edit path).
+			const closedTail = this.displayReady(tail);
+			if (closedTail === this.lastSentText && !this.cfg.requiresEditFinalize) {
 				this.markTurnFinalDelivered(tail);
 				return;
 			}
@@ -861,7 +1120,7 @@ export class GatewayStreamConsumer {
 			const res = await this.adapter.editMessage(
 				this.chatId,
 				this.messageId,
-				tail,
+				closedTail,
 				{ finalize: true, metadata: this.metadata },
 			);
 			if (res.success) {
@@ -886,7 +1145,7 @@ export class GatewayStreamConsumer {
 			// its own turn lane instead of reconciling into a sealed head.
 			const res = await this.adapter.send(
 				this.chatId,
-				tail,
+				this.displayReady(tail),
 				this.overflowChainTail,
 				this.metadataForSend({
 					final: true,
@@ -909,7 +1168,10 @@ export class GatewayStreamConsumer {
 	}
 
 	private markTurnFinalDelivered(text: string): void {
-		this.deliveredFinalText = text;
+		// Record the NORMALIZED display form (_record_turn_final_payload parity:
+		// media-strip + fence-close + trim) so raw final_response payloads
+		// reconcile against what actually reached the screen (#71643).
+		this.deliveredFinalText = this.normalizeDelivered(text);
 		this.finalResponseSentInternal = true;
 		this.finalContentDeliveredInternal = true;
 		this.alreadySentInternal = true;
@@ -964,7 +1226,7 @@ export class GatewayStreamConsumer {
 				const res = await this.adapter.editMessage(
 					this.chatId,
 					this.messageId,
-					head,
+					this.displayReady(head),
 					{ finalize: true, metadata: this.metadata },
 				);
 				if (!res.success) return text;
@@ -1000,11 +1262,15 @@ export class GatewayStreamConsumer {
 	 */
 	private async sendFallbackContinuation(finalText: string): Promise<void> {
 		this.fallbackFinalSend = false;
+		// Fence-close BEFORE computing the continuation so the closing fence
+		// reaches the user even when the fallback delivers only the tail after
+		// mid-stream edits failed (_send_fallback_final composition parity).
+		const closed = this.displayReady(finalText);
 		const prefix = this.lastSentText;
 		let continuation =
-			prefix !== "" && finalText.startsWith(prefix)
-				? finalText.slice(prefix.length)
-				: finalText;
+			prefix !== "" && closed.startsWith(prefix)
+				? closed.slice(prefix.length)
+				: closed;
 		continuation = continuation.replace(/^\s+/, "");
 		if (continuation.trim() === "") {
 			// Nothing new to send — the visible partial already matches the final.
@@ -1058,33 +1324,102 @@ export class GatewayStreamConsumer {
 		return Object.keys(meta).length > 0 ? meta : undefined;
 	}
 
-	// ── interim sends (stream_consumer.py:_send_commentary) ───────────────
+	// ── commentary (stream_consumer.py:_send_commentary / run() branch) ──
+
+	/**
+	 * Drain-path commentary delivery. FIFO order is guaranteed by the queue —
+	 * by the time this runs, every delta queued BEFORE the commentary has been
+	 * accumulated and is force-flushed first (Hermes' should_edit fires on
+	 * commentary too), then the send is wrapped in segment-state resets so
+	 * post-commentary prose opens a NEW bubble below instead of editing the
+	 * stale preview above (_reset_segment_state around _send_commentary).
+	 *
+	 * Stream-is-the-message native-draft runs are the exception: resetting
+	 * would break the connector's append-only invariant (whole-snapshot
+	 * re-append class), so they just post the beat onto the live stream.
+	 */
+	private async deliverCommentary(raw: string): Promise<void> {
+		const text = this.cleanForDisplay(raw);
+		if (text.trim() === "") return;
+		// Deliver buffered prose FIRST so the commentary lands below it.
+		await this.flushCurrent();
+		const resetAround = !(this.useDraftStreaming && this.streamIsMessage());
+		if (resetAround) await this.finalizeSegment();
+		await this.sendCommentary(text);
+		if (resetAround) await this.finalizeSegment();
+	}
 
 	/**
 	 * Send a completed interim assistant commentary message. Declares interim
 	 * intent via `_interim_send` (invariant 3): the door chokepoint pops the
 	 * marker and must NOT seal-intercept this send. Does NOT set already_sent
 	 * (#10454 parity — the final must never be suppressed by commentary).
+	 * Direct primitive: production ingress routes through onCommentary so the
+	 * beat queues FIFO behind deltas.
 	 */
 	async sendCommentary(text: string): Promise<boolean> {
-		if (text.trim() === "") return false;
+		const cleaned = this.cleanForDisplay(text);
+		if (cleaned.trim() === "") return false;
 		const meta = this.metadataForSend();
 		meta[INTERIM_SEND_MARKER] = true;
 		try {
 			const res: SendResult = await this.adapter.send(
 				this.chatId,
-				text,
+				cleaned,
 				undefined,
 				meta,
 			);
 			if (res.success) {
-				this.deliveredCommentaryTexts.push(text);
+				// Record the exact DELIVERED text so has_delivered_text/delivered_
+				// final_matches can reconcile interim beats (#14238 parity).
+				this.deliveredCommentaryTexts.push(cleaned);
 				return true;
 			}
 			return false;
 		} catch {
 			return false;
 		}
+	}
+
+	/**
+	 * Stale-session abandonment (stream_consumer.py:_abandon_native_stream +
+	 * run()'s early return when run_still_current() goes false). The session
+	 * was reset (/new, /stop): stop editing, best-effort SEAL the open native
+	 * stream in place with what is already on screen (or retract an edit-path
+	 * preview), and return WITHOUT setting any delivery flags — an abandoned
+	 * turn's text was partial and the gateway's normal paths own whatever
+	 * happens next.
+	 */
+	private async abandonStream(): Promise<void> {
+		if (this.useDraftStreaming && this.draftId !== null) {
+			const abandon = this.adapter.abandonOpenDraft?.bind(this.adapter);
+			if (abandon !== undefined) {
+				try {
+					await abandon(
+						String(this.chatId),
+						this.lastSentText !== ""
+							? this.lastSentText
+							: this.cleanForDisplay(this.accumulated),
+						this.metadataOrUndefined(),
+					);
+				} catch {
+					// best-effort seal — logger.debug parity
+				}
+			}
+		} else if (this.messageId !== null) {
+			// Edit-path preview: best-effort retract so a stale partial never
+			// masquerades as the answer inside a fresh session.
+			const deleteFn = this.adapter.deleteMessage?.bind(this.adapter);
+			if (deleteFn !== undefined) {
+				try {
+					await deleteFn(String(this.chatId), this.messageId);
+				} catch {
+					// best-effort cleanup
+				}
+			}
+		}
+		this.messageId = null;
+		this.lastSentText = "";
 	}
 
 	// ── think-block scrubber (stream_consumer.py:_filter_and_accumulate) ──

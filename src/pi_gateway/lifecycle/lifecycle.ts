@@ -100,7 +100,11 @@ import {
 	type LoopLivenessGuardHandle,
 	type TimerPort,
 } from "./watchdog.js";
-import { FATAL_CONFIG_EXIT_CODE, FATAL_CONFIG_REASON_CODE } from "./restart.js";
+import {
+	FATAL_CONFIG_EXIT_CODE,
+	FATAL_CONFIG_REASON_CODE,
+	resolveCronDrainBudget,
+} from "./restart.js";
 import {
 	runBootChoreography,
 	type BootRecoveryHooks,
@@ -118,6 +122,13 @@ import type { CommandRegistry } from "../commands/registry.js";
 export interface ServiceHandle {
 	name: string;
 	stop?: () => Promise<void>;
+	/**
+	 * Cooperative-drain input (#60432/#82161): live count of in-flight work
+	 * this service is driving (cron: job executions, get_running_job_ids
+	 * parity). The shutdown drain polls it to wait in-flight ticks out on
+	 * their OWN budget instead of killing them mid-run; absent ⇒ 0.
+	 */
+	inflightCount?: () => number;
 }
 
 /**
@@ -259,6 +270,10 @@ export interface LifecycleOptions {
 	/** Active-turn grace window for the drain (default 0 — interrupting chat
 	 *  turns is cheap; sessions are pre-marked resume_pending, #27856). */
 	drainGraceMs?: number;
+	/** Cron-only drain floor for in-flight ticks (#82161). Default
+	 *  DEFAULT_CRON_DRAIN_TIMEOUT_MS (agent.cron_drain_timeout parity);
+	 *  clamped to the watchdog leash by resolveCronDrainBudget. */
+	cronDrainTimeoutMs?: number;
 	logger?: Logger;
 	/** Fingerprint reader override (tests / non-git installs). */
 	fingerprintReader?: FingerprintReader;
@@ -361,6 +376,30 @@ function packageVersion(): string | null {
 }
 
 const DEFAULT_DRAIN_GRACE_MS = 0;
+
+/**
+ * Cron-only drain floor for in-flight ticks (parity of Hermes config default
+ * agent.cron_drain_timeout = 30s): a chat turn interrupted by a restart is
+ * announced and resumable, but an interrupted cron run lands in jobs.json as
+ * a permanent failure nobody is waiting on, so it must not inherit the 0s
+ * chat budget (#82161). Clamped at runtime to the shutdown-watchdog leash
+ * minus the cleanup reserve (restart.ts:resolveCronDrainBudget) so raising
+ * it past ~50s has no effect; 0 opts out (legacy: cron drains on the chat
+ * budget). Read ONCE per drain (DEC-013).
+ */
+export const DEFAULT_CRON_DRAIN_TIMEOUT_MS = 30_000;
+
+/**
+ * Post-drain cooperative ticker-join bound (parity of run.py's
+ * _CRON_SHUTDOWN_DRAIN_TIMEOUT = 65.0): after the FULL drain completes, the
+ * cron handle stop is awaited at most this long before the join gives up
+ * with a dropped-delivery warning (#58818) — daemon-thread give-up parity,
+ * never a hanging exit.
+ */
+export const CRON_SHUTDOWN_DRAIN_TIMEOUT_MS = 65_000;
+
+/** Drain poll cadence (run.py:_drain_active_agents asyncio.sleep(0.1)). */
+const CRON_DRAIN_POLL_MS = 100;
 
 export class GatewayLifecycle {
 	readonly events: StageEvent[] = [];
@@ -1135,10 +1174,14 @@ export class GatewayLifecycle {
 	// -----------------------------------------------------------------------
 
 	private drainHooks(): DrainHooks {
+		// Drain-phase clock (run.py:_stop_impl_body _phase_elapsed parity): the
+		// cron budget's watchdog clamp is computed from time already spent in
+		// the earlier phases, so the extension can never overrun the leash.
+		const drainStartedAtMs = this.timers.nowMs();
+		const cronFloorMs =
+			this.opts.cronDrainTimeoutMs ?? DEFAULT_CRON_DRAIN_TIMEOUT_MS;
 		const adapters = () =>
 			this.ctx.adapters.filter((a) => a.handle?.stop !== undefined);
-		const watchers = () =>
-			this.ctx.services.watchers.filter((w) => w.stop !== undefined);
 		const cron = () =>
 			this.ctx.services.cron.filter((c) => c.stop !== undefined);
 		// Engine defaults are no-op seams; opts.shutdownHooks overlays them with
@@ -1153,21 +1196,62 @@ export class GatewayLifecycle {
 				return [] as readonly string[];
 			},
 			stopIngress: async () => {
-				// Adapters stop polling/reading; embedded background services join
-				// this step until each gets its own cooperative-drain contract
-				// (cron bounded window, Phase 5).
+				// Adapters ONLY. The cron ticker deliberately KEEPS RUNNING through
+				// the whole drain (#82161/#60432): its in-flight runs are waited
+				// on their own budget below, then joined cooperatively after
+				// teardown — killing one mid-flight is a permanent jobs.json
+				// failure nobody is waiting on. Embedded WATCHER services moved
+				// to the same post-drain bounded join (run.py start_gateway tail:
+				// housekeeping + planned-stop watcher joins follow the ticker's).
 				for (const adapter of adapters()) await adapter.handle?.stop?.();
-				for (const service of [...watchers(), ...cron()])
-					await service.stop?.();
 			},
 			awaitActiveTurns: async (graceMs) => {
-				// Runner turn-tracking arrives with the Phase-1 runner; the grace
-				// budget is honored here so the contract shape is fixed now. The
-				// skeleton NEVER reports a timeout (nothing tracked yet), so drains
-				// stay on the graceful path until real turn tracking exists.
+				// CHAT turns: runner turn-tracking arrives with the Phase-1
+				// runner; the grace budget is honored here so the contract shape
+				// is fixed now (default 0 — interrupting chat turns is announced
+				// + resumable, #27856/#82161). The skeleton NEVER reports a
+				// chat-side timeout.
 				if (graceMs > 0) {
 					await new Promise<void>((resolve) =>
 						this.timers.setTimeout(resolve, graceMs),
+					);
+				}
+				// IN-FLIGHT CRON work drains on its OWN deadline (#82161/#60432;
+				// two-budget loop of run.py:_drain_active_agents(timeout,
+				// cron_timeout)): a cron run killed mid-flight is recorded in
+				// jobs.json as a permanent failure nobody waits on, so the wait
+				// EXTENDS past the chat budget by resolveCronDrainBudget —
+				// clamped to the armed shutdown-watchdog leash minus the cleanup
+				// reserve so the extension can never cost the process its
+				// post-drain teardown window (restart.py:resolve_cron_drain_budget
+				// parity; a floor ≤ 0 opts out — legacy shared-budget behavior).
+				// SEAM CONTRACT: a runner-side overlay replacing this hook MUST
+				// keep folding ctx.services.cron's inflightCount into the wait on
+				// its own resolveCronDrainBudget deadline — dropping it reopens
+				// #82161 (zero-budget kill of mid-flight runs).
+				const handles = cron();
+				if (handles.length === 0) return;
+				const startedMs = this.timers.nowMs();
+				const budgetMs =
+					resolveCronDrainBudget(graceMs / 1000, cronFloorMs / 1000, {
+						watchdogDelayS: resolveShutdownWatchdogDelayMs(graceMs) / 1000,
+						elapsedS: (startedMs - drainStartedAtMs) / 1000,
+					}) * 1000;
+				while (
+					handles.reduce(
+						(total, handle) =>
+							total + Math.max(0, handle.inflightCount?.() ?? 0),
+						0,
+					) > 0
+				) {
+					if (this.timers.nowMs() - startedMs >= budgetMs) {
+						// Budget expired with ticks still in flight — the drain
+						// TIMED OUT (clean-shutdown receipt suppressed so the next
+						// boot suspends half-finished work; timed_out parity).
+						return true;
+					}
+					await new Promise<void>((resolve) =>
+						this.timers.setTimeout(resolve, CRON_DRAIN_POLL_MS),
 					);
 				}
 			},
@@ -1198,6 +1282,94 @@ export class GatewayLifecycle {
 			},
 			...this.opts.shutdownHooks,
 		};
+	}
+
+	/**
+	 * POST-DRAIN cooperative join of embedded background services — moved OUT
+	 * of stop_ingress (#82161/#60432; parity of the run.py:start_gateway tail:
+	 * cron_stop.set() → _stop_cron_provider → _await_thread_exit(cron_thread,
+	 * timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT=65) → housekeeping/planned-stop
+	 * joins). Runs only AFTER executeDrain completed so an in-flight run's
+	 * mark+deliver tail finished inside its own budget above; each handle is
+	 * joined cooperatively but BOUNDED, so a wedged service can extend
+	 * shutdown by at most one window (daemon-thread give-up parity — never a
+	 * hanging exit). Cron tickers join FIRST: their delivery needs the live
+	 * loop (#58818); watchers follow.
+	 */
+	private async joinEmbeddedServicesPostDrain(): Promise<void> {
+		const crons = this.ctx.services.cron.filter((c) => c.stop !== undefined);
+		const watchers = this.ctx.services.watchers.filter(
+			(w) => w.stop !== undefined,
+		);
+		for (const ticker of crons) {
+			const breached = await this.boundedServiceStop(
+				ticker,
+				CRON_SHUTDOWN_DRAIN_TIMEOUT_MS,
+			);
+			if (breached) {
+				// Warning parity of the _CRON_SHUTDOWN_DRAIN_TIMEOUT breach.
+				this.log.warn(
+					`Cron ticker did not exit within ${Math.round(CRON_SHUTDOWN_DRAIN_TIMEOUT_MS / 1000)}s of shutdown — an in-flight delivery may have been dropped.`,
+					{ service: ticker.name },
+				);
+			}
+		}
+		for (const watcher of watchers) {
+			const breached = await this.boundedServiceStop(
+				watcher,
+				CRON_SHUTDOWN_DRAIN_TIMEOUT_MS,
+			);
+			if (breached) {
+				this.log.warn(
+					`service ${watcher.name} did not exit within ${Math.round(CRON_SHUTDOWN_DRAIN_TIMEOUT_MS / 1000)}s of shutdown — continuing teardown`,
+					{ service: watcher.name },
+				);
+			}
+		}
+	}
+
+	/**
+	 * One bounded cooperative stop (_await_thread_exit parity): race the
+	 * handle's stop promise against the window on the injected timer port;
+	 * a stop that RAISES is isolated (logged, never propagates into the
+	 * recorded drain outcome). Returns true when the window expired first.
+	 */
+	private async boundedServiceStop(
+		handle: ServiceHandle,
+		timeoutMs: number,
+	): Promise<boolean> {
+		const stop = handle.stop;
+		if (stop === undefined) return false;
+		let breached = false;
+		await new Promise<void>((resolve) => {
+			let settled = false;
+			const finish = (): void => {
+				if (settled) return;
+				settled = true;
+				resolve();
+			};
+			const timer = this.timers.setTimeout(() => {
+				breached = true;
+				finish();
+			}, timeoutMs);
+			void Promise.resolve()
+				.then(stop)
+				.then(
+					() => {
+						this.timers.clearTimeout(timer);
+						finish();
+					},
+					(err) => {
+						this.timers.clearTimeout(timer);
+						this.log.warn(
+							`service ${handle.name} raised during post-drain stop`,
+							{ service: handle.name, error: String(err) },
+						);
+						finish();
+					},
+				);
+		});
+		return breached;
 	}
 
 	/**
@@ -1244,6 +1416,13 @@ export class GatewayLifecycle {
 					draining: true,
 					pending_messages: this.pendingSlots.length,
 					adapters: this.ctx.adapters.length,
+					// In-flight cron visibility in the post-mortem dump
+					// (run.py _shutdown_watchdog_snapshot active_cron_jobs parity).
+					cron_jobs: this.ctx.services.cron.reduce(
+						(total, handle) =>
+							total + Math.max(0, handle.inflightCount?.() ?? 0),
+						0,
+					),
 				}),
 				hardExit: (code) => {
 					this.releaseOwnership(); // locks must never be stranded
@@ -1267,6 +1446,12 @@ export class GatewayLifecycle {
 			} finally {
 				watch.disarm();
 			}
+			// Post-drain cooperative join of cron/watcher handles (moved OUT of
+			// stop_ingress — #82161/#60432): the full drain above already waited
+			// in-flight ticks on their own budget, so this is teardown-only and
+			// runs OUTSIDE the watchdog leash exactly like Hermes joins its ticker
+			// after wait_for_shutdown. Never throws into the recorded outcome.
+			await this.joinEmbeddedServicesPostDrain();
 			this.shutdownOutcome = outcome;
 			this.transitionSafe("stopped");
 			// Release PID file + runtime lock AFTER teardown (never stranded).

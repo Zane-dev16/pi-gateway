@@ -8,12 +8,13 @@
 //   - Buzz does NOT speak Nostr itself: EVERYTHING rides the external `buzz`
 //     CLI ("JSON in, JSON out") through an INJECTED executor seam — the port
 //     NEVER spawns OS children (cli-wire.ts).
-//   - The live NIP-42 WebSocket relay loop is a documented probe-computed
-//     exclusion (manifest.ts); its PURE crypto core is fully ported in
-//     nostr-auth.ts and contract-tested against reference-computed vectors.
-//     The transport-MODE resolution stays source-true; the ws establishment is
-//     an injectable seam that defaults to "unavailable" (⇒ auto falls back to
-//     poll; pinned websocket-required fails connect — source truth).
+//   - The live NIP-42 WebSocket relay loop IS PORTED (_authenticate_websocket/
+//     _subscribe_websocket/_websocket_loop): it runs behind the wsStarter
+//     establishment seam over an INJECTED relay-socket factory (relay-wire.ts
+//     — this port never opens REAL sockets, FakeBuzzCli precedent). With a
+//     factory wired, transport=websocket/auto drive the authenticated push
+//     subscription; without one the seam reports unavailable (⇒ auto falls
+//     back to poll; pinned websocket-required fails connect — source truth).
 //
 // Source anchors (adapter.py):
 //   __init__ (@~300)          → constructor config/env precedence
@@ -34,6 +35,13 @@
 //   _is_mentioned/_strip_mention → isMentioned/stripMention
 //   _resolve_user_name        → resolveUserName (negative caching)
 //   _trim_seen                → trimSeen (OrderedDict popitem(last=false) = Map FIFO delete)
+//   _websocket_url            → websocketUrl (http↔ws scheme map, fragment dropped)
+//   _start_websocket          → startRelayWebsocket (ready window 20+5s, teardown on miss)
+//   _authenticate_websocket   → authenticateWebsocket (NIP-42 challenge→['AUTH',event]→OK)
+//   _subscribe_websocket      → subscribeWebsocket (#h chat REQs + kind-44100 membership)
+//   _handle_membership_event  → handleMembershipEvent (live DM rediscovery + new subs)
+//   _websocket_loop           → websocketLoop (EVENT/CLOSED/NOTICE routing,
+//                               1→30s reconnect backoff, disconnect-interruptible)
 
 import {
 	BasePlatformAdapter,
@@ -59,7 +67,17 @@ import type {
 	IncomingEvent,
 	TaskSpawner,
 } from "../../pi_gateway/guards/index.js";
-import type { BuzzCliExecutor, BuzzCliResult } from "./cli-wire.js";
+import type {
+	BuzzCliExecutor,
+	BuzzCliInvocation,
+	BuzzCliResult,
+} from "./cli-wire.js";
+import type {
+	BuzzRelaySocket,
+	BuzzRelaySocketFactory,
+	BuzzTiming,
+} from "./relay-wire.js";
+import { wallTiming } from "./relay-wire.js";
 import {
 	BUZZ_CHAT_KIND,
 	BUZZ_DM_DISCOVERY_EVERY,
@@ -70,11 +88,18 @@ import {
 	BUZZ_REQUIRE_MENTION_FALSE_TOKENS,
 	BUZZ_SEEN_CAP,
 	BUZZ_TRANSPORT_MODES,
+	BUZZ_WS_AUTH_TIMEOUT_S,
+	BUZZ_WS_BACKOFF_MAX_S,
+	BUZZ_WS_BACKOFF_START_S,
+	BUZZ_WS_MEMBERSHIP_KIND,
+	BUZZ_WS_MEMBERSHIP_SUB_ID,
+	BUZZ_CLI_TIMEOUT_S,
 	validateBuzzTrustBoundary,
 	declareBuzzTrustBoundary,
 	type BuzzTrustBoundary,
 } from "./manifest.js";
-import { hexToNpub, normalizeUserRef } from "./nostr-auth.js";
+import { buildAuthEvent, hexToNpub, normalizeUserRef } from "./nostr-auth.js";
+import type { AuthEvent } from "./nostr-auth.js";
 
 /** adapter.py per-channel state: chat_type + last_ts watermark + seen OrderedDict. */
 export interface BuzzChannelState {
@@ -119,11 +144,21 @@ export interface BuzzAdapterOptions {
 	/** Local-image existence probe behind sendImage (no real fs in fixtures). */
 	imageFileProbe?: ((path: string) => boolean) | undefined;
 	/**
-	 * WebSocket establishment seam (probe-computed exclusion of the live loop).
-	 * Undefined ⇒ unavailable ⇒ auto falls back to poll; transport=websocket
-	 * fails connect exactly like a failed NIP-42 handshake.
+	 * WebSocket establishment seam. Explicit overrides WIN; otherwise the
+	 * LIVE NIP-42 loop is the default starter whenever a relay-socket factory
+	 * is wired. Undefined + no factory ⇒ unavailable ⇒ auto falls back to
+	 * poll; transport=websocket fails connect exactly like a failed NIP-42
+	 * handshake.
 	 */
 	wsStarter?: (() => Promise<boolean>) | undefined;
+	/**
+	 * Relay-socket factory — the WS TRANSPORT MEDIUM for the live loop (the
+	 * port never opens real sockets, cli-wire precedent). MUTABLE so fixtures
+	 * can wire the transport after construction.
+	 */
+	relaySocketFactory?: BuzzRelaySocketFactory | undefined;
+	/** Injected timers (CLI deadline, WS ready window, reconnect backoff). */
+	timing?: BuzzTiming | undefined;
 	nowMs?: (() => number) | undefined;
 	scalarMaxUnits?: number | undefined;
 	/** Scoped identity lock (connect acquires relay:pubkey when supplied). */
@@ -151,6 +186,19 @@ function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((res) => {
+		resolve = res;
+	});
+	return { promise, resolve };
+}
+
 /** http(s) refs ride as link text; everything else is a local-path candidate. */
 function isHttpUrl(ref: string): boolean {
 	return /^https?:\/\//i.test(ref);
@@ -165,7 +213,10 @@ function expandUserPath(ref: string): string {
 
 /**
  * adapter.py:_resolve_cli_path — configured path (must exist) → `buzz` on
- * PATH → ~/bin/buzz (must exist) → "" so callers raise config errors.
+ * PATH → ~/bin/buzz (must exist) → "" so callers raise config errors. The
+ * fallback probes AND returns the EXPANDED home path (adapter.py:
+ * `Path.home() / "bin" / "buzz"`) — a literal "~/bin/buzz" argv[0] would be
+ * unusable to the OS.
  */
 export function resolveCliPath(
 	configured: string,
@@ -179,7 +230,8 @@ export function resolveCliPath(
 	if (trimmed.length > 0) return fileExists(trimmed) ? trimmed : "";
 	const found = probes.which?.("buzz");
 	if (found !== undefined && found.length > 0) return found;
-	return fileExists("~/bin/buzz") ? "~/bin/buzz" : "";
+	const fallbackPath = expandUserPath("~/bin/buzz");
+	return fileExists(fallbackPath) ? fallbackPath : "";
 }
 
 /** adapter.py:_cli_error_message — stderr JSON error contract parsing. */
@@ -267,17 +319,30 @@ export class BuzzAdapter extends BasePlatformAdapter {
 	};
 	private readonly imageFileExists: (path: string) => boolean;
 	/**
-	 * WebSocket establishment seam (probe-computed exclusion of the live loop).
-	 * MUTABLE so mode-resolution fixtures can flip availability per connect.
-	 * Undefined ⇒ unavailable ⇒ auto falls back to poll; transport=websocket
-	 * fails connect exactly like a failed NIP-42 handshake.
+	 * WebSocket establishment seam — MUTABLE so mode-resolution fixtures can
+	 * flip availability per connect. Explicit overrides WIN over the default;
+	 * when undefined AND no relaySocketFactory is wired, connect treats WS as
+	 * unavailable (auto falls back to poll; pinned websocket-required fails
+	 * exactly like a failed NIP-42 handshake).
 	 */
 	wsStarter: (() => Promise<boolean>) | undefined;
+	/**
+	 * Relay-socket factory — MUTABLE transport medium for the live NIP-42
+	 * loop (relay-wire.ts). Present + no explicit wsStarter ⇒ the LIVE loop
+	 * is the default starter at connect time.
+	 */
+	relaySocketFactory: BuzzRelaySocketFactory | undefined;
+	/**
+	 * Injected timers (CLI deadline, auth recv deadlines, ready window,
+	 * reconnect backoff) — MUTABLE so fixtures can install deterministic
+	 * clocks. Default is wall clock.
+	 */
+	timing: BuzzTiming;
 	private readonly nowFn: () => number;
 	private readonly lockManager: TokenLockManagerSeam | undefined;
 	private readonly lockOwner: string;
 
-	// ── runtime state ────────────────────────────────────────────────────────────
+	// ── runtime state ──────────────────────────────────────────────────────────────────────
 	private privateKey = "";
 	selfPubkey = "";
 	selfNpub = "";
@@ -299,6 +364,21 @@ export class BuzzAdapter extends BasePlatformAdapter {
 	lastCliError = "";
 	/** Contained-sweep error text (exception-class faults). */
 	lastSweepError = "";
+	/**
+	 * Live-WS state (adapter.py:_ws_active/_membership_since). wsActive is
+	 * true exactly while a connected socket owns inbound delivery.
+	 */
+	wsActive = false;
+	membershipSince = 0;
+	/** Requested reconnect-backoff durations, in order (row observability). */
+	readonly wsBackoffSleeps: number[] = [];
+	/** Last WebSocket disconnect/error text (row observability). */
+	lastWsError = "";
+	private wsLoopTask: Promise<void> | null = null;
+	private wsStopRequested = false;
+	private wsStoppedSignal: Promise<void> = Promise.resolve();
+	private resolveWsStopped: (() => void) | null = null;
+	private activeSocket: BuzzRelaySocket | null = null;
 	readonly fatalEvents: BuzzFaultRecord[] = [];
 	hooks: BuzzHooks | undefined;
 	/** Built IncomingEvents ENQUEUED for dispatch, in order (row observability). */
@@ -334,6 +414,8 @@ export class BuzzAdapter extends BasePlatformAdapter {
 		this.imageFileExists =
 			opts.imageFileProbe ?? ((p) => existsSync(expandUserPath(p)));
 		this.wsStarter = opts.wsStarter;
+		this.relaySocketFactory = opts.relaySocketFactory;
+		this.timing = opts.timing ?? wallTiming();
 		this.nowFn = opts.nowMs ?? (() => Date.now());
 		this.lockManager = opts.lockManager;
 		this.lockOwner = opts.lockOwner ?? "this-instance";
@@ -516,29 +598,66 @@ export class BuzzAdapter extends BasePlatformAdapter {
 
 	// ── buzz-cli plumbing ─────────────────────────────────────────────────────────
 
-	/** adapter.py:_run_cli + _exec_buzz — env carries relay+key, argv NEVER does. */
-	runCli(
+	/**
+	 * adapter.py:_run_cli + _exec_buzz — env carries relay+key, argv NEVER does.
+	 *
+	 * adapter.py KILL-PARITY (_exec_buzz): communicate() races
+	 * asyncio.wait_for(_CLI_TIMEOUT=30) — a hung CLI is killed and surfaces
+	 * rc124 + {"error":"timeout"} stderr JSON instead of stalling sweeps
+	 * forever. The port cannot reap a child: the executor call is RACED
+	 * against the BUZZ_CLI_TIMEOUT_S deadline, an AbortSignal rides the
+	 * invocation so cooperative executors observe the kill, and the abandoned
+	 * call's eventual outcome is discarded (never unhandled).
+	 */
+	async runCli(
 		args: readonly string[],
 		input?: string | undefined,
 	): Promise<BuzzCliResult> {
 		if (!this.privateKey) this.privateKey = this.resolvePrivateKeyEvent();
 		if (this.executor === undefined) {
-			return Promise.resolve({
+			return {
 				code: 4,
 				stdout: "",
 				stderr: JSON.stringify({
 					error: "executor_missing",
 					message: "no CLI executor wired",
 				}),
-			});
+			};
 		}
-		return this.executor(args, {
+		const controller = new AbortController();
+		const invocation: BuzzCliInvocation = {
 			env: {
 				BUZZ_RELAY_URL: this.relayUrl,
 				BUZZ_PRIVATE_KEY: this.privateKey,
 			},
 			...(input === undefined ? {} : { input }),
-		});
+			signal: controller.signal,
+		};
+		const pending = this.executor(args, invocation);
+		pending.catch(() => {}); // abandoned-call hygiene (timeout kill parity)
+		const deadline = this.timing.sleep(BUZZ_CLI_TIMEOUT_S);
+		try {
+			const outcome = await Promise.race<
+				{ kind: "result"; result: BuzzCliResult } | { kind: "timeout" }
+			>([
+				pending.then((result) => ({ kind: "result" as const, result })),
+				deadline.promise.then(() => ({ kind: "timeout" as const })),
+			]);
+			if (outcome.kind === "timeout") {
+				controller.abort(); // kill-parity hook for cooperative executors
+				return {
+					code: 124,
+					stdout: "",
+					stderr: JSON.stringify({
+						error: "timeout",
+						message: `buzz ${args[0] ?? ""} timed out after ${BUZZ_CLI_TIMEOUT_S}s`,
+					}),
+				};
+			}
+			return outcome.result;
+		} finally {
+			deadline.cancel(); // never hold the event loop on a loser timer
+		}
 	}
 
 	// ── connection lifecycle ─────────────────────────────────────────────────────
@@ -644,13 +763,18 @@ export class BuzzAdapter extends BasePlatformAdapter {
 		}
 		await this.discoverDms(true);
 
-		// Inbound transport: WS preferred (auto/websocket) — the LIVE LOOP is a
-		// documented exclusion; the starter seam decides availability. A failed
-		// websocket-required connect is FATAL retryable (source truth).
+		// Inbound transport: WS preferred (auto/websocket). The establishment
+		// seam is an explicit wsStarter when overridden; otherwise the LIVE
+		// NIP-42 loop (adapter.py:_start_websocket) whenever a relay-socket
+		// medium is wired — no medium ⇒ unavailable ⇒ source-truth fallbacks.
 		let transportUsed: "poll" | "websocket" = "poll";
 		if (this.transportMode === "auto" || this.transportMode === "websocket") {
-			const started =
-				this.wsStarter === undefined ? false : await this.wsStarter();
+			const starter =
+				this.wsStarter ??
+				(this.relaySocketFactory === undefined
+					? undefined
+					: () => this.startRelayWebsocket());
+			const started = starter === undefined ? false : await starter();
 			if (started) {
 				transportUsed = "websocket";
 			} else if (this.transportMode === "websocket") {
@@ -680,8 +804,405 @@ export class BuzzAdapter extends BasePlatformAdapter {
 			this.lockHandle.release();
 			this.lockHandle = null;
 		}
+		// adapter.py:disconnect — stop the inbound transports and drop runtime
+		// state. _ws_active=False first, then cancel+await the ws task (the
+		// port's stop is interrupt-and-join, not asyncio cancellation).
+		this.wsActive = false;
+		await this.stopWebsocketLoop();
 		this.channelState.clear();
 		this.pollCount = 0;
+	}
+
+	// ── inbound: live WebSocket transport (NIP-42 authenticated) ──────────────
+	//
+	// Push transport parity (adapter.py PR #73636 lane): events route through
+	// THE SAME handleEvent() machinery as the poll plane so de-dupe, mention
+	// gating, DM latching, and the allow-list behave identically on both
+	// transports. The SOCKET MEDIUM is injected (relay-wire.ts); every frame,
+	// filter, and timing below is adapter.py-faithful.
+
+	/**
+	 * adapter.py:_websocket_url — http→ws / https→wss (other schemes pass
+	 * through and are then rejected), netloc required, fragment dropped
+	 * (urlunsplit parity).
+	 */
+	websocketUrl(): string {
+		const raw = this.relayUrl.trim();
+		const match =
+			/^([A-Za-z][A-Za-z0-9+.-]*):(\/\/[^/?#]*)([^?#]*)(\?[^#]*)?/.exec(raw);
+		const invalid = new Error("Buzz relay URL must use http(s) or ws(s)");
+		if (match === null) throw invalid;
+		const schemeRaw = match[1] as string;
+		const netloc = (match[2] as string).slice(2);
+		const path = match[3] as string;
+		const query = (match[4] as string) ?? "";
+		const scheme = ({ http: "ws", https: "wss" } as Record<string, string>)[
+			schemeRaw
+		];
+		if (scheme === undefined || netloc.length === 0) {
+			throw invalid;
+		}
+		return `${scheme}://${netloc}${path}${query}`;
+	}
+
+	/**
+	 * adapter.py:_start_websocket — spawn the loop; True when it authenticates
+	 * within _WS_AUTH_TIMEOUT + 5. On a miss the loop task is torn down so the
+	 * caller falls back (auto) or fails connect (pinned websocket).
+	 */
+	private async startRelayWebsocket(): Promise<boolean> {
+		try {
+			this.websocketUrl(); // availability probe (source-truth ValueError)
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			this.logger?.info?.(
+				`Buzz: WebSocket transport unavailable (${message}); falling back to polling`,
+			);
+			return false;
+		}
+		await this.stopWebsocketLoop(); // never two loops
+		const ready = deferred<"ready">();
+		const stopped = deferred<void>();
+		this.wsStopRequested = false;
+		this.wsStoppedSignal = stopped.promise;
+		this.resolveWsStopped = stopped.resolve;
+		this.membershipSince = Math.floor(this.nowFn() / 1000);
+		const task = this.websocketLoop(ready, stopped);
+		task.catch(() => {}); // rejection-containment insurance
+		this.wsLoopTask = task;
+		const windowHandle = this.timing.sleep(BUZZ_WS_AUTH_TIMEOUT_S + 5);
+		let outcome: "ready" | "timeout";
+		try {
+			outcome = await Promise.race<"ready" | "timeout">([
+				ready.promise.then(() => "ready" as const),
+				windowHandle.promise.then(() => "timeout" as const),
+			]);
+		} finally {
+			windowHandle.cancel();
+		}
+		if (outcome === "ready") return true;
+		this.logger?.warn?.("Buzz: WebSocket did not authenticate in time");
+		this.wsActive = false;
+		await this.stopWebsocketLoop();
+		return false;
+	}
+
+	/** Cancel the loop task and join its exit (adapter.py cancel()+await parity). */
+	private async stopWebsocketLoop(): Promise<void> {
+		this.wsStopRequested = true;
+		this.resolveWsStopped?.();
+		this.resolveWsStopped = null;
+		const socket = this.activeSocket;
+		if (socket !== null) {
+			this.activeSocket = null;
+			try {
+				socket.close();
+			} catch {
+				/* already dead */
+			}
+		}
+		const task = this.wsLoopTask;
+		this.wsLoopTask = null;
+		if (task !== null) {
+			try {
+				await task;
+			} catch {
+				/* exit path is best-effort */
+			}
+		}
+	}
+
+	/** Backoff sleep aborted promptly by disconnect (asyncio-cancel parity). */
+	private async loopSleep(seconds: number): Promise<void> {
+		this.wsBackoffSleeps.push(seconds);
+		const handle = this.timing.sleep(seconds);
+		try {
+			await Promise.race([handle.promise, this.wsStoppedSignal]);
+		} finally {
+			handle.cancel();
+		}
+	}
+
+	/** One inbound frame; losers of any race never become unhandled. */
+	private recvFrame(socket: BuzzRelaySocket): Promise<string | null> {
+		const pending = socket.recv();
+		pending.catch(() => {});
+		return pending;
+	}
+
+	/** adapter.py asyncio.wait_for(websocket.recv(), _WS_AUTH_TIMEOUT). */
+	private async recvOrThrow(socket: BuzzRelaySocket): Promise<string> {
+		const handle = this.timing.sleep(BUZZ_WS_AUTH_TIMEOUT_S);
+		const pending = socket.recv();
+		pending.catch(() => {});
+		type RecvOutcome =
+			| { kind: "frame"; frame: string | null }
+			| { kind: "timeout" };
+		try {
+			const outcome = await Promise.race<RecvOutcome>([
+				pending.then((frame) => ({ kind: "frame" as const, frame })),
+				handle.promise.then(() => ({ kind: "timeout" as const })),
+			]);
+			if (outcome.kind === "timeout") {
+				throw new Error(
+					`Buzz WebSocket recv timed out after ${BUZZ_WS_AUTH_TIMEOUT_S}s`,
+				);
+			}
+			if (outcome.frame === null) {
+				throw new Error("Buzz relay connection closed during authentication");
+			}
+			return outcome.frame;
+		} finally {
+			handle.cancel();
+		}
+	}
+
+	/**
+	 * adapter.py:_authenticate_websocket — NIP-42: wait for the relay's AUTH
+	 * challenge, answer with the signed kind-22242 event (plus the optional
+	 * BUZZ_AUTH_TAG owner-attestation tag), and wait for the OK acknowledgment
+	 * keyed on OUR event id.
+	 */
+	private async authenticateWebsocket(
+		socket: BuzzRelaySocket,
+	): Promise<AuthEvent> {
+		const challengeRaw = await this.recvOrThrow(socket);
+		let challengeMessage: unknown;
+		try {
+			challengeMessage = JSON.parse(challengeRaw);
+		} catch (err) {
+			throw new Error(
+				`malformed AUTH challenge frame: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		if (
+			!Array.isArray(challengeMessage) ||
+			challengeMessage.length < 2 ||
+			challengeMessage[0] !== "AUTH"
+		) {
+			throw new Error("Buzz relay did not send a NIP-42 AUTH challenge");
+		}
+		const event = buildAuthEvent({
+			privateKey: this.privateKey,
+			challenge: String(challengeMessage[1]),
+			relayUrl: this.websocketUrl(),
+			authTagJson: this.secretReader("BUZZ_AUTH_TAG") ?? "",
+		});
+		await socket.send(JSON.stringify(["AUTH", event]));
+		for (;;) {
+			const raw = await this.recvOrThrow(socket);
+			let response: unknown;
+			try {
+				response = JSON.parse(raw);
+			} catch (err) {
+				throw new Error(
+					`malformed AUTH response frame: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			if (!Array.isArray(response) || response.length === 0) continue;
+			if (
+				response[0] === "OK" &&
+				response.length >= 4 &&
+				response[1] === event.id
+			) {
+				if (response[2] === true) return event;
+				throw new Error(`Buzz WebSocket AUTH rejected: ${String(response[3])}`);
+			}
+			if (response[0] === "NOTICE" || response[0] === "CLOSED") {
+				const detail =
+					response.length > 1
+						? String(response.at(-1))
+						: "authentication failed";
+				throw new Error(`Buzz WebSocket AUTH failed: ${detail}`);
+			}
+		}
+	}
+
+	/** Per-channel chat REQ — `since` resumes one second BEFORE the watermark. */
+	private async sendChannelSubscription(
+		socket: BuzzRelaySocket,
+		subscriptionId: string,
+		channelId: string,
+	): Promise<void> {
+		const state = this.channelState.get(channelId);
+		const fallbackSeconds = Math.floor(this.nowFn() / 1000);
+		const watermark =
+			state !== undefined && state.lastTs > 0 ? state.lastTs : fallbackSeconds;
+		const since = Math.max(Math.trunc(watermark) - 1, 0);
+		await socket.send(
+			JSON.stringify([
+				"REQ",
+				subscriptionId,
+				{ kinds: [BUZZ_CHAT_KIND], "#h": [channelId], since },
+			]),
+		);
+	}
+
+	/**
+	 * adapter.py:_subscribe_websocket — subscribe to every watched conversation
+	 * plus membership events (kind 44100 p-tagged to us) for live DM discovery.
+	 */
+	private async subscribeWebsocket(
+		socket: BuzzRelaySocket,
+	): Promise<Map<string, string | null>> {
+		const subscriptions = new Map<string, string | null>();
+		let index = 0;
+		for (const channelId of [...this.channelState.keys()]) {
+			const subscriptionId = `hermes-buzz-${index}`;
+			index += 1;
+			subscriptions.set(subscriptionId, channelId);
+			await this.sendChannelSubscription(socket, subscriptionId, channelId);
+		}
+		if (this.selfPubkey.length > 0) {
+			await socket.send(
+				JSON.stringify([
+					"REQ",
+					BUZZ_WS_MEMBERSHIP_SUB_ID,
+					{
+						kinds: [BUZZ_WS_MEMBERSHIP_KIND],
+						"#p": [this.selfPubkey],
+						since: Math.max(this.membershipSince - 1, 0),
+					},
+				]),
+			);
+			subscriptions.set(BUZZ_WS_MEMBERSHIP_SUB_ID, null);
+		}
+		return subscriptions;
+	}
+
+	/**
+	 * adapter.py:_handle_membership_event — a membership event p-tagged to us:
+	 * rediscover conversations and subscribe to any NEW ones (fresh DMs
+	 * dispatch from their beginning).
+	 */
+	private async handleMembershipEvent(
+		socket: BuzzRelaySocket,
+		subscriptions: Map<string, string | null>,
+		event: Record<string, unknown>,
+	): Promise<void> {
+		const createdAtRaw = Number(event["created_at"] ?? 0);
+		const createdAt = Number.isFinite(createdAtRaw)
+			? Math.trunc(createdAtRaw)
+			: 0; // int(event.get("created_at") or 0) parity for falsy/garbage
+		this.membershipSince = Math.max(this.membershipSince, createdAt);
+		const before = new Set(this.channelState.keys());
+		await this.discoverDms(false);
+		for (const channelId of this.channelState.keys()) {
+			if (before.has(channelId)) continue;
+			const subscriptionId = `hermes-buzz-dm-${subscriptions.size}`;
+			subscriptions.set(subscriptionId, channelId);
+			await this.sendChannelSubscription(socket, subscriptionId, channelId);
+			this.logger?.info?.(`Buzz: subscribed to new conversation ${channelId}`);
+		}
+	}
+
+	/** Frame-routing body of adapter.py's `async for raw in websocket:`. */
+	private async relayFrameLoop(
+		socket: BuzzRelaySocket,
+		subscriptions: Map<string, string | null>,
+	): Promise<void> {
+		for (;;) {
+			const raw = await this.recvFrame(socket);
+			if (raw === null) return; // clean close → immediate reconnect attempt
+			if (this.wsStopRequested) return;
+			let message: unknown;
+			try {
+				message = JSON.parse(raw);
+			} catch {
+				this.logger?.warn?.("Buzz: ignoring malformed WebSocket frame");
+				continue;
+			}
+			if (!Array.isArray(message) || message.length === 0) continue;
+			const messageType = message[0];
+			if (messageType === "EVENT" && message.length >= 3) {
+				const subscriptionId = String(message[1]);
+				const event = message[2];
+				if (
+					event === null ||
+					typeof event !== "object" ||
+					Array.isArray(event)
+				) {
+					continue;
+				}
+				if (subscriptionId === BUZZ_WS_MEMBERSHIP_SUB_ID) {
+					await this.handleMembershipEvent(
+						socket,
+						subscriptions,
+						event as Record<string, unknown>,
+					);
+					continue;
+				}
+				const channelId = subscriptions.get(subscriptionId);
+				const state =
+					typeof channelId === "string"
+						? this.channelState.get(channelId)
+						: undefined;
+				if (typeof channelId === "string" && state !== undefined) {
+					await this.handleEvent(
+						channelId,
+						state,
+						event as Record<string, unknown>,
+					);
+					this.trimSeen(state);
+				}
+			} else if (messageType === "CLOSED") {
+				const detail =
+					message.length > 2 ? String(message.at(-1)) : "subscription closed";
+				throw new Error(detail);
+			} else if (messageType === "NOTICE") {
+				this.logger?.warn?.(`Buzz: relay notice: ${String(message.at(-1))}`);
+			}
+		}
+	}
+
+	/**
+	 * adapter.py:_websocket_loop — persistent authenticated subscription with
+	 * bounded reconnect backoff (1s doubling to a 30s cap). Events route
+	 * through handleEvent — identical semantics to the poll loop. On
+	 * reconnect, per-channel `since` filters resume from the last observed
+	 * timestamps (same-second overlap de-duped by event id).
+	 */
+	private async websocketLoop(
+		ready: Deferred<"ready">,
+		stopped: Deferred<void>,
+	): Promise<void> {
+		let backoffSeconds = BUZZ_WS_BACKOFF_START_S;
+		try {
+			while (!this.wsStopRequested) {
+				let socket: BuzzRelaySocket | null = null;
+				try {
+					socket = await this.relaySocketFactory!(this.websocketUrl());
+					this.activeSocket = socket;
+					await this.authenticateWebsocket(socket);
+					const subscriptions = await this.subscribeWebsocket(socket);
+					this.wsActive = true;
+					ready.resolve("ready");
+					backoffSeconds = BUZZ_WS_BACKOFF_START_S;
+					await this.relayFrameLoop(socket, subscriptions);
+				} catch (err) {
+					if (this.wsStopRequested) break;
+					this.wsActive = false;
+					this.lastWsError = err instanceof Error ? err.message : String(err);
+					this.logger?.warn?.(
+						`Buzz: WebSocket disconnected; retrying in ${backoffSeconds}s: ${this.lastWsError}`,
+					);
+					await this.loopSleep(backoffSeconds);
+					backoffSeconds = Math.min(backoffSeconds * 2, BUZZ_WS_BACKOFF_MAX_S);
+				} finally {
+					if (socket !== null) {
+						try {
+							socket.close();
+						} catch {
+							/* already closed */
+						}
+						if (this.activeSocket === socket) this.activeSocket = null;
+					}
+				}
+			}
+		} finally {
+			this.wsActive = false;
+			stopped.resolve();
+		}
 	}
 
 	// ── sending ───────────────────────────────────────────────────────────────────

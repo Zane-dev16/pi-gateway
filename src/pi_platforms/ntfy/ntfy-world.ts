@@ -5,10 +5,13 @@
 // ── PROPOSED DEC (ntfy-replay-window) ───────────────────────────────────────
 // transport.ws.resubscribe-replay maps to ntfy's vendor-true surfaces: the
 // in-flight window (events pulled off the stream while the session was down
-// are HELD and redispatched exactly-once on reconnect) PLUS the 300s dedup
-// window, which makes any SERVER-side redelivery of a seen id exactly-once
-// downstream. Gap traffic outside both windows is lost by protocol (no since=
-// cursor exists in the reference client) — documented, never faked green.
+// are HELD and redispatched losslessly on reconnect). The 300s dedup window
+// makes any SERVER-side redelivery of a seen id exactly-once WITHIN one
+// connection generation; disconnect() CLEARS the map (adapter.py:disconnect
+// :327), so a NEW generation re-dispatches redeliveries of ids seen under the
+// previous one — Hermes truth, never faked green. Gap traffic outside the
+// in-flight window is lost by protocol (no since= cursor exists in the
+// reference client) — documented, never faked green.
 //
 // ── PROPOSED DEC (ntfy-retry-after-leg) ────────────────────────────────────
 // The reconnect ladder is the FIXED manifest array [2,5,10,30,60]s; the only
@@ -167,7 +170,7 @@ export function makeRealNtfyFixture(): WsFixture {
 			// Arm the in-flight hold window: pulled events park instead of
 			// dispatching (the reconnect-window discipline, deterministically).
 			w.engine.setInboundHoldGate(true);
-			const replayedId = stream.pushMessage("o1");
+			stream.pushMessage("o1");
 			stream.pushMessage("o2");
 			stream.pushMessage("o3");
 			await w.pumpStreamEvents(15);
@@ -177,7 +180,7 @@ export function makeRealNtfyFixture(): WsFixture {
 				`3 events held (${sentDuringDisconnect})`,
 			);
 
-			w.engine.disconnect(); // session DOWN mid-life
+			w.engine.disconnect(); // session DOWN mid-life (dedup map cleared)
 			let settled = false;
 			const reconnecting = w.engine
 				.connect({ isReconnect: true })
@@ -188,27 +191,46 @@ export function makeRealNtfyFixture(): WsFixture {
 			await reconnecting;
 			w.engine.setInboundHoldGate(false);
 
-			// Drain the held window — each text lands EXACTLY once (burst-
-			// tolerant: the guard may coalesce same-chat arrivals into one
-			// newline-joined drain turn; that discipline is the burst rows').
-			const blobOf = (): string => [...w.subject.turns()].join("\n");
+			// Drain the held window — every text lands (burst-tolerant: the guard
+			// may coalesce same-chat arrivals into one newline-joined drain turn;
+			// that discipline is the burst rows').
 			await eventually(() => {
-				const blob = blobOf();
+				const blob = [...w.subject.turns()].join("\n");
 				return (
 					blob.includes("o1") && blob.includes("o2") && blob.includes("o3")
 				);
 			});
-			// …and a SERVER-SIDE redelivery of a SEEN id stays exactly-once via
-			// the dedup window. The redelivery carries the ORIGINAL vendor id.
-			const newStream = w.engine.activeStreamForTests();
-			newStream?.pushMessage("o1", { id: replayedId });
+
+			// Within THIS generation the dedup window still shields exactly-once:
+			// a same-id redelivery on the LIVE stream is suppressed by ID even
+			// with different payload bytes. (Blob containment — the guard may
+			// coalesce same-chat arrivals into one newline-joined turn.)
+			const live = w.engine.activeStreamForTests();
+			live?.pushMessage("fresh after reconnect", { id: "gen2-fresh" });
+			live?.pushMessage("dup-A", { id: "fixed-dup" });
+			live?.pushMessage("dup-B (same id, different bytes)", {
+				id: "fixed-dup",
+			});
 			await w.pumpStreamEvents(20);
-			const turns = [...w.subject.turns()];
-			const o1Count = turns.filter((x) => x === "o1").length;
+			await eventually(() =>
+				[...w.subject.turns()].join("\n").includes("dup-A"),
+			);
+			const postReconnectBlob = [...w.subject.turns()].join("\n");
+			check(
+				postReconnectBlob.includes("dup-A") &&
+					!postReconnectBlob.includes("dup-B (same id, different bytes)"),
+				"same-generation same-id redelivery suppressed exactly once",
+			);
+			check(w.engine.dedupHits.duplicates >= 1, "duplicate counter ticked");
+
+			// Replay verdict: all three texts sent during the disconnect landed
+			// after the resubscribe (held-window losslessness).
+			const replayedAfterResubscribe = ["o1", "o2", "o3"].filter((t) =>
+				postReconnectBlob.includes(t),
+			).length;
 			return {
 				sentDuringDisconnect,
-				replayedAfterResubscribe:
-					o1Count === 1 && w.engine.dedupHits.duplicates >= 1 ? 3 : o1Count,
+				replayedAfterResubscribe,
 			};
 		},
 
@@ -572,12 +594,9 @@ export function makeNtfyShapeRows(): ConformanceRow[] {
 		),
 		deltaRow(
 			"transport.ntfy.publish-shapes",
-			"ntfy: publish wire shapes — ≤4096-char bodies ship as ONE op; oversized content splits per §6.3 with EVERY op ≤4096; echo tag on EVERY publish; publish_topic chain metadata→configured→chat_id; 401/404 FATAL stop",
+			"ntfy: publish wire shapes — ONE POST per delivery, oversized bodies TRUNCATED to content[:4096] with the vendor truncation warning (splitsLongMessages=false ⇒ no split lane); echo tag on EVERY publish; auth headers ride the stream GET with 401/404 classified from MODELED statuses; publish_topic chain metadata→configured→chat_id",
 			async () => {
-				const w = makeNtfyWorld({
-					name: "ntfy-publish",
-					scalarMaxUnits: NTFY_MAX_MESSAGE_CHARS,
-				});
+				const w = makeNtfyWorld({ name: "ntfy-publish" });
 				await w.connectAndAwaitLive();
 
 				// Within the 4096 vendor cap: EXACTLY ONE op, body verbatim.
@@ -589,21 +608,28 @@ export function makeNtfyShapeRows(): ConformanceRow[] {
 				check(pub?.body.length === 4000, `body verbatim (${pub?.body.length})`);
 				check(pub?.headers["X-Tags"] === NTFY_ECHO_TAG, "echo tag present");
 
-				// Oversized (>4096): §6.3 split, every wire op stays ≤4096.
+				// Oversized (>4096): STILL ONE POST, truncated to content[:4096],
+				// with the vendor truncation WARNING (adapter.py:send :429-439).
+				// MUTANT: a labeled multi-publish lane ships bodies Hermes never
+				// sends despite splitsLongMessages=false.
 				const big = "y".repeat(9000);
 				const results = await w.subject.deliverLongText(TOPIC, big);
-				check(results.length > 1, `oversized splits (${results.length})`);
 				check(
-					results.every((r) => r.success),
-					"all chunks deliver",
+					results.length === 1,
+					`oversized ships as ONE op (${results.length})`,
 				);
-				for (const op of w.wire.sendsOf(TOPIC).slice(-results.length)) {
-					check(
-						op.content.length <= NTFY_MAX_MESSAGE_CHARS,
-						`op within protocol cap (${op.content.length})`,
-					);
-					check(op.content.includes("yyyy"), "chunk carries payload bytes");
-				}
+				check(results[0]?.success === true, "truncated publish succeeds");
+				check(
+					w.server.published.at(-1)?.body ===
+						big.slice(0, NTFY_MAX_MESSAGE_CHARS),
+					"body is content[:4096]",
+				);
+				check(
+					w.engine.warningLog.some((l) =>
+						l.includes("truncated from 9000 to 4096 chars"),
+					),
+					"truncation warning recorded",
+				);
 
 				// publish_topic chain: metadata wins over configured over chat_id.
 				const r2 = await w.subject.sendThroughDoor1(
@@ -619,40 +645,66 @@ export function makeNtfyShapeRows(): ConformanceRow[] {
 					"metadata topic used",
 				);
 
-				// 401 stops reconnecting permanently (FATAL, non-retryable):
-				// connect() REJECTS with FatalStreamError — the leg asserts the
-				// typed fatal rather than swallowing the rejection.
-				const dead = makeNtfyWorld({ name: "ntfy-401", clock: w.clock });
-				dead.server.authRejectMode = true;
+				// Stream GET carries _auth_headers() (:233-234); the fake models
+				// the vendor RESPONSE STATUS and the adapter classifies fatality
+				// from it — never from error strings or harness knobs.
+				const guarded = makeNtfyWorld({ name: "ntfy-401", clock: w.clock });
+				guarded.server.requiredAuthHeader = "Bearer right-token";
 				let unauthorized = false;
 				try {
-					await dead.connectAndAwaitLive();
+					await guarded.connectAndAwaitLive();
 				} catch (err) {
-					unauthorized =
-						err instanceof FatalStreamError ||
-						String((err as Error).message).includes("401");
+					unauthorized = err instanceof FatalStreamError;
 				}
-				check(unauthorized, "401 surfaces as a fatal stream error");
+				check(unauthorized, "modeled 401 surfaces as a fatal stream error");
 				check(
-					dead.subject.lifecycleSnapshot().state === "fatal" &&
-						dead.subject
+					guarded.subject.lifecycleSnapshot().state === "fatal" &&
+						guarded.subject
 							.lifecycleSnapshot()
 							.detail.includes("ntfy_unauthorized"),
 					"401 ⇒ FATAL ntfy_unauthorized",
 				);
+				check(
+					(guarded.server.subscribeLog.at(-1)?.authHeaders.Authorization ??
+						undefined) === undefined,
+					"credential-less adapter presented NO Authorization header",
+				);
+				check(
+					guarded.server.streams.length === 0,
+					"refused reader NEVER admitted",
+				);
 
-				// 404 likewise.
+				// A MATCHING credential IS admitted, with buildAuthHeader output
+				// riding the stream GET.
+				const admitted = new FakeNtfyServer();
+				admitted.requiredAuthHeader = "Bearer tok-1";
+				const s = makeNtfySubject({
+					wire: new FakePlatformWire(),
+					server: admitted,
+					name: "ntfy-auth-ok",
+					clock: w.clock,
+					token: "tok-1",
+				});
+				check(
+					(await s.adapter.connect({ isReconnect: false })) === true,
+					"matching credential admits the reader",
+				);
+				check(
+					admitted.subscribeLog.at(-1)?.authHeaders.Authorization ===
+						"Bearer tok-1",
+					"buildAuthHeader output rode the stream GET",
+				);
+
+				// 404 likewise (modeled status → fatal classification).
 				const missing = makeNtfyWorld({ name: "ntfy-404", clock: w.clock });
 				missing.server.topicNotFound = true;
 				let notFound = false;
 				try {
 					await missing.connectAndAwaitLive();
 				} catch (err) {
-					notFound =
-						err instanceof FatalStreamError ||
-						String((err as Error).message).includes("404");
+					notFound = err instanceof FatalStreamError;
 				}
-				check(notFound, "404 surfaces as a fatal stream error");
+				check(notFound, "modeled 404 surfaces as a fatal stream error");
 				check(
 					missing.subject.lifecycleSnapshot().state === "fatal" &&
 						missing.subject

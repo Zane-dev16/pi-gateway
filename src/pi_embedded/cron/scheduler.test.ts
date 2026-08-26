@@ -405,3 +405,91 @@ describe("ticker loop lifecycle (#87644 backoff ownership)", () => {
 		expect(scheduler.isRunning).toBe(false);
 	});
 });
+
+describe("in-flight visibility (gateway shutdown-drain input, #60432/#82161)", () => {
+	it("a mid-run job is visible via the scheduler AND its handle; cleared only after full settlement", async () => {
+		const job = await dueIntervalJob();
+		const runGate = new Gate();
+		let deliveryDone = false;
+		let sawInflightDuringRun = false;
+		const scheduler = new CronScheduler({
+			store,
+			clock,
+			env: {},
+			runner: {
+				run: async () => {
+					// The run must be visible to the drain WHILE it works…
+					sawInflightDuringRun = scheduler.inflightJobCount === 1;
+					await runGate.wait;
+					return { ok: true, outputText: "late result" };
+				},
+				interrupt: async () => true,
+			},
+			deliverySink: {
+				deliver: async () => {
+					// …and still visible during the deliver tail (the phase a
+					// pre-drain stop would amputate — #82232 shape).
+					deliveryDone = scheduler.inflightJobCount === 1;
+					return null;
+				},
+			},
+		});
+		expect(scheduler.inflightJobCount).toBe(0);
+		expect(scheduler.runningJobs).toEqual([]);
+		const handle = scheduler.handle();
+		expect(handle.inflightCount()).toBe(0);
+
+		const tick = scheduler.tickOnce();
+		await new Promise<void>((r) => setImmediate(r)); // let the run start + park on the gate
+		expect(sawInflightDuringRun).toBe(true);
+		expect(scheduler.inflightJobCount).toBe(1);
+		expect(scheduler.runningJobs).toEqual([job.id]);
+		expect(handle.inflightCount()).toBe(1); // drain reads the SAME counter
+
+		runGate.open();
+		const report = await tick;
+		expect(report.executed).toBe(1);
+		expect(deliveryDone).toBe(true); // count stayed up through delivery
+		expect(scheduler.inflightJobCount).toBe(0);
+		expect(handle.inflightCount()).toBe(0);
+	});
+
+	it("a claim-lost stale run is registered too — the drain sees it while it unwinds", async () => {
+		const job = await dueIntervalJob();
+		const stolenGate = new Gate();
+		let stole = false;
+		let sawInflight = false;
+		const runner: ScheduledJobRunner = {
+			run: async ({ activity }) => {
+				activity.touch(clock.nowSeconds());
+				if (!stole) {
+					stole = true;
+					await store.mutate((jobs) => {
+						const j = jobs.find((x) => x.id === job.id)!;
+						j.fire_claim = {
+							at: new Date(clock.nowSeconds() * 1000).toISOString(),
+							by: "winner:B",
+						};
+					});
+				}
+				sawInflight = scheduler.inflightJobCount === 1;
+				await stolenGate.wait;
+				return { ok: true };
+			},
+			interrupt: () => {
+				stolenGate.open();
+				return Promise.resolve(true);
+			},
+		};
+		const scheduler = new CronScheduler({ store, clock, env: {}, runner });
+
+		// The bound's heartbeat poll detects the stolen claim and fires the
+		// interrupt itself (which opens the gate); monitor polls self-drive
+		// logical time.
+		const report = await scheduler.tickOnce();
+
+		expect(report.results[0]?.status).toBe("claim_lost");
+		expect(sawInflight).toBe(true);
+		expect(scheduler.inflightJobCount).toBe(0); // finally always releases
+	});
+});

@@ -23,6 +23,7 @@ import {
 	type MessageHandler,
 	type TaskSpawner,
 } from "../../pi_gateway/guards/index.js";
+import type { SessionSource } from "../../pi_gateway/resolution/session-key.js";
 import type {
 	EgressChokepoint,
 	DoorTransport,
@@ -204,6 +205,12 @@ export abstract class BasePlatformAdapter {
 			spawner?: TaskSpawner | undefined;
 			/** Lane C clarify-intercept predicate (§5.3). */
 			hasPendingClarify?: ((sessionKey: string) => boolean) | undefined;
+			/** Telegram DM topic-recovery hook (run.py:_recover_telegram_topic_thread_id). */
+			topicThreadRecovery?:
+				| ((source: SessionSource) => string | null | undefined)
+				| undefined;
+			/** Key rebuilder applied after a recovery rewrite (build_session_key parity). */
+			rebuildSessionKey?: ((source: SessionSource) => string) | undefined;
 		} = {},
 	): void {
 		if (this.guard !== null) return;
@@ -217,6 +224,12 @@ export abstract class BasePlatformAdapter {
 			...(opts.spawner !== undefined ? { spawner: opts.spawner } : {}),
 			...(opts.hasPendingClarify !== undefined
 				? { hasPendingClarify: opts.hasPendingClarify }
+				: {}),
+			...(opts.topicThreadRecovery !== undefined
+				? { topicThreadRecovery: opts.topicThreadRecovery }
+				: {}),
+			...(opts.rebuildSessionKey !== undefined
+				? { rebuildSessionKey: opts.rebuildSessionKey }
 				: {}),
 		});
 	}

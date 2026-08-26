@@ -8,6 +8,14 @@
 // (restart-boundary parity); self-owned pending/failed rows wait out the
 // exponential backoff (60s ×4 growth, 1h cap) so the ledger never busy-retries."
 //
+// Claim-time resume-clear parity (#91969): run.py:_claim_pending_obligations
+// clears resume_pending for EVERY claimed row BEFORE redelivery, so boot
+// resume never re-runs (re-pays) a turn whose answer the ledger already
+// holds. This scheduler is pi's claim point, so tick() hands each claimed
+// session_key to the injected clearResumePending hook before driveClaimed.
+// The lifecycle drain's clearResumePending stays pre-drain only — this is
+// the claim-time complement, not a replacement.
+//
 // HARD RULE honored here: time enters only through the injected GatewayClock.
 // The default systemClock touches Date.now/setTimeout; logic never does.
 
@@ -30,6 +38,17 @@ export interface RetrySchedulerOptions {
 	deliverablePlatforms?:
 		| ReadonlySet<string>
 		| (() => ReadonlySet<string> | undefined);
+	/**
+	 * Resume-clear parity (#91969, run.py:_claim_pending_obligations):
+	 * invoked once per claimed row's session key AFTER the claim and BEFORE
+	 * any driveClaimed send — a session with a claimed obligation already
+	 * produced its answer (only delivery is owed), so its resume_pending
+	 * flag must be gone before redelivery or boot-resume scheduling can
+	 * observe it. Per-key best-effort exactly like Hermes: a throwing key is
+	 * swallowed and never blocks the remaining keys or the sends. Absent ⇒
+	 * no-op (the lifecycle drain hook covers shutdown only).
+	 */
+	clearResumePending?: (sessionKey: string) => Promise<void>;
 }
 
 export interface SchedulerTickReport {
@@ -52,6 +71,9 @@ export class ObligationRetryScheduler {
 		| ReadonlySet<string>
 		| (() => ReadonlySet<string> | undefined)
 		| undefined;
+	private readonly clearResumePendingOpt:
+		| ((sessionKey: string) => Promise<void>)
+		| undefined;
 	private running = false;
 	private loopPromise: Promise<void> | null = null;
 	private pendingSleepResolvers: Array<() => void> = [];
@@ -70,6 +92,7 @@ export class ObligationRetryScheduler {
 		this.intervalSeconds =
 			opts.intervalSeconds ?? DEFAULT_TICK_INTERVAL_SECONDS;
 		this.deliverablePlatformsOpt = opts.deliverablePlatforms;
+		this.clearResumePendingOpt = opts.clearResumePending;
 	}
 
 	private deliverableNow(): ReadonlySet<string> | undefined {
@@ -101,6 +124,9 @@ export class ObligationRetryScheduler {
 			report.retried = retried.length;
 			const combined: ClaimedObligation[] = [...recovered, ...retried];
 			if (combined.length > 0) {
+				// #91969 parity: clears complete BEFORE any send so even a hung
+				// redelivery leaves no replay window for the resume path.
+				await this.clearResumeForClaimed(combined);
 				report.results = await this.ledger.driveClaimed(combined, this.sender, {
 					nowSeconds: now,
 				});
@@ -109,6 +135,27 @@ export class ObligationRetryScheduler {
 			// Best-effort: a failed tick must never crash the gateway loop.
 		}
 		return report;
+	}
+
+	/**
+	 * Per-claimed-row resume_pending clear (run.py:_claim_pending_obligations
+	 * loop): empty keys are skipped (`if not session_key: continue`), each key
+	 * is awaited individually and isolated — one store failure neither blocks
+	 * the remaining keys nor the redeliveries that follow.
+	 */
+	private async clearResumeForClaimed(
+		claimed: readonly ClaimedObligation[],
+	): Promise<void> {
+		const clear = this.clearResumePendingOpt;
+		if (clear === undefined) return;
+		for (const row of claimed) {
+			if (!row.sessionKey) continue;
+			try {
+				await clear(row.sessionKey);
+			} catch {
+				// parity: "clear_resume_pending failed for %s" at debug level
+			}
+		}
 	}
 
 	/** Begin the background loop (idempotent). */

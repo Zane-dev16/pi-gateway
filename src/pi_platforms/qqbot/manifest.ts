@@ -24,7 +24,8 @@ export const QQBOT_GATEWAY_URL_PATH = "/gateway"; // constants.py:GATEWAY_URL_PA
  * (utils.py:get_api_headers notes q.qq.com answers anti-bot challenge pages
  * without an identifying UA). Hermes format:
  *   `QQBotAdapter/<version> (Python/<py>; <os>; Hermes/<version>)`
- * This port preserves the vendor contract with truthful runtime tokens.
+ * This port preserves the vendor contract with truthful runtime tokens —
+ * the pi-gateway identity tail is DEC-060 (branding tokens).
  */
 export const QQBOT_USER_AGENT = `QQBotAdapter/${QQBOT_VERSION} (Node/${process.version}; ${process.platform}; pi-gateway)`;
 

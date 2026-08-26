@@ -18,6 +18,10 @@
 //   pi_embedded       4   deps: pi_state, pi_home; started BY the runner but
 //                         never importing it
 //   pi_server         5   client surfaces; the gateway NEVER imports these
+//   entrypoints       6   'pi main / pi gateway run' composition roots — the
+//                         ONE rank allowed to import every other layer and
+//                         bind it into a running gateway (DEC-058; 01 §5.3
+//                         top row: entrypoints sit ABOVE the whole graph)
 //
 // Hard failures:
 //   UPWARD_IMPORT     importer reaches a strictly higher-ranked layer
@@ -60,6 +64,7 @@ const LAYER_RANK = {
 	pi_platforms: 4,
 	pi_embedded: 4,
 	pi_server: 5,
+	entrypoints: 6,
 };
 
 /** Runner internals that platform/embedded code must never import. */

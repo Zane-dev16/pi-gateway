@@ -319,15 +319,24 @@ export const PHOTON_PLUGIN_MANIFEST: PluginManifest = Object.freeze({
 
 /**
  * _start_sidecar spawn contract as PURE DATA (the port spawns NO OS children).
- * Transcribed from adapter.py:_start_sidecar env assembly: the Node child gets
- * the project credentials + loopback bind + generated sidecar token, and
- * PHOTON_SIDECAR_WATCH_STDIN=1 so gateway death of ANY kind (even SIGKILL)
- * takes the sidecar down via stdin EOF.
+ * Transcribed from adapter.py:_start_sidecar env assembly (@~1629-1638): the
+ * Node child gets the project credentials (PHOTON_PROJECT_ID/PHOTON_PROJECT_SECRET)
+ * + loopback bind/port + the generated sidecar token (PHOTON_SIDECAR_TOKEN,
+ * adapter.py @750: scoped secret or token_hex) so the documented child contract
+ * can authenticate, and PHOTON_SIDECAR_WATCH_STDIN=1 so gateway death of ANY
+ * kind (even SIGKILL) takes the sidecar down via stdin EOF. Values are injected
+ * AT SPAWN TIME by the caller (the excluded lifecycle owner).
  */
 export function buildSidecarSpawnCommand(opts: {
 	nodeBin: string;
 	sidecarDir: string;
 	port?: number | undefined;
+	/** adapter.py env["PHOTON_PROJECT_ID"] = self._project_id. */
+	projectId: string;
+	/** adapter.py env["PHOTON_PROJECT_SECRET"] = self._project_secret. */
+	projectSecret: string;
+	/** adapter.py env["PHOTON_SIDECAR_TOKEN"] = self._sidecar_token. */
+	sidecarToken: string;
 }): {
 	argv: readonly string[];
 	envVars: Readonly<Record<string, string>>;
@@ -335,8 +344,11 @@ export function buildSidecarSpawnCommand(opts: {
 	return {
 		argv: [opts.nodeBin, `${opts.sidecarDir}/index.mjs`],
 		envVars: {
+			PHOTON_PROJECT_ID: opts.projectId,
+			PHOTON_PROJECT_SECRET: opts.projectSecret,
 			PHOTON_SIDECAR_PORT: String(opts.port ?? PHOTON_DEFAULT_SIDECAR_PORT),
 			PHOTON_SIDECAR_BIND: PHOTON_SIDECAR_BIND,
+			PHOTON_SIDECAR_TOKEN: opts.sidecarToken,
 			PHOTON_SIDECAR_WATCH_STDIN: "1",
 		},
 	};

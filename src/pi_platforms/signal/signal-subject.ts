@@ -127,7 +127,8 @@ class SubjectRpcBridge implements SignalCliTransport {
 		return true;
 	}
 
-	async openEventStream(): Promise<SignalEventStream> {
+	async openEventStream(account: string): Promise<SignalEventStream> {
+		void account; // harness subjects never hold a live SSE lane
 		throw new Error("event streams require the FakeSignalCliServer fixture");
 	}
 

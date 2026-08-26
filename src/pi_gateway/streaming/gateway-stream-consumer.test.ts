@@ -13,6 +13,7 @@ import { INTERIM_SEND_MARKER } from "./adapter-seam.js";
 import { StreamingCapabilities } from "./capability.js";
 import {
 	GatewayStreamConsumer,
+	ensureClosedCodeFences,
 	type StreamConsumerConfig,
 } from "./gateway-stream-consumer.js";
 import {
@@ -1013,5 +1014,560 @@ describe("think-block scrubber (stream_consumer.py:_filter_and_accumulate)", () 
 		consumer.finish("the <think> tag is used for notes");
 		await runP;
 		expect(allWireContent(fake)).toContain("the <think> tag is used for notes");
+	});
+});
+
+// ── stream-egress-1: display-side media-directive stripping ─────────────
+// stream_consumer.py:_clean_for_display runs before EVERY emission and
+// before every silence/delivered-payload comparison; raw MEDIA: tags and
+// [[audio_as_voice]]/[[as_document]] directives must never reach chats.
+
+describe("display cleaning (stream_consumer.py:_clean_for_display)", () => {
+	function bootClean(extra?: Partial<StreamConsumerConfig>) {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false; // edit-based path
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+			...extra,
+		});
+		return { fake, consumer, clock, runP: consumer.run() };
+	}
+
+	function allWireContent(fake: FakeDraftStreamAdapter): string {
+		return fake.ops.map((o) => ("content" in o ? o.content : "")).join("\n");
+	}
+
+	it("MUTATION: MEDIA directives in the buffer NEVER display — frames, edits, or final", async () => {
+		const { fake, consumer, clock, runP } = bootClean();
+		consumer.onDelta("check MEDIA:/a.png and [[audio_as_voice]] now");
+		await fake.waitForCount(
+			1,
+			(o) => "content" in o && o.content.includes("check"),
+		);
+		clock.advance(100);
+		consumer.onDelta(" plus MEDIA:/b.png");
+		await fake.waitForCount(1, (o) => o.op === "edit");
+		consumer.finish("check  and  now plus FINAL MEDIA:/c.png");
+		await runP;
+
+		const wire = allWireContent(fake);
+		expect(wire).not.toContain("MEDIA:");
+		expect(wire).not.toContain("[[audio_as_voice]]");
+		expect(wire).toContain("plus FINAL"); // prose survives
+		expect(consumer.finalContentDelivered).toBe(true);
+	});
+
+	it("draft frames are cleaned too (native streams never carry raw directives)", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "draft",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("frame MEDIA:/d.png body");
+		await fake.waitForCount(
+			1,
+			(o) => o.op === "draft" && o.content.includes("frame"),
+		);
+		expect(fake.draftFrames()[0]?.content).toBe("frame  body");
+		consumer.finish("frame  body");
+		await runP;
+		expect(allWireContent(fake)).not.toContain("MEDIA:");
+	});
+
+	it("a directive-masked silence marker is STILL suppressed (gate sees the cleaned buffer)", async () => {
+		const { fake, consumer, clock, runP } = bootClean();
+		// Raw buffer is not a marker; only the CLEANED form resolves to one.
+		consumer.onDelta("MEDIA:/a.png\n\nNO_REPLY");
+		clock.advance(1_000); // interval long since elapsed — hold-back checks too
+		expect(fake.ops).toHaveLength(0); // partial-marker hold-back saw through the directive
+
+		consumer.finish("MEDIA:/a.png\n\nNO_REPLY", {
+			agentResult: { failed: false },
+		});
+		await runP;
+		expect(
+			fake.ops.some((o) => "content" in o && /NO_REPLY|MEDIA:/.test(o.content)),
+		).toBe(false);
+		expect(consumer.finalContentDelivered).toBe(false);
+		expect(consumer.turnDisposition?.deliver).toBe(false);
+	});
+
+	it("commentary beats are cleaned at the same boundary", async () => {
+		const { fake, consumer, runP } = bootClean();
+		consumer.onCommentary("scanning MEDIA:/e.png [[as_document]] done");
+		await fake.waitForCount(
+			1,
+			(o) => o.op === "send" && o.content.includes("scanning"),
+		);
+		expect(
+			fake.ops.find(
+				(o): o is SendOp => o.op === "send" && o.content.includes("scanning"),
+			)?.content,
+		).toBe("scanning   done");
+		consumer.finish();
+		await runP;
+	});
+});
+
+// ── stream-egress-3: fence balancing on persistent surfaces ─────────────
+// stream_consumer.py:ensure_closed_code_fences — truncation mid-code-block
+// renders the whole remainder as one code block on Discord/Slack/Matrix.
+
+describe("fence closing (stream_consumer.py:ensure_closed_code_fences)", () => {
+	it("unit: odd ``` appends a fence; orphan inline backtick closes; balanced text untouched", () => {
+		expect(ensureClosedCodeFences("```js\ncode();")).toBe(
+			"```js\ncode();\n```",
+		);
+		expect(ensureClosedCodeFences("run `x and y")).toBe("run `x and y`");
+		expect(ensureClosedCodeFences("```js\ncode();\n```")).toBe(
+			"```js\ncode();\n```",
+		);
+		// Backticks INSIDE complete fences do not pollute the inline count.
+		expect(ensureClosedCodeFences("```\n`odd one`\n``` and `tail")).toBe(
+			"```\n`odd one`\n``` and `tail`",
+		);
+		expect(ensureClosedCodeFences("plain")).toBe("plain");
+	});
+
+	it("edit-path previews AND the finalize surface are fence-closed; unchanged finals skip", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("look:\n```js\ncode();");
+		const preview = await fake.waitFor((o): o is SendOp => o.op === "send");
+		// Mid-stream frame already balanced (G2 parity).
+		expect(preview.content).toBe("look:\n```js\ncode();\n```");
+
+		clock.advance(100);
+		consumer.finish("look:\n```js\ncode();"); // identical to fenced preview
+		await runP;
+		// The fenced preview IS the final — no redundant finalize edit.
+		expect(fake.ops.some((o) => o.op === "edit")).toBe(false);
+		expect(consumer.finalContentDelivered).toBe(true);
+		expect(consumer.deliveredFinalMatches("look:\n```js\ncode();")).toBe(true);
+	});
+
+	it("an orphaned INLINE backtick closes on the persistent surface", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("run `ls -la");
+		const send = await fake.waitFor((o): o is SendOp => o.op === "send");
+		expect(send.content).toBe("run `ls -la`");
+		consumer.finish("run `ls -la"); // fenced form already on screen → skip
+		await runP;
+		expect(consumer.finalContentDelivered).toBe(true);
+	});
+
+	it("draft frames stay UNFENCED so prefix stability holds across code-block ticks (invariant 1)", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "draft",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("```js\ncode");
+		await fake.waitForCount(
+			1,
+			(o) => o.op === "draft" && o.content === "```js\ncode",
+		);
+		clock.advance(100);
+		consumer.onDelta("();");
+		const frames = await fake.waitForCount(
+			2,
+			(o): o is DraftOp => o.op === "draft" && !o.final,
+		);
+		// Neither draft frame carries an appended fence…
+		for (const f of frames as DraftOp[])
+			expect(f.content).not.toContain("\n```");
+		// …and the second extends the first — NO prefix violation fired.
+		expect(frames[1]?.content).toBe("```js\ncode();");
+		expect(consumer.prefixViolations).toEqual([]);
+		expect(fake.draftFrames()).toHaveLength(2);
+
+		// The turn-final still closes the fence on its persistent surface.
+		consumer.finish("```js\ncode();");
+		await runP;
+		const finalSend = await fake.waitFor(
+			(o): o is SendOp => o.op === "send" && o.metadata?.["notify"] === true,
+		);
+		expect(finalSend.content).toBe("```js\ncode();\n```");
+		expect(consumer.prefixViolations).toEqual([]);
+	});
+});
+
+// ── stream-egress-2: commentary queues FIFO + segment-state reset ───────
+
+describe("commentary FIFO through the queue (stream_consumer.py:on_commentary)", () => {
+	function bootCommentary() {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		return { fake, consumer, clock, runP: consumer.run() };
+	}
+
+	it("MUTATION: commentary NEVER jumps queued deltas; post-commentary prose opens a NEW bubble", async () => {
+		const { fake, consumer, clock, runP } = bootCommentary();
+		// Enqueue delta THEN commentary back-to-back — the beat must wait for
+		// the buffered prose to hit the wire first.
+		consumer.onDelta("prose before");
+		consumer.onCommentary("mid-beat note");
+		const sends = await fake.waitForCount(
+			2,
+			(o): o is SendOp => o.op === "send",
+		);
+		expect(sends[0]?.content).toBe("prose before");
+		expect(sends[1]?.content).toBe("mid-beat note");
+
+		clock.advance(100);
+		consumer.onDelta("after the beat");
+		const later = await fake.waitForCount(
+			3,
+			(o): o is SendOp => o.op === "send",
+		);
+		// THE DISCRIMINATOR: without the segment-state reset around the
+		// commentary send, this prose would EDIT the stale preview above;
+		// with it, the wire shows a THIRD plain send (a fresh bubble below).
+		expect(later[2]?.content).toBe("after the beat");
+		expect(fake.ops.some((o) => o.op === "edit")).toBe(false);
+
+		consumer.finish("prose before after the beat");
+		await runP;
+		expect(consumer.deliveredSegments).toContain("prose before");
+		expect(consumer.deliveredCommentary).toEqual(["mid-beat note"]);
+		expect(consumer.finalContentDelivered).toBe(true);
+	});
+
+	it("relay-shaped native streams keep ONE cumulative stream across commentary (no reset)", async () => {
+		const fake = new FakeStreamIsMessageAdapter();
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "draft",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("part A");
+		await fake.waitForCount(
+			1,
+			(o) => o.op === "draft" && !o.final && o.content === "part A",
+		);
+		const draftId = fake.draftFrames()[0]?.draftId;
+
+		consumer.onCommentary("status beat");
+		await fake.waitFor(
+			(o): o is SendOp => o.op === "send" && o.content === "status beat",
+		);
+
+		// Post-beat deltas continue the SAME native stream — no segment reset,
+		// no draft-id bump (append-only invariant). The forced flush inside
+		// commentary delivery is a NO-OP for an unchanged cumulative snapshot.
+		clock.advance(100);
+		consumer.onDelta("+B");
+		const frames = await fake.waitForCount(
+			2,
+			(o): o is DraftOp => o.op === "draft" && !o.final,
+		);
+		expect(frames.every((f) => f.draftId === draftId)).toBe(true);
+		consumer.finish("part A+B");
+		await runP;
+		// Interim declaration intact through the queue (checked after run so the
+		// chokepoint's finally-pushed audit entry is visible).
+		const interimAudit = fake.audit.find((a) => a.interim);
+		expect(interimAudit?.action).toBe("plain-send");
+		expect(consumer.deliveredCommentary).toEqual(["status beat"]);
+	});
+});
+
+// ── stream-egress-4: session-staleness probe (_abandon_native_stream) ────
+
+describe("stale-session abandonment (stream_consumer.py:run_still_current)", () => {
+	it("MUTATION: after /new or /stop the drain STOPS editing and seals the native stream in place", async () => {
+		const state = { current: true };
+		const fake = new FakeDraftStreamAdapter();
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "draft",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+			runStillCurrent: () => state.current,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("one");
+		await fake.waitForCount(1, (o) => o.op === "draft" && o.content === "one");
+
+		state.current = false; // /new bumped the generation mid-stream
+		clock.advance(100);
+		// The stale delta WAKES the parked drain — and the wake-up probe drops
+		// it unprocessed: stale deltas are never delivered after /new or /stop.
+		consumer.onDelta(" STALE");
+		await runP;
+
+		// Best-effort seal-in-place with the last delivered frame…
+		expect(fake.abandons).toEqual([{ chatId: "chat-1", content: "one" }]);
+		// …and NOTHING further reached the wire.
+		expect(fake.draftFrames()).toHaveLength(1);
+		expect(
+			fake.ops.some((o) => "content" in o && o.content.includes("STALE")),
+		).toBe(false);
+		// No delivery flags from an abandoned turn.
+		expect(consumer.finalResponseSent).toBe(false);
+		expect(consumer.finalContentDelivered).toBe(false);
+		// Late finish is inert — the run already returned and the queue is
+		// closed, so no further wire op can appear.
+		const opsBeforeFinish = fake.ops.length;
+		consumer.finish("late final");
+		expect(fake.ops.length).toBe(opsBeforeFinish);
+	});
+
+	it("edit-path preview is RETRACTED best-effort when the run goes stale", async () => {
+		const state = { current: true };
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+			runStillCurrent: () => state.current,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("partial answer");
+		await fake.waitFor((o): o is SendOp => o.op === "send");
+		await vi.waitFor(() => expect(consumer.message_id).not.toBeNull());
+		const previewId = consumer.message_id;
+		state.current = false;
+		consumer.onDelta(" more"); // wakes the drain → dropped by the wake-up probe
+		await runP;
+
+		const del = fake.ops.find(
+			(o): o is Extract<WireOp, { op: "delete" }> => o.op === "delete",
+		);
+		expect(del?.messageId).toBe(previewId);
+		// Post-abandon stragglers never deliver (unread queue parity).
+		const opsAtAbandon = fake.ops.length;
+		consumer.onDelta(" more");
+		await Promise.resolve();
+		expect(fake.ops.length).toBe(opsAtAbandon);
+		expect(
+			fake.ops.some((o) => "content" in o && o.content.includes("more")),
+		).toBe(false);
+		expect(consumer.finalContentDelivered).toBe(false);
+	});
+
+	it("default probe keeps every existing behavior (always current)", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 50,
+			bufferThreshold: 1,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("normal turn");
+		await fake.waitForCount(1, (o) => "content" in o);
+		consumer.finish("normal turn");
+		await runP;
+		expect(consumer.finalContentDelivered).toBe(true);
+	});
+});
+
+// ── stream-egress-7: flush barrier before interactive prompts ────────────
+
+describe("flush barrier (stream_consumer.py:flush_pending_sync/_FLUSH)", () => {
+	it("MUTATION: buffered prose is ON THE WIRE before the barrier resolves — prompts land below", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		// Long interval: the normal tick will NOT fire during this test.
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 60_000,
+			bufferThreshold: 100,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("explanation text");
+		const flushed = consumer.flushPendingSync(5_000);
+		const outcome = await flushed;
+		expect(outcome).toBe(true);
+		// Ordering proof: the buffered explanation is already delivered BEFORE
+		// the caller's blocking prompt send that follows the barrier. The prompt
+		// carries its own turn identity so the door treats it as a fresh send.
+		const explanation = await fake.waitFor(
+			(o): o is SendOp => o.op === "send" && o.content === "explanation text",
+		);
+		const prompt = await fake.send("chat-1", "CLARIFY POLL", undefined, {
+			reply_to_message_id: "prompt-turn",
+		});
+		expect(prompt.success).toBe(true);
+		const ops = fake.ops.filter((o): o is SendOp => o.op === "send");
+		const promptIdx = ops.findIndex((o) => o.content === "CLARIFY POLL");
+		expect(ops.indexOf(explanation)).toBeLessThan(promptIdx);
+		expect(promptIdx).toBeGreaterThan(-1);
+
+		consumer.finish();
+		await runP;
+	});
+
+	it("barrier forces delivery past the interval/threshold gates (segment closes)", async () => {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			editIntervalMs: 60_000,
+			bufferThreshold: 100,
+			now: clock.now,
+		});
+		const runP = consumer.run();
+		consumer.onDelta("held back by gates");
+		const flushed = await consumer.flushPendingSync(5_000);
+		expect(flushed).toBe(true);
+		await fake.waitFor(
+			(o): o is SendOp => o.op === "send" && o.content === "held back by gates",
+		);
+		consumer.finish();
+		await runP;
+		expect(consumer.deliveredSegments).toContain("held back by gates");
+	});
+
+	it("timeout resolves false without hanging; run-exit sweep wakes leftover waiters", async () => {
+		// No run() draining → nothing consumes the barrier → bounded timeout.
+		const idle = new GatewayStreamConsumer(
+			new FakeDraftStreamAdapter(),
+			"chat-1",
+			{ transport: "auto" },
+		);
+		const started = Date.now();
+		await expect(idle.flushPendingSync(25)).resolves.toBe(false);
+		expect(Date.now() - started).toBeLessThan(5_000);
+
+		// Stale-from-birth run abandons immediately; its exit sweep settles the
+		// waiter instead of stalling the full timeout (finally parity).
+		const fake = new FakeDraftStreamAdapter();
+		const dead = new GatewayStreamConsumer(fake, "chat-1", {
+			transport: "auto",
+			runStillCurrent: () => false,
+		});
+		const pending = dead.flushPendingSync(30_000);
+		await dead.run();
+		await expect(pending).resolves.toBe(true);
+		expect(fake.ops).toHaveLength(0);
+	});
+});
+
+// ── stream-egress-9: tri-state reconciliation (#78541/#71643/#14238) ─────
+
+describe("deliveredFinalMatches tri-state (stream_consumer.py:delivered_final_matches)", () => {
+	function boot9(limit: number, extra?: Partial<StreamConsumerConfig>) {
+		const fake = new FakeDraftStreamAdapter();
+		fake.supportsDraftStreaming = () => false;
+		const clock = makeClock();
+		const consumer = new GatewayStreamConsumer(
+			fake,
+			"chat-1",
+			{
+				transport: "auto",
+				editIntervalMs: 0,
+				bufferThreshold: 1,
+				now: clock.now,
+				messageLimit: limit,
+				...extra,
+			},
+			undefined,
+			"user-msg-1",
+		);
+		return { fake, consumer, clock, runP: consumer.run() };
+	}
+
+	it("empty target reconciles to null regardless of history", async () => {
+		const { consumer } = boot9(0);
+		consumer.finish();
+		await consumer.run();
+		expect(consumer.deliveredFinalMatches("")).toBe(null);
+	});
+
+	it("MUTATION: payload-less split delivery REFUSES legacy trust — false, not null (#78541)", async () => {
+		const LIMIT = 24;
+		const { fake, consumer, runP } = boot9(LIMIT);
+		const payload = "A".repeat(60);
+		consumer.onDelta(payload);
+		await fake.waitForCount(2, (o) => o.op === "send"); // sealed heads
+		expect(consumer.turnSplitDelivery).toBe(true);
+
+		// Final tail delivery FAILS → no recorded payload, split flag stands.
+		fake.failSends = true;
+		consumer.finish(payload);
+		await runP;
+
+		// Pre-fix this returned null and upstream trusted flags blindly —
+		// swallowing complete replies after early multi-message deliveries.
+		expect(consumer.turnSplitDelivery).toBe(true);
+		expect(consumer.finalContentDelivered).toBe(false);
+		expect(consumer.deliveredFinalMatches(payload)).toBe(false);
+		expect(consumer.deliveredFinalMatches("anything else")).toBe(false);
+	});
+
+	it("commentary-delivered text matches via fallback even when the final record differs (#14238)", async () => {
+		const { fake, consumer, runP } = boot9(0);
+		await consumer.sendCommentary("the actual answer");
+		consumer.onDelta("other streamed tail");
+		consumer.finish("other streamed tail");
+		await runP;
+		expect(consumer.deliveredFinalMatches("other streamed tail")).toBe(true);
+		expect(consumer.deliveredFinalMatches("the actual answer")).toBe(true);
+		expect(consumer.deliveredFinalMatches("neither")).toBe(false);
+	});
+
+	it("segment-finalized text matches via fallback after a divergent final (#65919 review)", async () => {
+		const { consumer, fake, runP } = boot9(0);
+		consumer.onDelta("preamble part");
+		await fake.waitForCount(
+			1,
+			(o): o is SendOp => o.op === "send" && o.content === "preamble part",
+		); // preview on screen BEFORE the boundary
+		consumer.onSegmentBreak();
+		consumer.onDelta("tail part");
+		consumer.finish("rewritten tail");
+		await runP;
+		expect(consumer.deliveredSegments).toContain("preamble part");
+		expect(consumer.deliveredFinalMatches("preamble part")).toBe(true);
+		expect(consumer.deliveredFinalMatches("totally absent")).toBe(false);
 	});
 });

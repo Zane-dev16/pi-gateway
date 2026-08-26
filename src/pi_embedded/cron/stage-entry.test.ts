@@ -52,6 +52,11 @@ describe("cronTickerServiceEntry (DEC-040 stage 7 wiring)", () => {
 		expect(outcome.degraded).toBeUndefined();
 		expect(outcome.handle?.name).toBe("cron");
 		expect(typeof outcome.handle?.stop).toBe("function");
+		// Cooperative-drain input (#60432/#82161): the handle exposes the
+		// scheduler's live in-flight run count for the lifecycle's own-budget
+		// cron wait — idle ticker reports 0 through the mapping.
+		expect(typeof outcome.handle?.inflightCount).toBe("function");
+		expect(outcome.handle?.inflightCount?.()).toBe(0);
 		// The handle joins deterministically — the drain contract depends on it.
 		await outcome.handle?.stop?.();
 	});

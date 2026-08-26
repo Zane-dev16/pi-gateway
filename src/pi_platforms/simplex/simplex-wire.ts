@@ -40,6 +40,12 @@ export interface SimplexSocketListener {
 	onText(text: string): void;
 	onClose(info: SimplexCloseInfo): void;
 	onError(err: Error): void;
+	/**
+	 * Protocol PONG received — the answer to a client keepalive ping
+	 * (adapter.py:_ws_listener ping_interval/ping_timeout parity; the port
+	 * expresses the keepalive itself since pi embeds no websockets library).
+	 */
+	onPong?(): void;
 }
 
 export interface SimplexConnection {
@@ -47,6 +53,12 @@ export interface SimplexConnection {
 	/** Raw JSON text frame write. Throws when the socket is not open. */
 	send(text: string): void;
 	close(code?: number, reason?: string): void;
+	/**
+	 * Protocol-level WS ping frame (keepalive carrier). OPTIONAL: factories
+	 * without transport-level ping support simply omit it, and the adapter's
+	 * keepalive loop skips them. Throws when the socket is not open.
+	 */
+	ping?(): void;
 }
 
 /**
@@ -92,11 +104,17 @@ export class FakeSimplexDaemon implements SimplexConnectionFactory {
 	readonly commands: DaemonCommandRecord[] = [];
 	readonly connectionLog: Array<{ atMs: number }> = [];
 	readonly drops: Array<{ atMs: number; reason: string }> = [];
+	/** Protocol ping frames RECEIVED from the adapter (keepalive audit). */
+	readonly pingFrames: Array<{ atMs: number }> = [];
+
+	/** When false, pings go UNANSWERED (wedged-link shape → ping timeout). */
+	answerPongs = true;
 
 	/** When false, connect attempts fail (daemon unreachable → ladder). */
 	acceptNext = true;
 
-	private clockNow: () => number = () => Date.now();
+	// Fixture-shared clock read (client sockets stamp ping/pong receipts).
+	clockNow: () => number = () => Date.now();
 
 	/** Wire the daemon's clock (fixtures inject the manual clock). */
 	setClock(nowMs: () => number): void {
@@ -168,6 +186,15 @@ export class FakeSimplexDaemon implements SimplexConnectionFactory {
 
 	acceptConnections(): void {
 		this.acceptNext = true;
+	}
+
+	/** Wedged-zombie shape: socket stays OPEN but pings stop being answered. */
+	stallPongs(): void {
+		this.answerPongs = false;
+	}
+
+	resumePongs(): void {
+		this.answerPongs = true;
 	}
 
 	/** Test seam: flush nothing — backlog visibility only. */
@@ -251,6 +278,19 @@ export class FakeSimplexDaemon implements SimplexConnectionFactory {
 		void conn;
 	}
 
+	/**
+	 * Protocol keepalive: record the ping and answer with a pong unless
+	 * stalled — evaluated AT DELIVERY time so a stall armed between the ping
+	 * and its pong deterministically suppresses the answer.
+	 */
+	internalHandleClientPing(conn: DaemonSideConnection): void {
+		this.pingFrames.push({ atMs: this.clockNow() });
+		queueMicrotask(() => {
+			if (!this.answerPongs) return;
+			conn.socket.serverDeliverPong();
+		});
+	}
+
 	private enqueueOutbound(evt: unknown): void {
 		this.outbound.push({ text: JSON.stringify(evt) });
 		this.scheduleDrain();
@@ -309,6 +349,25 @@ class DaemonClientSocket implements SimplexConnection {
 			this.conn as DaemonSideConnection,
 			text,
 		);
+	}
+
+	/** Last keepalive ping sent on THIS socket (client clock; observability). */
+	lastPingSentAt: number | null = null;
+	/** Last pong received on THIS socket (client clock; observability). */
+	lastPongAt: number | null = null;
+
+	ping(): void {
+		if (this.state !== SX_OPEN) {
+			throw new Error(`ping on non-open socket (state=${this.state})`);
+		}
+		this.lastPingSentAt = this.server.clockNow();
+		this.server.internalHandleClientPing(this.conn as DaemonSideConnection);
+	}
+
+	serverDeliverPong(): void {
+		if (this.state !== SX_OPEN) return;
+		this.lastPongAt = this.server.clockNow();
+		this.listener.onPong?.();
 	}
 
 	close(code = 1000, reason = "client closing"): void {

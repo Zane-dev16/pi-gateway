@@ -75,6 +75,12 @@ export const HA_REST_NOTIFICATION_CREATE =
 export const HA_REST_NOTIFY_NOTIFY = "/api/services/notify/notify";
 
 /**
+ * adapter.py:_standalone_send — aiohttp ClientTimeout(total=30) budget for
+ * the out-of-process notify POST (distinct from the live-send path).
+ */
+export const HA_STANDALONE_TIMEOUT_MS = 30_000;
+
+/**
  * adapter.py:send payload title — VERBATIM VENDOR WIRE DATA ("Hermes Agent"
  * is what the reference ships on the wire inside every persistent
  * notification). Transcribed without silent rename per the census rule;
@@ -84,6 +90,18 @@ export const HA_REST_NOTIFY_NOTIFY = "/api/services/notify/notify";
  * string stays byte-exact until that DEC lands."
  */
 export const HA_NOTIFICATION_TITLE = "Hermes Agent";
+
+/**
+ * Single-POST truncation shape datum (04 §8 conditional-header probe,
+ * LINE_NATIVE_SPLIT_TRUNCATES precedent): the outbound lane issues ONE
+ * persistent_notification/create POST with message=content[:4096] and the
+ * byte-exact DEC-056 branding title (adapter.py:send :424-432). Full output
+ * is NOT preserved, so the kit LOSSLESS-split shared family
+ * (egress.chunk-flood / egress.per-chat-length-pair) probes THIS datum
+ * before applying; per-chat length-budget PAIRS do not exist on this source
+ * (the 4096 vendor cap is fixed for every notification).
+ */
+export const HA_SEND_TRUNCATES = true;
 
 /** The event channel every formatted state change dispatches onto. */
 export const HA_EVENTS_CHAT_ID = "ha_events";

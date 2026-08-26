@@ -12,9 +12,17 @@
 //       _ws_listener: reset to initial on successful connect, double up to
 //       max, +20% jitter against thundering herd)
 //     HEALTH_CHECK_INTERVAL = 30.0 / HEALTH_CHECK_STALE_THRESHOLD = 300.0
-//       (@78-79; _health_monitor is deliberately LOG-ONLY: the websockets
-//       client already pings protocol-level liveness, so application silence
-//       NEVER triggers a reconnect of a healthy quiet link)
+//       (@78-79; _health_monitor is deliberately LOG-ONLY: liveness is owned
+//       by the KEEPALIVE — in Hermes the websockets client's protocol pings,
+//       in this port the adapter-side ping/pong loop below — so application
+//       silence NEVER triggers a reconnect of a healthy quiet link)
+//     connect(open_timeout=10) (@~296) — reachability-probe handshake bound;
+//       expiry resolves FALSE instead of hanging startup/reconnect
+//     list_channels /contacts + /groups (timeout=10.0 each) (@~880-935)
+//     _ws_listener connect(ping_interval=20, ping_timeout=20) (@~310-315) —
+//       the keepalive carrier: pi has NO websockets library, so the port
+//       expresses the SAME client keepalive itself (ping every 20s; a ping
+//       left unanswered past 20s aborts the link 1011 → SAME ladder)
 //     _CORR_PREFIX = "hermes-" (@82) — VENDOR WIRE DATA transcribed verbatim:
 //       correlation ids we mint carry this prefix and the inbound echo filter
 //       discards any corrId starting with it (proposed DEC text in the port
@@ -53,10 +61,11 @@ export const WS_JITTER_FRACTION = 0.2;
 
 /**
  * adapter.py:@78-79 — health monitor cadence + idle bar. The monitor is
- * DELIBERATELY LOG-ONLY (_health_monitor docstring @~349-356: protocol pings
- * own liveness; treating chat-event silence as staleness causes needless
- * reconnect churn). Rows pin that posture: a stale idle never tears a live
- * link.
+ * DELIBERATELY LOG-ONLY (_health_monitor docstring @~349-356: liveness is
+ * carried by protocol ping/pong — websockets' keepalive in Hermes, the
+ * adapter-side SIMPLEX_WS_PING_* loop in this port — so treating chat-event
+ * silence as staleness causes needless reconnect churn). Rows pin that
+ * posture: a stale idle never tears a live link, while a stalled PING does.
  */
 export const HEALTH_CHECK_INTERVAL_MS = 30_000;
 export const HEALTH_CHECK_STALE_THRESHOLD_MS = 300_000;
@@ -83,6 +92,31 @@ export const SIMPLEX_TEXT_BATCH_DELAY_DEFAULT_S = 0.8;
 /** plugin.yaml optional_env — env override for the batch quiet period. */
 export const SIMPLEX_TEXT_BATCH_DELAY_ENV = "HERMES_SIMPLEX_TEXT_BATCH_DELAY";
 
+/** plugin.yaml optional_env — constructor reads these via the scoped reader. */
+export const SIMPLEX_AUTO_ACCEPT_ENV = "SIMPLEX_AUTO_ACCEPT";
+export const SIMPLEX_GROUP_ALLOWED_ENV = "SIMPLEX_GROUP_ALLOWED";
+
+/**
+ * adapter.py:__init__ — env-parse SIMPLEX_AUTO_ACCEPT: any '0'/'false'/'no'
+ * (case-insensitive) AND the empty string disable; ANY other value enables.
+ * Undefined (unset) yields undefined so the caller falls back to the injected
+ * option/default — set-but-empty DISABLES (Python getenv('') is not None).
+ */
+export function simplexAutoAcceptFromEnv(
+	raw: string | undefined,
+): boolean | undefined {
+	if (raw === undefined) return undefined;
+	return !["0", "false", "no", ""].includes(raw.trim().toLowerCase());
+}
+
+/** adapter.py:_parse_comma_list — split, trim entries, drop empties. */
+export function parseCommaList(raw: string): string[] {
+	return raw
+		.split(",")
+		.map((v) => v.trim())
+		.filter((v) => v !== "");
+}
+
 /** Resolve the batch quiet period in ms (env override parity, scoped read). */
 export function simplexTextBatchDelayMs(env?: string | undefined): number {
 	const raw = env?.trim();
@@ -92,6 +126,27 @@ export function simplexTextBatchDelayMs(env?: string | undefined): number {
 	}
 	return SIMPLEX_TEXT_BATCH_DELAY_DEFAULT_S * 1000;
 }
+
+/** adapter.py:connect — reachability-probe handshake bound (open_timeout=10). */
+export const SIMPLEX_CONNECT_OPEN_TIMEOUT_MS = 10_000;
+
+/**
+ * adapter.py:list_channels — correlated-reply bound for BOTH directory
+ * commands (/contacts and /groups, timeout=10.0 each).
+ */
+export const SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS = 10_000;
+
+/**
+ * adapter.py:_ws_listener — connect(ping_interval=20, ping_timeout=20) client
+ * keepalive. The health monitor is LOG-ONLY BECAUSE this carrier exists:
+ * application silence never reconnects a healthy link, but a ping left
+ * unanswered past the timeout marks the link DEAD (websockets aborts 1011)
+ * and feeds the SAME reconnect ladder.
+ */
+export const SIMPLEX_WS_PING_INTERVAL_MS = 20_000;
+export const SIMPLEX_WS_PING_TIMEOUT_MS = 20_000;
+/** websockets keepalive-expiry abort code (link declared dead). */
+export const SIMPLEX_WS_PING_CLOSE_CODE = 1011;
 
 /**
  * adapter.py:send @826 — extensions routed to the inline voice-note player

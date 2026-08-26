@@ -32,8 +32,8 @@ function recordingSink(): ConsumerSink & {
 		onSegmentBreak() {
 			calls.push({ fn: "onSegmentBreak", arg: "" });
 		},
-		sendCommentary(text) {
-			calls.push({ fn: "sendCommentary", arg: text });
+		onCommentary(text) {
+			calls.push({ fn: "onCommentary", arg: text });
 		},
 	};
 }
@@ -84,13 +84,13 @@ describe("GatewayEventDispatcher routing (base defaults = legacy behavior)", () 
 		expect(sink.calls).toEqual([{ fn: "onSegmentBreak", arg: "" }]);
 	});
 
-	it("Commentary → its own beat via sendCommentary", () => {
+	it("Commentary → its own beat via onCommentary (FIFO ingress)", () => {
 		const sink = recordingSink();
 		new GatewayEventDispatcher({ sink }).dispatch(
 			commentary("inspecting first"),
 		);
 		expect(sink.calls).toEqual([
-			{ fn: "sendCommentary", arg: "inspecting first" },
+			{ fn: "onCommentary", arg: "inspecting first" },
 		]);
 	});
 
@@ -111,13 +111,12 @@ describe("GatewayEventDispatcher routing (base defaults = legacy behavior)", () 
 		const render: StreamRenderAdapter = {
 			renderMessageEvent(event, s) {
 				seen.push(event.type);
-				if (event.type === "message_chunk")
-					s.sendCommentary(`EAT:${event.text}`);
+				if (event.type === "message_chunk") s.onCommentary(`EAT:${event.text}`);
 			},
 		};
 		new GatewayEventDispatcher({ sink, render }).dispatch(messageChunk("raw"));
 		expect(seen).toEqual(["message_chunk"]);
-		expect(sink.calls).toEqual([{ fn: "sendCommentary", arg: "EAT:raw" }]);
+		expect(sink.calls).toEqual([{ fn: "onCommentary", arg: "EAT:raw" }]);
 	});
 
 	it("defaultRenderMessageEvent maps all three message kinds onto sink primitives", () => {
@@ -129,7 +128,7 @@ describe("GatewayEventDispatcher routing (base defaults = legacy behavior)", () 
 		expect(sink.calls.map((c) => c.fn)).toEqual([
 			"onDelta",
 			"onSegmentBreak",
-			"sendCommentary",
+			"onCommentary",
 		]);
 	});
 });
@@ -245,7 +244,7 @@ describe("presentation NEVER breaks the turn", () => {
 			onSegmentBreak: () => {
 				throw new Error("break exploded");
 			},
-			sendCommentary: () => {
+			onCommentary: () => {
 				throw new Error("commentary exploded");
 			},
 		};

@@ -4,20 +4,31 @@
 //
 // Ported semantics (file:symbol anchors):
 //   _build_auth_header  strip whitespace; "user:pass" ⇒ Basic, else Bearer.
-//   connect/_run_stream subscribe {server}/{topic}/json?poll=false; 401 ⇒
-//                       FATAL ntfy_unauthorized (stop reconnecting); 404 ⇒
-//                       FATAL ntfy_topic_not_found; other errors ride the
-//                       FIXED ladder [2,5,10,30,60]s with reset after ≥60s
-//                       alive; read-timeout 90s > keepalive 55s.
-//   _on_message         dedup by id (300s window, max 1000, cutoff eviction) →
-//                       echo-tag skip (X-Tags hermes-agent) → empty-body skip →
-//                       user_id FIXED to the topic (title is publisher-
-//                       controlled and NEVER trusted for authorization).
+//   connect/_run_stream subscribe {server}/{topic}/json?poll=false carrying
+//                       _auth_headers() on EVERY stream GET (:233-234);
+//                       401 ⇒ FATAL ntfy_unauthorized (stop reconnecting);
+//                       404 ⇒ FATAL ntfy_topic_not_found — fatality derives
+//                       from the vendor RESPONSE STATUS, never error strings;
+//                       other errors ride the FIXED ladder [2,5,10,30,60]s
+//                       with reset after ≥60s alive; read-timeout 90s >
+//                       keepalive 55s.
+//   _on_message         dedup by id (300s window, max 1000, cutoff eviction;
+//                       id-less events mint a UNIQUE uuid4().hex fallback per
+//                       event :334) → echo-tag skip (X-Tags hermes-agent) →
+//                       empty-body skip → user_id FIXED to the topic (title
+//                       is publisher-controlled and NEVER trusted).
+//   disconnect          ends with _seen_messages.clear() (:327) so a NEW
+//                       connection generation re-dispatches server redelivery
+//                       of ids seen under the previous one.
 //   send                publish_topic chain metadata.publish_topic →
-//                       configured publish topic → chat_id; body truncated to
-//                       4096 chars; X-Tags echo tag; X-Markdown when enabled;
-//                       <300 ⇒ success with server id (or uuid fallback);
-//                       timeout ⇒ "Timeout publishing to ntfy".
+//                       configured publish topic → chat_id; ONE POST with the
+//                       body truncated to 4096 chars plus a truncation warning
+//                       (:429-439) — splitsLongMessages=false ⇒ NO split lane;
+//                       X-Tags echo tag; X-Markdown when enabled; <300 ⇒
+//                       success with server id (or uuid fallback); timeout ⇒
+//                       "Timeout publishing to ntfy".
+
+import { randomUUID } from "node:crypto";
 
 import {
 	ActionHandlerRegistry,
@@ -39,6 +50,7 @@ import type {
 	StreamEgressAdapter,
 	DraftFrameArgs,
 	EditOptions,
+	StreamLogger,
 } from "../../pi_gateway/streaming/adapter-seam.js";
 import { EgressChokepoint } from "../../pi_gateway/streaming/egress-door.js";
 import type {
@@ -112,6 +124,7 @@ export interface NtfyAdapterDeps {
 		  }
 		| undefined;
 	declaredDraftStreaming?: boolean | undefined;
+	logger?: StreamLogger | undefined;
 }
 
 interface StreamEventMessage {
@@ -144,7 +157,6 @@ export class NtfyAdapter
 	// ── runtime state ──
 	private readonly seenMessages = new Map<string, number>();
 	private activeStream: FakeNtfyStream | null = null;
-	private streamTask: Promise<void> | null = null;
 	private backoffIdx = 0;
 	private streamStartAtMs = 0;
 	private running = false;
@@ -155,6 +167,8 @@ export class NtfyAdapter
 	fatalCodes: Array<{ code: string; detail: string }> = [];
 	lastCapturedRetryAfterSeconds: number | null = null;
 	readonly dedupHits = { duplicates: 0, echoSkips: 0 };
+	/** Observability: vendor-parity truncation warnings (send :429-439). */
+	readonly warningLog: string[] = [];
 
 	// ── interactive surfaces (kit census posture) ──
 	readonly approvals = new OneShotPendingStore();
@@ -206,6 +220,7 @@ export class NtfyAdapter
 			capabilities: NTFY_PLUGIN_MANIFEST.capabilities,
 			lengthUnit: "chars",
 			scalarMaxUnits: deps.scalarMaxUnits ?? NTFY_MAX_MESSAGE_CHARS,
+			...(deps.logger !== undefined ? { logger: deps.logger } : {}),
 		});
 		this.deps = deps;
 		this.fakeServer = deps.server;
@@ -321,33 +336,36 @@ export class NtfyAdapter
 		this.running = true;
 		this.streamStartAtMs = this.nowMs();
 		this.activeStream = this.openStream();
-		this.streamTask = this.consumeStream(this.activeStream);
+		void this.consumeStream(this.activeStream);
 		// _mark_connected parity: drain the held-inbound window.
 		this.drainHeldInbound();
 		return true;
 	}
 
 	private openStream(): FakeNtfyStream {
-		try {
-			return this.fakeServer.subscribe(this.topic);
-		} catch (err) {
-			const message = String(err instanceof Error ? err.message : err);
-			if (this.fakeServer.authRejectMode && message.includes("401")) {
+		// GET {server}/{topic}/json carries _auth_headers() on EVERY generation
+		// (adapter.py:_run_stream :233-234). The fake models the RESPONSE:
+		// fatality classifies from the vendor STATUS CODE alone (_consume_stream
+		// :240-262) — no harness knobs, no error-string matching.
+		const outcome = this.fakeServer.subscribe(this.topic, this.authHeaders);
+		if (outcome.kind === "refused") {
+			if (outcome.status === 401) {
 				this.markFatal(
 					"ntfy_unauthorized",
 					"ntfy server rejected auth (401). Check NTFY_TOKEN.",
 				);
-				throw new FatalStreamError(message);
+				throw new FatalStreamError(outcome.body);
 			}
-			if (message.includes("404")) {
+			if (outcome.status === 404) {
 				this.markFatal(
 					"ntfy_topic_not_found",
 					`ntfy topic '${this.topic}' returned 404. Check NTFY_TOPIC.`,
 				);
-				throw new FatalStreamError(message);
+				throw new FatalStreamError(outcome.body);
 			}
-			throw err;
+			throw new Error(`stream GET failed: HTTP ${outcome.status}`);
 		}
+		return outcome.stream;
 	}
 
 	/** One stream generation. Fatal errors STOP the loop (vendor semantics). */
@@ -426,7 +444,7 @@ export class NtfyAdapter
 			if (err instanceof FatalStreamError) return false;
 			return true; // transient — caller may cycle again
 		}
-		this.streamTask = this.consumeStream(this.activeStream as FakeNtfyStream);
+		void this.consumeStream(this.activeStream as FakeNtfyStream);
 		return true;
 	}
 
@@ -434,12 +452,19 @@ export class NtfyAdapter
 		this.running = false;
 		this.activeStream?.close();
 		this.activeStream = null;
+		// adapter.py:disconnect :327 — a NEW connection generation starts with a
+		// CLEAN dedup map, so a server redelivery of an id seen under the
+		// previous one RE-DISPATCHES instead of being silently suppressed.
+		this.seenMessages.clear();
 	}
 
 	// ── inbound message processing (_on_message gates, exact order) ──
 
 	private async handleMessageEvent(event: StreamEventMessage): Promise<void> {
-		const msgId = event.id || "uuid-fallback";
+		// uuid.uuid4().hex parity (adapter.py:_on_message :334): id-less events
+		// mint a UNIQUE per-event fallback id — a constant would collide in the
+		// dedup map and drop every consecutive id-less publish but the first.
+		const msgId = event.id || randomUUID().replace(/-/gu, "");
 		if (this.isDuplicate(msgId)) {
 			this.dedupHits.duplicates += 1;
 			return;
@@ -479,6 +504,7 @@ export class NtfyAdapter
 	/**
 	 * Fixture seam arming the in-flight hold window deterministically (the
 	 * production path also holds whenever !running — same queue, same drain).
+	 * The 64-event hold/redelivery window across stream death is DEC-061.
 	 */
 	setInboundHoldGate(on: boolean): void {
 		this.inboundHoldGate = on;
@@ -589,18 +615,6 @@ export class NtfyAdapter
 		return this.cp.audit;
 	}
 
-	protected override chatDescriptorFor(chatId: string):
-		| {
-				maxMessageLength?: number | undefined;
-				lenUnit?: import("../kit/length-policy.js").LengthUnit | undefined;
-		  }
-		| undefined {
-		if (chatId.includes("utf16")) {
-			return { maxMessageLength: 30, lenUnit: "utf16" };
-		}
-		return undefined;
-	}
-
 	protected override async wireSend(
 		chatId: string,
 		content: string,
@@ -619,7 +633,11 @@ export class NtfyAdapter
 			typeof metadata["publish_topic"] === "string"
 				? (metadata["publish_topic"] as string)
 				: this.publishTopic || chatId;
-		// ntfy truncates at 4096 chars — NO chunking (splitsLongMessages=false).
+		// ntfy truncates at 4096 chars — NO chunking (splitsLongMessages=false);
+		// the vendor logs a warning when content is cut (send :429-439).
+		if (content.length > NTFY_MAX_MESSAGE_CHARS) {
+			this.noteTruncation(content.length);
+		}
 		const body = content.slice(0, NTFY_MAX_MESSAGE_CHARS);
 		const headers: Record<string, string> = {
 			...this.authHeaders,
@@ -647,21 +665,11 @@ export class NtfyAdapter
 		metadata: Metadata = {},
 	): Promise<SendResult[]> {
 		this.throwIfDisabled();
-		const policy = this.chatLengthPolicyForChat(chatId);
-		if (policy.lenFn(content) <= policy.maxUnits) {
-			return [await this.deliverViaLadder(chatId, content, metadata)];
-		}
-		// §6.3/A15: the chat length PAIR governs ALL text delivery. The vendor
-		// 4096 cap stays as the DOOR-level protocol safety net below.
-		const lines = planLabeledParagraphs(content, policy.maxUnits, policy.lenFn);
-		const total = lines.length;
-		const out: SendResult[] = [];
-		for (let i = 0; i < total; i++) {
-			const raw = lines[i] ?? "";
-			const labeled = total > 1 ? `${raw} (${i + 1}/${total})` : raw;
-			out.push(await this.deliverViaLadder(chatId, labeled, metadata));
-		}
-		return out;
+		// ONE POST truncated at the vendor cap (adapter.py:send :429-439):
+		// splitsLongMessages=false ⇒ NO multi-publish lane exists on this
+		// source — oversized bodies are cut (with the truncation warning) at
+		// the door below, never split into labeled pieces.
+		return [await this.deliverViaLadder(chatId, content, metadata)];
 	}
 
 	private ladderInstance: FormattingLadder | null = null;
@@ -722,6 +730,16 @@ export class NtfyAdapter
 			);
 		}
 		return outcome;
+	}
+
+	/**
+	 * Vendor truncation warning lane (adapter.py:send :430-433 logger.warning
+	 * parity) — fixture-visible via warningLog.
+	 */
+	private noteTruncation(fromLen: number): void {
+		const line = `[${this.manifestName}] Message truncated from ${fromLen} to ${NTFY_MAX_MESSAGE_CHARS} chars (ntfy limit)`;
+		this.warningLog.push(line);
+		this.logger?.warn?.(line);
 	}
 
 	private captureRetryAfter(seconds: number | null | undefined): void {
@@ -858,59 +876,6 @@ export class NtfyAdapter
 
 function sessionKeyFor(event: IncomingEvent): string {
 	return `ntfy:${String(event.source?.chatId ?? "?")}`;
-}
-
-/** Policy-split paragraphs with label-width reserve (kit scaffold parity). */
-function planLabeledParagraphs(
-	content: string,
-	maxUnits: number,
-	lenFn: (s: string) => number,
-): string[] {
-	const budget = maxUnits - 8;
-	let lines = hardSplit(content, budget, lenFn);
-	if (lines.length <= 1) return lines;
-	for (let pass = 0; pass < 4; pass++) {
-		const n = lines.length;
-		const labelWidth = lenFn(` (${n}/${n})`);
-		lines = hardSplit(content, budget - labelWidth, lenFn);
-		if (lines.length === n) break;
-	}
-	return lines;
-}
-
-function hardSplit(
-	content: string,
-	budget: number,
-	lenFn: (s: string) => number,
-): string[] {
-	const out: string[] = [];
-	for (const paragraph of content.split("\n")) {
-		if (paragraph.trim().length === 0) continue;
-		if (lenFn(paragraph) <= budget) {
-			out.push(paragraph);
-			continue;
-		}
-		let rest = paragraph;
-		while (lenFn(rest) > budget && rest.length > 0) {
-			let low = 1;
-			let high = rest.length;
-			let bestCut = 0;
-			while (low <= high) {
-				const mid = (low + high) >> 1;
-				if (lenFn(rest.slice(0, mid)) <= budget) {
-					bestCut = mid;
-					low = mid + 1;
-				} else {
-					high = mid - 1;
-				}
-			}
-			if (bestCut === 0) break;
-			out.push(rest.slice(0, bestCut).trimEnd());
-			rest = rest.slice(bestCut).trimStart();
-		}
-		if (rest.length > 0) out.push(rest);
-	}
-	return out.length > 0 ? out : [content];
 }
 
 function brief(err: unknown): string {

@@ -49,7 +49,11 @@ export function parseIrcMessage(raw: string): ParsedIrcLine {
 	const parts = rest.split(" ").filter((p) => p.length > 0);
 	const command = parts.length > 0 ? (parts[0] ?? "") : "";
 	const params = parts.length > 1 ? parts.slice(1) : [];
-	if (trailing !== "" || trailingIdx >= 0) params.push(trailing);
+	// adapter.py:104 bug-for-bug: `if trailing:` — an EMPTY trailing is NOT
+	// pushed. "PRIVMSG botnick :" parses to params=[botnick] (<2 params ⇒
+	// dropped by the PRIVMSG gate), never to a text="" turn that would pass
+	// the DM gates and dispatch an empty reply.
+	if (trailing !== "") params.push(trailing);
 
 	return { prefix, command, params };
 }

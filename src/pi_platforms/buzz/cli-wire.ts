@@ -29,6 +29,12 @@ export interface BuzzCliResult {
 export interface BuzzCliInvocation {
 	input?: string | undefined;
 	env: Readonly<Record<string, string>>;
+	/**
+	 * Aborted when the _CLI_TIMEOUT deadline kills the call (adapter.py
+	 * asyncio.wait_for ⇒ proc.kill parity, :_exec_buzz) — cooperative
+	 * executors observe cancellation instead of running orphaned.
+	 */
+	signal?: AbortSignal | undefined;
 }
 
 /**

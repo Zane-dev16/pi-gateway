@@ -306,6 +306,10 @@ function raftDeltaRows(newEngine: () => RaftAdapter): ConformanceRow[] {
 			"raft: activity events validate against the closed vocabulary — wrong schema / unknown field / unsafe scalar / bad status / negative-or-boolean durationMs each reject 400 naming the fault; valid events enqueue 202; over-cap toolInput truncates WITH flags",
 			async (fx) => {
 				await fx.connect({ isReconnect: false });
+				// connect() itself feeds the lane (observer-hook producers —
+				// dedicated row below); clear it so the matrix counts POSTs only.
+				expect(fx.activityQueue.size).toBeGreaterThan(0);
+				fx.activityQueue.drain();
 				const auth = { "x-raft-bridge-token": fx.clientToken as string };
 				const post = (body: string) =>
 					fx.handleActivityPost({
@@ -387,6 +391,9 @@ function raftDeltaRows(newEngine: () => RaftAdapter): ConformanceRow[] {
 			"raft: telemetry overflow drops OLDEST and counts drops; drain(max) returns FIFO up to max, reports+resets dropped, keeps the remainder; ?max junk falls back to the default clamp",
 			async (fx) => {
 				await fx.connect({ isReconnect: false });
+				// Clear the connect-time SessionStart telemetry (dedicated
+				// producers row below); the overflow math assumes an EMPTY lane.
+				fx.activityQueue.drain();
 				const auth = { "x-raft-bridge-token": fx.clientToken as string };
 				const mkEvent = (n: number): string =>
 					JSON.stringify({
@@ -460,6 +467,241 @@ function raftDeltaRows(newEngine: () => RaftAdapter): ConformanceRow[] {
 					((negative.body as Record<string, unknown>)["events"] as unknown[])
 						.length,
 				).toBe(1);
+			},
+		),
+		mk(
+			"transport.raft.observer-hook-producers-feed-drain",
+			"raft: the register_hook producers auto-fill the queue EVERY TURN without external reportActivity callers — connect ⇒ SessionStart, accepted wake ⇒ UserPromptSubmit + turn-frame Stop, prompt-turn dedup, disconnect ⇒ SessionEnd; eventIds are hermes-<uuid4>; a throwing observer never breaks emission",
+			async () => {
+				const scheduler = new ManualScheduler();
+				const fx = new RaftAdapter({
+					secretReader: () => FIXTURE_RAFT_PROFILE,
+					tokenHex: () => "hook-engine-token",
+				});
+				fx.attachStandardGuard(scheduler.spawner);
+				await fx.connect({ isReconnect: false });
+				const auth = { "x-raft-bridge-token": fx.clientToken as string };
+				const uuidRe =
+					/^hermes-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+				const drainedNames = () =>
+					(
+						fx.activityQueue.drain(500)["events"] as Array<
+							Record<string, unknown>
+						>
+					).map((e) => e["hookEventName"]);
+
+				// Producer 1 — SessionStart at the session boundary.
+				expect(drainedNames()).toEqual(["SessionStart"]);
+
+				// An accepted wake lands UserPromptSubmit immediately; Stop rides
+				// the completed turn frame.
+				let resp = await fx.handleWakePost({
+					headers: auth,
+					rawBody: Buffer.from(JSON.stringify({ eventId: "turn-1" })),
+				});
+				expect(resp.status).toBe(202);
+				expect(fx.activityQueue.size).toBe(1); // UserPromptSubmit already in
+				await scheduler.runToEnd();
+				expect(drainedNames()).toEqual(["UserPromptSubmit", "Stop"]);
+
+				// Every drained eventId is f\"hermes-{uuid.uuid4()}\" parity.
+				for (const event of fx.activityQueue.drain(500)["events"] as Array<
+					Record<string, unknown>
+				>) {
+					expect(String(event["eventId"])).toMatch(uuidRe);
+				}
+
+				// A repeated wake id does NOT re-emit UserPromptSubmit (prompt-turn
+				// dedup) but Stop has no dedup.
+				resp = await fx.handleWakePost({
+					headers: auth,
+					rawBody: Buffer.from(JSON.stringify({ eventId: "turn-1" })),
+				});
+				expect(resp.status).toBe(202);
+				await scheduler.runToEnd();
+				expect(drainedNames()).toEqual(["Stop"]);
+
+				// Observer containment (DEC-014): a throwing registrant is
+				// swallowed and the pipeline keeps emitting.
+				fx.registerHook("post_llm_call", () => {
+					throw new Error("observer boom");
+				});
+				resp = await fx.handleWakePost({
+					headers: auth,
+					rawBody: Buffer.from(JSON.stringify({ eventId: "turn-2" })),
+				});
+				expect(resp.status).toBe(202);
+				await scheduler.runToEnd();
+				expect(drainedNames()).toEqual(["UserPromptSubmit", "Stop"]);
+
+				// Disconnect finalizes: SessionEnd pairs the connect-time start.
+				await fx.disconnect();
+				expect(drainedNames()).toEqual(["SessionEnd"]);
+			},
+		),
+		mk(
+			"transport.raft.tool-call-producers-mapping",
+			"raft: tool-call producers mirror _make_activity_event mapping byte-for-byte — object args/results render json.dumps(sort_keys=True) sorted+spaced, failure verdicts map PostToolUseFailure with the error-class ladder, interrupted/incomplete ends emit error Stops, finalize forgets the scope",
+			async (fx) => {
+				await fx.connect({ isReconnect: false });
+				fx.activityQueue.drain(); // clear the connect-time SessionStart
+				const lastDrained = (): Record<string, unknown> => {
+					const events = fx.activityQueue.drain(500);
+					const list = events["events"] as Array<Record<string, unknown>>;
+					expect(list.length).toBe(1);
+					return list[list.length - 1] as Record<string, unknown>;
+				};
+
+				// PreToolUse: insertion-ordered args drain SORTED+SPACED
+				// ('{"b":1,"a":2}' would be the bare-stringify divergence).
+				fx.emitActivityHook("pre_tool_call", {
+					platform: "raft",
+					session_id: fx.runtimeSession,
+					tool_name: "edit_file",
+					args: { b: 1, a: "two", nested: { y: 2, x: [1, 2] } },
+				});
+				let ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("PreToolUse");
+				expect(ev["toolInput"]).toBe(
+					'{"a": "two", "b": 1, "nested": {"x": [1, 2], "y": 2}}',
+				);
+
+				// PostToolUse success path: result rendering + duration passthrough.
+				fx.emitActivityHook("post_tool_call", {
+					platform: "raft",
+					session_id: fx.runtimeSession,
+					tool_name: "bash",
+					args: ["ls"],
+					result: { ok: true, z: 1, a: 2 },
+					duration_ms: 42,
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("PostToolUse");
+				expect(ev["status"]).toBe("ok");
+				expect(ev["durationMs"]).toBe(42);
+				expect(ev["toolOutput"]).toBe('{"a": 2, "ok": true, "z": 1}');
+
+				// Failure ladder #1: status:error without an error_type falls back
+				// to tool_failure and error_message wins over result.
+				fx.emitActivityHook("post_tool_call", {
+					platform: "raft",
+					session_id: fx.runtimeSession,
+					tool_name: "bash",
+					status: "error",
+					error_message: "boom",
+					result: "ignored",
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("PostToolUseFailure");
+				expect(ev["status"]).toBe("error");
+				expect(ev["errorClass"]).toBe("tool_failure");
+				expect(ev["toolOutput"]).toBe("boom");
+
+				// Failure ladder #2: a truthy error_type names the class itself.
+				fx.emitActivityHook("post_tool_call", {
+					platform: "raft",
+					session_id: fx.runtimeSession,
+					error_type: "TimeoutError",
+					result: "partial output",
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("PostToolUseFailure");
+				expect(ev["errorClass"]).toBe("TimeoutError");
+
+				// Interrupted / incomplete session ends map onto error Stops.
+				fx.emitActivityHook("on_session_end", {
+					platform: "raft",
+					session_id: "sess-x",
+					interrupted: true,
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("Stop");
+				expect(ev["status"]).toBe("error");
+				expect(ev["errorClass"]).toBe("interrupted");
+
+				fx.emitActivityHook("on_session_end", {
+					platform: "raft",
+					session_id: "sess-y",
+					completed: false,
+				});
+				ev = lastDrained();
+				expect(ev["errorClass"]).toBe("incomplete");
+
+				// A CLEAN end emits nothing (strict completed-is-False semantics).
+				fx.emitActivityHook("on_session_end", {
+					platform: "raft",
+					session_id: "sess-z",
+				});
+				expect(fx.activityQueue.size).toBe(0);
+
+				// Scope gating: remember S1/T1 via the platform stamp, drive
+				// turn-scoped kwargs WITHOUT the stamp, then finalize and prove
+				// the forgotten scope goes silent. Foreign platforms NEVER emit.
+				fx.emitActivityHook("pre_llm_call", {
+					platform: "raft",
+					session_id: "S1",
+					turn_id: "T1",
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("UserPromptSubmit");
+
+				fx.emitActivityHook("pre_llm_call", {
+					session_id: "S1",
+					turn_id: "T1",
+				}); // deduped by remembered turn
+				expect(fx.activityQueue.size).toBe(0);
+
+				fx.emitActivityHook("post_llm_call", { session_id: "S1" });
+				expect(lastDrained()["hookEventName"]).toBe("Stop");
+
+				fx.emitActivityHook("pre_tool_call", {
+					platform: "telegram",
+					session_id: "other",
+					tool_name: "t",
+					args: { a: 1 },
+				});
+				expect(fx.activityQueue.size).toBe(0);
+
+				fx.emitActivityHook("on_session_finalize", {
+					session_id: "S1",
+					turn_id: "T1",
+				});
+				ev = lastDrained();
+				expect(ev["hookEventName"]).toBe("SessionEnd");
+
+				// Forgotten scope: S1 no longer admits unstamped kwargs.
+				fx.emitActivityHook("post_llm_call", { session_id: "S1" });
+				expect(fx.activityQueue.size).toBe(0);
+			},
+		),
+		mk(
+			"transport.raft.activity-invalid-json-ack",
+			"raft: malformed JSON on POST /activity acks the LITERAL invalid_json BEFORE validation (empty body included); parseable-but-invalid bodies keep the validation verdict verbatim; rejected bodies enqueue NOTHING",
+			async (fx) => {
+				await fx.connect({ isReconnect: false });
+				fx.activityQueue.drain(); // clear the connect-time SessionStart
+				const auth = { "x-raft-bridge-token": fx.clientToken as string };
+				const post = (body: Buffer) =>
+					fx.handleActivityPost({ headers: auth, rawBody: body });
+
+				let resp = await post(Buffer.from("{oops"));
+				expect(resp.status).toBe(400);
+				expect(resp.body).toEqual({ ok: false, error: "invalid_json" });
+
+				// json.loads("") fails the same way — empty body ⇒ invalid_json.
+				resp = await post(Buffer.alloc(0));
+				expect(resp.status).toBe(400);
+				expect(resp.body).toEqual({ ok: false, error: "invalid_json" });
+
+				// Parseable-but-not-an-object keeps Hermes' str(ValueError) ack.
+				resp = await post(Buffer.from("[1,2]"));
+				expect(resp.status).toBe(400);
+				expect(resp.body).toEqual({
+					ok: false,
+					error: "activity event must be an object",
+				});
+
+				expect(fx.activityQueue.size).toBe(0);
 			},
 		),
 		mk(

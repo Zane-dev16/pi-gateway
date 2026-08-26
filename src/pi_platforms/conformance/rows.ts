@@ -223,9 +223,10 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 
 	add(
 		"egress.chunk-flood",
-		"long replies split with fence carry + (i/n); FloodWait retry_after honored once",
+		"long replies split with fence carry + (i/n) — or BARE vendor chunks when the subject declares vendor-bare; FloodWait retry_after honored once",
 		"all",
 		async (s) => {
+			const bareChunks = s.chunkLabelStyle?.() === "vendor-bare";
 			const long = Array.from(
 				{ length: 30 },
 				(_, i) => `line-${i} filler`,
@@ -237,18 +238,30 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 				"every chunk delivers",
 			);
 			expectTrue(sends.length > 1, "long content splits");
-			sends.forEach((op, idx) => {
-				// MarkdownV2 dialects escape the kit-appended chunk marker on the
-				// wire (Hermes telegram format_message output: "(1/2)" ships as
-				// "\\(1/2\\)" so Telegram cannot reject the chunk). Normalize the
-				// escaped form before matching the (i/n) invariant — raw-dialect
-				// platforms are unaffected (their bytes carry no backslashes).
-				const tail = op.content.slice(-24).replace(/\\([()])/g, "$1");
-				expectTrue(
-					tail.endsWith(`(${idx + 1}/${sends.length})`),
-					`chunk ${idx + 1} carries (i/n): …${JSON.stringify(op.content.slice(-12))}`,
-				);
-			});
+			if (bareChunks) {
+				// Declared vendor truth (Hermes irc adapter.py::send): the vendor
+				// splitter's chunks ship BARE — a wire-visible '(i/n)' tail would be
+				// content mutation, so its ABSENCE is the invariant here.
+				sends.forEach((op) => {
+					expectTrue(
+						!/ \(\d+\/\d+\)$/u.test(op.content),
+						`declared-bare chunk carries NO (i/n): …${JSON.stringify(op.content.slice(-12))}`,
+					);
+				});
+			} else {
+				sends.forEach((op, idx) => {
+					// MarkdownV2 dialects escape the kit-appended chunk marker on the
+					// wire (Hermes telegram format_message output: "(1/2)" ships as
+					// "\\(1/2\\)" so Telegram cannot reject the chunk). Normalize the
+					// escaped form before matching the (i/n) invariant — raw-dialect
+					// platforms are unaffected (their bytes carry no backslashes).
+					const tail = op.content.slice(-24).replace(/\\([()])/g, "$1");
+					expectTrue(
+						tail.endsWith(`(${idx + 1}/${sends.length})`),
+						`chunk ${idx + 1} carries (i/n): …${JSON.stringify(op.content.slice(-12))}`,
+					);
+				});
+			}
 			s.wire.script(
 				"send",
 				{

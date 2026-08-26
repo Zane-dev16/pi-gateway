@@ -137,6 +137,9 @@ export type {
 	PluginManifest,
 	RegisteredPlatform,
 	ScopedSecretReader,
+	StandaloneSendArgs,
+	StandaloneSendResult,
+	StandaloneSenderFn,
 	TransportShape,
 } from "./registration.js";
 

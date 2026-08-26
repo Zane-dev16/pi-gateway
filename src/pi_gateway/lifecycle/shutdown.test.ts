@@ -7,11 +7,15 @@
 //   where recovery files are written BEFORE in-memory slots clear (#72680)
 // - second-signal fast-exit releases pid file + lock before hard exit
 
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GatewayLifecycle } from "./lifecycle.js";
+import {
+	GatewayLifecycle,
+	DEFAULT_CRON_DRAIN_TIMEOUT_MS,
+} from "./lifecycle.js";
+import { shutdownWatchdogDumpPath, type TimerPort } from "./watchdog.js";
 import {
 	DRAIN_PHASE_ORDER,
 	SHUTDOWN_EXIT_CODES,
@@ -460,3 +464,345 @@ describe("SIGUSR1 in-band restart (restart_signal_handler parity)", () => {
 		expect(readRuntimeStatus(home)?.gateway_state).toBe("stopped");
 	});
 });
+
+
+// ---------------------------------------------------------------------------
+// Cron drain moved OUT of stop_ingress (#82161/#60432; run.py
+// _drain_active_agents two-budget loop + _CRON_SHUTDOWN_DRAIN_TIMEOUT=65s
+// post-drain cooperative join parity)
+// ---------------------------------------------------------------------------
+
+interface CapturedLine {
+	level: string;
+	msg: string;
+}
+
+function captureLogger(): { logger: Logger; lines: CapturedLine[] } {
+	const lines: CapturedLine[] = [];
+	return {
+		lines,
+		logger: {
+			info: (m) => lines.push({ level: "info", msg: m }),
+			warn: (m) => lines.push({ level: "warn", msg: m }),
+			error: (m) => lines.push({ level: "error", msg: m }),
+		},
+	};
+}
+
+/** Deterministic timer port: tests advance the clock by hand. */
+function fakeTimers(): TimerPort & { run(ms: number): void; now(): number } {
+	let now = 0;
+	let seq = 0;
+	const jobs = new Map<number, { at: number; fn: () => void }>();
+	return {
+		setTimeout(fn: () => void, ms: number): unknown {
+			const id = ++seq;
+			jobs.set(id, { at: now + Math.max(0, ms), fn });
+			return id;
+		},
+		clearTimeout(handle: unknown): void {
+			jobs.delete(handle as number);
+		},
+		nowMs(): number {
+			return now;
+		},
+		now(): number {
+			return now;
+		},
+		run(ms: number): void {
+			const target = now + ms;
+			for (;;) {
+				let due: { id: number; at: number; fn: () => void } | null = null;
+				for (const [id, job] of jobs) {
+					if (job.at > target) continue;
+					if (due === null || job.at < due.at)
+						due = { id, at: job.at, fn: job.fn };
+				}
+				if (due === null) break;
+				jobs.delete(due.id);
+				now = Math.max(now, due.at);
+				due.fn();
+			}
+			now = target;
+		},
+	};
+}
+
+/** Settle every pending microtask chain deterministically. */
+const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+describe("cron drain out of stop_ingress (#82161/#60432)", () => {
+	function drainingLifecycle(
+		options: {
+			cronInflight?: () => number;
+			cronStop?: () => Promise<void>;
+			watcherStop?: () => Promise<void>;
+			adapterStop?: () => Promise<void>;
+			cronDrainTimeoutMs?: number;
+			timers?: TimerPort & { run(ms: number): void; now(): number };
+			logger?: Logger;
+			hardExit?: (code: number) => void;
+		} = {},
+	): GatewayLifecycle {
+		return new GatewayLifecycle({
+			home,
+			logger: options.logger ?? QUIET_LOGGER,
+			forensics: { snapshot: false, spawnDiagnostic: false },
+			// DEFAULT stage bodies on purpose: the DEC-040 seams below must
+			// RUN their entries so the handles land in ctx.services/ctx.adapters.
+			...(options.cronDrainTimeoutMs !== undefined
+				? { cronDrainTimeoutMs: options.cronDrainTimeoutMs }
+				: {}),
+			...(options.timers !== undefined ? { timers: options.timers } : {}),
+			...(options.hardExit !== undefined
+				? { hardExit: options.hardExit }
+				: {}),
+			services: {
+				cron_scheduler: [
+					{
+						name: "cron.ticker",
+						start: async () => ({
+							ok: true,
+							handle: {
+								name: "cron.ticker",
+								stop: options.cronStop ?? (async () => undefined),
+								inflightCount: options.cronInflight ?? (() => 0),
+							},
+						}),
+					},
+				],
+				embedded_watchers: [
+					{
+						name: "test.watcher",
+						start: async () => ({
+							ok: true,
+							handle: {
+								name: "test.watcher",
+								stop: options.watcherStop ?? (async () => undefined),
+							},
+						}),
+					},
+				],
+			},
+			adapters: [
+				{
+					platform: "test",
+					start: async () => ({
+						ok: true,
+						handle: {
+							name: "test.adapter",
+							stop: options.adapterStop ?? (async () => undefined),
+						},
+					}),
+				},
+			],
+		});
+	}
+
+	it("adapters stop IN stop_ingress; cron+watcher stop only AFTER the full drain (cron first)", async () => {
+		const order: string[] = [];
+		const lifecycle = drainingLifecycle({
+			cronStop: async () => {
+				order.push("cron.stop");
+			},
+			watcherStop: async () => {
+				order.push("watcher.stop");
+			},
+			adapterStop: async () => {
+				order.push("adapter.stop");
+			},
+		});
+		await lifecycle.startup();
+
+		const outcome = await lifecycle.requestShutdown("planned_stop");
+
+		// adapter.stop IS the stop_ingress step; cron/watcher land only after
+		// persist_exit_status — the LAST drain phase — never inside it.
+		const idxOf = (step: string) =>
+			outcome.trace.findIndex((t) => t.step === step);
+		expect(idxOf("persist_exit_status")).toBeGreaterThan(
+			idxOf("stop_ingress"),
+		);
+		expect(order).toEqual(["adapter.stop", "cron.stop", "watcher.stop"]);
+	});
+
+	it("in-flight ticks are waited on their OWN budget: grace 0 still waits the cron floor, then joins cleanly", async () => {
+		let inFlight = true;
+		setTimeout(() => {
+			inFlight = false; // the run settles ~30ms into the drain
+		}, 30);
+		const lifecycle = drainingLifecycle({
+			cronInflight: () => (inFlight ? 1 : 0),
+			cronDrainTimeoutMs: DEFAULT_CRON_DRAIN_TIMEOUT_MS,
+		});
+		await lifecycle.startup();
+
+		const outcome = await lifecycle.requestShutdown("planned_stop");
+
+		// The tick finished INSIDE its own budget ⇒ drain NOT timed out and
+		// the clean-shutdown receipt is written (killing the run would have
+		// been a permanent jobs.json failure nobody waits on).
+		expect(outcome.timedOut).toBe(false);
+		expect(outcome.cleanShutdownWritten).toBe(true);
+		expect(existsSync(cleanShutdownMarkerPath(home))).toBe(true);
+	});
+
+	it("budget expiry with a tick STILL in flight times the drain OUT (marker suppressed); join still runs", async () => {
+		const lifecycle = drainingLifecycle({
+			cronInflight: () => 1, // wedged run — never settles
+			cronDrainTimeoutMs: 50, // tiny floor so expiry lands on poll #2 (~100ms)
+		});
+		await lifecycle.startup();
+
+		const outcome = await lifecycle.requestShutdown("planned_stop");
+
+		expect(outcome.timedOut).toBe(true);
+		expect(outcome.cleanShutdownWritten).toBe(false);
+		expect(existsSync(cleanShutdownMarkerPath(home))).toBe(false);
+		// Timed-out or not, teardown still joined the ticker and finished.
+		expect(lifecycle.state).toBe("stopped");
+	});
+
+	it("a huge cron floor is CLAMPED to the watchdog leash minus reserve — the extension can never outrun the hard-exit backstop", async () => {
+		const timers = fakeTimers();
+		const exits: number[] = [];
+		const lifecycle = drainingLifecycle({
+			cronInflight: () => 1, // stuck forever
+			cronDrainTimeoutMs: 600_000, // operator misconfiguration: 10 minutes
+			timers,
+			hardExit: (code) => exits.push(code),
+		});
+		await lifecycle.startup();
+
+		const drained = lifecycle.requestShutdown("planned_stop");
+		// Advance past the clamped budget (60s leash − 10s reserve − elapsed),
+		// but WELL before both the 10-minute floor and the armed 60s watchdog.
+		for (let i = 0; i < 520; i++) {
+			timers.run(100);
+			await flush();
+		}
+		const outcome = await flushed(drained);
+
+		// Timed out at ~50s (the clamp), NOT 600s (the floor); the watchdog
+		// never needed to fire — timers stayed consistent with the window.
+		expect(outcome.timedOut).toBe(true);
+		expect(timers.now()).toBeLessThan(60_000);
+		expect(exits).toEqual([]);
+	});
+
+	it("wedged ticker join gives up at _CRON_SHUTDOWN_DRAIN_TIMEOUT=65s with the dropped-delivery warning", async () => {
+		const timers = fakeTimers();
+		const captured = captureLogger();
+		const joinStarts: number[] = [];
+		const lifecycle = drainingLifecycle({
+			cronInflight: () => 0,
+			cronStop: () =>
+				new Promise<void>(() => {
+					joinStarts.push(timers.now()); /* wedged delivery — never settles */
+				}),
+			timers,
+			logger: captured.logger,
+		});
+		await lifecycle.startup();
+
+		const drained = lifecycle.requestShutdown("planned_stop");
+		await flush(); // drain completes; join parks on its 65s bound
+		timers.run(64_999);
+		await flush();
+		let settled = false;
+		void drained.then(() => {
+			settled = true;
+		});
+		await flush();
+		expect(settled).toBe(false); // still inside the window — join holds
+		timers.run(1); // crosses 65s from join start
+		await flush();
+		await flush();
+		await drained;
+
+		expect(joinStarts).toHaveLength(1);
+		const warns = captured.lines.filter((l) => l.level === "warn");
+		expect(
+			warns.some(
+				(l) =>
+					l.msg.includes("Cron ticker did not exit within 65s") &&
+					l.msg.includes("in-flight delivery may have been dropped"),
+			),
+		).toBe(true);
+	});
+
+	it("the armed watchdog leash IGNORES a huge cron floor, and its dump carries in-flight cron visibility", async () => {
+		const timers = fakeTimers();
+		const exits: number[] = [];
+		const lifecycle = new GatewayLifecycle({
+			home,
+			logger: QUIET_LOGGER,
+			forensics: { snapshot: false, spawnDiagnostic: false },
+			timers,
+			hardExit: (code) => exits.push(code),
+			cronDrainTimeoutMs: 600_000, // floor far past the leash…
+			services: {
+				cron_scheduler: [
+					{
+						name: "cron.ticker",
+						start: async () => ({
+							ok: true,
+							handle: {
+								name: "cron.ticker",
+								stop: async () => undefined,
+								inflightCount: () => 1, // run stuck mid-flight
+							},
+						}),
+					},
+				],
+			},
+			shutdownHooks: {
+				// Wedge BEFORE the drain wait so only the backstop can end it.
+				notifyActiveSessions: () => new Promise<void>(() => {}),
+			},
+		});
+		await lifecycle.startup();
+
+		void lifecycle.requestShutdown("planned_stop");
+		await flush();
+		timers.run(60_000);
+		await flush();
+		await flush();
+
+		// Fired EXACTLY at the 60s leash (grace 0 + 60s) — the cron floor
+		// config can never push the hard-exit boundary out (timer consistency).
+		expect(exits).toEqual([SHUTDOWN_EXIT_CODES.unexpected_signal]);
+		const raw = readFileSync(shutdownWatchdogDumpPath(home), "utf8");
+		const record = JSON.parse(raw.trim()) as Record<string, unknown>;
+		const snapshot = record["snapshot"] as Record<string, unknown>;
+		// active_cron_jobs parity: the post-mortem sees the stuck tick.
+		expect(snapshot["cron_jobs"]).toBe(1);
+	});
+
+	it("a stop that RAISES during the post-drain join is isolated — outcome stays intact", async () => {
+		const captured = captureLogger();
+		const lifecycle = drainingLifecycle({
+			cronStop: async () => {
+				throw new Error("ticker exploded on stop");
+			},
+			logger: captured.logger,
+		});
+		await lifecycle.startup();
+
+		const outcome = await lifecycle.requestShutdown("planned_stop");
+
+		expect(outcome.klass).toBe("planned_stop");
+		expect(outcome.exitCode).toBe(0);
+		const warns = captured.lines.filter((l) => l.level === "warn");
+		expect(
+			warns.some((l) => l.msg.includes("raised during post-drain stop")),
+		).toBe(true);
+	});
+});
+
+/** Await a promise while letting fake-timer-driven chains settle. */
+async function flushed<T>(p: Promise<T>): Promise<T> {
+	await flush();
+	await flush();
+	return p;
+}

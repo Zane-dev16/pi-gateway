@@ -793,10 +793,13 @@ export class IrcAdapter
 		const clean = isPlainLane
 			? stripIrcControlChars(content)
 			: stripIrcControlChars(stripMarkdownForIrc(content));
-		if (clean.trim().length === 0) {
-			return { success: true, messageId: String(this.nowMs()) };
-		}
-		const result = await this.wireTransmitPrivmsg(target, clean, {
+		// adapter.py:359/:297 parity: _split_message SKIPS blank paragraphs, so a
+		// chunk whose payload is entirely whitespace ships in the [""] shape —
+		// ONE 'PRIVMSG <target> :' empty-trailing line (the A19 scrub has already
+		// turned control bytes into spaces). Short-circuiting success here would
+		// silently DROP a message the reference puts on the wire.
+		const line = clean.trim().length === 0 ? "" : clean;
+		const result = await this.wireTransmitPrivmsg(target, line, {
 			...metadata,
 			irc_privmsg_target: target,
 		});
@@ -811,7 +814,17 @@ export class IrcAdapter
 	): Promise<SendResult[]> {
 		this.throwIfDisabled();
 		const policy = this.chatLengthPolicyForChat(chatId);
-		const lines = planLabeledLines(content, chatId, policy);
+		// adapter.py::send — THE vendor splitter IS the chunker and its chunks go
+		// out BARE: truncate_message's '(i/n)' scaffold is NEVER applied on IRC
+		// (adapter.py:293-297). No label-width reservation, no per-line suffix —
+		// appending one would mutate wire-visible content on every long reply.
+		const lines = splitMessageForIrc(
+			content,
+			chatId,
+			policy.maxUnits,
+			policy.lenFn,
+			true,
+		);
 		if (
 			lines.length === 1 &&
 			lines[0] === "" &&
@@ -820,15 +833,14 @@ export class IrcAdapter
 			// hostile-target / unsplittable shape: let the ladder surface it
 			return [await this.deliverViaLadder(chatId, content, metadata)];
 		}
-		const total = lines.length;
 		const results: SendResult[] = [];
-		for (let i = 0; i < total; i++) {
+		for (let i = 0; i < lines.length; i++) {
 			// adapter.py::send pacing — 300ms between consecutive PRIVMSG lines
 			// (excess-flood budget = manifest data), driven by the clock seam.
 			if (i > 0) await this.sleepMs(IRC_INTERLINE_PACING_MS);
-			const raw = lines[i] ?? "";
-			const labeled = total > 1 ? `${raw} (${i + 1}/${total})` : raw;
-			results.push(await this.deliverViaLadder(chatId, labeled, metadata));
+			results.push(
+				await this.deliverViaLadder(chatId, lines[i] ?? "", metadata),
+			);
 		}
 		return results;
 	}
@@ -1024,11 +1036,6 @@ export class IrcAdapter
 		return { promise, resolve };
 	}
 
-	private nowMs(): number {
-		if (this.clock !== undefined) return this.clock.nowMs();
-		return Date.now();
-	}
-
 	private async sleepMs(ms: number): Promise<void> {
 		if (this.clock !== undefined) {
 			await this.clock.sleepMs(ms);
@@ -1060,44 +1067,6 @@ export class IrcAdapter
 
 function brief(err: unknown): string {
 	return String(err instanceof Error ? err.message : err).slice(0, 160);
-}
-
-/**
- * Policy-measured vendor split WITH kit label discipline: split against the
- * chat pair (budget measured with the POLICY's lenFn, byte-capped by the
- * protocol overhead); when MORE THAN ONE line results, reserve the (i/n)
- * scaffold width and re-split so EVERY labeled line stays within budget —
- * the §6.3 pair governs all text delivery, labels included.
- */
-function planLabeledLines(
-	content: string,
-	target: string,
-	policy: { maxUnits: number; lenFn: (s: string) => number },
-): string[] {
-	// keepMarkup: chunk bytes stay ORIGINAL (§6.1 byte preservation); the
-	// markdown strip happens at the wire door (vendor order preserved).
-	let lines = splitMessageForIrc(
-		content,
-		target,
-		policy.maxUnits,
-		policy.lenFn,
-		true,
-	);
-	if (lines.length <= 1) return lines;
-	for (let pass = 0; pass < 4; pass++) {
-		const n = lines.length;
-		const labelWidth = policy.lenFn(` (${n}/${n})`);
-		const reserved = splitMessageForIrc(
-			content,
-			target,
-			policy.maxUnits - labelWidth,
-			policy.lenFn,
-			true,
-		);
-		lines = reserved;
-		if (reserved.length === n) break;
-	}
-	return lines;
 }
 
 function sessionKeyFor(event: IncomingEvent): string {

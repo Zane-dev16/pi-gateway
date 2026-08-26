@@ -52,7 +52,9 @@ export interface WaMediaUploadInput {
 }
 
 /**
- * THE transport seam. The adapter NEVER imports http/undici — production and
+ * THE transport seam (DEC-059 posture: production bindings are
+ * deployment-time integrations; conformance asserts arg-level wire parity
+ * HERE). The adapter NEVER imports http/undici — production and
  * tests supply different implementations of these five calls.
  */
 export interface WaCloudTransport {

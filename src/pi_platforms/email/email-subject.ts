@@ -41,6 +41,12 @@ export interface EmailSubjectOptions {
 	scalarMaxUnits?: number | undefined;
 	withSecret?: boolean | undefined;
 	requireAuthenticatedSender?: boolean | undefined;
+	/** adapter.py extra.get("skip_attachments") operator opt-out (eml-3). */
+	skipAttachments?: boolean | undefined;
+	/** extra.get("authserv_id") — config-level authserv-id pin (eml-10). */
+	authservId?: string | undefined;
+	/** _get_secret("EMAIL_AUTHSERV_ID") value served by the scoped reader. */
+	emailAuthservIdEnv?: string | undefined;
 	/** EMAIL_ALLOW_ALL_USERS opt-in (allowed-users unset alongside). */
 	allowAllUsers?: boolean | undefined;
 	/** GATEWAY_ALLOW_ALL_USERS opt-in (allowed-users unset alongside). */
@@ -75,13 +81,17 @@ export class EmailSubject implements ConformanceSubject {
 			...(opts.spawner === undefined ? {} : { spawner: opts.spawner }),
 			scalarMaxUnits: opts.scalarMaxUnits ?? 64,
 			manifestName: this.name,
-			...(opts.requireAuthenticatedSender !== undefined
-				? {
-						config: {
+			config: {
+				...(opts.requireAuthenticatedSender !== undefined
+					? {
 							requireAuthenticatedSender: opts.requireAuthenticatedSender,
-						},
-					}
-				: {}),
+						}
+					: {}),
+				...(opts.skipAttachments === true ? { skipAttachments: true } : {}),
+				...(opts.authservId !== undefined && opts.authservId.length > 0
+					? { authservId: opts.authservId }
+					: {}),
+			},
 			...(opts.declaredDraftStreaming === undefined
 				? {}
 				: { declaredDraftStreaming: opts.declaredDraftStreaming }),
@@ -91,6 +101,12 @@ export class EmailSubject implements ConformanceSubject {
 				if (key === "EMAIL_PASSWORD") return "fake-app-password";
 				if (key === "EMAIL_IMAP_HOST") return opts.imap.host;
 				if (key === "EMAIL_SMTP_HOST") return opts.smtp.host;
+				if (
+					key === "EMAIL_AUTHSERV_ID" &&
+					opts.emailAuthservIdEnv !== undefined
+				) {
+					return opts.emailAuthservIdEnv;
+				}
 				const openAccess =
 					opts.allowAllUsers === true ||
 					opts.gatewayAllowAllUsers === true ||

@@ -41,14 +41,12 @@ import {
 	DELIVERY_FAILED_NOTICE,
 	FormattingLadder,
 	classifySendError,
-	chunkWithFenceCarry,
 	OneShotPendingStore,
 	PLAIN_TEXT_FALLBACK_PREFIX,
 	sendWithRetry,
 	plainTextFallbackBody,
 	resolveEnablement,
 } from "../kit/index.js";
-import type { ChunkPlan } from "../kit/chunking.js";
 import type {
 	Metadata,
 	SendResult,
@@ -94,7 +92,10 @@ import {
 	signalSendTimeout,
 } from "./rate-limit.js";
 import { extToMime, guessExtension } from "./media.js";
-import { markdownToSignal } from "./signal-format.js";
+import {
+	markdownToSignal,
+	splitSignalFormattedMessage,
+} from "./signal-format.js";
 import type { SignalCliTransport, SignalEventStream } from "./signal-wire.js";
 
 /** The one command registry (07 §1 derivation — mirrors the reference set). */
@@ -492,7 +493,7 @@ export class SignalAdapter extends BasePlatformAdapter {
 		let backoffMs = SSE_RETRY_DELAY_INITIAL_MS;
 		while (this.running) {
 			try {
-				const stream = await this.transport.openEventStream();
+				const stream = await this.transport.openEventStream(this.account);
 				this.sseStream = stream;
 				backoffMs = SSE_RETRY_DELAY_INITIAL_MS; // reset on successful connect
 				this.lastSseActivityMs = this.nowFn();
@@ -875,6 +876,8 @@ export class SignalAdapter extends BasePlatformAdapter {
 			logFailures?: boolean | undefined;
 			raiseOnRateLimit?: boolean | undefined;
 			metadata?: Metadata | undefined;
+			/** HTTP timeout carried to the transport (_rpc timeout= parity). */
+			timeoutMs?: number | undefined;
 		} = {},
 	): Promise<{ ok: boolean; result?: unknown; error?: string }> {
 		const rpcId = opts.id ?? `${method}_${this.nowFn()}`;
@@ -883,6 +886,7 @@ export class SignalAdapter extends BasePlatformAdapter {
 			outcome = await this.transport.rpc(method, params, {
 				id: rpcId,
 				...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+				...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
 			});
 		} catch (err) {
 			this.logRpcFailure(method, opts, errText(err));
@@ -1029,12 +1033,17 @@ export class SignalAdapter extends BasePlatformAdapter {
 		await this.stopTypingIndicator(chatId);
 		// The §6.1 plain-text fallback lane carries ORIGINAL chunk bytes by
 		// contract — dialect conversion is SKIPPED for that envelope (its prefix
-		// marks it); everything else converts to plain + bodyRanges first.
+		// marks it). Everything else converts to plain + bodyRanges — EXCEPT
+		// chunks arriving pre-converted from deliverText (sigbb-4): their
+		// translated ranges ride activeChunkStyles (reconversion would return
+		// marker-free text with ZERO ranges).
 		const [plainText, textStyles] = content.startsWith(
 			PLAIN_TEXT_FALLBACK_PREFIX,
 		)
 			? [content, [] as string[]]
-			: markdownToSignal(content);
+			: this.activeChunkStyles !== null
+				? [content, this.activeChunkStyles]
+				: markdownToSignal(content);
 		const params: Record<string, unknown> = {
 			account: this.account,
 			message: plainText,
@@ -1340,6 +1349,43 @@ export class SignalAdapter extends BasePlatformAdapter {
 		if (attachmentPaths.length === 0) return [];
 		await this.stopTypingIndicator(chatId);
 
+		// Pre-batch stat gate (signal.py:send_multiple_images :1325-1355): one
+		// bad path must not lose the rest of the batch — missing files and
+		// oversize entries are SKIPPED before any slicing/RPC. DEC-019's
+		// single-attachment lanes keep their own verdict-shaped gates; the batch
+		// lane skips silently exactly like the upstream warning-and-continue walk.
+		const attachments: string[] = [];
+		let skippedMissing = 0;
+		let skippedOversize = 0;
+		for (const filePath of attachmentPaths) {
+			let fileSize: number;
+			try {
+				fileSize = statSync(filePath).size;
+			} catch {
+				skippedMissing += 1;
+				continue;
+			}
+			if (fileSize > SIGNAL_MAX_ATTACHMENT_SIZE) {
+				skippedOversize += 1;
+				continue;
+			}
+			attachments.push(filePath);
+		}
+		if (attachments.length === 0) {
+			// "no valid images in batch" upstream — nothing to slice, nothing to send.
+			this.logger?.warn?.(
+				`Signal: no valid attachments in batch of ${attachmentPaths.length} ` +
+					`(missing=${skippedMissing} oversize=${skippedOversize})`,
+			);
+			return [];
+		}
+		if (skippedMissing + skippedOversize > 0) {
+			this.logger?.warn?.(
+				`Signal: batch stat gate skipped ${skippedMissing} missing / ` +
+					`${skippedOversize} oversize of ${attachmentPaths.length}`,
+			);
+		}
+
 		const baseParams: Record<string, unknown> = {
 			account: this.account,
 			message: "",
@@ -1349,11 +1395,11 @@ export class SignalAdapter extends BasePlatformAdapter {
 		const batches: string[][] = [];
 		for (
 			let i = 0;
-			i < attachmentPaths.length;
+			i < attachments.length;
 			i += SIGNAL_MAX_ATTACHMENTS_PER_MSG
 		) {
 			batches.push([
-				...attachmentPaths.slice(i, i + SIGNAL_MAX_ATTACHMENTS_PER_MSG),
+				...attachments.slice(i, i + SIGNAL_MAX_ATTACHMENTS_PER_MSG),
 			]);
 		}
 
@@ -1379,7 +1425,6 @@ export class SignalAdapter extends BasePlatformAdapter {
 			}
 
 			const params = { ...baseParams, attachments: batch };
-			const timeout = signalSendTimeout(n);
 
 			let settled = false;
 			let lastError: string | undefined;
@@ -1393,9 +1438,11 @@ export class SignalAdapter extends BasePlatformAdapter {
 					const t0 = this.nowFn();
 					const result = await this.rpc("send", params, {
 						raiseOnRateLimit: true,
+						// Scaled send budget (_signal_send_timeout parity): serial server-
+						// side uploads truncate under the ~30s default on large batches.
+						timeoutMs: signalSendTimeout(n),
 					});
 					const durationS = (this.nowFn() - t0) / 1000;
-					void timeout; // production transports apply the scaled HTTP timeout
 					if (result.ok) {
 						const verdict = validateSendResult(result.result);
 						if (verdict.success) {
@@ -1635,12 +1682,21 @@ export class SignalAdapter extends BasePlatformAdapter {
 	 * CURRENT chatId dynamically. The base's lazily-built ladder captures the
 	 * FIRST call's chatId in its closures — fine for single-chat rows but a
 	 * latent mis-addressing for any multi-chat session; this override keeps
-	 * every base behavior (chunk plan, ladder tiers, §6.1 retry ladder,
-	 * plain-text fallback lane) while addressing each chunk at ITS chat.
+	 * every base behavior (converted-chunk plan, ladder tiers, §6.1 retry
+	 * ladder, plain-text fallback lane) while addressing each chunk at ITS chat.
 	 * Discord precedent: adapters may override deliverText wholesale.
 	 */
 	private sessionLadder: FormattingLadder | null = null;
 	private activeChatId = "";
+	/**
+	 * BodyRanges of the chunk currently being delivered (sigbb-4): conversion
+	 * runs ONCE over the WHOLE message and the converted text then splits with
+	 * per-chunk range translation (_split_signal_formatted_message parity) —
+	 * tier-2/3 sends must wire THESE ranges because reconverting converted
+	 * text is a no-op that would drop every style. Bound per chunk around the
+	 * awaited ladder walk; the §6.1 fallback prefix branch still wins first.
+	 */
+	private activeChunkStyles: string[] | null = null;
 
 	override async deliverText(
 		chatId: string,
@@ -1648,15 +1704,18 @@ export class SignalAdapter extends BasePlatformAdapter {
 		metadata: Metadata = {},
 	): Promise<SendResult[]> {
 		this.throwIfDisabled();
+
+		// Convert WHOLE message FIRST, then split CONVERTED text
+		// (signal.py:send :1179-1186 → _split_signal_formatted_message :1114):
+		// chunking raw markdown before conversion loses styles that cross chunk
+		// boundaries and leaks literal ** markers onto the wire.
+		const [converted, styles] = markdownToSignal(content);
 		const policy = this.chatLengthPolicyForChat(chatId);
-		const plan: ChunkPlan =
-			this.splitsLongMessages || policy.lenFn(content) <= policy.maxUnits
-				? {
-						chunks: [content],
-						chunkCount: 1,
-						scaffold: [{ prefixLen: 0, closeAdded: false, labelJoinLen: 0 }],
-					}
-				: chunkWithFenceCarry(content, policy);
+		const chunks = splitSignalFormattedMessage(
+			converted,
+			styles,
+			policy.maxUnits,
+		);
 
 		if (this.sessionLadder === null) {
 			this.sessionLadder = new FormattingLadder(
@@ -1675,9 +1734,24 @@ export class SignalAdapter extends BasePlatformAdapter {
 		const ladder = this.sessionLadder;
 
 		const results: SendResult[] = [];
-		for (const chunk of plan.chunks) {
+		for (const chunk of chunks) {
 			this.activeChatId = chatId; // per-chunk door target binding
-			results.push(await this.deliverChunkOn(ladder, chunk, metadata));
+			this.activeChunkStyles = chunk.styles;
+			try {
+				results.push(
+					await this.deliverChunkOn(
+						ladder,
+						chunk.text,
+						metadata,
+						// §6.1 fallback parity: when the WHOLE delivery is ONE chunk,
+						// the plain-text lane resends the ORIGINAL content bytes
+						// ({content[:3500]} intent) — not the marker-stripped chunk.
+						chunks.length === 1 ? content : undefined,
+					),
+				);
+			} finally {
+				this.activeChunkStyles = null;
+			}
 		}
 		return results;
 	}
@@ -1687,6 +1761,7 @@ export class SignalAdapter extends BasePlatformAdapter {
 		ladder: FormattingLadder,
 		chunk: string,
 		metadata: Metadata,
+		overrideFallbackSource?: string,
 	): Promise<SendResult> {
 		const outcome = await ladder.sendText(chunk, metadata);
 		if (outcome.success) return outcome;
@@ -1714,7 +1789,10 @@ export class SignalAdapter extends BasePlatformAdapter {
 		if (failureClass === "formatting") {
 			return this.wireSend(
 				this.activeChatId,
-				plainTextFallbackBody(chunk),
+				// Single-chunk deliveries fall back over the ORIGINAL bytes
+				// (§6.1 {content[:3500]}); multi-chunk deliveries fall back per
+				// converted chunk — after sigbb-4 those chunks ARE the delivered unit.
+				plainTextFallbackBody(overrideFallbackSource ?? chunk),
 				metadata,
 			);
 		}

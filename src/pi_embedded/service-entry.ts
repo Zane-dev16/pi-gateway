@@ -9,10 +9,16 @@
 // other. Any change on the lifecycle side must be reflected HERE and in the
 // stage-entry tests that pin each service's mapping.
 
-/** Mirrors GatewayLifecycle.ServiceHandle structurally (name + optional stop). */
+/**
+ * Mirrors GatewayLifecycle.ServiceHandle structurally (name + optional stop +
+ * optional in-flight count). `inflightCount` is the cooperative-drain input
+ * (#60432/#82161): the lifecycle shutdown drain polls it to wait out
+ * in-flight cron work on its own budget instead of killing it mid-run.
+ */
 export interface EmbeddedServiceHandle {
 	name: string;
 	stop?: () => Promise<void>;
+	inflightCount?: () => number;
 }
 
 /**

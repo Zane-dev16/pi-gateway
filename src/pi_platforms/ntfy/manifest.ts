@@ -36,6 +36,18 @@ export const NTFY_PUBLISH_TIMEOUT_MS = 15_000;
 /** Outbound echo-loop tag (adapter.py:_ECHO_TAG). */
 export const NTFY_ECHO_TAG = "hermes-agent";
 
+/**
+ * Single-POST truncation shape datum (04 §8 conditional-header probe,
+ * LINE_NATIVE_SPLIT_TRUNCATES precedent): the outbound lane issues ONE POST
+ * with body content[:MAX_MESSAGE_LENGTH] plus a truncation warning
+ * (adapter.py:send :429-439). Full output is NOT preserved, so the kit
+ * LOSSLESS-split shared family (egress.chunk-flood /
+ * egress.per-chat-length-pair) probes THIS datum before applying; per-chat
+ * length-budget PAIRS do not exist on this source (the 4096 vendor cap is
+ * fixed for every topic).
+ */
+export const NTFY_SEND_TRUNCATES = true;
+
 // ── the PluginManifest ──────────────────────────────────────────────────────
 
 /**

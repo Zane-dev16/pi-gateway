@@ -238,6 +238,45 @@ export function urlOnlyCandidate(text: string): string | null {
 }
 
 /**
+ * adapter.py:_richlink_url_from_content — candidate extraction RECURSES into
+ * group items: a text item folds its whole-text candidate, a richlink item its
+ * url, so MULTI-ITEM group messages arm the 30s preview-suppression window
+ * from their embedded URL (adapter.py:_record_recent_richline call site @1464).
+ */
+export function richlinkUrlFromContent(
+	content: Record<string, unknown>,
+): string | null {
+	const ctype = content["type"];
+	if (ctype === "text") {
+		return urlOnlyCandidate(String(content["text"] ?? ""));
+	}
+	if (ctype === "richlink") {
+		return urlOnlyCandidate(String(content["url"] ?? ""));
+	}
+	if (ctype === "group") {
+		const items = Array.isArray(content["items"]) ? content["items"] : [];
+		for (const item of items) {
+			if (item === null || typeof item !== "object" || Array.isArray(item)) {
+				continue;
+			}
+			const itemContent = (item as Record<string, unknown>)["content"];
+			if (
+				itemContent === null ||
+				typeof itemContent !== "object" ||
+				Array.isArray(itemContent)
+			) {
+				continue;
+			}
+			const url = richlinkUrlFromContent(
+				itemContent as Record<string, unknown>,
+			);
+			if (url !== null) return url;
+		}
+	}
+	return null;
+}
+
+/**
  * adapter.py:_richlink_candidate — intentionally narrow: only exact http(s)
  * URL messages become rich links; prose containing URLs stays on the normal
  * markdown/text path. Markdown OFF disables the lane entirely.
@@ -615,8 +654,9 @@ export class PhotonAdapter extends BasePlatformAdapter {
 		}
 		// Sidecar readiness ping (autostart/_start_sidecar healthz gate parity;
 		// the spawn itself is a documented exclusion — the seam must answer).
+		// Headers-only POST (adapter.py:_start_sidecar wait @~1720).
 		try {
-			await this.transport.call("/healthz", {});
+			await this.transport.call("/healthz");
 		} catch (err) {
 			this.setFatalError(
 				"SIDECAR_FAILED",
@@ -840,7 +880,9 @@ export class PhotonAdapter extends BasePlatformAdapter {
 			text = cleanMentionText(this.mentionPatterns, text);
 		}
 
-		this.recordRecentRichlink(spaceId, urlOnlyCandidate(text) ?? text, content);
+		// adapter.py @1464: the candidate comes from _richlink_url_from_content
+		// (RECURSES into group items) or falls back to the whole text.
+		this.recordRecentRichlink(spaceId, richlinkUrlFromContent(content) ?? text);
 
 		const outgoing: IncomingEvent = {
 			messageType,
@@ -958,20 +1000,13 @@ export class PhotonAdapter extends BasePlatformAdapter {
 		return this.sentMessageIds.has(messageId);
 	}
 
-	private recordRecentRichlink(
-		chatId: string,
-		text: string,
-		content: Record<string, unknown>,
-	): void {
-		if (!chatId) return;
-		// Source records url-only candidates AND richlink-content URLs; the
-		// candidate extraction already folded both into `text`.
-		const candidate =
-			urlOnlyCandidate(text) ??
-			(content["type"] === "richlink"
-				? urlOnlyCandidate(String(content["url"] ?? ""))
-				: null);
-		if (!candidate) return;
+	/**
+	 * adapter.py:_record_recent_richlink — arms the 30s preview-suppression
+	 * window for the chat when the (already-extracted) candidate is a url-only
+	 * candidate; bounded insertion-order eviction under the injected clock.
+	 */
+	private recordRecentRichlink(chatId: string, candidateText: string): void {
+		if (!chatId || !urlOnlyCandidate(candidateText)) return;
 		const key = normalizeChatKey(chatId);
 		if (this.recentRichlinksByChat.has(key))
 			this.recentRichlinksByChat.delete(key);
@@ -1351,14 +1386,21 @@ export class PhotonAdapter extends BasePlatformAdapter {
 		claritySessionKey: string,
 	): Promise<SendResult> {
 		if (!choices || choices.length === 0) {
-			return this.send(chatId, question);
+			// base.py:send_clarify open-ended render — bare '❓ ' + question.
+			return this.send(chatId, `❓ ${question}`);
 		}
 		this.clarifyArmedSet.add(claritySessionKey);
 		const result = await this.sidecarSendPoll(chatId, question, choices);
 		if (!result.success) {
-			// Fall back to a numbered-text clarify so the user can still answer.
-			const numbered = choices.map((c, i) => `${i + 1}. ${c}`).join("\n");
-			return this.send(chatId, `${question}\n${numbered}`);
+			// Fall back to the numbered-text clarify (base.py:send_clarify default
+			// render, BYTE-EXACT) so the user can still answer.
+			const lines = [`❓ ${question}`, ""];
+			for (let i = 0; i < choices.length; i += 1) {
+				lines.push(`  ${i + 1}. ${choices[i]}`);
+			}
+			lines.push("");
+			lines.push("Reply with the number, the option text, or your own answer.");
+			return this.send(chatId, lines.join("\n"));
 		}
 		return result;
 	}
@@ -1411,7 +1453,13 @@ export class PhotonAdapter extends BasePlatformAdapter {
 
 	/**
 	 * adapter.py:_send_with_retry — ONE retry for network-classified failures;
-	 * permanent classes return as-is (never double-send); timeouts NOT retried.
+	 * permanent classes return as-is (never double-send); timeout-classified
+	 * errors NEVER ride the ladder NOR the plain-text resend (DEC-046 veto —
+	 * delivery outcome unknown). Everything else that failed — exhausted
+	 * retries AND non-network non-timeout non-permanent failures alike — falls
+	 * through to ONE richlink=False/markdown=False plain-text resend
+	 * (adapter.py @2478), so a rich-link outage or a formatting-class blip does
+	 * not strand an otherwise sendable message.
 	 * NO numeric hint participates anywhere: delays derive from the local
 	 * schedule alone (retry_after extraction deliberately absent — this wire
 	 * has none).
@@ -1429,19 +1477,24 @@ export class PhotonAdapter extends BasePlatformAdapter {
 		const errorStr = result.error ?? "";
 		const isNetwork =
 			result.retryable === true || this.isRetryableError(errorStr);
-		if (!isNetwork || errorStr.toLowerCase().includes("timed out"))
-			return result;
-		for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-			await this.sleepFn(baseDelayMs * 2 ** (attempt - 1));
-			result = await this.photonSend(chatId, text);
-			if (result.success) return result;
-			if (this.isPermanentSidecarFailure(result)) return result;
-			const nextError = result.error ?? "";
-			if (!(result.retryable === true || this.isRetryableError(nextError)))
-				break;
+		// DEC-046 timeout veto: classified timeouts return as-is (the request
+		// may have been delivered — neither retry nor plain-text resend).
+		if (errorStr.toLowerCase().includes("timed out")) return result;
+		if (isNetwork) {
+			for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+				await this.sleepFn(baseDelayMs * 2 ** (attempt - 1));
+				result = await this.photonSend(chatId, text);
+				if (result.success) return result;
+				if (this.isPermanentSidecarFailure(result)) return result;
+				const nextError = result.error ?? "";
+				if (!(result.retryable === true || this.isRetryableError(nextError)))
+					break;
+			}
 		}
-		// Plain-text fallback (bypasses richlink so a rich-link outage does not
-		// strand an otherwise sendable URL).
+		// Plain-text fallback (adapter.py @2478 fall-through): reached by
+		// exhausted retries AND non-network non-timeout non-permanent failures;
+		// bypasses richlink so a rich-link outage does not strand an otherwise
+		// sendable URL.
 		return this.sidecarSend(chatId, text.slice(0, PHOTON_MAX_MESSAGE_LENGTH), {
 			richlink: false,
 			markdown: false,
@@ -1478,7 +1531,8 @@ export class PhotonAdapter extends BasePlatformAdapter {
 	 */
 	async probeOnce(): Promise<ProbeVerdict> {
 		try {
-			await this.transport.call("/probe", {});
+			// Headers-only POST (adapter.py:_probe_once @~1869 passes no body).
+			await this.transport.call("/probe");
 			return "alive";
 		} catch (err) {
 			if (err instanceof SidecarHungError || isTimeoutShapedError(err)) {

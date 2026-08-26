@@ -10,6 +10,7 @@ import type {
 } from "../l1-adapter-guard.js";
 import { AdapterSessionGuard } from "../l1-adapter-guard.js";
 import type { IncomingEvent } from "../events.js";
+import type { SessionSource } from "../../resolution/session-key.js";
 
 /** A queued frame. `start()` is the deterministic execution point. */
 export class ManualTask implements GatewayTask {
@@ -167,6 +168,10 @@ export interface FixtureOptions {
 	scheduleTimer?: (delayMs: number, fn: () => void) => () => void;
 	/** Bounded cancel wait override (wedged-owner tests). */
 	cancelWaitTimeoutMs?: number;
+	/** Telegram DM topic-recovery hook (base.py:set_topic_recovery_fn). */
+	topicThreadRecovery?: (source: SessionSource) => string | null | undefined;
+	/** Key rebuilder applied after a recovery rewrite. */
+	rebuildSessionKey?: (source: SessionSource) => string;
 }
 
 /**
@@ -275,6 +280,12 @@ export function makeFixture(options: FixtureOptions = {}): {
 	}
 	if (options.cancelWaitTimeoutMs !== undefined) {
 		deps.cancelWaitTimeoutMs = options.cancelWaitTimeoutMs;
+	}
+	if (options.topicThreadRecovery !== undefined) {
+		deps.topicThreadRecovery = options.topicThreadRecovery;
+	}
+	if (options.rebuildSessionKey !== undefined) {
+		deps.rebuildSessionKey = options.rebuildSessionKey;
 	}
 	const guard = new AdapterSessionGuard(deps);
 

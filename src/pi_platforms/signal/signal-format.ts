@@ -208,3 +208,123 @@ export function markdownToSignal(text: string): [string, string[]] {
 
 	return [text, styleStrings];
 }
+
+// ── post-conversion splitting (signal.py:_split_signal_formatted_message) ────
+
+/**
+ * Cumulative UTF-16 offsets at every CODEPOINT boundary
+ * (signal.py:_utf16_offsets): offsets[i] = UTF-16 length of the first i
+ * codepoints. Splitting walks THESE so a cut never lands inside a surrogate
+ * pair while style math stays in the wire's UTF-16 space.
+ */
+function utf16Offsets(text: string): number[] {
+	const offsets = [0];
+	let total = 0;
+	for (const char of text) {
+		total += utf16Len(char);
+		offsets.push(total);
+	}
+	return offsets;
+}
+
+/**
+ * Translate full-message Signal styles into ONE chunk-local range list
+ * (signal.py:_styles_for_chunk): each "start:len:STYLE" string is clipped to
+ * [chunkStart, chunkEnd) and re-anchored at the chunk origin; ranges that do
+ * not overlap the chunk are dropped.
+ */
+export function stylesForChunk(
+	textStyles: readonly string[],
+	chunkStart: number,
+	chunkEnd: number,
+): string[] {
+	const adjusted: string[] = [];
+	for (const styleString of textStyles) {
+		const parts = styleString.split(":");
+		if (parts.length < 3) continue;
+		const styleType = parts.slice(2).join(":");
+		const styleStart = Number(parts[0]);
+		const styleLength = Number(parts[1]);
+		if (
+			!Number.isFinite(styleStart) ||
+			!Number.isFinite(styleLength) ||
+			styleStart < 0 ||
+			styleLength < 0
+		) {
+			continue; // malformed range: ignored upstream too (debug log there)
+		}
+		const styleEnd = styleStart + styleLength;
+		const overlapStart = Math.max(styleStart, chunkStart);
+		const overlapEnd = Math.min(styleEnd, chunkEnd);
+		if (overlapStart < overlapEnd) {
+			adjusted.push(
+				`${overlapStart - chunkStart}:${overlapEnd - overlapStart}:${styleType}`,
+			);
+		}
+	}
+	return adjusted;
+}
+
+/** One converted wire chunk plus its chunk-local bodyRanges. */
+export interface FormattedChunk {
+	text: string;
+	styles: string[];
+}
+
+/** Room for " (XX/XX)" — mirrors BasePlatformAdapter.truncate_message. */
+const SPLIT_INDICATOR_RESERVE = 10;
+
+/**
+ * Split ALREADY-CONVERTED Signal text without breaking markdown before
+ * conversion (signal.py:_split_signal_formatted_message :1114):
+ *
+ * markdownToSignal emits UTF-16 body ranges for the fully converted plain
+ * text, so conversion runs over the WHOLE message FIRST and only then does
+ * the plain text split — with overlapping ranges translated into each chunk —
+ * so styles that cross a chunk boundary are preserved instead of leaking
+ * literal Markdown markers. Multi-chunk output carries Hermes' " (i/total)"
+ * label appended AFTER range translation (labels are never styled).
+ *
+ * `maxUnits` is the chat-resolved budget; the walk itself is UTF-16-based,
+ * which never exceeds a codepoint-unit budget (codepoints ≤ UTF-16 units).
+ */
+export function splitSignalFormattedMessage(
+	plainText: string,
+	textStyles: readonly string[],
+	maxUnits: number,
+): FormattedChunk[] {
+	if (utf16Len(plainText) <= maxUnits) {
+		return [{ text: plainText, styles: [...textStyles] }];
+	}
+
+	const bodyLimit = Math.max(1, maxUnits - SPLIT_INDICATOR_RESERVE);
+	const offsets = utf16Offsets(plainText);
+	const codepoints = Array.from(plainText);
+	const chunks: FormattedChunk[] = [];
+	let startIdx = 0;
+	const totalU16 = offsets[offsets.length - 1] ?? 0;
+	while ((offsets[startIdx] ?? 0) < totalU16) {
+		const startU16 = offsets[startIdx] ?? 0;
+		const endBudget = Math.min(totalU16, startU16 + bodyLimit);
+		let endIdx = startIdx + 1;
+		while (endIdx < offsets.length && (offsets[endIdx] ?? 0) <= endBudget) {
+			endIdx += 1;
+		}
+		endIdx -= 1;
+		if (endIdx <= startIdx) endIdx = startIdx + 1;
+		const chunkStart = offsets[startIdx] ?? 0;
+		const chunkEnd = offsets[endIdx] ?? totalU16;
+		chunks.push({
+			text: codepoints.slice(startIdx, endIdx).join(""),
+			styles: stylesForChunk(textStyles, chunkStart, chunkEnd),
+		});
+		startIdx = endIdx;
+	}
+
+	if (chunks.length === 1) return chunks;
+	const total = chunks.length;
+	return chunks.map((chunk, idx) => ({
+		text: `${chunk.text} (${idx + 1}/${total})`,
+		styles: chunk.styles,
+	}));
+}

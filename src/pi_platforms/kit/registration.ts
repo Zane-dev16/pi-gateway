@@ -10,7 +10,12 @@
 // Optional hooks reserved up front (§4.2 list):
 //   envEnablementFn    — seed PlatformConfig.extra from env BEFORE construction
 //   applyYamlConfigFn  — platform owns its YAML schema (env > YAML precedence)
-//   cronDeliverEnvVar + standaloneSenderFn — out-of-process cron delivery pair
+//   cronDeliverEnvVar  — out-of-process cron delivery pair member (STILL
+//                        reserved, not yet wired)
+//   standaloneSenderFn — out-of-process cron delivery pair member (WIRED:
+//                        registerPlatform({standaloneSenderFn}) stores the
+//                        hook; getStandaloneSender() hands it to the cron /
+//                        send-tool fallback lane)
 //
 // "Missing secrets disable the adapter LOUDLY (visible in /status), never
 // silently" — enablement resolves through a SCOPED secret reader (fail-closed:
@@ -60,6 +65,8 @@ export interface RegisteredPlatform {
 	manifestName: string;
 	state: AdapterLifecycleState;
 	factory: PlatformFactory;
+	/** Out-of-process cron/send-tool sender (StandaloneSenderFn), if any. */
+	standaloneSenderFn?: StandaloneSenderFn | undefined;
 }
 
 /**
@@ -78,6 +85,11 @@ export class PluginContext {
 		return this.platforms.get(manifestName);
 	}
 
+	/** The registered out-of-process sender for a platform, if any. */
+	getStandaloneSender(manifestName: string): StandaloneSenderFn | undefined {
+		return this.platforms.get(manifestName)?.standaloneSenderFn;
+	}
+
 	/**
 	 * §11 step 3/4 flow: resolve enablement from required env; missing secret
 	 * ⇒ LOUD disable (state visible in /status); token lock acquired here so
@@ -86,7 +98,11 @@ export class PluginContext {
 	registerPlatform(
 		manifest: PluginManifest,
 		factory: PlatformFactory,
-		opts: { lockOwner?: string | undefined } = {},
+		opts: {
+			lockOwner?: string | undefined;
+			/** Hermes register(ctx) parity: standalone_sender_fn=… */
+			standaloneSenderFn?: StandaloneSenderFn | undefined;
+		} = {},
 	): AdapterDisabledError | null {
 		const state = new AdapterLifecycleState();
 
@@ -105,6 +121,9 @@ export class PluginContext {
 			manifestName: manifest.name,
 			state,
 			factory,
+			...(opts.standaloneSenderFn !== undefined
+				? { standaloneSenderFn: opts.standaloneSenderFn }
+				: {}),
 		});
 		return null;
 	}
@@ -138,3 +157,44 @@ export function resolveEnablement(
 
 /** Factory producing the concrete adapter once enablement is proven. */
 export type PlatformFactory = () => unknown;
+
+// ── out-of-process cron delivery: the standalone sender hook ────────────────
+
+/**
+ * One out-of-process send request (tools/send_message_tool.py:
+ * _send_via_adapter step-2 call shape — chat_id + message chunk plus the
+ * signature-parity kwargs every platform accepts and MAY IGNORE).
+ */
+export interface StandaloneSendArgs {
+	chatId: string;
+	message: string;
+	threadId?: string | undefined;
+	mediaFiles?: readonly string[] | undefined;
+	forceDocument?: boolean | undefined;
+}
+
+/**
+ * Result-dict parity: {"success": true, "platform": …, "chat_id": …[,"message_id":…]]}
+ * or {"error": str}. _send_via_adapter admits EXACTLY this disjunction
+ * (`result.get("success") or result.get("error")`) — anything else is an
+ * invalid-result error, so both arms are mandatory shapes here.
+ */
+export type StandaloneSendResult =
+	| {
+			success: true;
+			platform: string;
+			chatId: string;
+			messageId?: string | undefined;
+	  }
+	| { error: string };
+
+/**
+ * Out-of-process publish hook, consulted when the gateway runner is NOT in
+ * this process (cron running standalone; tools/send_message_tool.py:
+ * _send_via_adapter attempt #2). Without a registered fn, deliver=<platform>
+ * cron jobs fail with "No live adapter for platform …" — the failure mode
+ * this hook exists to prevent.
+ */
+export type StandaloneSenderFn = (
+	args: StandaloneSendArgs,
+) => Promise<StandaloneSendResult>;

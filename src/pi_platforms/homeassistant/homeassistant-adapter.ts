@@ -21,7 +21,8 @@
 //     by default) → per-entity cooldown (injected clock) → format → channel
 //     dispatch on ha_events
 //   - send(): REST POST persistent_notification/create with Bearer token;
-//     message truncated at 4096; title "Hermes Agent" (verbatim vendor wire
+//     ONE POST per delivery with message truncated at 4096 (no chunk lane —
+//     splitsLongMessages=false); title "Hermes Agent" (verbatim vendor wire
 //     data — see manifest proposed-DEC note); ≥300 ⇒ "HTTP {status}: {body}"
 //   - send_typing: deliberate NO-OP ("No typing indicator for Home
 //     Assistant") — absence datum, rowed in the conformance suite
@@ -38,7 +39,6 @@ import {
 	CallbackQueryRouter,
 	ClarifyPendingStore,
 	classifySendError,
-	chunkWithFenceCarry,
 	DELIVERY_FAILED_NOTICE,
 	FormattingLadder,
 	OneShotPendingStore,
@@ -46,7 +46,6 @@ import {
 	resolveEnablement,
 	sendWithRetry,
 } from "../kit/index.js";
-import type { ChunkPlan } from "../kit/chunking.js";
 import type {
 	Metadata,
 	SendResult,
@@ -64,7 +63,6 @@ import type {
 	AdapterStatusSnapshot,
 	DisableReason,
 } from "../kit/lifecycle-state.js";
-import type { ChatLengthPolicy, LengthUnit } from "../kit/length-policy.js";
 
 import {
 	formatStateChange,
@@ -470,7 +468,8 @@ export class HomeAssistantAdapter extends BasePlatformAdapter {
 		this.handshaken = true;
 
 		// Step 5: Verify subscription acknowledgement — SKIP any live traffic
-		// that interleaves before the result frame arrives (backlog flushes).
+		// that interleaves before the result frame arrives (backlog flushes;
+		// DEC-061 interleave-tolerance delta over strict next-frame abort).
 		let ack = await this.receiveFrame();
 		while (ack["type"] !== "result" && ack["success"] === undefined) {
 			void this.handleLiveFrame(ack);
@@ -833,16 +832,11 @@ export class HomeAssistantAdapter extends BasePlatformAdapter {
 		metadata: Metadata = {},
 	): Promise<SendResult[]> {
 		this.throwIfDisabled();
-		const policy = this.chatLengthPolicyForChat(chatId);
-		const plan: ChunkPlan =
-			this.splitsLongMessages || policy.lenFn(content) <= policy.maxUnits
-				? {
-						chunks: [content],
-						chunkCount: 1,
-						scaffold: [{ prefixLen: 0, closeAdded: false, labelJoinLen: 0 }],
-					}
-				: chunkWithFenceCarry(content, policy);
-
+		// ONE persistent_notification/create POST with message=content[:4096]
+		// (adapter.py:send :424-432; title per the DEC-056 branding datum —
+		// byte-exact until that DEC lands): splitsLongMessages=false ⇒ NO
+		// chunk lane exists on this source — the door-level slice below IS
+		// the vendor cap, never a split into labeled pieces.
 		if (this.sessionLadder === null) {
 			this.sessionLadder = new FormattingLadder(
 				{
@@ -859,12 +853,8 @@ export class HomeAssistantAdapter extends BasePlatformAdapter {
 		}
 		const ladder = this.sessionLadder;
 
-		const results: SendResult[] = [];
-		for (const chunk of plan.chunks) {
-			this.activeChatId = chatId; // per-chunk door target binding
-			results.push(await this.deliverChunkOn(ladder, chunk, metadata));
-		}
-		return results;
+		this.activeChatId = chatId; // door target binding for THIS delivery
+		return [await this.deliverChunkOn(ladder, content, metadata)];
 	}
 
 	/** Base deliverChunk parity over the SHARED session ladder. */
@@ -1111,24 +1101,14 @@ export class HomeAssistantAdapter extends BasePlatformAdapter {
 	}
 
 	/**
-	 * Per-chat length pair (§6.3/A15): chats whose id names "utf16" front a
-	 * UTF-16-class platform — budget 30 CODE UNITS. Budget AND unit move
-	 * together through THE one chat resolution (utf16 harness convention).
+	 * Per-chat length pair (§6.3/A15): REMOVED — the source has no per-chat
+	 * budgets (LINE_NATIVE_SPLIT_TRUNCATES precedent). HA's vendor cap is the
+	 * FIXED MAX_MESSAGE_LENGTH=4096 on every notification (adapter.py
+	 * MAX_MESSAGE_LENGTH class attr), enforced at the door.
 	 */
-	protected override chatDescriptorFor(chatId: string):
-		| {
-				maxMessageLength?: number | undefined;
-				lenUnit?: LengthUnit | undefined;
-		  }
-		| undefined {
-		if (chatId.includes("utf16")) {
-			return { maxMessageLength: 30, lenUnit: "utf16" };
-		}
-		return undefined;
-	}
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────────
 
 function asState(v: unknown): HaEntityState | null {
 	if (v === null || v === undefined) return null;

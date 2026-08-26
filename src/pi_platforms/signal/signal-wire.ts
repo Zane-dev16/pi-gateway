@@ -38,6 +38,8 @@ export interface SignalRpcCall {
 	id: string;
 	/** The outcome result the server returned for this call (capture aid). */
 	result?: unknown;
+	/** Scaled HTTP send timeout carried by the caller (capture aid). */
+	timeoutMs?: number;
 }
 
 /** A live SSE connection: raw text chunks in order until close(). */
@@ -64,12 +66,24 @@ export interface SignalCliTransport {
 			 * script markers (e.g. forceFormattingError).
 			 */
 			metadata?: Metadata;
+			/**
+			 * HTTP timeout for THIS request (_rpc timeout= param). Callers pass
+			 * signalSendTimeout(n) on batch sends — signal-cli uploads attachments
+			 * serially server-side, so a fixed ~30s budget truncates large batches
+			 * mid-upload (signal_rate_limit.py:_signal_send_timeout).
+			 */
+			timeoutMs?: number;
 		},
 	): Promise<RpcOutcome>;
 	/** GET /api/v1/check — true ⇔ 200. */
 	checkHealth(): Promise<boolean>;
-	/** Open the SSE event stream for the configured account. */
-	openEventStream(): Promise<SignalEventStream>;
+	/**
+	 * Open THE account-scoped SSE event stream:
+	 * GET /api/v1/events?account={quote(account, safe='')} (signal.py:_sse_listener
+	 * :454) — signal-cli routes the stream BY this query parameter, so the
+	 * account must ride every (re)connect.
+	 */
+	openEventStream(account: string): Promise<SignalEventStream>;
 	/**
 	 * Harness seam ONLY: whether a "rich" behavior is scripted on the fake
 	 * wire (models an optional rich endpoint for the §10.1 latch row — the
@@ -133,7 +147,8 @@ export class FakeSignalCliServer implements SignalCliTransport {
 	private nextAttachmentNum = 0;
 	private nextTimestamp = 1_700_000_000_000;
 
-	readonly connectionLog: Array<{ atMs: number }> = [];
+	/** One entry per accepted event-stream open, account-scoped (sigbb-2). */
+	readonly connectionLog: Array<{ atMs: number; account: string }> = [];
 	readonly drops: Array<{ atMs: number; reason: string }> = [];
 	private clockNow: () => number = () => Date.now();
 
@@ -225,7 +240,7 @@ export class FakeSignalCliServer implements SignalCliTransport {
 	async rpc(
 		method: string,
 		params: Record<string, unknown>,
-		opts?: { id?: string; metadata?: Metadata },
+		opts?: { id?: string; metadata?: Metadata; timeoutMs?: number },
 	): Promise<RpcOutcome> {
 		void opts?.metadata; // production fake ignores door metadata
 		const rpcId = opts?.id ?? `${method}_${this.clockNow()}`;
@@ -233,6 +248,7 @@ export class FakeSignalCliServer implements SignalCliTransport {
 			method,
 			params,
 			id: rpcId,
+			...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
 		});
 		const failures = this.failureScripts.get(method) ?? [];
 		const failure = failures.shift();
@@ -294,9 +310,9 @@ export class FakeSignalCliServer implements SignalCliTransport {
 		return this.healthOk;
 	}
 
-	async openEventStream(): Promise<SignalEventStream> {
+	async openEventStream(account: string): Promise<SignalEventStream> {
 		if (this.refuseEvents) throw new Error("cannot reach signal-cli daemon");
-		this.connectionLog.push({ atMs: this.clockNow() });
+		this.connectionLog.push({ atMs: this.clockNow(), account });
 		const prior = this.activeStream;
 		if (prior !== null && !prior.closed) prior.close();
 		const stream = new FakeEventStream(() => {

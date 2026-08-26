@@ -43,18 +43,25 @@ import {
 import {
 	checkTwilioSignature,
 	stripMarkdownForSms,
+	twilioBasicAuthHeader,
 	twilioPortVariantUrl,
 	verifyTwilioSignature,
 	signTwilioParams,
+	SmsAdapter,
 } from "../sms/sms-adapter.js";
 import {
 	MAX_SMS_LENGTH,
 	SMS_PLUGIN_MANIFEST,
+	TWILIO_API_BASE,
 	TWILIO_WEBHOOK_MAX_BODY_BYTES,
 	declareSmsTrustBoundary,
 	validateSmsTrustBoundary,
 } from "../sms/manifest.js";
-import { FIXTURE_FROM_NUMBER } from "../sms/fixture-secrets.js";
+import {
+	FIXTURE_ACCOUNT_SID,
+	FIXTURE_AUTH_TOKEN,
+	FIXTURE_FROM_NUMBER,
+} from "../sms/fixture-secrets.js";
 
 // ── shared-row harness ──────────────────────────────────────────────────────
 
@@ -450,6 +457,85 @@ function smsDeltaRows(newFixture: () => SmsFixture): ConformanceRow[] {
 			},
 		),
 		mk(
+			"transport.sms.env-only-deployment",
+			"sms env-only deployment: SMS_WEBHOOK_PORT / SMS_WEBHOOK_HOST / SMS_INSECURE_NO_SIGNATURE resolve via the scoped reader (adapter.py:95-100/:113 os.getenv parity) with config-object override — env alone binds port/host, reaches insecure mode, and explicit config still wins",
+			async (fx) => {
+				const envSecrets = (name: string): string | undefined => {
+					switch (name) {
+						case "TWILIO_ACCOUNT_SID":
+							return FIXTURE_ACCOUNT_SID;
+						case "TWILIO_AUTH_TOKEN":
+							return FIXTURE_AUTH_TOKEN;
+						case "TWILIO_PHONE_NUMBER":
+							return FIXTURE_FROM_NUMBER;
+						case "SMS_WEBHOOK_PORT":
+							return "9443";
+						case "SMS_WEBHOOK_HOST":
+							return "0.0.0.0";
+						case "SMS_INSECURE_NO_SIGNATURE":
+							// Source compares lowercased — case-insensitive TRUE.
+							return "TRUE";
+						default:
+							return undefined;
+					}
+				};
+
+				// Env-only: NO config object fields for port/host/insecure.
+				const envOnly = new SmsAdapter({
+					rest: fx.rest,
+					secretReader: envSecrets,
+				});
+				envOnly.attachStandardGuard();
+				expect(envOnly.port).toBe(9443);
+				expect(envOnly.host).toBe("0.0.0.0");
+				expect(envOnly.insecureNoSignature).toBe(true);
+
+				// …and insecure mode is REACHABLE from env alone: connect proceeds
+				// with no SMS_WEBHOOK_URL anywhere, logging the DISABLED warning.
+				await expect(envOnly.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+				expect(envOnly.isConnected).toBe(true);
+
+				// Explicit CONFIG still wins over env (config-object fallback order):
+				// insecure_no_signature:false + empty webhook_url ⇒ refusal ladder.
+				const cfgWins = new SmsAdapter({
+					config: {
+						port: 7001,
+						host: "127.0.0.2",
+						insecure_no_signature: false,
+					},
+					secretReader: envSecrets,
+				});
+				cfgWins.attachStandardGuard();
+				expect(cfgWins.port).toBe(7001);
+				expect(cfgWins.host).toBe("127.0.0.2");
+				expect(cfgWins.insecureNoSignature).toBe(false);
+				await expect(cfgWins.connect({ isReconnect: false })).resolves.toBe(
+					false,
+				);
+				expect(cfgWins.lifecycle.statusSnapshot().detail).toContain(
+					"sms_missing_webhook_url",
+				);
+
+				// No env AND no config ⇒ documented defaults (8080/127.0.0.1/false).
+				const defaults = new SmsAdapter({
+					secretReader: (name) =>
+						name === "TWILIO_ACCOUNT_SID"
+							? FIXTURE_ACCOUNT_SID
+							: name === "TWILIO_AUTH_TOKEN"
+								? FIXTURE_AUTH_TOKEN
+								: name === "TWILIO_PHONE_NUMBER"
+									? FIXTURE_FROM_NUMBER
+									: undefined,
+				});
+				defaults.attachStandardGuard();
+				expect(defaults.port).toBe(8080);
+				expect(defaults.host).toBe("127.0.0.1");
+				expect(defaults.insecureNoSignature).toBe(false);
+			},
+		),
+		mk(
 			"transport.sms.markdown-strip-chunking",
 			"sms egress: strip_markdown ladder ports helpers.py EXACTLY (bold/italic star+under, fence markers, inline code, headings, links, newline collapse); oversized bodies split ≤1600-char chunks each POSTed with From/To preserved",
 			async (fx) => {
@@ -482,11 +568,21 @@ function smsDeltaRows(newFixture: () => SmsFixture): ConformanceRow[] {
 				expect(result.success).toBe(true);
 				const posts = fx.rest.posts;
 				expect(posts.length).toBeGreaterThan(1);
+				// Wire contract (adapter.py:104-107/:194): every chunk POSTs the
+				// composed Messages.json URL with Basic auth over sid:token.
+				const expectedUrl = `${TWILIO_API_BASE}/${FIXTURE_ACCOUNT_SID}/Messages.json`;
+				const expectedAuth = twilioBasicAuthHeader(
+					FIXTURE_ACCOUNT_SID,
+					FIXTURE_AUTH_TOKEN,
+				);
 				for (const post of posts) {
 					expect(post.body.length).toBeLessThanOrEqual(MAX_SMS_LENGTH);
 					expect(post.from).toBe(FIXTURE_FROM_NUMBER);
 					expect(post.to).toBe("+15557654321");
 					expect(post.status).toBe(201);
+					expect(post.url).toBe(expectedUrl);
+					expect(post.authorization).toBe(expectedAuth);
+					expect(post.authorization.startsWith("Basic ")).toBe(true);
 				}
 				// strip_markdown applied at the transport boundary: the FIRST
 				// posted body carries stripped text, never literal "**".
@@ -693,13 +789,14 @@ describe("conformance suite — sms census port (shape: webhook)", () => {
 		}
 	});
 
-	it("passes ALL SEVEN sms shape-delta rows through the real engine fixture", async () => {
+	it("passes ALL EIGHT sms shape-delta rows through the real engine fixture", async () => {
 		const rows = smsDeltaRows(() => makeSmsFixture());
 		expect(rows.map((r) => r.id)).toEqual([
 			"transport.sms.signature-matrix",
 			"transport.sms.body-cap-preparse",
 			"transport.sms.form-and-field-ladder",
 			"transport.sms.connect-refusal-ladders",
+			"transport.sms.env-only-deployment",
 			"transport.sms.markdown-strip-chunking",
 			"transport.sms.rest-error-mapping",
 			"transport.sms.trust-boundary-complete",

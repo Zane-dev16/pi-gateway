@@ -70,6 +70,8 @@ abstract class FakeAdapterBase {
 	failDraftFrames = false;
 	/** Force progressive editMessage failures (fallback-final contracts). */
 	failEdits = false;
+	/** Force door-send failures (payload-less-split #78541 contracts). */
+	failSends = false;
 
 	// Probe observability for latch assertions.
 	supportsProbeCalls = 0;
@@ -92,6 +94,9 @@ abstract class FakeAdapterBase {
 		return {
 			streamIsMessageForChat: (chatId) => this.isMessageAnswer(chatId),
 			transmitSend: async (chatId, content, metadata, platform) => {
+				if (this.failSends) {
+					return { success: false, error: "forced send failure" };
+				}
 				const messageId = this.nextMessageId("msg");
 				await this.pushOp({
 					op: "send",
@@ -254,6 +259,13 @@ abstract class FakeAdapterBase {
 		return true;
 	}
 
+	/** Recorded stale-stream abandonments (_abandon_native_stream observability). */
+	readonly abandons: Array<{ chatId: string; content: string }> = [];
+
+	async abandonOpenDraft(chatId: string, content: string): Promise<void> {
+		this.abandons.push({ chatId, content });
+	}
+
 	// ── test observability (event-based sync; no sleeps) ──────────────────
 
 	async pushOp(op: WireOp): Promise<void> {
@@ -267,7 +279,17 @@ abstract class FakeAdapterBase {
 		}
 	}
 
+	waitForCount<T extends WireOp>(
+		count: number,
+		pred: (op: WireOp) => op is T,
+		timeoutMs?: number,
+	): Promise<T[]>;
 	waitForCount(
+		count: number,
+		pred: (op: WireOp) => boolean,
+		timeoutMs?: number,
+	): Promise<WireOp[]>;
+	async waitForCount(
 		count: number,
 		pred: (op: WireOp) => boolean,
 		timeoutMs = 5_000,

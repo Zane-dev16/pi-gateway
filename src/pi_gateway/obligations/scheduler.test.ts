@@ -1,7 +1,9 @@
 // Behavior contracts for the retry scheduler (injected clock only — no test
 // and no logic path reads a wall clock). Covers: backoff gating under the
-// proposed schedule, dead-owner immediate recovery, deliverable-platform
-// filtering without budget burn, and start/stop loop lifecycle.
+// proposed schedule, dead-owner immediate recovery, claim-time resume-clear
+// parity (#91969 — every claimed session key cleared BEFORE any send),
+// deliverable-platform filtering without budget burn, and start/stop loop
+// lifecycle.
 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -184,6 +186,145 @@ describe("dead-owner immediate recovery vs backoff", () => {
 		const report = await scheduler.tick(clock.nowSeconds() + 1); // no backoff wait
 		expect(report.recovered).toBe(1);
 		expect(report.results[0]?.ok).toBe(true);
+		await store.close();
+	});
+});
+
+describe("claim-time resume-clear parity (#91969)", () => {
+	it("clears resume_pending for EVERY claimed session key BEFORE any send, on both claim paths", async () => {
+		const { ledger, store, clock } = await makeScaffold();
+		const events: string[] = [];
+		// Dead-owned row → sweepRecoverable path; self-owned pending row past
+		// its first backoff slot → claimDueRetries path. Both must be cleared.
+		store.db
+			.prepare(
+				`INSERT INTO delivery_obligations
+				   (obligation_id, session_key, platform, chat_id, thread_id, content,
+				    state, attempts, created_at, updated_at, owner_pid, owner_started_at)
+				 VALUES ('orphan', 'sk-dead', 'telegram', 'c', NULL, 'lost text',
+				         'attempting', 1, ?, ?, 970_001, 42)`,
+			)
+			.run(clock.nowSeconds(), clock.nowSeconds());
+		await ledger.record(
+			sample({ sessionKey: "sk-live", content: "owed", messageRef: "m2" }),
+			{ nowSeconds: clock.nowSeconds() },
+		);
+		const t0 = clock.nowSeconds();
+		const scheduler = new ObligationRetryScheduler(
+			ledger,
+			async (req) => {
+				events.push(`send:${req.sessionKey}`);
+				return { ok: true };
+			},
+			{
+				clock,
+				clearResumePending: async (key) => {
+					events.push(`clear:${key}`);
+				},
+			},
+		);
+
+		const report = await scheduler.tick(t0 + 61); // dead-owner immediate + first retry slot
+
+		expect(report.recovered).toBe(1);
+		expect(report.retried).toBe(1);
+		// Exact interleaving: clears complete before the FIRST send (a hung
+		// redelivery must never reopen the boot-resume replay window).
+		expect(events).toEqual([
+			"clear:sk-dead",
+			"clear:sk-live",
+			"send:sk-dead",
+			"send:sk-live",
+		]);
+		expect(report.results.map((r) => r.ok)).toEqual([true, true]);
+		await store.close();
+	});
+
+	it("isolates a throwing key: later keys still clear and ALL claimed rows still deliver", async () => {
+		const { ledger, store, clock } = await makeScaffold();
+		const cleared: string[] = [];
+		for (const [id, key] of [
+			["bad-row", "sk-bad"],
+			["good-row", "sk-good"],
+		] as const) {
+			store.db
+				.prepare(
+					`INSERT INTO delivery_obligations
+					   (obligation_id, session_key, platform, chat_id, thread_id, content,
+					    state, attempts, created_at, updated_at, owner_pid, owner_started_at)
+					 VALUES (?, ?, 'telegram', 'c', NULL, 'text', 'pending', 0, ?, ?, 970_001, 42)`,
+				)
+				.run(id, key, clock.nowSeconds(), clock.nowSeconds());
+		}
+		const sender = new ScriptedSender();
+		const scheduler = new ObligationRetryScheduler(ledger, sender.bind(), {
+			clock,
+			clearResumePending: async (key) => {
+				cleared.push(key);
+				if (key === "sk-bad") throw new Error("store offline");
+			},
+		});
+
+		const report = await scheduler.tick(clock.nowSeconds() + 1);
+
+		// The failing key was attempted, the remaining key still cleared…
+		expect(cleared).toEqual(["sk-bad", "sk-good"]);
+		// …and neither the sends nor the settles were blocked.
+		expect(report.recovered).toBe(2);
+		expect(sender.calls.map((c) => c.sessionKey)).toEqual([
+			"sk-bad",
+			"sk-good",
+		]);
+		expect(ledger.stateOf("bad-row")).toBe("delivered");
+		expect(ledger.stateOf("good-row")).toBe("delivered");
+		await store.close();
+	});
+
+	it("skips empty session keys but still drives those rows (if not session_key: continue)", async () => {
+		const { ledger, store, clock } = await makeScaffold();
+		store.db
+			.prepare(
+				`INSERT INTO delivery_obligations
+				   (obligation_id, session_key, platform, chat_id, thread_id, content,
+				    state, attempts, created_at, updated_at, owner_pid, owner_started_at)
+				 VALUES ('anon', '', 'telegram', 'c', NULL, 'keyless',
+				         'attempting', 1, ?, ?, 970_001, 42)`,
+			)
+			.run(clock.nowSeconds(), clock.nowSeconds());
+		const cleared: string[] = [];
+		const sender = new ScriptedSender();
+		const scheduler = new ObligationRetryScheduler(ledger, sender.bind(), {
+			clock,
+			clearResumePending: async (key) => {
+				cleared.push(key);
+			},
+		});
+
+		const report = await scheduler.tick(clock.nowSeconds() + 1);
+
+		expect(cleared).toEqual([]); // nothing to clear for a keyless row
+		expect(sender.calls).toHaveLength(1);
+		expect(report.results[0]?.ok).toBe(true);
+		await store.close();
+	});
+
+	it("never invokes the hook when a tick claims nothing", async () => {
+		const { ledger, store, clock } = await makeScaffold();
+		let calls = 0;
+		const scheduler = new ObligationRetryScheduler(
+			ledger,
+			new ScriptedSender().bind(),
+			{
+				clock,
+				clearResumePending: async () => {
+					calls++;
+				},
+			},
+		);
+		const report = await scheduler.tick(clock.nowSeconds() + 1);
+		expect(report.recovered).toBe(0);
+		expect(report.retried).toBe(0);
+		expect(calls).toBe(0);
 		await store.close();
 	});
 });

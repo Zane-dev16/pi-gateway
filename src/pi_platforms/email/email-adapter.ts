@@ -22,20 +22,33 @@
 //                       best-effort/swallowed).
 //   parseFetchedMessage _extract_attachments over parts: image exts are
 //                       magic-byte-checked (non-images SKIPPED), others cache
-//                       as documents.
+//                       as documents; config skip_attachments short-circuits
+//                       the whole walk (adapter.py:565/:969).
 //   _dispatch_message   gates in order: self-drop → automated drop → allowlist
 //                       gate (unset + no allow-all ⇒ drop; EMAIL_ALLOW_ALL_USERS
 //                       OR GATEWAY_ALLOW_ALL_USERS opt in) → authenticated-
 //                       sender gate ONLY when allowlist in effect & allow-all
-//                       off (GHSA-rxqh-5572-8m77 fail-closed); attachments
-//                       become event mediaUrls/mediaTypes with DOCUMENT-wins
-//                       typing (image ⇒ PHOTO only while still TEXT).
-//   _send_email         MIMEMultipart with MIMEText PLAIN only; thread context
-//                       Re:/In-Reply-To/References; default subject "Hermes
-//                       Agent"; RFC 2822 local-time Date; Message-ID hermes-<hex>;
-//                       port 465 implicit TLS else STARTTLS; A21 IPv4 ladder.
+//                       off (GHSA-rxqh-5572-8m77 fail-closed); Authentication-
+//                       Results instances feed verifySenderAuthentication as an
+//                       ORDERED LIST — first-instance trust, optional authserv-id
+//                       pin (msg.get_all parity; Record collapse never decides).
+//   _send_email         MIMEMultipart with MIMEText PLAIN only (FULL body — the
+//                       50000 cap is plugin max_message_length metadata feeding
+//                       policy chunking upstream, never an SMTP-lane slice);
+//                       thread context Re:/In-Reply-To/References; default
+//                       subject "Hermes Agent"; RFC 2822 local-time Date;
+//                       Message-ID hermes-<hex>; port 465 implicit TLS else
+//                       STARTTLS; A21 IPv4 ladder; smtp.quit() in finally
+//                       (best-effort, chased by close) after EVERY send and
+//                       connect test.
+//   send_document /     MIMEBase('application','octet-stream') base64 parts
+//   send_multiple_images attached to the thread-context multipart (local files;
+//                       remote URLs link in the body).
 //
 // PROPOSED DEC text lives in email-world.ts (polling-row leg mappings).
+
+import { existsSync, readFileSync } from "node:fs";
+import { basename } from "node:path";
 
 import {
 	ActionHandlerRegistry,
@@ -94,6 +107,7 @@ import type { PacingClockLike } from "./clock.js";
 import {
 	type FakeImapServer,
 	type FakeSmtpServer,
+	type SentAttachment,
 	SmtpAuthenticationError,
 } from "./fake-mail-servers.js";
 
@@ -129,6 +143,9 @@ export interface EmailAdapterDeps {
 				pollIntervalMs?: number | undefined;
 				requireAuthenticatedSender?: boolean | undefined;
 				authservId?: string | undefined;
+				/** adapter.py extra.get("skip_attachments") — operator opt-out that
+				 *  short-circuits attachment extraction entirely (:565/:969). */
+				skipAttachments?: boolean | undefined;
 		  }
 		| undefined;
 	declaredDraftStreaming?: boolean | undefined;
@@ -171,6 +188,7 @@ export class EmailAdapter
 	readonly pollIntervalMs: number;
 	readonly requireAuthenticatedSender: boolean;
 	readonly authservId: string;
+	private readonly skipAttachments: boolean;
 
 	// ── runtime state (adapter.py __init__) ──
 	private readonly seenUids = new Set<string>();
@@ -251,22 +269,17 @@ export class EmailAdapter
 		this.address = (env("EMAIL_ADDRESS") ?? "").trim();
 		this.password = env("EMAIL_PASSWORD") ?? "";
 		this.imapHost = (env("EMAIL_IMAP_HOST") ?? "").trim();
-		const imapPortRaw = Number(env("EMAIL_IMAP_PORT"));
-		this.imapPort =
-			env("EMAIL_IMAP_PORT") === undefined || !Number.isFinite(imapPortRaw)
-				? EMAIL_IMAP_PORT_DEFAULT
-				: imapPortRaw;
+		// _esecret_int parity (adapter.py:78-86): strip, treat BLANK/whitespace as
+		// unset, strict integer parse — a blank-but-present value falls back to the
+		// default instead of Number('')===0 driving port-0 connects / 0ms polls.
+		this.imapPort = esecretInt(env, "EMAIL_IMAP_PORT", EMAIL_IMAP_PORT_DEFAULT);
 		this.smtpHost = (env("EMAIL_SMTP_HOST") ?? "").trim();
-		const smtpPortRaw = Number(env("EMAIL_SMTP_PORT"));
-		this.smtpPort =
-			env("EMAIL_SMTP_PORT") === undefined || !Number.isFinite(smtpPortRaw)
-				? EMAIL_SMTP_PORT_DEFAULT
-				: smtpPortRaw;
-		const pollRaw = Number(env("EMAIL_POLL_INTERVAL"));
+		this.smtpPort = esecretInt(env, "EMAIL_SMTP_PORT", EMAIL_SMTP_PORT_DEFAULT);
+		const pollRaw = (env("EMAIL_POLL_INTERVAL") ?? "").trim();
 		this.pollIntervalMs =
-			env("EMAIL_POLL_INTERVAL") === undefined || !Number.isFinite(pollRaw)
-				? (deps.config?.pollIntervalMs ?? EMAIL_POLL_INTERVAL_MS)
-				: pollRaw * 1000;
+			pollRaw.length > 0 && /^[+-]?\d+$/.test(pollRaw)
+				? Number(pollRaw) * 1000
+				: (deps.config?.pollIntervalMs ?? EMAIL_POLL_INTERVAL_MS);
 		if (this.password.length > 0) this.registerLogSecret(this.password);
 
 		// require_authenticated_sender: extra flag > EMAIL_TRUST_FROM_HEADER
@@ -277,7 +290,17 @@ export class EmailAdapter
 		this.requireAuthenticatedSender =
 			deps.config?.requireAuthenticatedSender ??
 			(trustFromHeader ? false : true);
-		this.authservId = (deps.config?.authservId ?? "").toLowerCase();
+		// adapter.py:591-592 — config extra first, EMAIL_AUTHSERV_ID secret second;
+		// env-configured operators keep their injected-header pinning defense.
+		this.authservId = (
+			deps.config?.authservId ||
+			(env("EMAIL_AUTHSERV_ID") ?? "")
+		)
+			.trim()
+			.toLowerCase();
+		// adapter.py:565 — operator opt-out: when set, attachment/inline parts are
+		// ignored entirely (malware protection / bandwidth savings).
+		this.skipAttachments = deps.config?.skipAttachments === true;
 
 		// §11 step 3/4: missing required secret ⇒ LOUD disable at construction.
 		const enablement = resolveEnablement(
@@ -373,12 +396,16 @@ export class EmailAdapter
 		}
 
 		// IMAP connection test (handle closed in finally — #79889).
+		let imapHandleOpen = false;
 		try {
 			this.imap.connectCalls += 1;
 			if (this.imap.connectFailuresArmed > 0) {
 				this.imap.connectFailuresArmed -= 1;
 				throw new Error("unreachable host");
 			}
+			// TCP handle exists from here on: teardown is due on EVERY path
+			// (#79889 — adapter.py connect() finally: _close_imap(imap)).
+			imapHandleOpen = true;
 			this.imap.login(this.address, this.password);
 			this.sendImapId();
 			this.imap.selectInbox();
@@ -396,8 +423,6 @@ export class EmailAdapter
 				for (const uid of this.imap.uidSearch("ALL")) this.seenUids.add(uid);
 				this.trimSeenUids();
 			}
-			this.imap.logout();
-			this.seenSnapshot.set(this.address, new Set(this.seenUids));
 		} catch (err) {
 			// Generic IMAP error: kept RETRYABLE deliberately — imaplib raises the
 			// same IMAP4.error for bad credentials AND transient NOs (OOF-156).
@@ -407,15 +432,27 @@ export class EmailAdapter
 				true,
 			);
 			return false;
+		} finally {
+			if (imapHandleOpen) {
+				// _close_imap parity (adapter.py:115/:744): best-effort teardown
+				// OUTSIDE the failing try — an abort raised by logout can never
+				// fail an otherwise-successful connection test.
+				try {
+					this.imap.logout();
+				} catch {
+					/* eaten — socket death is guaranteed regardless */
+				}
+			}
 		}
+		this.seenSnapshot.set(this.address, new Set(this.seenUids));
 
-		// SMTP connection test.
+		// SMTP connection test (_connect_smtp ladder + quit-in-finally).
 		try {
-			this.connectSmtp();
+			this.connectSmtpWithLadder();
 			try {
 				this.smtp.login(this.address, this.password);
 			} finally {
-				void this.smtp;
+				this.smtp.quit();
 			}
 		} catch (err) {
 			if (err instanceof SmtpAuthenticationError) {
@@ -508,11 +545,14 @@ export class EmailAdapter
 
 	private fetchNewMessages(): ParsedMail[] {
 		const results: ParsedMail[] = [];
+		let imapHandleOpen = false;
 		try {
 			this.imap.connectCalls += 1;
 			if (this.imap.connectFailuresArmed > 0) {
 				throw new Error("IMAP fetch error: unreachable host");
 			}
+			// Handle exists from here on — teardown due on EVERY path (#79889).
+			imapHandleOpen = true;
 			this.imap.login(this.address, this.password);
 			this.sendImapId();
 			this.imap.selectInbox();
@@ -542,10 +582,21 @@ export class EmailAdapter
 					);
 				}
 			}
-			this.imap.logout();
 		} catch (err) {
 			this.lastFetchFailed = true;
 			this.lastFetchError = brief(err);
+		} finally {
+			if (imapHandleOpen) {
+				// _close_imap parity (adapter.py:115/:919): teardown lives OUTSIDE
+				// the failing try with its exceptions eaten — an armed
+				// ImapLogoutAbortError can never mark fully-successful fetches as
+				// failed and spur the reconnect escalation ladder.
+				try {
+					this.imap.logout();
+				} catch {
+					/* eaten — socket death is guaranteed regardless */
+				}
+			}
 		}
 		// Snapshot updated after EVERY poll (mid-outage recreation restores an
 		// up-to-date baseline).
@@ -567,8 +618,12 @@ export class EmailAdapter
 		// Automated/noreply senders skip BEFORE any processing.
 		if (isAutomatedSender(senderAddr, mail.headers)) return null;
 
-		// From-domain authentication verdict consumed at dispatch.
-		const arHeaders = Object.entries(mail.headers)
+		// From-domain authentication verdict consumed at dispatch. The A-R
+		// headers feed verifySenderAuthentication as an ORDERED LIST (eml-7):
+		// msg.get_all preserves duplicates and the receiving server PREPENDS its
+		// verdict, so first-instance trust is only representable when every
+		// instance survives — a collapsed Record decided with last-wins bytes.
+		const arHeaders = mail.headerList
 			.filter(([k]) => k.toLowerCase() === "authentication-results")
 			.map(([, v]) => v);
 		const verdict = verifySenderAuthentication(
@@ -585,17 +640,21 @@ export class EmailAdapter
 				charset: p.charset ?? null,
 			})),
 		);
-		const attachments = extractAttachments(
-			mail.uid,
-			mail.parts.map((p) => ({
-				contentType: p.contentType,
-				disposition: p.disposition,
-				payload: p.payload as Buffer | null,
-				...(p.filename !== undefined && p.filename !== null
-					? { filename: p.filename }
-					: {}),
-			})),
-		);
+		// skip_attachments short-circuit (adapter.py:969): when configured, ALL
+		// attachment/inline parts are ignored (malware protection / bandwidth).
+		const attachments = this.skipAttachments
+			? []
+			: extractAttachments(
+					mail.uid,
+					mail.parts.map((p) => ({
+						contentType: p.contentType,
+						disposition: p.disposition,
+						payload: p.payload as Buffer | null,
+						...(p.filename !== undefined && p.filename !== null
+							? { filename: p.filename }
+							: {}),
+					})),
+				);
 
 		return {
 			uid: mail.uid,
@@ -966,20 +1025,59 @@ export class EmailAdapter
 
 	// ══════════════════════════════════════════════════════════════════════
 	// SMTP send lane (_send_email): MIME multipart, text/plain part ONLY;
+	// FULL body (the 50000 cap lives upstream as plugin max_message_length
+	// metadata feeding deliverText policy chunking — never an SMTP-lane slice);
 	// threading headers from thread context; default subject "Hermes Agent";
 	// RFC 2822 local-time Date (formatdate localtime=True, clock-pinned);
 	// Message-ID hermes-<hex12>@domain; port 465 implicit TLS else STARTTLS;
 	// A21 IPv4 fallback ladder on connection-class failures (TLS verification
-	// errors NOT retried).
+	// errors NOT retried); smtp.quit() best-effort in EVERY lane's finally.
 	// ══════════════════════════════════════════════════════════════════════
 
+	/** One SMTP connection (adapter.py:_connect_smtp._connect). */
 	private connectSmtp(ipv4Only = false): void {
-		this.smtp.openConnection(this.smtpPort, ipv4Only);
-		if (this.smtpPort === EMAIL_SMTP_IMPLICIT_TLS_PORT) {
-			// implicit TLS — no STARTTLS verb
-		} else {
-			this.smtp.startTls();
+		const conn = this.smtp.openConnection(this.smtpPort, ipv4Only);
+		try {
+			if (this.smtpPort === EMAIL_SMTP_IMPLICIT_TLS_PORT) {
+				// implicit TLS — no STARTTLS verb
+			} else {
+				this.smtp.startTls();
+			}
+		} catch (err) {
+			conn.close(); // smtp.close() before raise — never leak the handle
+			throw err;
 		}
+	}
+
+	/**
+	 * adapter.py:_connect_smtp — the connection plus its A21 ladder INSIDE:
+	 * connection-class failures retry IPv4-only; TLS verification errors are
+	 * NOT retried. Shared by the connect test AND every send lane (the ladder
+	 * is not a send-only affordance).
+	 */
+	private connectSmtpWithLadder(): void {
+		try {
+			this.connectSmtp(false);
+		} catch (err) {
+			if ((err as { name?: string }).name === "SSLError") throw err;
+			this.connectSmtp(true); // IPv4-only retry
+		}
+	}
+
+	/** Best-effort session teardown (adapter.py send lanes' finally). */
+	private quitSmtpBestEffort(): void {
+		try {
+			this.smtp.quit();
+		} catch {
+			this.smtp.close(); // socket death guaranteed regardless (#79889)
+		}
+	}
+
+	private newMessageId(): string {
+		return `<hermes-${Math.floor(Math.random() * 0xffffffffffff)
+			.toString(16)
+			.padStart(12, "0")
+			.slice(0, 12)}@${this.messageIdDomain()}>`;
 	}
 
 	async sendEmail(
@@ -994,36 +1092,178 @@ export class EmailAdapter
 		let subject = ctx.subject;
 		if (!subject.startsWith("Re:")) subject = `Re: ${subject}`;
 		const originalMsgId = replyToMsgId ?? ctx.messageId;
-		const msgId = `<hermes-${Math.floor(Math.random() * 0xffffffffffff)
-			.toString(16)
-			.padStart(12, "0")
-			.slice(0, 12)}@${this.messageIdDomain()}>`;
+		const msgId = this.newMessageId();
 
-		// Connection ladder (A21): default resolution first; connection-class
-		// failures retry IPv4-only. TLS verification errors are NOT retried.
+		this.connectSmtpWithLadder();
 		try {
-			this.connectSmtp(false);
-		} catch (err) {
-			if ((err as { name?: string }).name === "SSLError") throw err;
-			this.connectSmtp(true); // IPv4-only retry
+			this.smtp.login(this.address, this.password);
+			// msg["Date"] = formatdate(localtime=True) — epoch pinned via the clock
+			// seam so contracts stay deterministic.
+			const nowMs = this.clock !== undefined ? this.clock.nowMs() : Date.now();
+			this.smtp.sendMessage({
+				from: this.address,
+				to: toAddr,
+				subject,
+				// MIMEText(body) carries the FULL body (adapter.py:_send_email) —
+				// no SMTP-lane truncation; policy chunking owns the 50000 budget.
+				bodyText: body,
+				headers: {
+					...(originalMsgId.length > 0
+						? { "In-Reply-To": originalMsgId, References: originalMsgId }
+						: {}),
+					Date: formatRfc2822Date(nowMs),
+					"Message-ID": msgId,
+				},
+			});
+		} finally {
+			this.quitSmtpBestEffort();
 		}
-		this.smtp.login(this.address, this.password);
-		// msg["Date"] = formatdate(localtime=True) — epoch pinned via the clock
-		// seam so contracts stay deterministic.
+		return msgId;
+	}
+
+	// ── outbound media lanes (adapter.py send_image / send_document /
+	//    send_multiple_images — DEC-019 post-stream delivery surface) ──
+
+	/** adapter.py:send_image — URL linked into the body; plain send. */
+	async sendImage(
+		chatId: string,
+		imageSource: string,
+		caption?: string | undefined,
+		replyTo?: string | undefined,
+	): Promise<SendResult> {
+		let text = caption ?? "";
+		text += `\n\nImage: ${imageSource}`;
+		return this.send(chatId, text.trim(), replyTo);
+	}
+
+	/**
+	 * adapter.py:send_multiple_images — ONE email carrying every local file as
+	 * a MIMEBase('application','octet-stream') base64 part; remote URLs link in
+	 * the body. No hard cap — email clients handle dozens of attachments.
+	 */
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		if (images.length === 0) return [];
+		const bodyParts: string[] = [];
+		const localPaths: string[] = [];
+		for (const source of images) {
+			const localPath = unwrapLocalMediaPath(source);
+			if (localPath !== null) {
+				if (existsSync(localPath)) {
+					localPaths.push(localPath);
+				} else {
+					this.logger?.warn?.(`[email] Skipping missing image: ${localPath}`);
+				}
+			} else {
+				// Remote URLs just get linked in the body (send_image parity).
+				bodyParts.push(`Image: ${source}`);
+			}
+		}
+		if (localPaths.length === 0 && bodyParts.length === 0) return [];
+		try {
+			const messageId = this.sendEmailWithAttachments(
+				chatId,
+				bodyParts.join("\n\n"),
+				localPaths.map((p) => ({ path: p, filename: basename(p) })),
+				true,
+			);
+			return [{ success: true, messageId }];
+		} catch {
+			// super().send_multiple_images fallback: degrade to per-image
+			// send_image links instead of losing the batch.
+			const results: SendResult[] = [];
+			for (const source of images) {
+				results.push(await this.sendImage(chatId, source));
+			}
+			return results;
+		}
+	}
+
+	/** adapter.py:send_document — one file attached preserving original bytes. */
+	async sendDocument(
+		chatId: string,
+		filePath: string,
+		filename?: string | undefined,
+		caption?: string | undefined,
+	): Promise<SendResult> {
+		try {
+			const messageId = this.sendEmailWithAttachments(
+				chatId,
+				caption ?? "",
+				[
+					{
+						path: filePath,
+						filename: filename ?? basename(filePath),
+					},
+				],
+				false,
+			);
+			return { success: true, messageId };
+		} catch (err) {
+			return { success: false, error: brief(err) };
+		}
+	}
+
+	/**
+	 * adapter.py:_send_email_with_attachments / _send_email_with_attachment —
+	 * thread-context multipart whose files ride octet-stream base64 parts.
+	 * `skipUnreadable` mirrors the lane split: the multi-image lane logs and
+	 * SKIPS an unreadable file while the document lane fails the whole send.
+	 */
+	private sendEmailWithAttachments(
+		toAddr: string,
+		body: string,
+		files: ReadonlyArray<{ path: string; filename: string }>,
+		skipUnreadable: boolean,
+	): string {
+		const ctx = this.threadContext.get(toAddr) ?? {
+			subject: "Hermes Agent",
+			messageId: "",
+		};
+		let subject = ctx.subject;
+		if (!subject.startsWith("Re:")) subject = `Re: ${subject}`;
+		const originalMsgId = ctx.messageId;
+		const msgId = this.newMessageId();
 		const nowMs = this.clock !== undefined ? this.clock.nowMs() : Date.now();
-		this.smtp.sendMessage({
-			from: this.address,
-			to: toAddr,
-			subject,
-			bodyText: body.slice(0, EMAIL_MAX_BODY_CHARS),
-			headers: {
-				...(originalMsgId !== undefined
-					? { "In-Reply-To": originalMsgId, References: originalMsgId }
-					: {}),
-				Date: formatRfc2822Date(nowMs),
-				"Message-ID": msgId,
-			},
-		});
+
+		const attachments: SentAttachment[] = [];
+		for (const file of files) {
+			try {
+				attachments.push({
+					contentType: "application/octet-stream",
+					filename: file.filename,
+					payloadBase64: readFileSync(file.path).toString("base64"),
+				});
+			} catch (err) {
+				if (!skipUnreadable) throw err;
+				this.logger?.warn?.(
+					`[email] Failed to attach ${file.path}: ${brief(err)}`,
+				);
+			}
+		}
+
+		this.connectSmtpWithLadder();
+		try {
+			this.smtp.login(this.address, this.password);
+			this.smtp.sendMessage({
+				from: this.address,
+				to: toAddr,
+				subject,
+				bodyText: body,
+				headers: {
+					...(originalMsgId.length > 0
+						? { "In-Reply-To": originalMsgId, References: originalMsgId }
+						: {}),
+					Date: formatRfc2822Date(nowMs),
+					"Message-ID": msgId,
+				},
+				attachments,
+			});
+		} finally {
+			this.quitSmtpBestEffort();
+		}
 		return msgId;
 	}
 
@@ -1111,6 +1351,40 @@ export class EmailAdapter
 
 function brief(err: unknown): string {
 	return String(err instanceof Error ? err.message : err).slice(0, 160);
+}
+
+/**
+ * adapter.py:_esecret_int — scope-aware integer env read. Blank/whitespace ⇒
+ * default; non-integer text (int() would raise) ⇒ default. Prevents the
+ * Number('')===0 trap: port 0 connects, poll interval 0 busy-loops.
+ */
+function esecretInt(
+	read: (name: string) => string | undefined,
+	name: string,
+	fallback: number,
+): number {
+	const raw = (read(name) ?? "").trim();
+	if (raw.length === 0) return fallback;
+	return /^[+-]?\d+$/.test(raw) ? Number(raw) : fallback;
+}
+
+/**
+ * Media-source classification for the attachment lanes. Hermes run.py wraps
+ * local paths as file:// URLs before send_multiple_images; pi's post-stream
+ * rescan passes expanded bare paths — BOTH attach. True scheme URLs link in
+ * the body (adapter.py remote-URL parity). Returns null for remote sources.
+ */
+function unwrapLocalMediaPath(source: string): string | null {
+	if (source.startsWith("file://")) {
+		const raw = source.slice("file://".length);
+		try {
+			return decodeURIComponent(raw); // urllib.parse.unquote parity
+		} catch {
+			return raw;
+		}
+	}
+	if (/^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(source)) return null; // remote URL
+	return source;
 }
 
 const CHUNK_RESERVE = 8;

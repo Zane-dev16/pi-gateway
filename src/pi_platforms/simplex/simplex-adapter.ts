@@ -15,19 +15,24 @@
 //     display-name lookup and silently drops unresolved names — ID-addressed
 //     json form avoids that), "/accept <reqId>", fire-and-forget "/freceive"
 //     (the daemon never acks it — awaiting would stall a full timeout)
-//   - health monitor DELIBERATELY LOG-ONLY (adapter.py:_health_monitor): the
-//     websockets client pings protocol liveness, so application silence NEVER
-//     reconnects a healthy quiet link
+//   - health monitor DELIBERATELY LOG-ONLY (adapter.py:_health_monitor):
+//     liveness is carried by PROTOCOL PING/PONG on the seam — Hermes got it
+//     from the websockets client (ping_interval=20/ping_timeout=20); this
+//     port expresses the SAME keepalive itself (adapter-side loop), so
+//     application silence NEVER reconnects a healthy quiet link while a
+//     genuinely dead one times out its ping into the SAME ladder
 //   - NO message-edit API exists on this wire ⇒ native draft streaming
 //     excluded BY THE PROBE from SIMPLEX_SUPPORTS_MESSAGE_EDITING=false; NO
-//     typing indicator (send_typing deliberate no-op); list_channels out of
-//     scope for the census port (noted in the port report)
+//     typing indicator (send_typing deliberate no-op); channel directory via
+//     listChannels (/contacts + /groups correlated commands)
 //
 // Layering: imports pi_gateway downward + kit same-layer ONLY; no adapter
 // cross-imports.
 
 import { existsSync } from "node:fs";
-import { extname } from "node:path";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
 
 import {
 	BasePlatformAdapter,
@@ -67,17 +72,28 @@ import { buildSessionKey } from "../../pi_gateway/resolution/session-key.js";
 import {
 	HEALTH_CHECK_INTERVAL_MS,
 	HEALTH_CHECK_STALE_THRESHOLD_MS,
-	isAudioExt,
-	isImageExt,
+	SIMPLEX_AUTO_ACCEPT_ENV,
+	simplexAutoAcceptFromEnv,
 	SIMPLEX_CAPABILITIES,
 	SIMPLEX_COMMAND_TIMEOUT_MS,
+	SIMPLEX_CONNECT_OPEN_TIMEOUT_MS,
 	SIMPLEX_CORR_PREFIX,
+	SIMPLEX_GROUP_ALLOWED_ENV,
+	isAudioExt,
+	isImageExt,
+	SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS,
 	SIMPLEX_MAX_MESSAGE_LENGTH,
 	SIMPLEX_MAX_PENDING_CORR,
 	SIMPLEX_PLUGIN_MANIFEST,
+	parseCommaList,
 	SIMPLEX_SUPPORTS_MESSAGE_EDITING,
 	SIMPLEX_TEXT_BATCH_DELAY_DEFAULT_S,
+	SIMPLEX_TEXT_BATCH_DELAY_ENV,
+	simplexTextBatchDelayMs,
 	SIMPLEX_VOICE_EXTS,
+	SIMPLEX_WS_PING_CLOSE_CODE,
+	SIMPLEX_WS_PING_INTERVAL_MS,
+	SIMPLEX_WS_PING_TIMEOUT_MS,
 	WS_JITTER_FRACTION,
 	WS_RETRY_DELAY_INITIAL_MS,
 	WS_RETRY_DELAY_MAX_MS,
@@ -124,6 +140,32 @@ export interface SimplexEgressCapture {
 	transmitRich(chatId: string, content: string): Promise<SendResult>;
 }
 
+/**
+ * Prepared image artifact riding the /_send image payload
+ * (adapter.py:_prepare_image parity): the PNG-converted path plus a small
+ * inline-thumbnail data URI for the msgContent.image field.
+ */
+export interface SimplexPreparedImage {
+	pngPath: string;
+	thumbDataUri: string;
+}
+
+/**
+ * _prepare_image SEAM — PNG conversion + thumbnail generation. Production
+ * default mirrors Hermes' no-converter fallback posture (original bytes,
+ * empty thumbnail, logged); deployments with an encoder wire one here.
+ */
+export type SimplexImagePreparer = (
+	filePath: string,
+) => Promise<SimplexPreparedImage>;
+
+/**
+ * cache_image_from_url SEAM (base.py:883) — download an http(s) image to a
+ * local cache path. Default uses global fetch + a temp dir; fixtures inject
+ * deterministic fetchers.
+ */
+export type SimplexImageUrlFetcher = (url: string) => Promise<string>;
+
 export interface SimplexAdapterOptions {
 	/** Injected WS connection factory (fake daemon in tests). */
 	wsFactory: SimplexConnectionFactory;
@@ -135,7 +177,7 @@ export interface SimplexAdapterOptions {
 	rng?: (() => number) | undefined;
 	logger?: StreamLogger | undefined;
 	spawner?: TaskSpawner | undefined;
-	/** plugin.yaml SIMPLEX_AUTO_ACCEPT (default true). */
+	/** plugin.yaml SIMPLEX_AUTO_ACCEPT (default true; env overrides). */
 	autoAccept?: boolean | undefined;
 	/** Parsed SIMPLEX_GROUP_ALLOWED entries ('*' opens all; empty disables). */
 	groupAllowFrom?: readonly string[] | undefined;
@@ -143,6 +185,10 @@ export interface SimplexAdapterOptions {
 	textBatchDelayMs?: number | undefined;
 	/** Pending-corr bound (fixture seam injects smaller caps). */
 	maxPendingCorr?: number | undefined;
+	/** _prepare_image seam (PNG conversion + inline thumbnail data URI). */
+	imagePreparer?: SimplexImagePreparer | undefined;
+	/** cache_image_from_url seam (http(s) download → local cache path). */
+	imageUrlFetcher?: SimplexImageUrlFetcher | undefined;
 	captureWire?: SimplexEgressCapture | undefined;
 	/**
 	 * Lie-scan injection point: THE manifest datum that drives the
@@ -170,6 +216,9 @@ export interface SimplexCounters {
 	transfersCompleted: number;
 	commandTimeouts: number;
 	droppedWrites: number;
+	pingsSent: number;
+	pongsReceived: number;
+	pingTimeouts: number;
 	accepted: number;
 	batchesFlushed: number;
 }
@@ -200,6 +249,8 @@ export class SimplexAdapter extends BasePlatformAdapter {
 	private readonly rngFn: () => number;
 	private readonly declaredMessageEditing: boolean;
 	private readonly captureWire: SimplexEgressCapture | undefined;
+	private readonly imagePreparer: SimplexImagePreparer | undefined;
+	private readonly imageUrlFetcher: SimplexImageUrlFetcher | undefined;
 	private readonly cp: EgressChokepoint;
 
 	// ── config (__init__ parity, injected as data) ──────────────────────────
@@ -215,6 +266,9 @@ export class SimplexAdapter extends BasePlatformAdapter {
 	private conn: SimplexConnection | null = null;
 	private listenerTask: Promise<void> | null = null;
 	private healthTask: Promise<void> | null = null;
+	private keepaliveTask: Promise<void> | null = null;
+	/** Outstanding keepalive ping's send time (null = none outstanding). */
+	private awaitingPongAtMs: number | null = null;
 	/** Reconnect ladder steps chosen so far (observability). */
 	readonly reconnectLog: Array<{
 		delayMs: number;
@@ -260,6 +314,9 @@ export class SimplexAdapter extends BasePlatformAdapter {
 		transfersCompleted: 0,
 		commandTimeouts: 0,
 		droppedWrites: 0,
+		pingsSent: 0,
+		pongsReceived: 0,
+		pingTimeouts: 0,
 		accepted: 0,
 		batchesFlushed: 0,
 	};
@@ -311,11 +368,32 @@ export class SimplexAdapter extends BasePlatformAdapter {
 			opts.sleepMs ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
 		this.rngFn = opts.rng ?? (() => Math.random());
 		this.captureWire = opts.captureWire;
+		this.imagePreparer = opts.imagePreparer;
+		this.imageUrlFetcher = opts.imageUrlFetcher;
 		this.wsUrl = (this.secretReader("SIMPLEX_WS_URL") ?? "").trim();
-		this.autoAccept = opts.autoAccept ?? true;
-		this.groupAllowSet = new Set(opts.groupAllowFrom ?? []);
+		// __init__ env resolution parity (adapter.py:__init__): operator-set
+		// env WINS over injected config, which wins over defaults.
+		//   SIMPLEX_AUTO_ACCEPT — '0'/'false'/'no'/empty ⇒ false (any case);
+		//     set-but-empty DISABLES even when an option says true.
+		const envAutoAccept = simplexAutoAcceptFromEnv(
+			this.secretReader(SIMPLEX_AUTO_ACCEPT_ENV),
+		);
+		this.autoAccept = envAutoAccept ?? opts.autoAccept ?? true;
+		//   SIMPLEX_GROUP_ALLOWED — comma-split; set-but-EMPTY falls back to
+		//     the option (Python `os.getenv(K, "") or extra.get(...)`).
+		const envGroups = this.secretReader(SIMPLEX_GROUP_ALLOWED_ENV);
+		this.groupAllowSet = new Set(
+			envGroups !== undefined && envGroups.trim() !== ""
+				? parseCommaList(envGroups)
+				: (opts.groupAllowFrom ?? []),
+		);
+		//   HERMES_SIMPLEX_TEXT_BATCH_DELAY — quiet-period seconds through THE
+		//   batch-delay helper (invalid values fall back to the default).
+		const envBatchDelay = this.secretReader(SIMPLEX_TEXT_BATCH_DELAY_ENV);
 		this.textBatchDelayMs =
-			opts.textBatchDelayMs ?? SIMPLEX_TEXT_BATCH_DELAY_DEFAULT_S * 1000;
+			envBatchDelay !== undefined && envBatchDelay.trim() !== ""
+				? simplexTextBatchDelayMs(envBatchDelay)
+				: (opts.textBatchDelayMs ?? SIMPLEX_TEXT_BATCH_DELAY_DEFAULT_S * 1000);
 		this.maxPendingCorr = opts.maxPendingCorr ?? SIMPLEX_MAX_PENDING_CORR;
 		this.declaredMessageEditing =
 			opts.declaredMessageEditing ?? SIMPLEX_SUPPORTS_MESSAGE_EDITING;
@@ -405,6 +483,7 @@ export class SimplexAdapter extends BasePlatformAdapter {
 			this.lastWsActivityMs = this.nowFn();
 			this.listenerTask = this.wsListener();
 			this.healthTask = this.healthMonitor();
+			this.keepaliveTask = this.wsKeepaliveLoop();
 		}
 		return true;
 	}
@@ -431,11 +510,16 @@ export class SimplexAdapter extends BasePlatformAdapter {
 		// Cancel pending command futures (CancelledError parity → null).
 		for (const entry of this.pendingResponses.values()) entry.resolve(null);
 		this.pendingResponses.clear();
-		for (const task of [this.listenerTask, this.healthTask]) {
+		for (const task of [
+			this.listenerTask,
+			this.healthTask,
+			this.keepaliveTask,
+		]) {
 			await task?.catch(() => undefined);
 		}
 		this.listenerTask = null;
 		this.healthTask = null;
+		this.keepaliveTask = null;
 	}
 
 	get isRunning(): boolean {
@@ -462,6 +546,18 @@ export class SimplexAdapter extends BasePlatformAdapter {
 				onClose: () => done(false),
 				onError: () => done(false),
 				onText: () => undefined,
+			});
+			// open_timeout=10 parity (adapter.py:connect): a daemon accepting
+			// TCP but STALLING the handshake must not hang connect() forever —
+			// expiry resolves FALSE and abandons the probe socket.
+			void this.interruptibleSleep(SIMPLEX_CONNECT_OPEN_TIMEOUT_MS).then(() => {
+				if (settled) return;
+				done(false);
+				try {
+					conn.close(1000, "reachability probe timed out");
+				} catch {
+					/* already gone */
+				}
 			});
 		});
 	}
@@ -536,11 +632,19 @@ export class SimplexAdapter extends BasePlatformAdapter {
 				onOpen: () => {
 					opened = true;
 					this.conn = socket;
+					this.awaitingPongAtMs = null; // fresh link: keepalive resets
 					this.lastWsActivityMs = this.nowFn();
 				},
 				onText: (text) => {
 					this.lastWsActivityMs = this.nowFn();
 					void this.handleRawText(text);
+				},
+				onPong: () => {
+					// Protocol pong: answers the keepalive ping. Deliberately does
+					// NOT touch lastWsActivityMs — the health monitor measures
+					// APPLICATION silence, and pongs would mask it.
+					this.awaitingPongAtMs = null;
+					this.counts.pongsReceived += 1;
 				},
 				onClose: (info: SimplexCloseInfo) => {
 					this.closeEvents.push({
@@ -554,7 +658,49 @@ export class SimplexAdapter extends BasePlatformAdapter {
 		});
 	}
 
-	// ── health monitor (adapter.py:_health_monitor parity — LOG-ONLY) ────────
+	// ── keepalive (adapter.py:_ws_listener ping_interval=20/ping_timeout=20) ──
+
+	/**
+	 * Client protocol keepalive — the carrier Hermes got for free from the
+	 * websockets library. Every PING_INTERVAL a ping rides the socket UNLESS
+	 * the previous one is still unanswered past PING_TIMEOUT, in which case
+	 * the link is DEAD: abort it (1011) so onClose feeds the SAME reconnect
+	 * ladder. Factories whose connections cannot ping are skipped silently.
+	 */
+	private async wsKeepaliveLoop(): Promise<void> {
+		while (this.running) {
+			await this.interruptibleSleep(SIMPLEX_WS_PING_INTERVAL_MS);
+			if (!this.running) break;
+			const conn = this.conn;
+			if (conn === null || conn.ping === undefined) continue;
+			const now = this.nowFn();
+			if (
+				this.awaitingPongAtMs !== null &&
+				now - this.awaitingPongAtMs >= SIMPLEX_WS_PING_TIMEOUT_MS
+			) {
+				this.counts.pingTimeouts += 1;
+				this.logger?.warn?.("SimpleX: WS ping timeout — closing stale link");
+				this.awaitingPongAtMs = null;
+				try {
+					conn.close(SIMPLEX_WS_PING_CLOSE_CODE, "ping timeout");
+				} catch {
+					/* already gone */
+				}
+				continue;
+			}
+			this.awaitingPongAtMs = now;
+			this.counts.pingsSent += 1;
+			try {
+				conn.ping();
+			} catch (err) {
+				this.logger?.warn?.(
+					`SimpleX: WS ping failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+	}
+
+	// ── health monitor (adapter.py:_health_monitor parity — LOG-ONLY) ───────
 
 	private async healthMonitor(): Promise<void> {
 		while (this.running) {
@@ -562,8 +708,9 @@ export class SimplexAdapter extends BasePlatformAdapter {
 			if (!this.running) break;
 			const elapsed = this.nowFn() - this.lastWsActivityMs;
 			if (elapsed > HEALTH_CHECK_STALE_THRESHOLD_MS) {
-				// DELIBERATELY LOG-ONLY: protocol pings own liveness; treating
-				// application silence as staleness causes needless reconnect churn.
+				// DELIBERATELY LOG-ONLY: liveness is carried by the seam-level
+				// ping/pong keepalive above; treating application silence as
+				// staleness causes needless reconnect churn.
 				this.idleLogs.push({ atMs: this.nowFn(), elapsedMs: elapsed });
 				this.logger?.debug?.(
 					`SimpleX: WS application-idle for ${Math.floor(elapsed / 1000)}s`,
@@ -1131,6 +1278,67 @@ export class SimplexAdapter extends BasePlatformAdapter {
 		await this.sendWsJson({ corrId, cmd: command });
 	}
 
+	// ── channel directory (adapter.py:list_channels parity) ───────────────
+
+	/**
+	 * Enumerate contacts and allowed groups for the channel directory.
+	 * Issues correlated '/contacts' then '/groups' (10s timeouts each) over
+	 * the live socket. Returns NULL (never []) when the WebSocket is down or
+	 * the daemon unresponsive so the directory falls back to session-history
+	 * discovery instead of wiping previously known targets. Entry ids match
+	 * the send-target formats the adapter accepts: display name for DMs,
+	 * 'group:<groupId>' for groups.
+	 */
+	async listChannels(): Promise<SimplexChannelEntry[] | null> {
+		if (this.conn === null) return null;
+		const channels: SimplexChannelEntry[] = [];
+
+		const contactsResp = await this.sendCommand(
+			"/contacts",
+			SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS,
+		);
+		if (contactsResp === null) {
+			// Daemon unresponsive — keep whatever the directory already has.
+			return null;
+		}
+		for (const contact of arrayOrEmpty(contactsResp["contacts"])) {
+			if (!isRecord(contact)) continue;
+			const contactId = contact["contactId"];
+			const name =
+				stringOf(contact["localDisplayName"]) ||
+				stringOf(asRec(contact["profile"])["displayName"]);
+			if ((contactId === null || contactId === undefined) && name === "") {
+				continue;
+			}
+			// Display name is what the DM send path actually addresses; fall
+			// back to the numeric contactId.
+			const label = name !== "" ? name : String(contactId);
+			channels.push({ id: label, name: label, type: "dm" });
+		}
+
+		const groupsResp = await this.sendCommand(
+			"/groups",
+			SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS,
+		);
+		if (groupsResp !== null) {
+			for (const group of arrayOrEmpty(groupsResp["groups"])) {
+				// The daemon returns each group as either a groupInfo dict or a
+				// [groupInfo, groupSummary] pair depending on version.
+				const info = Array.isArray(group) ? (group[0] ?? null) : group;
+				if (!isRecord(info)) continue;
+				const groupId = info["groupId"];
+				if (groupId === null || groupId === undefined) continue;
+				const name =
+					stringOf(info["localDisplayName"]) ||
+					stringOf(asRec(info["groupProfile"])["displayName"]) ||
+					String(groupId);
+				channels.push({ id: `group:${String(groupId)}`, name, type: "group" });
+			}
+		}
+
+		return channels;
+	}
+
 	// ── egress doors ─────────────────────────────────────────────────────────
 
 	protected override get chokepoint(): EgressChokepoint {
@@ -1250,6 +1458,107 @@ export class SimplexAdapter extends BasePlatformAdapter {
 		const result = await this.sendCommand(addressCommand(chatId, composed));
 		if (result !== null) return { success: true };
 		return { success: false, error: "Failed to send document" };
+	}
+
+	// ── outbound images/video (adapter.py:send_image family parity) ──────
+
+	/**
+	 * Send an image natively (adapter.py:send_image). Supports 'file://' URLs
+	 * and http(s) URLs (downloaded through THE cache seam first). The file is
+	 * PNG-prepared via _prepare_image parity, then shipped as the correlated
+	 * '/_send @id|#gid json [{filePath, msgContent:{type:"image",
+	 * image:<thumb-data-uri>, text}}]' command — /_send addresses by ID; '/f'
+	 * only accepts display names which breaks for group IDs.
+	 */
+	async sendImage(
+		chatId: string,
+		imageUrl: string,
+		caption = "",
+	): Promise<SendResult> {
+		let filePath: string;
+		if (imageUrl.startsWith("file://")) {
+			try {
+				filePath = decodeURIComponent(imageUrl.slice("file://".length));
+			} catch {
+				filePath = imageUrl.slice("file://".length); // raw fallback
+			}
+		} else {
+			try {
+				filePath = await this.cacheImageFromUrl(imageUrl);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				this.logger?.warn?.(`SimpleX: failed to download image: ${message}`);
+				return { success: false, error: message };
+			}
+		}
+
+		if (filePath === "" || !existsSync(filePath)) {
+			return { success: false, error: "Image file not found" };
+		}
+
+		const prepared = await this.prepareImage(filePath);
+		const composed = JSON.stringify([
+			{
+				filePath: prepared.pngPath,
+				msgContent: {
+					type: "image",
+					image: prepared.thumbDataUri,
+					text: caption,
+				},
+			},
+		]);
+		const result = await this.sendCommand(addressCommand(chatId, composed));
+		if (result !== null) return { success: true };
+		return { success: false, error: "Failed to send image" };
+	}
+
+	/** Send a local image file via SimpleX (adapter.py:send_image_file). */
+	async sendImageFile(
+		chatId: string,
+		imagePath: string,
+		caption = "",
+	): Promise<SendResult> {
+		return this.sendImage(chatId, `file://${imagePath}`, caption);
+	}
+
+	/** Video ships as a plain file attachment (adapter.py:send_video). */
+	async sendVideo(
+		chatId: string,
+		videoPath: string,
+		caption = "",
+	): Promise<SendResult> {
+		return this.sendDocument(chatId, videoPath, caption);
+	}
+
+	/**
+	 * Image batch for the post-stream rescan lane — every entry gets its own
+	 * native image send (base.py:send_multiple_images default shape).
+	 */
+	async sendMultipleImages(
+		chatId: string,
+		images: readonly string[],
+	): Promise<SendResult[]> {
+		const results: SendResult[] = [];
+		for (const image of images) {
+			results.push(await this.sendImageFile(chatId, image));
+		}
+		return results;
+	}
+
+	/** _prepare_image dispatch: injected encoder or the fallback posture. */
+	private prepareImage(filePath: string): Promise<SimplexPreparedImage> {
+		if (this.imagePreparer !== undefined) return this.imagePreparer(filePath);
+		// No converter wired: adapter.py:_prepare_image fallback posture —
+		// keep the original bytes and ship WITHOUT an inline thumbnail
+		// (conversion unavailable is logged, never thrown).
+		this.logger?.debug?.(`SimpleX: image conversion unavailable: ${filePath}`);
+		return Promise.resolve({ pngPath: filePath, thumbDataUri: "" });
+	}
+
+	/** cache_image_from_url dispatch: injected fetcher or default download. */
+	private cacheImageFromUrl(url: string): Promise<string> {
+		if (this.imageUrlFetcher !== undefined) return this.imageUrlFetcher(url);
+		return defaultCacheImageFromUrl(url);
 	}
 
 	/**
@@ -1448,6 +1757,43 @@ export class SimplexAdapter extends BasePlatformAdapter {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** One channel-directory entry (adapter.py:list_channels row shape). */
+export interface SimplexChannelEntry {
+	id: string;
+	name: string;
+	type: "dm" | "group";
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+	return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Python `resp.get("x") or []` parity — null/undefined/non-array ⇒ []. */
+function arrayOrEmpty(v: unknown): unknown[] {
+	return Array.isArray(v) ? v : [];
+}
+
+/**
+ * Default cache_image_from_url posture: download via global fetch (30s
+ * timeout, redirect-following) into a fresh temp dir. Extension guessed
+ * from the URL pathname, '.jpg' fallback (base.py:883 default ext).
+ */
+async function defaultCacheImageFromUrl(url: string): Promise<string> {
+	const res = await fetch(url, {
+		signal: AbortSignal.timeout(30_000),
+		redirect: "follow",
+		headers: { Accept: "image/*,*/*;q=0.8" },
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+	const bytes = new Uint8Array(await res.arrayBuffer());
+	let ext = extname(new URL(url).pathname).toLowerCase();
+	if (!/^\.(png|jpe?g|gif|webp)$/.test(ext)) ext = ".jpg";
+	const dir = await mkdtemp(join(tmpdir(), "simplex-img-"));
+	const path = join(dir, `image${ext}`);
+	await writeFile(path, bytes);
+	return path;
+}
 
 function asRec(v: unknown): Record<string, unknown> {
 	return v !== null && typeof v === "object" && !Array.isArray(v)

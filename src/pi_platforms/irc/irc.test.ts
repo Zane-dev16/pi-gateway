@@ -164,6 +164,14 @@ describe("line-protocol helpers (parse/nick/CTCP classification)", () => {
 
 		const colonOnly = parseIrcMessage(":weird");
 		expect(colonOnly).toEqual({ prefix: "weird", command: "", params: [] });
+
+		// adapter.py:104 bug-for-bug (`if trailing:`): an EMPTY trailing is NOT
+		// pushed — "PRIVMSG botnick :" parses to params=[botnick], which the
+		// PRIVMSG gate drops (<2 params). Pushing text="" instead would let an
+		// empty turn pass the DM gates and dispatch an empty reply.
+		const emptyTrailing = parseIrcMessage(":bob!u@h PRIVMSG botnick :");
+		expect(emptyTrailing.command).toBe("PRIVMSG");
+		expect(emptyTrailing.params).toEqual(["botnick"]);
 	});
 
 	it("extracts nicks and classifies CTCP payloads", () => {
@@ -205,5 +213,53 @@ describe("line-protocol helpers (parse/nick/CTCP classification)", () => {
 				"QUIT :Hermes Agent shutting down",
 			);
 		});
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════
+// Whitespace-only outbound (adapter.py:359/:297 parity): _split_message
+// yields [""] and send() transmits ONE 'PRIVMSG <target> :' empty-trailing
+// line. Short-circuiting success would silently DROP a message the reference
+// puts on the wire.
+// ═════════════════════════════════════════════════════════════════
+
+describe("whitespace-only outbound transmits the empty-trailing PRIVMSG", () => {
+	it("whitespace-only content puts ONE empty-trailing line on the wire", async () => {
+		const { makeIrcWorld, CHANNEL } = await import("./irc-world.js");
+		const w = makeIrcWorld({ name: "irc-blank" });
+		await w.connectAndAwaitLive();
+
+		const result = await w.subject.sendThroughDoor1(CHANNEL, "   \n\t ");
+		expect(result.success).toBe(true);
+		const sends = w.wire.sendsOf(CHANNEL);
+		expect(sends.length).toBe(1);
+		expect(sends[0]?.content).toBe("");
+	});
+
+	it("markdown-stripped content keeps its bytes — only PURE whitespace collapses to the empty-trailing shape", async () => {
+		const { makeIrcWorld, CHANNEL } = await import("./irc-world.js");
+		const w = makeIrcWorld({ name: "irc-blank-md" });
+		await w.connectAndAwaitLive();
+
+		// "**__**" strips (vendor order) to "__" — NOT whitespace, so it ships
+		// verbatim exactly like Hermes format_message output would.
+		const result = await w.subject.sendThroughDoor1(CHANNEL, "**__**");
+		expect(result.success).toBe(true);
+		const sends = w.wire.sendsOf(CHANNEL);
+		expect(sends.length).toBe(1);
+		expect(sends[0]?.content).toBe("__");
+	});
+
+	it("the paced deliverText lane collapses blank content to the SAME empty-trailing shape", async () => {
+		const { makeIrcWorld, CHANNEL } = await import("./irc-world.js");
+		const w = makeIrcWorld({ name: "irc-blank-paced" });
+		await w.connectAndAwaitLive();
+
+		const results = await w.subject.deliverLongText(CHANNEL, "   ");
+		expect(results.length).toBe(1);
+		expect(results[0]?.success).toBe(true);
+		const sends = w.wire.sendsOf(CHANNEL);
+		expect(sends.length).toBe(1);
+		expect(sends[0]?.content).toBe("");
 	});
 });

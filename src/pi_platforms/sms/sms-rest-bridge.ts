@@ -18,8 +18,12 @@ export interface ScriptedSmsResponse {
 	json: Record<string, unknown>;
 }
 
-/** One observed Messages.json POST (From/To/Body + resolved verdict). */
+/** One observed Messages.json POST (URL/auth/From/To/Body + resolved verdict). */
 export interface SmsPostRecord {
+	/** Composed REST URL: {TWILIO_API_BASE}/{account_sid}/Messages.json. */
+	url: string;
+	/** Authorization header the adapter sent: Basic base64(sid:token). */
+	authorization: string;
 	from: string;
 	to: string;
 	body: string;
@@ -57,6 +61,8 @@ export class TwilioRestBridge implements SmsRestTransport {
 	}
 
 	async postMessages(input: {
+		url: string;
+		authorization: string;
 		from: string;
 		to: string;
 		body: string;
@@ -77,6 +83,8 @@ export class TwilioRestBridge implements SmsRestTransport {
 		const recorded = await this.raw.transmitSend(input.to, input.body, md);
 		if (scripted !== undefined) {
 			this.posts.push({
+				url: input.url,
+				authorization: input.authorization,
 				from: input.from,
 				to: input.to,
 				body: input.body,
@@ -94,6 +102,8 @@ export class TwilioRestBridge implements SmsRestTransport {
 			};
 		}
 		this.posts.push({
+			url: input.url,
+			authorization: input.authorization,
 			from: input.from,
 			to: input.to,
 			body: input.body,

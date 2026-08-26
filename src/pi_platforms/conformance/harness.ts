@@ -70,6 +70,15 @@ export interface ConformanceSubject {
 	sendInterim(chatId: string, content: string): Promise<SendResult>;
 	deliverLongText(chatId: string, content: string): Promise<SendResult[]>;
 	deliverToUtf16Chat(chatId: string, content: string): Promise<SendResult[]>;
+	/**
+	 * Declared §6.3 chunk-label policy of THIS transport's vendor truth.
+	 * Optional — UNDECLARED means "kit-labeled" (chunks ship with the kit
+	 * fence-carry + '(i/n)' scaffold). A subject whose reference emits BARE
+	 * vendor-splitter chunks declares "vendor-bare" (Hermes irc adapter.py::send:
+	 * truncate_message's '(i/n)' is never applied on IRC). Rows branch on this
+	 * DECLARED datum — never on platform-name sniffing.
+	 */
+	chunkLabelStyle?(): "kit-labeled" | "vendor-bare";
 	deliverFormattingRejected(
 		chatId: string,
 		content: string,

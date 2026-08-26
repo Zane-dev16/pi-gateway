@@ -8,9 +8,12 @@
 //     scripted fetch refusals; LOGOUT abort simulation (IMAP4.abort parity);
 //     connection failure arming (#79889/#80032 surfaces).
 //   FakeSmtpServer  — AUTH ok/bad (typed SMTPAuthenticationError analog);
-//     send_message capture; port modeling (587 STARTTLS / 465 implicit TLS);
+//     send_message capture incl. MIMEBase('application','octet-stream') base64
+//     attachment parts; port modeling (587 STARTTLS / 465 implicit TLS);
 //     RESOLVER SEAM returning candidate addresses for the A21 IPv4 fallback
-//     ladder (v6 blackhole first, v4 live second).
+//     ladder (v6 blackhole first, v4 live second); QUIT/CLOSE session model
+//     (adapter.py smtp.quit() after every send + connect-test finally) so a
+//     skipped teardown shows up as a leaked session.
 //
 // Message shape mirrors what imaplib hands the adapter: raw RFC822-ish
 // records with headers + body parts the adapter parses.
@@ -26,7 +29,15 @@ export interface MailPart {
 export interface StoredMail {
 	uid: string;
 	fromRaw: string;
+	/** Collapsed single-value view — Python dict(msg.items()) parity: LAST
+	 *  instance wins for duplicated names. Consumers that need EVERY instance
+	 *  in wire order (Authentication-Results, eml-7) read headerList instead. */
 	headers: Record<string, string>;
+	/** Ordered raw header list preserving REPEATED names (msg.get_all parity).
+	 *  The receiving server PREPENDS its Authentication-Results verdict, so
+	 *  duplicates are semantically load-bearing (GHSA-rxqh first-instance
+	 *  trust). */
+	headerList: ReadonlyArray<readonly [string, string]>;
 	parts: MailPart[];
 	messageId: string;
 	inReplyTo: string;
@@ -69,9 +80,23 @@ export interface ImapMailInput {
 	subject?: string | undefined;
 	textBody?: string | undefined;
 	htmlBody?: string | undefined;
-	headers?: Record<string, string> | undefined;
+	/** Header name → value. An ARRAY value models a REPEATED header (eml-7:
+	 *  multiple Authentication-Results instances in wire order). */
+	headers?: Record<string, string | readonly string[]> | undefined;
 	inReplyTo?: string | undefined;
 	attachments?: readonly ImapMailAttachmentInput[] | undefined;
+}
+
+/** First value whose header name matches case-insensitively, else undefined. */
+export function firstHeaderValue(
+	list: ReadonlyArray<readonly [string, string]>,
+	name: string,
+): string | undefined {
+	const lower = name.toLowerCase();
+	for (const [key, value] of list) {
+		if (key.toLowerCase() === lower) return value;
+	}
+	return undefined;
 }
 
 export class FakeImapServer {
@@ -140,16 +165,35 @@ export class FakeImapServer {
 				charset: "utf-8",
 			});
 		}
+		// Ordered raw header wire (Subject first, then scripted order; array
+		// values expand into repeated headers).
+		const headerList: Array<readonly [string, string]> = [
+			["Subject", mail.subject ?? "(no subject)"],
+		];
+		for (const [name, value] of Object.entries(mail.headers ?? {})) {
+			const values: readonly string[] =
+				typeof value === "string" ? [value] : value;
+			for (const v of values) headerList.push([name, v]);
+		}
+		// adapter.py:_parse_fetched_message msg.get('Message-ID'/'In-Reply-To')
+		// parity: ACTUAL scripted headers flow through (eml-5); the synthesized
+		// <fake-{uid}> ID exists only when the sender scripted none.
+		const messageId =
+			firstHeaderValue(headerList, "Message-ID") ??
+			`<fake-${uid}@mx.fake.example>`;
+		const inReplyTo =
+			firstHeaderValue(headerList, "In-Reply-To") ?? mail.inReplyTo ?? "";
+		// Collapsed Record view — dict(msg.items()) last-wins collapse.
+		const collapsed: Record<string, string> = {};
+		for (const [name, value] of headerList) collapsed[name] = value;
 		this.mailbox.set(uid, {
 			uid,
 			fromRaw: mail.from,
-			headers: {
-				Subject: mail.subject ?? "(no subject)",
-				...(mail.headers ?? {}),
-			},
+			headers: collapsed,
+			headerList,
 			parts,
-			messageId: `<fake-${uid}@mx.fake.example>`,
-			inReplyTo: mail.inReplyTo ?? "",
+			messageId,
+			inReplyTo,
 			date: new Date(0).toISOString(),
 			seen: false,
 		});
@@ -227,12 +271,21 @@ export class FakeImapServer {
 	}
 }
 
+/** MIMEBase('application','octet-stream') base64 attachment part (eml-2). */
+export interface SentAttachment {
+	contentType: "application/octet-stream";
+	filename: string;
+	/** encoders.encode_base64(part) parity — raw bytes base64-encoded. */
+	payloadBase64: string;
+}
+
 export interface SentMailRecord {
 	to: string;
 	from: string;
 	subject: string;
 	bodyText: string;
 	headers: Record<string, string>;
+	attachments: SentAttachment[];
 	port: number;
 	viaIpv4: boolean;
 }
@@ -250,6 +303,12 @@ export class FakeSmtpServer {
 	// ── scenario knobs ──
 	authBad = false;
 	/**
+	 * Arm quit() to raise AFTER the session is torn down (broken-pipe parity:
+	 * adapter.py's finally chases a raising quit with close(), so the socket
+	 * dies regardless — eml-1 best-effort teardown contract).
+	 */
+	quitFailuresArmed = 0;
+	/**
 	 * DNS candidates returned by the resolver seam, in order. The A21 ladder
 	 * walks them: connection-class failures fall through to IPv4-only.
 	 */
@@ -261,11 +320,21 @@ export class FakeSmtpServer {
 	connectCalls = 0;
 	lastCandidateFamily: 4 | 6 | null = null;
 
+	// ── session accounting (eml-1 fd-leak audit) ──
+	/** Sessions opened by openConnection and not yet torn down. */
+	openSessions = 0;
+	quitCalls = 0;
+	closeCalls = 0;
+
 	reset(): void {
 		this.sent.length = 0;
 		this.authBad = false;
 		this.tlsVerifyFailuresArmed = 0;
 		this.lastCandidateFamily = null;
+		this.openSessions = 0;
+		this.quitCalls = 0;
+		this.closeCalls = 0;
+		this.quitFailuresArmed = 0;
 	}
 
 	/**
@@ -280,7 +349,8 @@ export class FakeSmtpServer {
 		for (const candidate of candidates) {
 			if (candidate.reachable) {
 				this.lastCandidateFamily = candidate.family;
-				return { close: () => {} };
+				this.openSessions += 1;
+				return { close: () => this.close() };
 			}
 			if (ipv4Only) break; // IPv4-only path stops at the FIRST v4 address
 		}
@@ -307,9 +377,40 @@ export class FakeSmtpServer {
 		}
 	}
 
-	sendMessage(record: Omit<SentMailRecord, "port" | "viaIpv4">): void {
+	/**
+	 * smtplib.SMTP.quit parity: tears the session down UNCONDITIONALLY (the
+	 * socket dies even when the verb itself fails — #79889 chase-with-close),
+	 * then surfaces an armed failure so adapters must prove their teardown is
+	 * best-effort.
+	 */
+	quit(): void {
+		this.quitCalls += 1;
+		this.close();
+		if (this.quitFailuresArmed > 0) {
+			this.quitFailuresArmed -= 1;
+			throw new Error("quit failed: connection reset by peer");
+		}
+	}
+
+	/** smtplib.SMTP.close parity — unconditional, never raises. */
+	close(): void {
+		this.closeCalls += 1;
+		if (this.openSessions > 0) this.openSessions -= 1;
+	}
+
+	/** Nonzero ⇒ a send/connect lane leaked its SMTP session (eml-1). */
+	get leakedSessions(): number {
+		return this.openSessions;
+	}
+
+	sendMessage(
+		record: Omit<SentMailRecord, "port" | "viaIpv4" | "attachments"> & {
+			attachments?: SentAttachment[];
+		},
+	): void {
 		this.sent.push({
 			...record,
+			attachments: record.attachments ?? [],
 			port: EMAIL_PORT_UNDER_TEST,
 			viaIpv4: this.lastCandidateFamily === 4,
 		});

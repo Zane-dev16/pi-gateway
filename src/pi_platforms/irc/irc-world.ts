@@ -3,7 +3,7 @@
 // (documented leg mappings), and PROPOSED-DEC notes for every under-determined
 // mapping (DEC-026: divergences are recorded, never silent).
 //
-// ── PROPOSED DEC (irc-replay-window) ────────────────────────────────────────
+// ── DEC-061 (irc-replay-window; ratified 2026-08-26, formerly proposed) ─────
 // transport.ws.resubscribe-replay asserts post-resubscribe coverage of
 // traffic sent during a disconnect. IRC has NO server-side history: channel
 // traffic during a netsplit is unrecoverable by protocol. The vendor-true
@@ -301,10 +301,7 @@ export function makeRealIrcFixture(scheduler?: ManualScheduler): WsFixture {
 				async () => {
 					const r = attempts[calls];
 					calls += 1;
-					return (
-						r ??
-						({ success: true, messageId: "fallback" } as SendResult)
-					);
+					return r ?? ({ success: true, messageId: "fallback" } as SendResult);
 				},
 				{ maxRetries: 2, sleep: (ms) => clock.sleepMs(ms) },
 			);
@@ -565,7 +562,7 @@ export function makeIrcShapeRows(): ConformanceRow[] {
 				await w.engine.disconnect();
 			},
 		),
-deltaRow(
+		deltaRow(
 			"transport.irc.nick-collision-ladder",
 			"irc: 433 collision suffix ladder through REGISTRATION — hermes_ then hermes_1… bounded, never regressing; welcome arrives under the adopted nick",
 			async () => {
@@ -674,15 +671,18 @@ deltaRow(
 					check(cur.atMs - prev.atMs >= 300, "virtual gaps monotonic ≥300ms");
 				}
 				// Budget is DATA: the 64-char harness budget governs the split
-				// count; every labeled wire line stays within it (label included).
+				// count. Hermes send() emits BARE _split_message chunks —
+				// truncate_message's '(i/n)' scaffold is never applied on IRC
+				// (adapter.py:293-297) — so every wire line stays within the bare
+				// budget and carries NO label tail.
 				for (const op of sends) {
 					check(
-						op.content.length <= 64 + 8,
-						`line within labeled budget, got ${op.content.length}`,
+						op.content.length <= 64,
+						`line within bare budget, got ${op.content.length}`,
 					);
 					check(
-						/ \(\d+\/\d+\)$/u.test(op.content),
-						`every wire line carries (i/n): ${JSON.stringify(op.content)}`,
+						!/ \(\d+\/\d+\)$/u.test(op.content),
+						`wire lines are bare chunks (no (i/n)): ${JSON.stringify(op.content)}`,
 					);
 				}
 			},

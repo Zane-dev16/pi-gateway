@@ -57,10 +57,13 @@ import type {
 import type { ScopedSecretReader } from "../kit/registration.js";
 import type { DisableReason } from "../kit/lifecycle-state.js";
 import {
+	DEFAULT_WEBHOOK_HOST,
+	DEFAULT_WEBHOOK_PORT,
 	MAX_SMS_LENGTH,
 	SMS_HEALTH_PATH,
 	SMS_PLUGIN_MANIFEST,
 	SMS_WEBHOOK_PATH,
+	TWILIO_API_BASE,
 	TWILIO_WEBHOOK_MAX_BODY_BYTES,
 	declareSmsTrustBoundary,
 	validateSmsTrustBoundary,
@@ -126,6 +129,16 @@ export interface SmsAdapterConfig {
 /** Outbound REST edge: ONE Messages.json POST per chunk (send() loop parity). */
 export interface SmsRestTransport {
 	postMessages(input: {
+		/**
+		 * Composed REST URL — adapter.py:194 parity:
+		 * `{TWILIO_API_BASE}/{account_sid}/Messages.json`.
+		 */
+		url: string;
+		/**
+		 * Authorization header value — adapter.py:_basic_auth_header parity:
+		 * `Basic base64(account_sid:auth_token)`.
+		 */
+		authorization: string;
 		from: string;
 		to: string;
 		body: string;
@@ -200,6 +213,18 @@ export function checkTwilioSignature(
 	signature: string,
 ): boolean {
 	return secureCompare(signTwilioParams(authToken, url, params), signature);
+}
+
+/**
+ * sms/adapter.py:_basic_auth_header — HTTP Basic credentials for the Twilio
+ * REST edge: `Basic base64("{account_sid}:{auth_token}")` (ASCII).
+ */
+export function twilioBasicAuthHeader(
+	accountSid: string,
+	authToken: string,
+): string {
+	const creds = `${accountSid}:${authToken}`;
+	return `Basic ${Buffer.from(creds, "ascii").toString("base64")}`;
 }
 
 /**
@@ -413,14 +438,24 @@ export class SmsAdapter extends BasePlatformAdapter {
 			config.phone_number,
 			"TWILIO_PHONE_NUMBER",
 		);
-		this.port = Number(config.port ?? 8080);
-		this.host = config.host ?? "127.0.0.1";
+		this.port = this.resolvePort(config.port);
+		this.host = this.resolveEnvValue(
+			config.host,
+			"SMS_WEBHOOK_HOST",
+			DEFAULT_WEBHOOK_HOST,
+		);
 		this.webhookUrl = (
 			config.webhook_url ??
 			this.secretReader("SMS_WEBHOOK_URL") ??
 			""
 		).trim();
-		this.insecureNoSignature = config.insecure_no_signature ?? false;
+		// adapter.py:95-100/:113 parity: SMS_INSECURE_NO_SIGNATURE is read from
+		// the environment (`os.getenv(...).lower() == "true"` — no strip);
+		// the config object is the explicit override. Env-only deployments
+		// reach insecure mode.
+		this.insecureNoSignature =
+			config.insecure_no_signature ??
+			this.secretReader("SMS_INSECURE_NO_SIGNATURE")?.toLowerCase() === "true";
 		this.maxBodyBytes = Math.max(
 			1,
 			Number(config.max_body_bytes ?? TWILIO_WEBHOOK_MAX_BODY_BYTES),
@@ -497,6 +532,39 @@ export class SmsAdapter extends BasePlatformAdapter {
 			return fromConfig.trim();
 		}
 		return this.secretReader(envName)?.trim() ?? "";
+	}
+
+	/**
+	 * adapter.py:__init__ os.getenv parity for STRING settings: config object
+	 * first, scoped env read second, documented default last — an env-only
+	 * deployment resolves identically to the source's direct getenv reads.
+	 */
+	private resolveEnvValue(
+		fromConfig: string | undefined,
+		envName: string,
+		fallback: string,
+	): string {
+		if (typeof fromConfig === "string" && fromConfig.trim() !== "") {
+			return fromConfig.trim();
+		}
+		const raw = this.secretReader(envName)?.trim();
+		return raw !== undefined && raw !== "" ? raw : fallback;
+	}
+
+	/**
+	 * SMS_WEBHOOK_PORT resolution — `int(os.getenv("SMS_WEBHOOK_PORT", …))`
+	 * parity: config object first, scoped env read second, default last;
+	 * non-numeric values fall back to the documented default port.
+	 */
+	private resolvePort(fromConfig: number | undefined): number {
+		const raw =
+			fromConfig !== undefined
+				? String(fromConfig)
+				: (this.secretReader("SMS_WEBHOOK_PORT") ?? "");
+		const trimmed = raw.trim();
+		if (trimmed === "") return DEFAULT_WEBHOOK_PORT;
+		const parsed = Number(trimmed);
+		return Number.isFinite(parsed) ? parsed : DEFAULT_WEBHOOK_PORT;
 	}
 
 	/**
@@ -879,11 +947,22 @@ export class SmsAdapter extends BasePlatformAdapter {
 		const policy = this.chatLengthPolicyForChat(chatId);
 		const plan = chunkWithFenceCarry(formatted, policy);
 
+		// adapter.py:194-197 parity — the REST URL and Basic auth header are
+		// composed ONCE per send (outside the chunk loop) from the resolved
+		// account SID/auth token, then reused for every chunk POST.
+		const url = `${TWILIO_API_BASE}/${this.accountSid}/Messages.json`;
+		const authorization = twilioBasicAuthHeader(
+			this.accountSid,
+			this.authToken,
+		);
+
 		let lastResult: SendResult = { success: true };
 		for (const chunk of plan.chunks) {
 			let response: SmsRestResponse;
 			try {
 				response = await this.rest.postMessages({
+					url,
+					authorization,
 					from: this.fromNumber,
 					to: chatId,
 					body: chunk,

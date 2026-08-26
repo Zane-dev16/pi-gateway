@@ -351,7 +351,7 @@ export const METRICS_PATH = "/metrics";
 /**
  * Capabilities AS DATA (04 §2).
  *
- * DIVERGENCE NOTE (proposed DEC text — logged here per DEC-026 protocol,
+ * DIVERGENCE NOTE (DEC-063, logged per DEC-026 protocol;
  * msgraph/raft ruling pattern): Hermes' A2A adapter inherits BOTH base
  * defaults (supports_async_delivery=True, interactive_resume=True). But its
  * reply plane is a BOUNDED SYNC WINDOW: every inbound task blocks an HTTP
@@ -379,7 +379,7 @@ export const A2A_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
  * loopback-only unless a token is configured (resolve_bind_host), and the
  * request body is capped at 1 MiB.
  *
- * PROPOSED DEC TEXT (bind-safety escalation, logged per DEC-026 protocol):
+ * BIND-SAFETY ESCALATION (DEC-064, logged per DEC-026 protocol):
  * Hermes answers an operator-requested non-loopback A2A_HOST with NO
  * configured credential by WARNING and silently downgrading the bind to
  * 127.0.0.1 (security.py:resolve_bind_host). The port ESCALATES that same

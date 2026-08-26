@@ -20,6 +20,12 @@
 //   POST /send-richlink   → {ok, messageId}          (URL-only candidates)
 //   POST /probe           → {ok}                     (presence watchdog)
 //
+// Body-less endpoints: /probe and the startup /healthz readiness ping ride
+// HEADERS-ONLY POSTs upstream (adapter.py:_probe_once @~1869 and the
+// _start_sidecar healthz wait @~1720 pass no JSON body) — the sidecar routes
+// read before the body. The seam therefore treats `body` as OPTIONAL; every
+// other endpoint posts a JSON object.
+//
 // Latency-free by construction: a scripted HUNG probe surfaces the SAME error
 // shape the real httpx timeout produces (SidecarHungError) synchronously —
 // injected latency, never wall-clock waits.
@@ -42,14 +48,18 @@ export type SidecarPath =
  */
 export interface SidecarTransport {
 	/**
-	 * POST <loopback>/<path> with JSON body; resolves the parsed response or
-	 * THROWS: SidecarHttpError for non-200 / ok:false responses
+	 * POST <loopback>/<path>; resolves the parsed response or THROWS:
+	 * SidecarHttpError for non-200 / ok:false responses
 	 * (_sidecar_error_from_response parity), plain Errors for transport
 	 * failures, SidecarHungError when the call itself times out.
+	 *
+	 * `body` is OMITTED (headers-only POST) for the body-less endpoints
+	 * /probe and the startup /healthz ping (_probe_once/_start_sidecar
+	 * parity); every other endpoint posts a JSON object.
 	 */
 	call(
 		path: string,
-		body: Record<string, unknown>,
+		body?: Record<string, unknown> | undefined,
 	): Promise<Record<string, unknown>>;
 }
 
@@ -117,7 +127,8 @@ export type SidecarBehavior =
 
 export interface RecordedSidecarCall {
 	path: string;
-	body: Record<string, unknown>;
+	/** Undefined for the body-less endpoints (/probe, startup /healthz). */
+	body?: Record<string, unknown> | undefined;
 	seq: number;
 	outcome: "ok" | "error";
 	/** The error BODY when outcome === "error" (mutant observability). */
@@ -167,7 +178,7 @@ export class FakeSidecarServer implements SidecarTransport {
 
 	async call(
 		path: string,
-		body: Record<string, unknown>,
+		body?: Record<string, unknown> | undefined,
 	): Promise<Record<string, unknown>> {
 		const behavior = this.next(path);
 		if (behavior.kind === "hung") {

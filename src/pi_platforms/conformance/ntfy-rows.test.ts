@@ -21,11 +21,26 @@ import { runConformanceSuite, formatReport } from "./runner.js";
 import { FakeNtfyServer } from "../ntfy/fake-ntfy-server.js";
 import { makeNtfySubject } from "../ntfy/ntfy-subject.js";
 import { makeNtfyShapeRows, makeRealNtfyFixture } from "../ntfy/ntfy-world.js";
+import { NTFY_SEND_TRUNCATES } from "../ntfy/manifest.js";
 
 const STREAMING_ROW_IDS: readonly string[] = [
 	"streaming.prefix-mutation-detected",
 	"streaming.seal-discipline",
 	"streaming.failed-seal-still-delivers",
+];
+
+/**
+ * Kit LOSSLESS-split family — encodes the base fence-carry splitter (full
+ * output preserved as labeled pieces). Hermes' NtfyAdapter.send issues ONE
+ * POST with body content[:4096] plus a truncation warning (adapter.py:send
+ * :429-439) — full output is NOT preserved and per-chat budget pairs don't
+ * exist on this source (fixed vendor cap for every topic). Excluded BY THE
+ * PROBE from the manifest datum (NTFY_SEND_TRUNCATES), never a hardcoded
+ * skip; transport.ntfy.publish-shapes rows the conforming single-POST truth.
+ */
+const LOSSLESS_SPLIT_ROW_IDS: readonly string[] = [
+	"egress.chunk-flood",
+	"egress.per-chat-length-pair",
 ];
 
 function makeSubject(
@@ -54,10 +69,10 @@ function computeApplicability(): {
 	excludedIds: string[];
 } {
 	const probe = makeSubject();
-	return {
-		streamsSupported: probe.adapter.supportsDraftStreaming() === true,
-		excludedIds: [...STREAMING_ROW_IDS],
-	};
+	const streamsSupported = probe.adapter.supportsDraftStreaming() === true;
+	const excludedIds = [...STREAMING_ROW_IDS];
+	if (NTFY_SEND_TRUNCATES) excludedIds.push(...LOSSLESS_SPLIT_ROW_IDS);
+	return { streamsSupported, excludedIds };
 }
 
 function makeLyingNtfyShapeRows(): Row[] {
@@ -84,25 +99,27 @@ function makeLyingNtfyShapeRows(): Row[] {
 		),
 		mk(
 			"transport.ntfy.publish-shapes",
-			"lying fixture: body chunked past 4096",
+			"lying fixture: oversized body shipped untruncated / split into multiple posts",
 		),
 	];
 }
 
 describe("conformance suite — NTFY census port (shape: ws)", () => {
-	it("applicability is COMPUTED from capability data (streaming family excluded iff the no-draft probe closes)", () => {
+	it("applicability is COMPUTED from capability data (streaming family excluded iff the no-draft probe closes; lossless-split family excluded iff the single-POST lane truncates)", () => {
 		const { streamsSupported, excludedIds } = computeApplicability();
 		expect(streamsSupported).toBe(false);
-		expect(excludedIds).toEqual(STREAMING_ROW_IDS);
+		expect(excludedIds).toEqual([
+			...STREAMING_ROW_IDS,
+			...LOSSLESS_SPLIT_ROW_IDS,
+		]);
 	});
 
 	it("passes EVERY applicable shared row against the NTFY subject", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const rows: Row[] = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
-		expect(all.length - rows.length).toBe(streamsSupported ? 0 : 3);
+		const { excludedIds } = computeApplicability();
+		// Nothing may be silently dropped — exclusions are EXACT and probe-driven.
+		const rows: Row[] = all.filter((r) => !excludedIds.includes(r.id));
+		expect(all.length - rows.length).toBe(excludedIds.length);
 
 		const report = await runConformanceSuite({
 			subjectName: "ntfy",
@@ -111,7 +128,9 @@ describe("conformance suite — NTFY census port (shape: ws)", () => {
 		});
 		if (report.failed > 0) console.error(formatReport(report));
 		expect(report.failed).toBe(0);
-		expect(report.passed).toBeGreaterThanOrEqual(20);
+		// 23 catalog rows minus the FIVE probe-driven exclusions (3 streaming
+		// passive + 2 lossless-split truncating).
+		expect(report.passed).toBeGreaterThanOrEqual(18);
 	});
 
 	it("passes ALL FIVE inherited ws transport rows against the REAL engine fixture (documented leg mappings)", async () => {
@@ -144,10 +163,8 @@ describe("conformance suite — NTFY census port (shape: ws)", () => {
 
 	it("FULL applicable catalog is GREEN — merge-gate semantics hold (allApplicablePassed, zero deferred)", async () => {
 		const all = buildSharedRows({ makeSubject });
-		const { streamsSupported } = computeApplicability();
-		const shared: Row[] = streamsSupported
-			? all
-			: all.filter((r) => !STREAMING_ROW_IDS.includes(r.id));
+		const { excludedIds } = computeApplicability();
+		const shared: Row[] = all.filter((r) => !excludedIds.includes(r.id));
 
 		const transport = makeWsRows(makeRealNtfyFixture());
 		const suppliedTransportRowIds = new Set(transport.map((r) => r.id));

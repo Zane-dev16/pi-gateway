@@ -36,7 +36,8 @@
 //   3. Fresh SimpleX shape-delta rows execute through the real engine fixture
 //      (corr machinery, auto-accept, chat-item pipeline, group allowlist, text
 //      batching, send-command shapes, media routing, file-transfer deferral,
-//      reconnect ladder, health posture).
+//      reconnect ladder, health posture, image/video doors, channel directory,
+//      env config resolution, probe open-timeout, ping/pong keepalive).
 //   4. Full-catalog gate: allApplicablePassed === true, deferred === [].
 //   5. The gate DETECTS: lying fixtures fail their OWN named rows, and the
 //      REAL fixture facts contradict every lie (matrix bottom pattern).
@@ -56,11 +57,21 @@ import type { WsFixture } from "./shapes.js";
 import { runConformanceSuite, formatReport } from "./runner.js";
 import type { ConformanceSubject } from "./harness.js";
 import { makeSimplexSubject } from "../simplex/simplex-subject.js";
-import { FakeSimplexDaemon } from "../simplex/simplex-wire.js";
+import {
+	FakeSimplexDaemon,
+	SX_CONNECTING,
+	SX_OPEN,
+	type SimplexConnectionFactory,
+	type SimplexReadyState,
+} from "../simplex/simplex-wire.js";
 import { ManualClock } from "../persistent-ws/manual-clock.js";
-import { SimplexAdapter } from "../simplex/simplex-adapter.js";
+import {
+	SimplexAdapter,
+	type SimplexAdapterOptions,
+} from "../simplex/simplex-adapter.js";
 import {
 	SIMPLEX_CORR_PREFIX,
+	SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS,
 	SIMPLEX_PLUGIN_MANIFEST,
 	SIMPLEX_SUPPORTS_MESSAGE_EDITING,
 } from "../simplex/manifest.js";
@@ -122,6 +133,10 @@ interface EngineWorldOptions {
 	groupAllowFrom?: readonly string[] | undefined;
 	maxPendingCorr?: number | undefined;
 	rng?: (() => number) | undefined;
+	/** _prepare_image seam injection (deterministic PNG/thumb fixture). */
+	imagePreparer?: SimplexAdapterOptions["imagePreparer"] | undefined;
+	/** cache_image_from_url seam injection (deterministic fetch fixture). */
+	imageUrlFetcher?: SimplexAdapterOptions["imageUrlFetcher"] | undefined;
 }
 
 interface EngineWorld {
@@ -159,6 +174,12 @@ function makeEngineWorld(
 		autoAccept: opts.autoAccept,
 		groupAllowFrom: opts.groupAllowFrom,
 		maxPendingCorr: opts.maxPendingCorr,
+		...(opts.imagePreparer !== undefined
+			? { imagePreparer: opts.imagePreparer }
+			: {}),
+		...(opts.imageUrlFetcher !== undefined
+			? { imageUrlFetcher: opts.imageUrlFetcher }
+			: {}),
 		textBatchDelayMs: 800,
 		secretReader: (key) =>
 			key === "SIMPLEX_WS_URL" ? "ws://127.0.0.1:5225" : undefined,
@@ -1160,6 +1181,480 @@ function simplexDeltaRows(): ConformanceRow[] {
 				expect(SIMPLEX_PLUGIN_MANIFEST.trustBoundary).toBeUndefined();
 			},
 		),
+		mk(
+			"transport.simplex.image-video-doors",
+			"simplex: native media doors — send_image ships the correlated '/_send @id|#gid json [{filePath,msgContent:{type:\"image\",image:<thumb-data-uri>,text}}]' shape byte-exact over the PNG-prepared path (file:// + http(s) sources); missing-file/download-failure/dead-link failures never half-send; send_video routes the document shape; sendMultipleImages fans out per entry",
+			async () => {
+				const dir = mkdtempSync(join(tmpdir(), "simplex-img-"));
+				try {
+					const webpPath = join(dir, "pic.webp");
+					const pngPath = join(dir, "native.png");
+					const cachedPath = join(dir, "cached.jpg");
+					const vidPath = join(dir, "clip.mp4");
+					writeFileSync(webpPath, Buffer.alloc(4));
+					writeFileSync(pngPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+					writeFileSync(cachedPath, Buffer.alloc(2));
+					writeFileSync(vidPath, Buffer.alloc(4));
+
+					const fetchedUrls: string[] = [];
+					// _prepare_image parity fixture: png/jpg/jpeg stay UNCONVERTED;
+					// anything else becomes the sibling .png + fixed thumb data URI.
+					const w = makeEngineWorld("simplex-image", {
+						imagePreparer: async (filePath) => ({
+							pngPath: /\.(png|jpe?g)$/.test(filePath)
+								? filePath
+								: filePath.replace(/\.[^.]+$/, ".png"),
+							thumbDataUri: "data:image/jpg;base64,QUJDREVG",
+						}),
+						imageUrlFetcher: async (url) => {
+							fetchedUrls.push(url);
+							if (url.includes("broken")) {
+								throw new Error("DNS resolution failed");
+							}
+							return cachedPath;
+						},
+					});
+					await w.connectAndAwaitLive();
+
+					// Local image via file:// → PNG-prepared path + inline thumb
+					// ride the EXACT composed Hermes shape; correlated reply.
+					w.daemon.scriptCommandResponse("/_send", { type: "ok-image" });
+					const r1 = await w.adapter.sendImageFile(
+						"c-i",
+						webpPath,
+						"a caption",
+					);
+					expect(r1.success).toBe(true);
+					const dmExpected = `/_send @c-i json ${JSON.stringify([
+						{
+							filePath: join(dir, "pic.png"),
+							msgContent: {
+								type: "image",
+								image: "data:image/jpg;base64,QUJDREVG",
+								text: "a caption",
+							},
+						},
+					])}`;
+					expect(
+						w.daemon.commandsStartingWith("/_send @c-i json ")[0]?.cmd,
+					).toBe(dmExpected);
+
+					// Group addressing uses '#<gid>'; absent caption ⇒ empty text.
+					w.daemon.scriptCommandResponse("/_send", { type: "ok-image2" });
+					const r2 = await w.adapter.sendImage("group:g7", `file://${pngPath}`);
+					expect(r2.success).toBe(true);
+					const groupExpected = `/_send #g7 json ${JSON.stringify([
+						{
+							filePath: pngPath,
+							msgContent: {
+								type: "image",
+								image: "data:image/jpg;base64,QUJDREVG",
+								text: "",
+							},
+						},
+					])}`;
+					expect(
+						w.daemon.commandsStartingWith("/_send #g7 json ")[0]?.cmd,
+					).toBe(groupExpected);
+
+					// http(s) source flows through THE cache seam then the SAME
+					// door with the caption intact.
+					w.daemon.scriptCommandResponse("/_send", { type: "ok-image3" });
+					const r3 = await w.adapter.sendImage(
+						"c-i",
+						"https://cdn.example/x/img.jpeg",
+						"from web",
+					);
+					expect(r3.success).toBe(true);
+					expect(fetchedUrls).toEqual(["https://cdn.example/x/img.jpeg"]);
+					const webExpected = `/_send @c-i json ${JSON.stringify([
+						{
+							filePath: cachedPath,
+							msgContent: {
+								type: "image",
+								image: "data:image/jpg;base64,QUJDREVG",
+								text: "from web",
+							},
+						},
+					])}`;
+					expect(
+						w.daemon.commandsStartingWith("/_send @c-i json ")[1]?.cmd,
+					).toBe(webExpected);
+
+					// Missing local file → 'Image file not found', NO command.
+					const rMiss = await w.adapter.sendImageFile(
+						"c-i",
+						join(dir, "nope.png"),
+					);
+					expect(rMiss).toEqual({
+						success: false,
+						error: "Image file not found",
+					});
+
+					// Download failure surfaces THE fetch error verbatim
+					// (Hermes str(e)); still zero commands.
+					const rDl = await w.adapter.sendImage(
+						"c-i",
+						"https://cdn.example/broken.webp",
+					);
+					expect(rDl.success).toBe(false);
+					expect(rDl.error).toBe("DNS resolution failed");
+					expect(w.daemon.commandsStartingWith("/_send @c-i ").length).toBe(2);
+
+					// Video routes the DOCUMENT shape (adapter.py:send_video →
+					// send_document); missing video inherits 'File not found'.
+					w.daemon.scriptCommandResponse("/_send", { type: "ok-video" });
+					const rv = await w.adapter.sendVideo("c-v", vidPath, "clip cap");
+					expect(rv.success).toBe(true);
+					expect(
+						w.daemon.commandsStartingWith("/_send @c-v json ")[0]?.cmd,
+					).toBe(
+						`/_send @c-v json ${JSON.stringify([
+							{
+								filePath: vidPath,
+								msgContent: { type: "file", text: "clip cap" },
+							},
+						])}`,
+					);
+					const rvMiss = await w.adapter.sendVideo("c-v", join(dir, "no.mp4"));
+					expect(rvMiss.error).toBe("File not found");
+
+					// Batch fan-out: every entry its own image command, in order.
+					for (let i = 0; i < 3; i++) {
+						w.daemon.scriptCommandResponse("/_send", {
+							type: `ok-b${i}`,
+						});
+					}
+					const rb = await w.adapter.sendMultipleImages("c-b", [
+						webpPath,
+						pngPath,
+						webpPath,
+					]);
+					expect(rb.every((r) => r.success)).toBe(true);
+					const batchCmds = w.daemon.commandsStartingWith("/_send @c-b json ");
+					expect(batchCmds.length).toBe(3);
+					expect(
+						composedPayloadOf(batchCmds[0]?.cmd ?? "")[0]?.["filePath"],
+					).toBe(join(dir, "pic.png"));
+					expect(
+						composedPayloadOf(batchCmds[1]?.cmd ?? "")[0]?.["filePath"],
+					).toBe(pngPath);
+
+					// Dead link: the correlated image command resolves null fast
+					// ⇒ failure verdict, never a silent half-send.
+					w.daemon.refuseConnections();
+					w.daemon.dropActive("gone before image");
+					await eventually(() => w.adapter.reconnectLog.length >= 1);
+					const rFail = await w.adapter.sendImage("c-i", `file://${pngPath}`);
+					expect(rFail.success).toBe(false);
+					expect(rFail.error).toBe("Failed to send image");
+				} finally {
+					rmSync(dir, { recursive: true, force: true });
+				}
+			},
+		),
+		mk(
+			"transport.simplex.channel-directory",
+			"simplex: listChannels issues '/contacts'+'/groups' (10s bounds) and parses display-name/id/pair forms into directory entries; disconnected ⇒ null WITHOUT sending; unresponsive daemon ⇒ null (directory keeps its cache); failed /groups tolerated with contacts kept",
+			async () => {
+				const w = makeEngineWorld("simplex-channels");
+				await w.connectAndAwaitLive();
+
+				w.daemon.scriptCommandResponse("/contacts", {
+					type: "contacts",
+					contacts: [
+						{
+							contactId: 42,
+							localDisplayName: "Alice",
+							profile: { displayName: "Alice P" },
+						},
+						{ profile: { displayName: "NoId" } },
+						{ contactId: 43 },
+						"junk-non-dict",
+						{},
+					],
+				});
+				w.daemon.scriptCommandResponse("/groups", {
+					type: "groups",
+					groups: [
+						{
+							groupId: "g1",
+							localDisplayName: "Team X",
+							groupProfile: { displayName: "TX" },
+						},
+						[
+							{ groupId: "g2", groupProfile: { displayName: "Pair Form" } },
+							{ summary: true },
+						],
+						{ groupId: "g3" },
+						{ noGroupId: 1 },
+						42,
+					],
+				});
+				expect(await w.adapter.listChannels()).toEqual([
+					{ id: "Alice", name: "Alice", type: "dm" },
+					{ id: "NoId", name: "NoId", type: "dm" },
+					{ id: "43", name: "43", type: "dm" },
+					{ id: "group:g1", name: "Team X", type: "group" },
+					{ id: "group:g2", name: "Pair Form", type: "group" },
+					{ id: "group:g3", name: "g3", type: "group" },
+				]);
+				expect(w.daemon.hasCommand("/contacts")).toBe(true);
+				expect(w.daemon.hasCommand("/groups")).toBe(true);
+				expect(SIMPLEX_LIST_CHANNELS_COMMAND_TIMEOUT_MS).toBe(10_000);
+
+				// Disconnected: NULL without any command leaving.
+				const cold = makeEngineWorld("simplex-channels-cold");
+				expect(await cold.adapter.listChannels()).toBeNull();
+				expect(cold.daemon.commands.length).toBe(0);
+
+				// Unresponsive daemon (/contacts never answered): the 10s
+				// correlated bound expires ⇒ null.
+				const mute = makeEngineWorld("simplex-channels-mute");
+				await mute.connectAndAwaitLive();
+				const pendingMute = mute.adapter.listChannels();
+				await mute.clock.advance(10_000);
+				expect(await pendingMute).toBeNull();
+
+				// Failed /groups tolerated — contacts kept for the directory.
+				const half = makeEngineWorld("simplex-channels-half");
+				await half.connectAndAwaitLive();
+				half.daemon.scriptCommandResponse("/contacts", {
+					contacts: [{ contactId: 9, localDisplayName: "Dee" }],
+				});
+				const pendingHalf = half.adapter.listChannels();
+				await half.clock.advance(20_000); // /groups silence expires
+				expect(await pendingHalf).toEqual([
+					{ id: "Dee", name: "Dee", type: "dm" },
+				]);
+			},
+		),
+		mk(
+			"transport.simplex.env-config-resolution",
+			"simplex: __init__ env resolution via the scoped reader — SIMPLEX_AUTO_ACCEPT parsed ('0'/'false'/'no'/empty ⇒ false, case-insensitive, env BEATS injected opt), SIMPLEX_GROUP_ALLOWED comma-split with empty-env fallback, HERMES_SIMPLEX_TEXT_BATCH_DELAY seconds wired through the batch-delay helper into the ACTUAL flush window",
+			async () => {
+				const readerWith =
+					(vals: Record<string, string | undefined>) =>
+					(key: string): string | undefined =>
+						key === "SIMPLEX_WS_URL" ? "ws://127.0.0.1:5225" : vals[key];
+				const envWorld = (
+					vals: Record<string, string | undefined>,
+					opts: Partial<SimplexAdapterOptions> = {},
+				): {
+					adapter: SimplexAdapter;
+					daemon: FakeSimplexDaemon;
+					clock: ManualClock;
+				} => {
+					const clock = new ManualClock();
+					const daemon = new FakeSimplexDaemon();
+					daemon.setClock(clock.nowMs);
+					const adapter = new SimplexAdapter({
+						wsFactory: daemon,
+						scalarMaxUnits: 64,
+						nowMs: clock.nowMs,
+						sleepMs: clock.sleepMs,
+						rng: () => 0,
+						textBatchDelayMs: 800,
+						secretReader: readerWith(vals),
+						...opts,
+					});
+					adapter.attachStandardGuard();
+					return { adapter, daemon, clock };
+				};
+
+				// SIMPLEX_AUTO_ACCEPT matrix.
+				const autoOf = (raw: string | undefined, optAuto?: boolean): boolean =>
+					envWorld(
+						{ SIMPLEX_AUTO_ACCEPT: raw },
+						optAuto === undefined ? {} : { autoAccept: optAuto },
+					).adapter.autoAccept;
+				expect(autoOf(undefined)).toBe(true); // unset ⇒ default true
+				expect(autoOf(undefined, false)).toBe(false); // unset ⇒ option honored
+				expect(autoOf("", true)).toBe(false); // set-but-EMPTY disables even over true
+				expect(autoOf("0")).toBe(false);
+				expect(autoOf("False")).toBe(false); // case-insensitive
+				expect(autoOf("no")).toBe(false);
+				expect(autoOf("true")).toBe(true);
+				expect(autoOf("1", false)).toBe(true); // env BEATS injected option
+				expect(autoOf("YES", false)).toBe(true);
+
+				// SIMPLEX_GROUP_ALLOWED comma-split + trim, empties dropped;
+				// unset AND set-but-empty fall back to the injected option.
+				const groupsOf = (
+					raw: string | undefined,
+					opt?: readonly string[],
+				): readonly string[] => [
+					...envWorld(
+						{ SIMPLEX_GROUP_ALLOWED: raw },
+						opt === undefined ? {} : { groupAllowFrom: opt },
+					).adapter.groupAllowSet,
+				];
+				expect(groupsOf("a, b,,c")).toEqual(["a", "b", "c"]);
+				expect(groupsOf("*")).toEqual(["*"]);
+				expect(groupsOf(undefined, ["z"])).toEqual(["z"]);
+				expect(groupsOf("", ["z"])).toEqual(["z"]);
+				expect(groupsOf(undefined)).toEqual([]);
+
+				// HERMES_SIMPLEX_TEXT_BATCH_DELAY: env seconds WIN over the
+				// injected option; invalid values fall back to the default.
+				const delayed = envWorld({
+					HERMES_SIMPLEX_TEXT_BATCH_DELAY: "1.5",
+				});
+				expect(delayed.adapter.textBatchDelayMs).toBe(1500);
+				expect(
+					envWorld({ HERMES_SIMPLEX_TEXT_BATCH_DELAY: "abc" }).adapter
+						.textBatchDelayMs,
+				).toBe(800);
+				expect(envWorld({}).adapter.textBatchDelayMs).toBe(800);
+
+				// The env-derived delay WIRES the real flush window: past the old
+				// 800ms mark the batch stays parked; it flushes at 1500ms.
+				await delayed.adapter.connect({ isReconnect: false });
+				await eventually(() => delayed.daemon.hasLiveConnection);
+				delayed.daemon.pushEvent(
+					itemsEnvelope([directItem({ text: "env-d1" })]),
+				);
+				delayed.daemon.pushEvent(
+					itemsEnvelope([directItem({ text: "env-d2" })]),
+				);
+				await eventually(() => delayed.adapter.counts.accepted >= 2);
+				expect(delayed.adapter.turnLog.length).toBe(0);
+				await delayed.clock.advance(800);
+				expect(delayed.adapter.turnLog.length).toBe(0); // NOT yet
+				await delayed.clock.advance(700); // 1500ms total ⇒ flush
+				await eventually(() => delayed.adapter.turnLog.length >= 1);
+				expect(delayed.adapter.turnLog[0]).toBe("env-d1\nenv-d2");
+			},
+		),
+		mk(
+			"transport.simplex.probe-open-timeout",
+			"simplex: reachability probe raced against open_timeout=10 — a daemon accepting TCP but stalling the handshake resolves FALSE at the 10s bound (injected clock) instead of hanging connect(), abandoning the probe socket; promptly-opening daemons still probe TRUE",
+			async () => {
+				const clock = new ManualClock();
+				let probeSockets = 0;
+				let lastClose: { code: number; reason: string } | null = null;
+				const stallingFactory: SimplexConnectionFactory = {
+					connect(_listener) {
+						probeSockets += 1;
+						return {
+							readyState: SX_CONNECTING,
+							send: () => undefined as void,
+							close: (code = 1000, reason = "") => {
+								lastClose = { code, reason };
+							},
+						};
+					},
+				};
+				const adapter = new SimplexAdapter({
+					wsFactory: stallingFactory,
+					scalarMaxUnits: 64,
+					nowMs: clock.nowMs,
+					sleepMs: clock.sleepMs,
+					rng: () => 0,
+					secretReader: (k) =>
+						k === "SIMPLEX_WS_URL" ? "ws://stall.example" : undefined,
+				});
+				adapter.attachStandardGuard();
+
+				const pending = adapter.connect({ isReconnect: false });
+				await clock.advance(9_999);
+				let settledEarly = false;
+				void pending.then(() => {
+					settledEarly = true;
+				});
+				await eventually(() => true); // yield macrotasks
+				expect(settledEarly).toBe(false); // unresolved BEFORE the bound…
+				expect(adapter.isRunning).toBe(false); // …and nothing started
+
+				await clock.advance(1); // cross open_timeout=10 ⇒ FALSE
+				expect(await pending).toBe(false);
+				expect(adapter.isRunning).toBe(false);
+				expect(probeSockets).toBe(1);
+				expect(lastClose).toEqual({
+					code: 1000,
+					reason: "reachability probe timed out",
+				});
+
+				// Contrast leg: promptly-opening daemon probes TRUE and starts.
+				const ok = makeEngineWorld("simplex-probe-ok");
+				await expect(ok.adapter.connect({ isReconnect: false })).resolves.toBe(
+					true,
+				);
+				await eventually(() => ok.daemon.hasLiveConnection);
+			},
+		),
+		mk(
+			"transport.simplex.ping-pong-keepalive",
+			"simplex: seam keepalive (_ws_listener ping_interval=20/ping_timeout=20 parity) — protocol pings ride the live socket every 20s; answered pongs NEVER reconnect a quiet link (log-only posture intact); a stalled ping expires at +20s ⇒ link closed 1011 'ping timeout' into the SAME ladder, then recovery answers again; factories without ping capability are skipped safely",
+			async () => {
+				const w = makeEngineWorld("simplex-keepalive");
+				await w.connectAndAwaitLive();
+
+				// Quiet link, pongs flowing: 120s of application silence = one
+				// ping per 20s answered 1:1, ZERO reconnects.
+				await w.clock.advance(120_000);
+				const quietPings = w.daemon.pingFrames.length;
+				expect(quietPings).toBe(6);
+				expect(w.adapter.counts.pingsSent).toBe(quietPings);
+				expect(w.adapter.counts.pongsReceived).toBe(quietPings);
+				expect(w.adapter.reconnectLog.length).toBe(0);
+
+				// Stall: pings sent at t=140k get NO pong; at t=160k the 20s
+				// timeout expires the link — closed 1011 'ping timeout', ladder.
+				w.daemon.stallPongs();
+				const timeoutsBefore = w.adapter.counts.pingTimeouts;
+				await w.clock.advance(40_000);
+				expect(w.adapter.counts.pingTimeouts).toBe(timeoutsBefore + 1);
+				await eventually(() => w.adapter.reconnectLog.length >= 1);
+				expect(
+					w.adapter.closeEvents.some((c) => c.reason.startsWith("1011:")),
+				).toBe(true);
+
+				// Recovery: answers resume on the reopened link — no FURTHER
+				// timeouts, connection stays up, pongs keep counting.
+				w.daemon.resumePongs();
+				await w.clock.advance(60_000);
+				expect(w.adapter.counts.pingTimeouts).toBe(timeoutsBefore + 1);
+				expect(w.daemon.hasLiveConnection).toBe(true);
+				expect(w.adapter.counts.pongsReceived).toBeGreaterThan(quietPings);
+
+				// Legacy factory WITHOUT ping capability: keepalive skips
+				// silently — no crash, no counters, link untouched.
+				const legacyClock = new ManualClock();
+				const legacyFactory: SimplexConnectionFactory = {
+					connect(listener) {
+						const sock = {
+							readyState: SX_OPEN as SimplexReadyState,
+							send: () => undefined as void,
+							close: () => {
+								// A real socket terminates its pump on close — required
+								// for disconnect()'s cooperative task drain.
+								listener.onClose({ code: 1000, reason: "closed" });
+							},
+							// NO ping member — pre-seam factories stay compatible.
+						};
+						queueMicrotask(() => listener.onOpen());
+						return sock;
+					},
+				};
+				const legacy = new SimplexAdapter({
+					wsFactory: legacyFactory,
+					scalarMaxUnits: 64,
+					nowMs: legacyClock.nowMs,
+					sleepMs: legacyClock.sleepMs,
+					rng: () => 0,
+					secretReader: (k) =>
+						k === "SIMPLEX_WS_URL" ? "ws://legacy.example" : undefined,
+				});
+				legacy.attachStandardGuard();
+				expect(await legacy.connect({ isReconnect: false })).toBe(true);
+				await legacyClock.advance(60_000); // three keepalive windows
+				expect(legacy.counts.pingsSent).toBe(0);
+				expect(legacy.counts.pingTimeouts).toBe(0);
+				expect(legacy.isRunning).toBe(true);
+				await legacy.disconnect();
+			},
+		),
 	];
 }
 
@@ -1217,6 +1712,11 @@ describe("conformance suite — SimpleX census port (shape: ws)", () => {
 			"transport.simplex.file-transfer-deferral",
 			"transport.simplex.reconnect-ladder",
 			"transport.simplex.health-posture",
+			"transport.simplex.image-video-doors",
+			"transport.simplex.channel-directory",
+			"transport.simplex.env-config-resolution",
+			"transport.simplex.probe-open-timeout",
+			"transport.simplex.ping-pong-keepalive",
 		]);
 		const report = await runConformanceSuite({
 			subjectName: "simplex-deltas",

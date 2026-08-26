@@ -100,13 +100,14 @@ export const RAFT_ACTIVITY_ALLOWED_FIELDS: ReadonlySet<string> = new Set([
 /**
  * Capabilities AS DATA (04 §2).
  *
- * DIVERGENCE NOTE (proposed DEC text — logged here per DEC-026 protocol, same
+ * DIVERGENCE NOTE (DEC-063, logged per DEC-026 protocol; same
  * ruling as the msgraph-webhook port): Hermes' raft adapter overrides NEITHER
  * supports_async_delivery NOR interactive_resume, so it inherits the base
  * defaults (True/True) even though send() is a documented NO-OP ("agent
  * delivers via raft CLI") that can never push a later completion anywhere.
  * The 04 §8 webhook-shape row mandates the stateless pairing for exactly this
  * shape; the port declares BOTH FLAGS FALSE — the honest capability data.
+ * The never-spawn-headless spawn-contract posture is DEC-062.
  */
 export const RAFT_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({

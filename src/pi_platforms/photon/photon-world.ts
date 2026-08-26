@@ -416,11 +416,9 @@ export function makeRealPhotonFixture(
 			// ── leg (i): markdown byte-exact WITH the format flag ──
 			const md = "**bold** and `code`";
 			await engine.sidecarSend("+15551234567", md);
-			const mdCall = sidecar.callsOf("/send")[0];
+			const mdBody = sentBody(sidecar.callsOf("/send")[0]);
 			const markdownByteExactWithFlag =
-				mdCall !== undefined &&
-				mdCall.body["text"] === md &&
-				mdCall.body["format"] === "markdown";
+				mdBody["text"] === md && mdBody["format"] === "markdown";
 
 			// ── leg (ii): plain mode strips + omits the flag ──
 			const plainWorld = freshWorld("photon-dual-plain", {
@@ -430,26 +428,24 @@ export function makeRealPhotonFixture(
 			// send() parity: format_message applies INSIDE the door path.
 			await plainWorld.engine.photonSend("+15551234567", "**bold** and _soft_");
 			const plainCall = plainWorld.sidecar.callsOf("/send")[0];
+			const plainBody = sentBody(plainCall);
 			const plainModeStrippedNoFlag =
-				plainCall !== undefined &&
-				plainCall.body["text"] === "bold and soft" &&
-				plainCall.body["format"] === undefined;
+				plainBody["text"] === "bold and soft" &&
+				plainBody["format"] === undefined;
 
 			// ── leg (iii): URL-only candidates divert to /send-richlink ──
 			await engine.sidecarSend("+15551234567", "https://example.com/article");
-			const richCall = sidecar.callsOf("/send-richlink")[0];
+			const richBody = sentBody(sidecar.callsOf("/send-richlink")[0]);
 			const sendsBeforeProse = sidecar.callsOf("/send").length;
 			await engine.sidecarSend(
 				"+15551234567",
 				"read https://example.com/x today",
 			);
-			const proseCall = sidecar.callsOf("/send")[sendsBeforeProse];
+			const proseBody = sentBody(sidecar.callsOf("/send")[sendsBeforeProse]);
 			const urlOnlyRoutedToRichlink =
-				richCall !== undefined &&
-				richCall.body["url"] === "https://example.com/article";
+				richBody["url"] === "https://example.com/article";
 			const proseUrlStayedOnSend =
-				proseCall !== undefined &&
-				proseCall.body["text"] === "read https://example.com/x today" &&
+				proseBody["text"] === "read https://example.com/x today" &&
 				sidecar.callsOf("/send-richlink").length === 1;
 
 			// ── leg (iv): markdown OFF kills the richlink lane entirely ──
@@ -464,7 +460,7 @@ export function makeRealPhotonFixture(
 					richCallsBefore &&
 				plainWorld.sidecar
 					.callsOf("/send")
-					.some((c) => c.body["text"] === "https://example.com/plain");
+					.some((c) => c.body?.["text"] === "https://example.com/plain");
 
 			// ── leg (v): 30s preview-artifact suppression (inbound) ──
 			await ingress.push(
@@ -512,6 +508,19 @@ function classificationTable(engine: PhotonAdapter): Record<string, boolean> {
 		emptyErrorNotRetryable: engine.isRetryableError("") === false,
 		nullErrorNotRetryable: engine.isRetryableError(null) === false,
 	};
+}
+
+/**
+ * Body of a recorded sidecar call that MUST carry JSON (/send lanes); the
+ * body-less endpoints (/probe, startup /healthz) record `undefined` instead.
+ */
+export function sentBody(
+	call: { body?: Record<string, unknown> | undefined } | undefined,
+): Record<string, unknown> {
+	if (call === undefined || call.body === undefined) {
+		throw new Error("expected a JSON-bodied sidecar call");
+	}
+	return call.body;
 }
 
 /** An OpenGraph preview-artifact attachment trailing a link bubble. */

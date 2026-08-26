@@ -69,6 +69,9 @@ export function makeEmailWorld(
 		allowAllUsers?: boolean | undefined;
 		gatewayAllowAllUsers?: boolean | undefined;
 		unsetAllowedUsers?: boolean | undefined;
+		skipAttachments?: boolean | undefined;
+		authservId?: string | undefined;
+		emailAuthservIdEnv?: string | undefined;
 	} = {},
 ): EmailWorld {
 	const clock = opts.clock ?? new AutoAdvanceClock();
@@ -85,6 +88,11 @@ export function makeEmailWorld(
 		// Fixture worlds DEFAULT the authz gate OFF — sender authentication has
 		// its own dedicated shape row; unrelated legs stay focused.
 		requireAuthenticatedSender: opts.requireAuthenticatedSender ?? false,
+		...(opts.skipAttachments === true ? { skipAttachments: true } : {}),
+		...(opts.authservId !== undefined ? { authservId: opts.authservId } : {}),
+		...(opts.emailAuthservIdEnv !== undefined
+			? { emailAuthservIdEnv: opts.emailAuthservIdEnv }
+			: {}),
 		...(opts.allowAllUsers !== undefined
 			? { allowAllUsers: opts.allowAllUsers }
 			: {}),

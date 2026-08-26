@@ -21,7 +21,13 @@ import type {
 export const CRON_TICKER_SERVICE_NAME = "cron-ticker";
 
 function toEmbeddedHandle(handle: CronServiceHandle): EmbeddedServiceHandle {
-	return { name: handle.name, stop: () => handle.stop() };
+	return {
+		name: handle.name,
+		stop: () => handle.stop(),
+		// Drain input (#60432/#82161): live in-flight run count for the
+		// lifecycle's own-budget cron wait.
+		inflightCount: () => handle.inflightCount(),
+	};
 }
 
 /**

@@ -15,6 +15,7 @@
 //   _WS_MAX_MESSAGE_BYTES = 2_000_000        → BUZZ_WS_MAX_MESSAGE_BYTES
 //   _WS_MEMBERSHIP_KIND = 44100              → BUZZ_WS_MEMBERSHIP_KIND
 //   _WS_MEMBERSHIP_SUB_ID "hermes-buzz-membership" → BUZZ_WS_MEMBERSHIP_SUB_ID
+//   _websocket_loop backoff 1.0 → min(b*2, 30) → BUZZ_WS_BACKOFF_START_S/_MAX_S
 //   _DEFAULT_CREDENTIALS_DIR ~/.config/buzz glob "*credentials*.json"
 //                                            → BUZZ_CREDENTIALS_DIR / _GLOB
 //   credential field order nsec → private_key_hex → private_key
@@ -27,13 +28,15 @@
 //     prompt(password=True))                 → requiresEnv below
 //
 // EXCLUSIONS (probe-computed, documented — never silent, never faked green):
-//   1. THE LIVE RELAY WEBSOCKET LOOP (_websocket_loop/@~800 + NIP-42 handshake
-//      _authenticate_websocket): a persistent authenticated Nostr subscription.
-//      The port NEVER opens sockets; the pure crypto core it needs is FULLY
-//      ported and contract-tested (nostr-auth.ts + vectors.ts), the transport
-//      MODE resolution stays source-true (junk⇒auto, websocket-required fails
-//      connect via an injectable ws-starter seam), and the loop itself is
-//      excluded by probe. The CLI POLLING plane covers all inbound rows.
+//   1. THE REAL NETWORK SOCKET MEDIUM (adapter.py `websockets.connect` in
+//      _websocket_loop): the port NEVER opens sockets — the live NIP-42 relay
+//      loop is FULLY PORTED (buzz-adapter.ts startRelayWebsocket /
+//      authenticateWebsocket / subscribeWebsocket / handleMembershipEvent /
+//      websocketLoop) and runs against an INJECTED relay-socket factory
+//      (relay-wire.ts; FakeBuzzCli precedent). The in-memory fixture relay
+//      independently VERIFIES the signed kind-22242 auth event. No factory
+//      wired ⇒ transport unavailable (auto falls back to poll; pinned
+//      websocket-required fails connect — source truth preserved).
 //   2. THE REAL buzz CLI BINARY: replaced by the injected FakeBuzzCli seam
 //      (cli-wire.ts); argv/env CONTRACTS are behavior-tested instead.
 //   3. CREDENTIALS-FILE GLOBS UNDER $HOME (~/.config/buzz): resolved through
@@ -65,6 +68,10 @@ export const BUZZ_WS_MAX_MESSAGE_BYTES = 2_000_000;
 export const BUZZ_WS_MEMBERSHIP_KIND = 44100;
 /** adapter.py:_WS_MEMBERSHIP_SUB_ID — live DM-discovery subscription id. */
 export const BUZZ_WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership";
+/** adapter.py:_websocket_loop reconnect backoff START (seconds). */
+export const BUZZ_WS_BACKOFF_START_S = 1;
+/** adapter.py:_websocket_loop reconnect backoff CAP (min(b*2, 30)). */
+export const BUZZ_WS_BACKOFF_MAX_S = 30;
 /** adapter.py:_DEFAULT_CREDENTIALS_DIR (+ its *credentials*.json glob). */
 export const BUZZ_CREDENTIALS_DIR = "~/.config/buzz";
 export const BUZZ_CREDENTIALS_GLOB = "*credentials*.json";

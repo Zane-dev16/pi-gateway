@@ -24,6 +24,10 @@ import type {
 //       stream edits when the adapter's edit accepts it)
 //   - gateway/stream_consumer.py:_suppress_silence_marker (best-effort
 //       delete_message retract of a streamed silence marker)
+//   - gateway/stream_consumer.py:_abandon_native_stream (optional best-effort
+//       abandon_open_draft seal-in-place for stale-generation exits)
+//   - gateway/stream_consumer.py:on_commentary (commentary enqueues FIFO —
+//       ConsumerSink.onCommentary; direct sends reorder vs queued deltas)
 
 /** Gateway→platform wire metadata (gateway-internal keys popped at the door). */
 export type Metadata = Record<string, unknown>;
@@ -122,9 +126,23 @@ export interface StreamEgressAdapter {
 	/**
 	 * Optional best-effort deletion (base.py:delete_message analogue). Present
 	 * on adapters that CAN retract a message; the consumer's silence-marker
-	 * suppression uses it defensively and tolerates absence.
+	 * suppression and stale-session preview retraction use it defensively and
+	 * tolerate absence.
 	 */
 	deleteMessage?(chatId: string, messageId: string): Promise<unknown>;
+
+	/**
+	 * Optional best-effort native-stream abandonment
+	 * (stream_consumer.py:_abandon_native_stream): seal the open draft IN
+	 * PLACE with `content` — what is already on screen — so a stale-generation
+	 * exit (/new, /stop) never leaves a live streaming indicator or armed
+	 * interception state behind. Best-effort; absence is tolerated.
+	 */
+	abandonOpenDraft?(
+		chatId: string,
+		content: string,
+		metadata?: Metadata | undefined,
+	): Promise<unknown>;
 
 	/**
 	 * DOOR 2 (04 §1.1, finding #7): the delivery-resolver lane (queued
@@ -145,12 +163,14 @@ export type ToolProgressMode = "all" | "new" | "verbose" | "off";
 
 /**
  * What render hooks drive message events onto (base.py:render_message_event
- * receives the sink = the GatewayStreamConsumer primitives).
+ * receives the sink = the GatewayStreamConsumer primitives). Commentary MUST
+ * route through the QUEUING ingress (`onCommentary`) — a direct send would
+ * reorder interim beats against deltas already queued in the DeltaQueue.
  */
 export interface ConsumerSink {
 	onDelta(text: string): void;
 	onSegmentBreak(): void;
-	sendCommentary(text: string): void;
+	onCommentary(text: string): void;
 }
 
 /**
@@ -188,7 +208,7 @@ export function defaultRenderMessageEvent(
 			if (!event.final) sink.onSegmentBreak();
 			return;
 		case "commentary":
-			if (event.text) sink.sendCommentary(event.text);
+			if (event.text) sink.onCommentary(event.text);
 			return;
 	}
 }

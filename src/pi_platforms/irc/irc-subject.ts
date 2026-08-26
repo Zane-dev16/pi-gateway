@@ -182,6 +182,15 @@ export class IrcSubject implements ConformanceSubject {
 	deliverLongText(chatId: string, content: string): Promise<SendResult[]> {
 		return this.adapter.deliverText(chatId, content);
 	}
+	/**
+	 * Declared §6.3 wire-label policy: Hermes irc adapter.py::send emits BARE
+	 * _split_message chunks — truncate_message's '(i/n)' scaffold is never
+	 * applied to IRC (adapter.py:293-297). Shared rows read this datum and
+	 * assert the bare form; a labeled line would be a divergence.
+	 */
+	chunkLabelStyle(): "kit-labeled" | "vendor-bare" {
+		return "vendor-bare";
+	}
 	deliverToUtf16Chat(chatId: string, content: string): Promise<SendResult[]> {
 		return this.adapter.deliverText(chatId, content);
 	}

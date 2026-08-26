@@ -5,7 +5,13 @@
 // no vendor-error-string snapshots.
 
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	truncateSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +20,7 @@ import { FakeSignalCliServer } from "./signal-wire.js";
 import {
 	HEALTH_CHECK_INTERVAL_MS,
 	HEALTH_CHECK_STALE_THRESHOLD_MS,
+	SIGNAL_MAX_ATTACHMENT_SIZE,
 	SIGNAL_MAX_ATTACHMENTS_PER_MSG,
 } from "./manifest.js";
 import {
@@ -59,12 +66,11 @@ function makeWorld(
 		transport: daemon,
 		account: "+15550001111",
 		// Engine worlds resolve secrets through a SCOPED reader (fail-closed).
-		secretReader: (name) =>
-			name === "SIGNAL_HTTP_URL"
-				? "http://127.0.0.1:8080"
-				: name === "SIGNAL_ACCOUNT"
-					? "+15550001111"
-					: undefined,
+		secretReader: (name) => {
+			if (name === "SIGNAL_HTTP_URL") return "http://127.0.0.1:8080";
+			if (name === "SIGNAL_ACCOUNT") return "+15550001111";
+			return undefined;
+		},
 		nowMs: clock.nowMs,
 		sleepMs: clock.sleepMs,
 		rng: () => 0, // deterministic ladder: zero jitter component
@@ -729,6 +735,25 @@ describe("SSE reconnect ladder + health monitor", () => {
 		expect(w.adapter.forcedReconnects).toHaveLength(1);
 		await w.adapter.disconnect();
 	});
+
+	it("every stream open is ACCOUNT-SCOPED: ?account= rides connect AND reconnects", async () => {
+		const w = makeWorld();
+		await w.adapter.connect({ isReconnect: false });
+		await eventually(() => w.daemon.hasLiveStream);
+		expect(w.daemon.connectionLog.length).toBe(1);
+		expect(w.daemon.connectionLog[0]?.account).toBe("+15550001111");
+
+		// The reconnect ladder re-opens with the SAME account (signal-cli routes
+		// the event stream BY the query parameter — a bare GET would subscribe to
+		// whatever default account the daemon picks).
+		w.daemon.dropStream("forced outage");
+		await eventually(() => w.adapter.reconnectLog.length >= 1);
+		await w.clock.advance(4_000);
+		await eventually(() => w.daemon.hasLiveStream);
+		const last = w.daemon.connectionLog[w.daemon.connectionLog.length - 1];
+		expect(last?.account).toBe("+15550001111");
+		await w.adapter.disconnect();
+	});
 });
 
 // ── batch sends through the rate-limit scheduler ─────────────────────────────
@@ -736,21 +761,42 @@ describe("SSE reconnect ladder + health monitor", () => {
 describe("batch attachment sends paced by the scheduler", () => {
 	it("splits at 32/batch and consults the scheduler per batch (full bucket ⇒ zero waits)", async () => {
 		const w = makeWorld();
-		const paths = Array.from({ length: 40 }, (_, i) => `/tmp/img-${i}.png`);
-		const notices: string[] = [];
-		const outcomes = await w.adapter.batchSendAttachments("chat-batch", paths, {
-			notify: async (t) => {
-				notices.push(t);
-			},
-		});
-		expect(outcomes.map((o) => o.success)).toEqual([true, true]);
-		const sends = w.daemon.callsOf("send");
-		expect(sends).toHaveLength(2);
-		expect((sends[0]?.params["attachments"] as string[]).length).toBe(
-			SIGNAL_MAX_ATTACHMENTS_PER_MSG,
-		);
-		expect((sends[1]?.params["attachments"] as string[]).length).toBe(8);
-		expect(notices).toHaveLength(0);
+		try {
+			// Batch lane stat-gates every entry (sigbb-8) — paths must EXIST.
+			const paths = Array.from({ length: 40 }, (_, i) => {
+				const p = join(w.mediaDir, `img-${i}.png`);
+				writeFileSync(p, Buffer.from("png-bytes"));
+				return p;
+			});
+			const notices: string[] = [];
+			const outcomes = await w.adapter.batchSendAttachments(
+				"chat-batch",
+				paths,
+				{
+					notify: async (t) => {
+						notices.push(t);
+					},
+				},
+			);
+			expect(outcomes.map((o) => o.success)).toEqual([true, true]);
+			const sends = w.daemon.callsOf("send");
+			expect(sends).toHaveLength(2);
+			const firstBatch = sends[0]?.params["attachments"];
+			const secondBatch = sends[1]?.params["attachments"];
+			expect(Array.isArray(firstBatch)).toBe(true);
+			expect(Array.isArray(secondBatch)).toBe(true);
+			expect((firstBatch as string[]).length).toBe(
+				SIGNAL_MAX_ATTACHMENTS_PER_MSG,
+			);
+			expect((secondBatch as string[]).length).toBe(8);
+			// Scaled send budget rides EVERY batch RPC (sigbb-3): 5s/attachment
+			// with a 60s floor (_signal_send_timeout parity).
+			expect(sends[0]?.timeoutMs).toBe(160_000); // 32 × 5s
+			expect(sends[1]?.timeoutMs).toBe(60_000); // 8 × 5s = 40s → 60s floor
+			expect(notices).toHaveLength(0);
+		} finally {
+			w.cleanup();
+		}
 	});
 
 	it("rate-limited batches retry ONCE with server feedback recalibrating the bucket", async () => {
@@ -789,26 +835,137 @@ describe("batch attachment sends paced by the scheduler", () => {
 				results: [{ type: "RATE_LIMIT_FAILURE", retryAfterSeconds: 7 }],
 			});
 
-			const outcomesP = adapter.batchSendAttachments("chat-rl", [
-				"/tmp/a.png",
-				"/tmp/b.png",
-			]);
+			// Batch entries are stat-gated — real files on disk (sigbb-8).
+			const pa = join(mediaDir, "a.png");
+			const pb = join(mediaDir, "b.png");
+			writeFileSync(pa, Buffer.from("a"));
+			writeFileSync(pb, Buffer.from("b"));
+			const outcomesP = adapter.batchSendAttachments("chat-rl", [pa, pb]);
 			// Let the chain reach its FIRST paced acquire (8s default-rate wait).
 			await eventually(() => clock.pendingWaits > 0);
 			await clock.advance(30_000);
 			const outcomes = await outcomesP;
 
 			expect(outcomes.map((o) => o.success)).toEqual([true]);
-			expect(daemon.callsOf("send").length).toBe(2);
+			const rlSends = daemon.callsOf("send");
+			expect(rlSends.length).toBe(2);
+			// BOTH attempts carry the scaled budget for n=2 (60s floor).
+			for (const call of rlSends) {
+				expect(call.timeoutMs).toBe(60_000);
+			}
 			// Server feedback WAS authoritative: seconds-per-token recalibrated to 7.
 			expect(scheduler.state().refillSecondsPerToken).toBe(7);
 		} finally {
 			rmSync(mediaDir, { recursive: true, force: true });
 		}
 	});
+
+	it("batch lane stat-gates missing and oversize entries BEFORE slicing batches", async () => {
+		const w = makeWorld();
+		try {
+			const v1 = join(w.mediaDir, "a.png");
+			writeFileSync(v1, Buffer.from("a"));
+			const ghost = join(w.mediaDir, "ghost.png"); // never created
+			const v2 = join(w.mediaDir, "b.png");
+			writeFileSync(v2, Buffer.from("b"));
+			// Sparse oversize entry: size past SIGNAL_MAX_ATTACHMENT_SIZE without
+			// materializing 100 MB (send_multiple_images oversize-skip parity).
+			const huge = join(w.mediaDir, "huge.png");
+			writeFileSync(huge, Buffer.from("PNG"));
+			truncateSync(huge, SIGNAL_MAX_ATTACHMENT_SIZE + 1);
+
+			const outcomes = await w.adapter.batchSendAttachments("chat-gate", [
+				v1,
+				ghost,
+				v2,
+				huge,
+			]);
+			// One bad URL must not lose the rest of the batch: exactly ONE rpc
+			// carrying ONLY the valid entries.
+			expect(outcomes.map((o) => o.success)).toEqual([true]);
+			const sends = w.daemon.callsOf("send");
+			expect(sends).toHaveLength(1);
+			expect(sends[0]?.params["attachments"]).toEqual([v1, v2]);
+
+			// ALL entries invalid ⇒ zero RPCs, zero outcomes.
+			w.daemon.rpcCalls.length = 0;
+			const none = await w.adapter.batchSendAttachments("chat-gate", [
+				ghost,
+				huge,
+			]);
+			expect(none).toEqual([]);
+			expect(w.daemon.callsOf("send")).toHaveLength(0);
+		} finally {
+			w.cleanup();
+		}
+	});
 });
 
 // ── rate-limit module contracts (mutation-checked shapes) ───────────────────
+
+// ── converted-plan splitting (sigbb-4: convert WHOLE, then split) ────────────
+
+describe("deliverText converts whole message first, splits converted text", () => {
+	it("a style crossing NO boundary lands chunk-local; labels ride every chunk; no ** leaks", async () => {
+		const w = makeWorld({ scalarMaxUnits: 40 });
+		const content = `start ${"x".repeat(30)} **bold** ${"y".repeat(30)} end`;
+		// Converted (markers stripped) — the splitter walks THIS text:
+		const converted = `start ${"x".repeat(30)} bold ${"y".repeat(30)} end`;
+		expect(markdownToSignal(content)).toEqual([converted, ["37:4:BOLD"]]);
+
+		const results = await w.adapter.deliverText("chat-split", content);
+		expect(results.every((r) => r.success)).toBe(true);
+
+		const sends = w.daemon.callsOf("send");
+		expect(sends).toHaveLength(3);
+		// BYTE-EXACT plan shape (DEC-047 convention, converted-plan form):
+		// 30-unit body budget + Hermes' " (i/n)" label.
+		const expected = [
+			`${converted.slice(0, 30)} (1/3)`,
+			`${converted.slice(30, 60)} (2/3)`,
+			`${converted.slice(60)} (3/3)`,
+		];
+		sends.forEach((call, i) => {
+			expect(call.params["message"]).toBe(expected[i]);
+		});
+		// The bold range [37,41) lives in chunk 2 ([30,60)) → re-anchored to
+		// [7,11); chunks 1/3 carry no ranges; ZERO literal markers anywhere.
+		expect(sends[0]?.params["textStyle"]).toBeUndefined();
+		expect(sends[0]?.params["textStyles"]).toBeUndefined();
+		expect(sends[1]?.params["textStyle"]).toBe("7:4:BOLD");
+		expect(sends[2]?.params["textStyle"]).toBeUndefined();
+	});
+
+	it("a style SPANNING the cut is clipped into EVERY overlapping chunk", async () => {
+		const w = makeWorld({ scalarMaxUnits: 13 }); // 16-unit text ⇒ six 3-unit bodies
+		const content = "ab**0123456789**tail";
+		const results = await w.adapter.deliverText("chat-span", content);
+		expect(results.every((r) => r.success)).toBe(true);
+
+		const sends = w.daemon.callsOf("send");
+		expect(sends).toHaveLength(6);
+		const bodies = ["ab0", "123", "456", "789", "tai", "l"];
+		sends.forEach((call, i) => {
+			expect(call.params["message"]).toBe(`${bodies[i]} (${i + 1}/6)`);
+		});
+		// Bold source range [2,12): clipped into chunks 1–4, absent from 5–6.
+		expect(sends[0]?.params["textStyle"]).toBe("2:1:BOLD");
+		expect(sends[1]?.params["textStyle"]).toBe("0:3:BOLD");
+		expect(sends[2]?.params["textStyle"]).toBe("0:3:BOLD");
+		expect(sends[3]?.params["textStyle"]).toBe("0:3:BOLD");
+		expect(sends[4]?.params["textStyle"]).toBeUndefined();
+		expect(sends[5]?.params["textStyle"]).toBeUndefined();
+	});
+
+	it("short content stays ONE chunk with its full global style set", async () => {
+		const w = makeWorld({ scalarMaxUnits: 8000 });
+		await w.adapter.deliverText("chat-one", "**bold** intro");
+		const sends = w.daemon.callsOf("send");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]?.params["message"]).toBe("bold intro");
+		expect(sends[0]?.params["textStyle"]).toBe("0:4:BOLD");
+	});
+});
 
 describe("rate-limit module contracts", () => {
 	const frozenScheduler = () =>
@@ -849,7 +1006,10 @@ describe("rate-limit module contracts", () => {
 		let n = 0;
 		const s = new SignalAttachmentScheduler({
 			clock: {
-				nowMs: () => ((n += 100_000), n), // 100s elapse per read (upload)
+				nowMs: () => {
+					n += 100_000; // 100s elapse per read (upload)
+					return n;
+				},
 				sleepMs: async () => {},
 			},
 		});
@@ -1224,11 +1384,10 @@ describe("post-stream media lanes (signal.py:_send_attachment parity)", () => {
 			const p = join(w.mediaDir, "f.pdf");
 			writeFileSync(p, Buffer.from("%PDF"));
 			await w.adapter.sendAttachment("+15551112222", p);
-			const ts = Number(
-				(w.daemon.callsOf("send")[0]?.result as Record<string, unknown>)[
-					"timestamp"
-				],
-			);
+			const sendResult = w.daemon.callsOf("send")[0]?.result as
+				| Record<string, unknown>
+				| undefined;
+			const ts = Number(sendResult?.["timestamp"]);
 			await w.adapter.handleEnvelope({
 				envelope: {
 					syncMessage: {

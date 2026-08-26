@@ -51,7 +51,11 @@ import {
 	photonReactionEvent,
 } from "../photon/sidecar-wire.js";
 import { ManualClock } from "../persistent-ws/manual-clock.js";
-import { PHOTON_TARGET_NOT_ALLOWED_MESSAGE } from "../photon/manifest.js";
+import {
+	buildSidecarSpawnCommand,
+	PHOTON_RICHLINK_PREVIEW_SUPPRESS_MS,
+	PHOTON_TARGET_NOT_ALLOWED_MESSAGE,
+} from "../photon/manifest.js";
 
 // ── shared-row harness ──────────────────────────────────────────────────────
 
@@ -604,7 +608,7 @@ function photonDeltaRows(): ConformanceRow[] {
 				// Truncation at 8000 codepoints (astral chars count as ONE).
 				const long = "🎉".repeat(9000); // 9000 codepoints
 				await plain.engine.photonSend("+1555", long);
-				const truncated = plain.sidecar.callsOf("/send").at(-1)?.body[
+				const truncated = bodyOf(plain.sidecar.callsOf("/send").at(-1))[
 					"text"
 				] as string;
 				let cp = 0;
@@ -632,9 +636,11 @@ function photonDeltaRows(): ConformanceRow[] {
 				// stop ALWAYS passes and clears the cooldown.
 				clock.advance(10);
 				expect(await engine.stopTyping("+1555")).toBe(true);
-				expect(sidecar.callsOf("/typing").at(-1)?.body["state"]).toBe("stop");
+				expect(bodyOf(sidecar.callsOf("/typing").at(-1))["state"]).toBe("stop");
 				expect(await engine.sendTyping("+1555")).toBe(true);
-				expect(sidecar.callsOf("/typing").at(-1)?.body["state"]).toBe("start");
+				expect(bodyOf(sidecar.callsOf("/typing").at(-1))["state"]).toBe(
+					"start",
+				);
 
 				// Per-chat isolation + soft failure.
 				expect(await engine.sendTyping("+1666")).toBe(true);
@@ -670,6 +676,9 @@ function photonDeltaRows(): ConformanceRow[] {
 				});
 				const { engine, sidecar, clock } = world;
 				await connect(engine);
+				// Startup /healthz readiness ping is a HEADERS-ONLY POST
+				// (adapter.py:_start_sidecar wait @~1720 passes no JSON body).
+				expect(sidecar.callsOf("/healthz")[0]?.body).toBeUndefined();
 				engine.noteUpstreamActivity();
 				expect(engine.currentProbeFailures).toBe(0);
 				expect(await engine.watchdogTick()).toBe("skipped-idle");
@@ -685,6 +694,8 @@ function photonDeltaRows(): ConformanceRow[] {
 				expect(await engine.watchdogTick()).toBe("inconclusive");
 				expect(engine.currentProbeFailures).toBe(0);
 				expect(engine.respawnSignals).toHaveLength(0);
+				// _probe_once rides a HEADERS-ONLY POST too (@~1869).
+				expect(sidecar.callsOf("/probe")[0]?.body).toBeUndefined();
 
 				// Interleaved ALIVE prevents respawn (failures reset between).
 				clock.advance(250);
@@ -725,7 +736,7 @@ function photonDeltaRows(): ConformanceRow[] {
 		),
 		mk(
 			"photon.error-classification-table",
-			"photon error classification: the seven _PHOTON_RETRYABLE_PATTERNS all classify retryable; explicit retryable=false and auth_or_config veto wins; empty/null errors are not retryable; structured SidecarHttpErrors carry raw_response classification with the target_not_allowed canonical message replacing raw upstream text; permanent failures NEVER double-send; timeout-shaped errors never retry; missing credentials fail fatal non-retryable",
+			"photon error classification: the seven _PHOTON_RETRYABLE_PATTERNS all classify retryable; explicit retryable=false and auth_or_config veto wins; empty/null errors are not retryable; structured SidecarHttpErrors carry raw_response classification with the target_not_allowed canonical message replacing raw upstream text; permanent failures NEVER double-send; timeout-shaped errors never retry NOR fall back (DEC-046); non-network non-timeout failures skip the ladder but STILL get the ONE richlink=False/markdown=False plain-text resend",
 			async () => {
 				const { engine, sidecar } = deltaEngine();
 				for (const [leg, ok] of Object.entries(classificationTable(engine))) {
@@ -807,6 +818,22 @@ function photonDeltaRows(): ConformanceRow[] {
 				expect(timedOut.success).toBe(false);
 				expect(sidecar.callsOf("/send").length - sendsBeforeTimeout).toBe(1);
 
+				// Non-network non-timeout failure: NO ladder retries, but the ONE
+				// plain-text resend still fires (adapter.py @2478 fall-through) so
+				// a formatting-class blip doesn't strand a sendable message.
+				sidecar.clearScripts();
+				sidecar.script("*", {
+					kind: "error",
+					status: 400,
+					error: "message text is empty",
+				});
+				const sendsBeforeNonNetwork = sidecar.callsOf("/send").length;
+				const nonNetwork = await engine.sendWithRetryPhoton("+1555", "s");
+				expect(sidecar.callsOf("/send").length - sendsBeforeNonNetwork).toBe(2); // initial + ONE resend
+				expect(nonNetwork.success).toBe(true);
+				const nnBody = bodyOf(sidecar.callsOf("/send").at(-1));
+				expect(nnBody["format"]).toBeUndefined(); // fallback is PLAIN
+
 				// Network-pattern failure retries ONCE, then plain-text fallback
 				// (richlink+markdown flags suppressed on the fallback).
 				sidecar.clearScripts();
@@ -886,7 +913,7 @@ function photonDeltaRows(): ConformanceRow[] {
 		),
 		mk(
 			"photon.clarify-poll-surfaces",
-			"photon clarify/poll surfaces: multiple-choice clarify POSTs /send-poll {spaceId,title,options} and arms text-capture; <2 options or empty title refuse WITHOUT a call; poll wire-failure falls back to the numbered-text clarify; open-ended clarifies stay plain text; inbound poll votes dispatch the chosen option as TEXT while deselections and empty titles drop",
+			"photon clarify/poll surfaces: multiple-choice clarify POSTs /send-poll {spaceId,title,options} and arms text-capture; <2 options or empty title refuse WITHOUT a call; poll wire-failure falls back to the BYTE-EXACT base.py numbered-text clarify ('❓ {question}' + two-space indented list + reply trailer); open-ended clarifies render '❓ {question}'; inbound poll votes dispatch the chosen option as TEXT while deselections and empty titles drop",
 			async () => {
 				const { engine, sidecar } = deltaEngine();
 				await connect(engine);
@@ -931,13 +958,13 @@ function photonDeltaRows(): ConformanceRow[] {
 				expect(noTitle.error).toBeUndefined();
 				// ZERO /send-poll attempts were made for either refusal…
 				expect(sidecar.callsOf("/send-poll").length).toBe(pollsBeforeRefusals);
-				// …and BOTH fell back to numbered text on /send.
+				// …and BOTH fell back to the byte-exact base.py render on /send.
 				expect(sidecar.callsOf("/send").length - sendsBeforeRefusals).toBe(2);
-				expect(String(sidecar.callsOf("/send").at(-2)?.body["text"])).toContain(
-					"1. only",
+				expect(bodyOf(sidecar.callsOf("/send").at(-2))["text"]).toBe(
+					"❓ Pick one\n\n  1. only\n\nReply with the number, the option text, or your own answer.",
 				);
 
-				// Wire failure falls back to numbered text on /send.
+				// Wire failure falls back to the same byte-exact render on /send.
 				sidecar.script("*", {
 					kind: "error",
 					status: 500,
@@ -951,9 +978,11 @@ function photonDeltaRows(): ConformanceRow[] {
 					"clar-4",
 				);
 				expect(fellBack.success).toBe(true);
-				const textBody = sidecar.callsOf("/send")[sendsBeforeFallback]?.body;
-				expect(String(textBody?.["text"])).toContain("1. A");
-				expect(String(textBody?.["text"])).toContain("2. B");
+				expect(
+					bodyOf(sidecar.callsOf("/send")[sendsBeforeFallback])["text"],
+				).toBe(
+					"❓ Pick one\n\n  1. A\n  2. B\n\nReply with the number, the option text, or your own answer.",
+				);
 
 				// Open-ended clarify stays plain text (no poll endpoint).
 				const pollsBeforeOpen = sidecar.callsOf("/send-poll").length;
@@ -965,8 +994,8 @@ function photonDeltaRows(): ConformanceRow[] {
 				);
 				expect(openEnded.success).toBe(true);
 				expect(sidecar.callsOf("/send-poll").length).toBe(pollsBeforeOpen);
-				expect(sidecar.callsOf("/send").at(-1)?.body["text"]).toBe(
-					"What do you mean?",
+				expect(bodyOf(sidecar.callsOf("/send").at(-1))["text"]).toBe(
+					"❓ What do you mean?",
 				);
 
 				// Inbound votes: selection forwards TEXT; deselection/empty drop.
@@ -1077,6 +1106,103 @@ function photonDeltaRows(): ConformanceRow[] {
 				expect(calm.hasFatalError).toBe(false);
 			},
 		),
+		mk(
+			"photon.group-richlink-suppression",
+			"photon group richlink suppression: candidate extraction RECURSES into group items (_richlink_url_from_content parity) so a multi-item group message carrying a text/richlink item URL arms the 30s preview-suppression window — trailing GROUP preview artifacts are swallowed inside the window and dispatched outside it, while url-less groups arm nothing",
+			async () => {
+				const { engine, clock } = deltaEngine();
+
+				// A multi-item GROUP message whose items embed a URL…
+				await engine.dispatchInbound({
+					messageId: "grp-url-1",
+					platform: "iMessage",
+					space: { id: "group-guid-xyz", type: "group", phone: null },
+					sender: { id: "+15551234567" },
+					content: {
+						type: "group",
+						items: [
+							{ content: { type: "text", text: "check this out" } },
+							{
+								content: {
+									type: "richlink",
+									url: "https://example.com/gallery",
+									title: "Gallery",
+								},
+							},
+						],
+					},
+					timestamp: "2026-05-14T19:06:32.000Z",
+				});
+				expect(engine.dispatchedEvents).toHaveLength(1);
+
+				// …arms the window: the trailing GROUP preview artifact is swallowed.
+				await engine.dispatchInbound(groupPreviewArtifactEvent("grp-prev-1"));
+				expect(engine.dispatchedEvents).toHaveLength(1);
+
+				// Outside the window it dispatches as a real message again.
+				clock.advance(PHOTON_RICHLINK_PREVIEW_SUPPRESS_MS + 1_000);
+				await engine.dispatchInbound(groupPreviewArtifactEvent("grp-prev-2"));
+				expect(engine.dispatchedEvents).toHaveLength(2);
+				expect(String(engine.dispatchedEvents.at(-1)?.text ?? "")).toContain(
+					"photo.pluginpayloadattachment",
+				);
+
+				// Negative control: a URL-less group arms NOTHING — its own trailing
+				// preview artifact dispatches instead of being suppressed.
+				const fresh = deltaEngine();
+				await fresh.engine.dispatchInbound({
+					messageId: "grp-plain-1",
+					platform: "iMessage",
+					space: { id: "group-guid-xyz", type: "group", phone: null },
+					sender: { id: "+15551234567" },
+					content: {
+						type: "group",
+						items: [{ content: { type: "text", text: "just words" } }],
+					},
+					timestamp: "2026-05-14T19:06:32.000Z",
+				});
+				expect(fresh.engine.dispatchedEvents).toHaveLength(1);
+				await fresh.engine.dispatchInbound(
+					groupPreviewArtifactEvent("grp-prev-3"),
+				);
+				expect(fresh.engine.dispatchedEvents).toHaveLength(2);
+			},
+		),
+		mk(
+			"photon.spawn-contract-data",
+			"photon spawn contract data: buildSidecarSpawnCommand exports the documented Node-child env assembly — project credentials (PHOTON_PROJECT_ID/PHOTON_PROJECT_SECRET) plus the generated sidecar token (PHOTON_SIDECAR_TOKEN) alongside port/bind/stdin-watchdog — injected AT SPAWN TIME so the excluded lifecycle owner can start an AUTHENTICATING sidecar (adapter.py:_start_sidecar env assembly @~1629)",
+			async () => {
+				const cmd = buildSidecarSpawnCommand({
+					nodeBin: "/usr/local/bin/node",
+					sidecarDir: "/opt/hermes/photon-sidecar",
+					port: 9001,
+					projectId: "proj-123",
+					projectSecret: "sec-ret",
+					sidecarToken: "tok-en",
+				});
+				expect(cmd.argv).toEqual([
+					"/usr/local/bin/node",
+					"/opt/hermes/photon-sidecar/index.mjs",
+				]);
+				expect(cmd.envVars).toEqual({
+					PHOTON_PROJECT_ID: "proj-123",
+					PHOTON_PROJECT_SECRET: "sec-ret",
+					PHOTON_SIDECAR_PORT: "9001",
+					PHOTON_SIDECAR_BIND: "127.0.0.1",
+					PHOTON_SIDECAR_TOKEN: "tok-en",
+					PHOTON_SIDECAR_WATCH_STDIN: "1",
+				});
+				// Default port rides the manifest constant when omitted.
+				const defaulted = buildSidecarSpawnCommand({
+					nodeBin: "node",
+					sidecarDir: "/s",
+					projectId: "p",
+					projectSecret: "s",
+					sidecarToken: "t",
+				});
+				expect(defaulted.envVars["PHOTON_SIDECAR_PORT"]).toBe("8789");
+			},
+		),
 	];
 }
 
@@ -1086,6 +1212,20 @@ function lastDispatchOf(engine: PhotonAdapter): IncomingEvent | undefined {
 	return engine.dispatchedEvents.at(-1);
 }
 
+/**
+ * Body of a recorded sidecar call that MUST carry JSON (/send, /typing,
+ * /react lanes); the body-less endpoints (/probe, startup /healthz) record
+ * `undefined` instead — passing one here fails the row loudly.
+ */
+function bodyOf(
+	call: { body?: Record<string, unknown> | undefined } | undefined,
+): Record<string, unknown> {
+	if (call === undefined || call.body === undefined) {
+		throw new Error("expected a JSON-bodied sidecar call");
+	}
+	return call.body;
+}
+
 /** Reaction-plane probe: /react + /unreact calls in order. */
 function reactionCallsOf(sidecar: FakeSidecarServer): Array<{
 	path: string;
@@ -1093,7 +1233,32 @@ function reactionCallsOf(sidecar: FakeSidecarServer): Array<{
 }> {
 	return sidecar.calls
 		.filter((c) => c.path === "/react" || c.path === "/unreact")
-		.map((c) => ({ path: c.path, body: c.body }));
+		.map((c) => ({ path: c.path, body: bodyOf(c) }));
+}
+
+/** A whole-GROUP preview-artifact payload (all items are preview attachments). */
+function groupPreviewArtifactEvent(messageId: string): Record<string, unknown> {
+	return {
+		messageId,
+		platform: "iMessage",
+		space: { id: "group-guid-xyz", type: "group", phone: null },
+		sender: { id: "+15551234567" },
+		content: {
+			type: "group",
+			items: [
+				{
+					content: {
+						type: "attachment",
+						id: `f-${messageId}`,
+						name: `photo${".pluginpayloadattachment"}`,
+						mimeType: "image/jpeg",
+						size: 2048,
+					},
+				},
+			],
+		},
+		timestamp: "2026-05-14T19:07:00.000Z",
+	};
 }
 
 function classificationTable(engine: PhotonAdapter): Record<string, boolean> {
