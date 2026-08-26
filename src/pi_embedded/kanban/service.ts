@@ -23,17 +23,28 @@
 // degrades loudly — falling through to another board would silently dispatch
 // cards across the exact boundary HERMES_KANBAN_BOARD exists to enforce.
 //
-// Divergence / PROPOSED DEC text: Hermes resolves the dispatcher singleton
-// via a machine-global flock file (<kanban_home>/kanban/.dispatcher.lock);
-// Node has no flock and new native lock deps are suspect (DEC-027 rationale),
-// so v0.1 relies on (a) the config gate + env escape hatch as PRIMARY
-// control, exactly like Hermes ("lock is backstop"), and (b) the board's own
-// CAS transitions, which make double-ticks benign rather than corrupting. A
-// SQLite-held singleton backstop mirroring DEC-027 remains future work for
-// the runner wiring phase; the seam accepts an external `hasSingleton`
-// probe so that wiring can assert it without touching this module.
+// Single-dispatcher backstop (DEC-057; secops-11): before dispatching, the
+// service takes the MACHINE-GLOBAL dispatcher singleton — an open BEGIN
+// IMMEDIATE transaction on `<kanbanHome>/kanban/.dispatcher.lock.db`
+// (DEC-027 idiom at the kanban root) — and holds it for the service's
+// lifetime. Contended ⇒ this gateway does NOT dispatch (clean skip, another
+// gateway owns the role); unresolvable/unavailable ⇒ loud warning and the
+// service proceeds on config control alone (exact parity of the reference's
+// flock-unavailable branch). The kanban home resolves from an explicit
+// option or HERMES_KANBAN_HOME (kanban_home() anchor); with neither set the
+// advisory layer cannot be established and the config gate remains the only
+// control — composition roots MUST wire kanbanHome for multi-gateway hosts.
+// An injected `hasSingleton` probe overrides the built-in lock entirely
+// (fakes / external ownership oracles).
+
+import { join } from "node:path";
 
 import { KANBAN_BOARD_ENV, resolveBoardSlug } from "./board.js";
+import {
+	DISPATCHER_LOCK_FILENAME,
+	sharedKanbanDispatcherLock,
+	type KanbanDispatcherLock,
+} from "./dispatcher-lock.js";
 import { systemClock, type GatewayClock } from "./clock.js";
 import {
 	dispatchOnce,
@@ -49,6 +60,26 @@ const FALSEY_ENV = new Set(["0", "false", "no", "off"]);
 /** The gateway-hosted-dispatcher gate env var (parity escape hatch). */
 export const KANBAN_DISPATCH_IN_GATEWAY_ENV =
 	"HERMES_KANBAN_DISPATCH_IN_GATEWAY";
+
+/** Machine-global kanban home override (parity of kanban_db.kanban_home's
+ * HERMES_KANBAN_HOME resolution step). */
+export const KANBAN_HOME_ENV = "HERMES_KANBAN_HOME";
+
+/**
+ * Resolve the machine-global singleton-lock path: explicit lockPath wins,
+ * then the kanban home (`<home>/kanban/.dispatcher.lock.db`); null when no
+ * home can be resolved (advisory layer unavailable — config-only control).
+ */
+export function resolveDispatcherLockPath(input: {
+	kanbanHome?: string | null | undefined;
+	lockPath?: string | null | undefined;
+	env?: Record<string, string | undefined> | undefined;
+}): string | null {
+	if (input.lockPath) return input.lockPath;
+	const override = (input.env?.[KANBAN_HOME_ENV] ?? "").trim();
+	const home = input.kanbanHome?.trim() || override || null;
+	return home === null ? null : join(home, "kanban", DISPATCHER_LOCK_FILENAME);
+}
 
 export interface KanbanDispatcherConfig {
 	board: string;
@@ -191,11 +222,17 @@ export interface StartKanbanDispatcherOptions {
 	config?: Record<string, unknown>;
 	clock?: GatewayClock;
 	/**
-	 * External singleton-backstop probe (see module header divergence note):
-	 * when provided and false, the service does NOT dispatch (another
-	 * process owns the machine-global dispatcher role).
+	 * External singleton-backstop probe (legacy seam): when provided and
+	 * false, the service does NOT dispatch (another process owns the
+	 * machine-global dispatcher role). When ABSENT, the built-in DEC-057
+	 * sidecar lock takes over (see resolveDispatcherLockPath).
 	 */
 	hasSingleton?: () => boolean;
+	/** Machine-global kanban home anchoring the sidecar lock (kanban_home()
+	 * parity). Unset ⇒ env fallback, else config-only control. */
+	kanbanHome?: string | null;
+	/** Explicit lock path override (tests / unusual deployments). */
+	lockPath?: string | null;
 }
 
 export interface RunningKanbanDispatcher {
@@ -236,18 +273,64 @@ export async function startKanbanDispatcher(
 			result: { ok: false, degraded: true, reason, warnings: cfg.warnings },
 		};
 	}
-	if (opts.hasSingleton && !opts.hasSingleton()) {
-		const reason = "another gateway holds the machine-global dispatcher role";
-		log(`[kanban] dispatcher: ${reason}; this gateway will NOT dispatch.`);
-		return { result: { ok: false, degraded: false, reason, warnings: [] } };
+
+	// Single-dispatcher backstop (parity _kanban_dispatcher_watcher): taken
+	// BEFORE the board is opened / the loop starts, held for the service's
+	// lifetime. An injected probe wins over the built-in sidecar lock.
+	let dispatcherLock: KanbanDispatcherLock | null = null;
+	if (opts.hasSingleton !== undefined) {
+		if (!opts.hasSingleton()) {
+			const reason = "another gateway holds the machine-global dispatcher role";
+			log(`[kanban] dispatcher: ${reason}; this gateway will NOT dispatch.`);
+			return { result: { ok: false, degraded: false, reason, warnings: [] } };
+		}
+	} else {
+		const lockPath = resolveDispatcherLockPath({
+			kanbanHome: opts.kanbanHome,
+			lockPath: opts.lockPath,
+			env: opts.env,
+		});
+		if (lockPath === null) {
+			log(
+				`[kanban] dispatcher: WARNING no machine-global kanban home resolved ` +
+					`(${KANBAN_HOME_ENV} unset); advisory dispatcher lock unavailable — ` +
+					`proceeding on config control alone.`,
+			);
+		} else {
+			const lock = sharedKanbanDispatcherLock(lockPath);
+			const state = lock.acquire();
+			if (state === "contended") {
+				const reason =
+					`another gateway already holds the dispatcher lock (${lockPath}); ` +
+					"this gateway will NOT dispatch";
+				log(`[kanban] dispatcher: ${reason}.`);
+				return {
+					result: { ok: false, degraded: false, reason, warnings: [] },
+				};
+			}
+			if (state === "held") {
+				dispatcherLock = lock; // hold for service/process lifetime
+				log(
+					`[kanban] dispatcher: holding singleton dispatcher lock (${lockPath})`,
+				);
+			} else {
+				log(
+					`[kanban] dispatcher: WARNING advisory lock unavailable at ${lockPath}; ` +
+						"proceeding on config control alone.",
+				);
+			}
+		}
 	}
 
 	// Board open — a wrong/unopenable board degrades LOUDLY, never falls
-	// through to a different board.
+	// through to a different board. A singleton lock already taken here is
+	// released first: a degraded boot must not pin the machine-global role.
 	let board: BoardClient;
 	try {
 		board = await opts.openBoard(cfg.board);
 	} catch (err) {
+		dispatcherLock?.release();
+		dispatcherLock = null;
 		const reason = err instanceof Error ? err.message : String(err);
 		const full = `cannot open board ${JSON.stringify(cfg.board)}: ${reason}`;
 		log(`[kanban] dispatcher: DEGRADED — ${full}`);
@@ -256,6 +339,8 @@ export async function startKanbanDispatcher(
 		};
 	}
 	if (board.board !== cfg.board) {
+		dispatcherLock?.release();
+		dispatcherLock = null;
 		const full =
 			`board client resolved to ${JSON.stringify(board.board)} but ` +
 			`dispatcher pinned ${JSON.stringify(cfg.board)} — refusing (hard board boundary)`;
@@ -288,6 +373,10 @@ export async function startKanbanDispatcher(
 			stop: async () => {
 				running = false;
 				await loopDone;
+				// Process lifetime ends with the service (parity of the
+				// shutdown-path _release_kanban_dispatcher_lock call).
+				dispatcherLock?.release();
+				dispatcherLock = null;
 			},
 		},
 	};

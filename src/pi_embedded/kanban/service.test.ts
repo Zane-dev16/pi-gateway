@@ -3,7 +3,15 @@
 // HARD board boundary refusal, per-tick failure isolation ("failures in one
 // tick don't stop subsequent ticks"), and clean stop.
 
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import {
+	DISPATCHER_LOCK_FILENAME,
+	KanbanDispatcherLock,
+} from "./dispatcher-lock.js";
 
 import { KANBAN_BOARD_ENV } from "./board.js";
 import {
@@ -235,3 +243,130 @@ function countingBoard(onTick: () => void): BoardClient {
 		},
 	};
 }
+
+// --- DEC-057: machine-global singleton dispatcher lock (secops-11) ---------
+
+describe("machine-global dispatcher singleton lock (DEC-057)", () => {
+	let dir: string;
+	let lockPath: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "pi-gw-kanban-svc-"));
+		lockPath = join(dir, "kanban", DISPATCHER_LOCK_FILENAME);
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("uncontended ⇒ lock acquired BEFORE dispatching and held; stop() releases the role", async () => {
+		const l = lines();
+		const started = await startKanbanDispatcher(
+			{
+				openBoard: () => impostorBoard("default"),
+				spawn: () => {},
+				env: {},
+				clock: new ManualClock(),
+				config: { dispatch_interval_seconds: 1 },
+				lockPath,
+			},
+			l.log,
+		);
+		expect(started.result.ok).toBe(true);
+		expect(l.out.join("\n")).toContain(
+			`holding singleton dispatcher lock (${lockPath})`,
+		);
+
+		// A sibling gateway CANNOT take the role while we dispatch.
+		const sibling = new KanbanDispatcherLock(lockPath);
+		expect(sibling.acquire()).toBe("contended");
+
+		await (started.running as RunningKanbanDispatcher).stop();
+
+		// Process lifetime ended ⇒ the machine-global role is free again.
+		expect(new KanbanDispatcherLock(lockPath).acquire()).toBe("held");
+	});
+
+	it("contended ⇒ this gateway does NOT dispatch (clean skip); the board is NEVER opened", async () => {
+		const l = lines();
+		const holder = new KanbanDispatcherLock(lockPath);
+		expect(holder.acquire()).toBe("held");
+
+		let opened = false;
+		const { result } = await startKanbanDispatcher(
+			{
+				openBoard: () => {
+					opened = true;
+					return impostorBoard("default");
+				},
+				spawn: () => {},
+				env: {},
+				clock: new ManualClock(),
+				lockPath,
+			},
+			l.log,
+		);
+		expect(result.ok).toBe(false);
+		expect(result.degraded).toBe(false);
+		expect(result.reason).toContain("already holds the dispatcher lock");
+		expect(result.reason).toContain("will NOT dispatch");
+		expect(opened).toBe(false); // refusal precedes any board interaction
+		holder.release();
+	});
+
+	it("advisory lock unavailable ⇒ LOUD warning, proceeds on config control alone", async () => {
+		const l = lines();
+		// A regular file where the kanban dir must live makes the sidecar
+		// unopenable — the reference's flock-unavailable branch.
+		writeFileSync(join(dir, "kanban"), "not a directory", "utf8");
+		const started = await startKanbanDispatcher(
+			{
+				openBoard: () => impostorBoard("default"),
+				spawn: () => {},
+				env: {},
+				clock: new ManualClock(),
+				config: { dispatch_interval_seconds: 1 },
+				lockPath,
+			},
+			l.log,
+		);
+		expect(started.result.ok).toBe(true); // degraded to config-only control
+		expect(l.out.join("\n")).toContain("advisory lock unavailable");
+		expect(l.out.join("\n")).toContain("config control alone");
+		await (started.running as RunningKanbanDispatcher).stop();
+	});
+
+	it("no kanban home resolvable ⇒ advisory layer unavailable warning, still dispatches", async () => {
+		const l = lines();
+		const started = await startKanbanDispatcher(
+			{
+				openBoard: () => impostorBoard("default"),
+				spawn: () => {},
+				env: {}, // no HERMES_KANBAN_HOME, no kanbanHome option
+				clock: new ManualClock(),
+				config: { dispatch_interval_seconds: 1 },
+			},
+			l.log,
+		);
+		expect(started.result.ok).toBe(true);
+		expect(l.out.join("\n")).toContain("no machine-global kanban home resolved");
+		await (started.running as RunningKanbanDispatcher).stop();
+	});
+
+	it("HERMES_KANBAN_HOME env anchors the machine-global lock path", async () => {
+		const l = lines();
+		const started = await startKanbanDispatcher(
+			{
+				openBoard: () => impostorBoard("default"),
+				spawn: () => {},
+				env: { HERMES_KANBAN_HOME: dir },
+				clock: new ManualClock(),
+				config: { dispatch_interval_seconds: 1 },
+			},
+			l.log,
+		);
+		expect(started.result.ok).toBe(true);
+		expect(l.out.join("\n")).toContain(`holding singleton dispatcher lock (${lockPath})`);
+		await (started.running as RunningKanbanDispatcher).stop();
+	});
+});

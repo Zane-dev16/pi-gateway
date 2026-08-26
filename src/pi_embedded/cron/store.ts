@@ -20,8 +20,22 @@
 //   cron/jobs.py:mark_job_run                   → markJobRun
 //   cron/jobs.py:pause_job / resume_job / update_job / remove_job → …
 //   cron/jobs.py:record_catch_up_occurrence     → catchUpOccurrenceCount
+//   cron/jobs.py:get_due_jobs stale-error re-arm (_job_is_stale_error_
+//     recurring + _record_persisted_error_recovery) → getDueJobs wedge
+//     branch (below) — a recurring job whose persisted state shows
+//     last_status=error with last_run_at older than a full cadence+grace
+//     and next_run_at parked in the future has been sitting WEDGED since
+//     its post-error re-arm; it is invisible to every other sweep (not
+//     running, not due), so it just sits dead. getDueJobs re-arms it:
+//     interval → now (no excluded times ⇒ immediate retry is always a
+//     legal fire), cron → the next LEGAL occurrence from now (re-arming to
+//     now would fire at instants the expression explicitly excludes). Each
+//     re-arm appends one countable row to
+//     `<cronDir>/persisted_error_recoveries.jsonl` (parity of
+//     _record_persisted_error_recovery's JSONL telemetry sink).
 
 import {
+	appendFileSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -40,6 +54,7 @@ import {
 	epochToIso,
 	isoToEpoch,
 	parseSchedule,
+	scheduleCadenceSeconds,
 	type CronSchedule,
 } from "./schedule.js";
 import { JobsFileLock } from "./jobs-lock.js";
@@ -177,6 +192,71 @@ export interface GetDueReport {
 
 const FIRE_CLAIM_TTL_SECONDS = 300;
 
+/** Recent-recovery ring bound (parity _PERSISTED_ERROR_RECOVERY_HISTORY). */
+export const PERSISTED_ERROR_RECOVERY_HISTORY = 20;
+
+/** JSONL telemetry sink under cronDir (parity file name). */
+export const PERSISTED_ERROR_RECOVERIES_FILENAME =
+	"persisted_error_recoveries.jsonl";
+
+/** One persisted-error re-arm record (field names follow jobs.py's entry). */
+export interface PersistedErrorRecoveryEntry {
+	job_id: string;
+	name: string;
+	/** The wedged next_run_at this recovery replaced. */
+	previous_next_run_at: string;
+	rearmed_at: string;
+}
+
+export interface PersistedErrorRecoveryStats {
+	persisted_error_recoveries: number;
+	recent: PersistedErrorRecoveryEntry[];
+}
+
+/**
+ * True when a RECURRING job is wedged in a stale persisted error state
+ * (parity _job_is_stale_error_recurring, all must hold):
+ *   - persisted last_status === "error" (a prior fire errored and never
+ *     recovered);
+ *   - no live run gets re-armed underneath itself (#62002): pi realizes the
+ *     reference's running-set liveness as the persisted fire-claim lease —
+ *     a FRESH claim means a run is alive somewhere (this process or a
+ *     sibling tick), so the job is left alone until the lease expires;
+ *   - last_run_at exists and is older than cadence+grace: markJobRun stamps
+ *     last_run_at on EVERY fire (success or failure), so a merely erroring-
+ *     and-retrying job stays fresh and never trips this; a full silent
+ *     period does.
+ * Unknown cadence falls back to the grace window for the cadence half
+ * (never re-arm anything younger than the grace floor).
+ */
+function isStaleErrorRecurring(
+	job: CronJobRecord,
+	schedule: CronSchedule,
+	nowSec: number,
+): boolean {
+	if (job.last_status !== "error") return false;
+	if (hasFreshFireClaim(job, nowSec)) return false;
+	if (!job.last_run_at) return false;
+	const lastRunSec = isoToEpoch(job.last_run_at);
+	if (lastRunSec === null) return false;
+	const age = nowSec - lastRunSec;
+	if (age < 0) return false; // clock-skewed last_run never counts as old
+	const grace = catchupGraceSeconds(schedule, nowSec);
+	const cadence = scheduleCadenceSeconds(schedule, nowSec) ?? grace;
+	return age > cadence + grace;
+}
+
+/** Fresh fire claim ≙ a run is live right now (both-sides-bounded age, the
+ * heartbeatRunClaim freshness rule). */
+function hasFreshFireClaim(job: CronJobRecord, nowSec: number): boolean {
+	const claim = job.fire_claim;
+	if (claim === null || claim === undefined) return false;
+	const claimedAt = isoToEpoch(claim.at);
+	if (claimedAt === null) return false;
+	const age = nowSec - claimedAt;
+	return age >= 0 && age < FIRE_CLAIM_TTL_SECONDS;
+}
+
 export interface CronJobStoreOptions {
 	paths?: CronStorePaths;
 	clock?: CronClock;
@@ -186,6 +266,8 @@ export class CronJobStore {
 	private readonly pathsValue: CronStorePaths;
 	private readonly clock: CronClock;
 	private readonly lock: JobsFileLock;
+	private recoveryCount = 0;
+	private recentRecoveries: PersistedErrorRecoveryEntry[] = [];
 
 	constructor(options: CronJobStoreOptions = {}) {
 		this.pathsValue = options.paths ?? defaultCronStorePaths(".");
@@ -410,8 +492,8 @@ export class CronJobStore {
 				if (!isRunnable(job)) continue;
 				const nextRaw = job.next_run_at;
 				if (nextRaw === null || nextRaw === undefined) continue;
-				const nextSec = isoToEpoch(nextRaw);
-				if (nextSec === null || nextSec > nowSec) continue;
+				let nextSec = isoToEpoch(nextRaw);
+				if (nextSec === null) continue;
 
 				const schedule = storedScheduleToCron(job.schedule);
 				if (schedule.kind === "once") {
@@ -422,8 +504,8 @@ export class CronJobStore {
 					// accumulating ticks as a ghost.
 					const lastRun =
 						job.last_run_at !== null && job.last_run_at !== undefined
-						? isoToEpoch(job.last_run_at)
-						: null;
+							? isoToEpoch(job.last_run_at)
+							: null;
 					if (lastRun !== null) continue;
 					const graceAgedOut =
 						schedule.runAtSeconds < nowSec - 120 && nextSec <= nowSec;
@@ -435,6 +517,30 @@ export class CronJobStore {
 					report.due.push({ job: structuredClone(job), fastForwarded: false });
 					continue;
 				}
+
+				// Persisted-state stale-error recovery (t_8b5480b3 parity): a
+				// recurring job parked in the FUTURE whose persisted state shows
+				// last_status=error with last_run_at older than a full cadence has
+				// been sitting wedged (errored once, next_run_at re-armed forward
+				// by markJobRun, never re-dispatched — invisible to every other
+				// sweep). Re-arm so the job re-dispatches WITHOUT force-run/resume:
+				//   * interval → now — no excluded times, immediate retry is a
+				//     legal fire and lands DUE THIS TICK below;
+				//   * cron → the next LEGAL occurrence from now — re-arming to now
+				//     would fire at instants the expression explicitly excludes; a
+				//     correctly-parked cron value is left as-is.
+				if (nextSec > nowSec && isStaleErrorRecurring(job, schedule, nowSec)) {
+					const recoveredNext =
+						schedule.kind === "interval"
+							? nowSec
+							: computeNextRun(schedule, nowSec, null);
+					if (recoveredNext !== null && recoveredNext < nextSec) {
+						this.recordPersistedErrorRecoveryUnlocked(job, nextRaw, nowSec); // count + JSONL telemetry BEFORE the row mutates
+						job.next_run_at = epochToIso(recoveredNext);
+						nextSec = recoveredNext;
+					}
+				}
+				if (nextSec > nowSec) continue;
 
 				// Recurring: stale slot past the catchup grace window ⇒ skip the
 				// accumulated missed runs but still execute once NOW (fast-
@@ -539,7 +645,12 @@ export class CronJobStore {
 		return this.mutate((jobs) => {
 			const job = jobs.find((j) => j.id === jobId);
 			const claim = job?.fire_claim;
-			if (job === undefined || claim === null || claim === undefined || claim.by !== expectedOwner)
+			if (
+				job === undefined ||
+				claim === null ||
+				claim === undefined ||
+				claim.by !== expectedOwner
+			)
 				return false;
 			const claimedAt = isoToEpoch(claim.at);
 			if (claimedAt !== null) {
@@ -556,7 +667,12 @@ export class CronJobStore {
 		return this.mutate((jobs) => {
 			const job = jobs.find((j) => j.id === jobId);
 			const claim = job?.fire_claim;
-			if (job === undefined || claim === null || claim === undefined || claim.by !== expectedOwner)
+			if (
+				job === undefined ||
+				claim === null ||
+				claim === undefined ||
+				claim.by !== expectedOwner
+			)
 				return false;
 			job.fire_claim = null;
 			return true;
@@ -587,7 +703,11 @@ export class CronJobStore {
 			if (job === undefined) return false;
 			if (input.expectedFireOwner !== undefined) {
 				const claim = job.fire_claim;
-				if (claim === null || claim === undefined || claim.by !== input.expectedFireOwner) {
+				if (
+					claim === null ||
+					claim === undefined ||
+					claim.by !== input.expectedFireOwner
+				) {
 					return false; // discard stale completion — winner owns the record
 				}
 			}
@@ -626,6 +746,52 @@ export class CronJobStore {
 			}
 			return true;
 		});
+	}
+
+	// ------------------------------------------------------------------
+	// persisted-error wedge recovery telemetry (parity of
+	// _record_persisted_error_recovery / get_persisted_error_recovery_stats)
+	// ------------------------------------------------------------------
+
+	/** Count + append one stale-error re-arm to the JSONL sink. Telemetry
+	 * NEVER breaks a tick (best-effort append, parity try/except). */
+	private recordPersistedErrorRecoveryUnlocked(
+		job: CronJobRecord,
+		previousNextRunAt: string,
+		nowSec: number,
+	): void {
+		const entry: PersistedErrorRecoveryEntry = {
+			job_id: job.id,
+			name: job.name || job.id,
+			previous_next_run_at: previousNextRunAt,
+			rearmed_at: epochToIso(nowSec),
+		};
+		this.recoveryCount++;
+		this.recentRecoveries.push(entry);
+		if (this.recentRecoveries.length > PERSISTED_ERROR_RECOVERY_HISTORY) {
+			this.recentRecoveries.splice(
+				0,
+				this.recentRecoveries.length - PERSISTED_ERROR_RECOVERY_HISTORY,
+			);
+		}
+		try {
+			this.ensureDirs();
+			appendFileSync(
+				join(this.pathsValue.cronDir, PERSISTED_ERROR_RECOVERIES_FILENAME),
+				`${JSON.stringify(entry)}\n`,
+				"utf8",
+			);
+		} catch {
+			/* never let telemetry break a tick */
+		}
+	}
+
+	/** Probe-visible snapshot of persisted-error recoveries. */
+	getPersistedErrorRecoveryStats(): PersistedErrorRecoveryStats {
+		return {
+			persisted_error_recoveries: this.recoveryCount,
+			recent: [...this.recentRecoveries],
+		};
 	}
 
 	// ------------------------------------------------------------------

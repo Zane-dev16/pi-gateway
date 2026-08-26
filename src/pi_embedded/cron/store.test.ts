@@ -13,6 +13,7 @@ import {
 	OneShotGraceError,
 	defaultCronStorePaths,
 	type CronDeliveryTarget,
+	type CronJobRecord,
 	type CronStorePaths,
 } from "./store.js";
 import { ManualClock } from "./testing/manual-clock.js";
@@ -396,4 +397,246 @@ describe("pause / resume / remove", () => {
 		expect(await store.getJob(a)).toBeNull();
 		expect(await store.getJob(b)).not.toBeNull();
 	});
+});
+
+describe("persisted-error wedge recovery (t_8b5480b3 parity)", () => {
+	const DAY = 86_400;
+
+	/** Seed a WEDGED recurring job: errored last run, ancient last_run_at,
+	 * next_run_at parked in the future (the markJobRun post-error re-arm). */
+	async function seedWedge(
+		schedule:
+			| { kind: "interval"; minutes: number }
+			| { kind: "cron"; expr: string },
+		opts: {
+			lastRunAgeSeconds: number;
+			parkedAheadSeconds: number;
+			lastStatus?: string;
+			withFreshClaim?: boolean;
+			name?: string;
+		},
+	): Promise<string> {
+		const id = (
+			await store.createJob({
+				prompt: "wedged",
+				name: opts.name ?? "wedged-job",
+				schedule,
+			})
+		).id;
+		await store.mutate((jobs) => {
+			const job = jobs.find((j) => j.id === id)!;
+			const status = opts.lastStatus ?? "error";
+			job.last_status = status as NonNullable<
+				CronJobRecord["last_status"]
+			>;
+			job.last_run_at = new Date(
+				(clock.nowSeconds() - opts.lastRunAgeSeconds) * 1000,
+			).toISOString();
+			job.next_run_at = new Date(
+				(clock.nowSeconds() + opts.parkedAheadSeconds) * 1000,
+			).toISOString();
+			if (opts.withFreshClaim) {
+				job.fire_claim = {
+					at: new Date(clock.nowSeconds() * 1000).toISOString(),
+					by: "999:live-runner",
+				};
+			}
+		});
+		return id;
+	}
+
+	function readRecoveryRows(): Array<Record<string, unknown>> {
+		try {
+			const text = readFileSync(
+				join(dir, "cron", "persisted_error_recoveries.jsonl"),
+				"utf8",
+			);
+			return text
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+		} catch {
+			return [];
+		}
+	}
+
+	it("interval wedge re-arms to NOW and fires DUE this tick; JSONL row + stats recorded", async () => {
+		const id = await seedWedge(
+			{ kind: "interval", minutes: 10 },
+			{ lastRunAgeSeconds: 10 * DAY, parkedAheadSeconds: 3600 },
+		);
+		const before = (await store.getJob(id))!.next_run_at!;
+
+		const report = await store.getDueJobs();
+
+		expect(report.due).toHaveLength(1); // recovered to now ⇒ due immediately
+		expect(report.due[0]!.job.id).toBe(id);
+		expect(report.due[0]!.fastForwarded).toBe(false);
+		const after = isoToEpoch((await store.getJob(id))!.next_run_at!)!;
+		expect(after).toBeLessThanOrEqual(isoToEpoch(before)!); // moved EARLIER
+		expect(after).toBe(clock.nowSeconds()); // interval ⇒ exactly now
+
+		const rows = readRecoveryRows();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			job_id: id,
+			name: "wedged-job",
+			previous_next_run_at: before,
+			rearmed_at: new Date(clock.nowSeconds() * 1000).toISOString(),
+		});
+		expect(store.getPersistedErrorRecoveryStats()).toEqual({
+			persisted_error_recoveries: 1,
+			recent: [rows[0]],
+		});
+	});
+
+	it("cron wedge re-arms to the next LEGAL occurrence, NOT now — never due early", async () => {
+		// Daily 09:00 job that errored 10 days ago with next_run_at parked a
+		// month out: recovery must land on tomorrow's 09:00 UTC, not "now".
+		const id = await seedWedge(
+			{ kind: "cron", expr: "0 9 * * *" },
+			{ lastRunAgeSeconds: 10 * DAY, parkedAheadSeconds: 30 * DAY },
+		);
+		const report = await store.getDueJobs();
+		expect(report.due).toHaveLength(0); // parked at the legal slot, not due
+
+		const recovered = isoToEpoch((await store.getJob(id))!.next_run_at!)!;
+		expect(recovered).toBeGreaterThan(clock.nowSeconds());
+		const date = new Date(recovered * 1000);
+		expect(date.getUTCHours()).toBe(9);
+		expect(date.getUTCMinutes()).toBe(0);
+		expect(readRecoveryRows()).toHaveLength(1);
+	});
+
+	it("transient error still within cadence+grace is LEFT ALONE (erroring-and-retrying jobs never trip)", async () => {
+		// 10m interval: cadence 600 + grace 300 ⇒ threshold 900s.
+		const id = await seedWedge(
+			{ kind: "interval", minutes: 10 },
+			{ lastRunAgeSeconds: 500, parkedAheadSeconds: 120 },
+		);
+		const before = (await store.getJob(id))!.next_run_at;
+		await store.getDueJobs();
+		expect((await store.getJob(id))!.next_run_at).toBe(before);
+		expect(readRecoveryRows()).toHaveLength(0);
+		expect(
+			store.getPersistedErrorRecoveryStats().persisted_error_recoveries,
+		).toBe(0);
+	});
+
+	it("last_status ok / interrupted / absent never recover — only persisted 'error' wedges", async () => {
+		for (const status of ["ok", "interrupted"]) {
+			const id = await seedWedge(
+				{ kind: "interval", minutes: 10 },
+				{
+					lastRunAgeSeconds: 10 * DAY,
+					parkedAheadSeconds: 3600,
+					lastStatus: status,
+				},
+			);
+			const before = (await store.getJob(id))!.next_run_at;
+			await store.getDueJobs();
+			expect((await store.getJob(id))!.next_run_at).toBe(before);
+		}
+		// Absent last_status entirely (never-run recurring row parked future).
+		const bare = await seedWedge(
+			{ kind: "interval", minutes: 10 },
+			{ lastRunAgeSeconds: 10 * DAY, parkedAheadSeconds: 3600 },
+		);
+		await store.mutate((jobs) => {
+			delete jobs.find((j) => j.id === bare)!.last_status;
+		});
+		await store.getDueJobs();
+		expect((await store.getJob(bare))!.next_run_at).toBe(
+			new Date((clock.nowSeconds() + 3600) * 1000).toISOString(),
+		);
+		expect(readRecoveryRows()).toHaveLength(0);
+	});
+
+	it("a LIVE run (fresh fire claim) is never re-armed underneath itself (#62002)", async () => {
+		const live = await seedWedge(
+			{ kind: "interval", minutes: 10 },
+			{
+				lastRunAgeSeconds: 10 * DAY,
+				parkedAheadSeconds: 3600,
+				withFreshClaim: true,
+			},
+		);
+		await store.getDueJobs();
+		expect((await store.getJob(live))!.next_run_at).toBe(
+			new Date((clock.nowSeconds() + 3600) * 1000).toISOString(),
+		);
+		expect(readRecoveryRows()).toHaveLength(0);
+
+		clock.advance(301); // claim TTL (300s) expires ⇒ the wedge is recoverable
+		const report = await store.getDueJobs();
+		expect(report.due).toHaveLength(1);
+		expect(report.due[0]!.job.id).toBe(live);
+		expect(readRecoveryRows()).toHaveLength(1);
+	});
+
+	it("correctly-parked cron value (equal to the computed legal occurrence) stays untouched", async () => {
+		// Park next_run_at at EXACTLY the next occurrence from now: the strict
+		// `recovered < parked` comparison refuses to churn a correct value.
+		const nowSec = clock.nowSeconds();
+		const nextOccurrence = new Date(nowSec * 1000);
+		nextOccurrence.setUTCMinutes(0, 0, 0);
+		nextOccurrence.setUTCHours(nextOccurrence.getUTCHours() + 1); // top of next hour
+		const id = await seedWedge(
+			{ kind: "cron", expr: "0 * * * *" },
+			{ lastRunAgeSeconds: 10 * DAY, parkedAheadSeconds: 3600 },
+		);
+		await store.mutate((jobs) => {
+			const job = jobs.find((j) => j.id === id)!;
+			job.next_run_at = nextOccurrence.toISOString();
+		});
+		await store.getDueJobs();
+		expect((await store.getJob(id))!.next_run_at).toBe(
+			nextOccurrence.toISOString(),
+		);
+		expect(readRecoveryRows()).toHaveLength(0);
+	});
+
+	it("future-dated last_run_at (clock skew) counts as fresh, never stale", async () => {
+		const id = await seedWedge(
+			{ kind: "interval", minutes: 10 },
+			{ lastRunAgeSeconds: -600, parkedAheadSeconds: 3600 }, // last_run in the FUTURE
+		);
+		const before = (await store.getJob(id))!.next_run_at;
+		await store.getDueJobs();
+		expect((await store.getJob(id))!.next_run_at).toBe(before);
+		expect(readRecoveryRows()).toHaveLength(0);
+	});
+
+	it("unknown cadence (minutes=0) falls back to grace for the cadence half", async () => {
+		const id = await createJobDirect({
+			kind: "interval",
+			minutes: 0,
+		} as CronJobRecord["schedule"]);
+		await store.mutate((jobs) => {
+			const job = jobs.find((j) => j.id === id)!;
+			job.last_status = "error";
+			job.last_run_at = new Date(
+				(clock.nowSeconds() - 241) * 1000, // > grace(120)+grace(120)
+			).toISOString();
+			job.next_run_at = new Date(
+				(clock.nowSeconds() + 3600) * 1000,
+			).toISOString();
+		});
+		const report = await store.getDueJobs();
+		expect(report.due).toHaveLength(1);
+		expect(readRecoveryRows()).toHaveLength(1);
+	});
+
+	/** Bypass grammar validation: force an arbitrary stored schedule shape. */
+	async function createJobDirect(
+		schedule: CronJobRecord["schedule"],
+	): Promise<string> {
+		const id = (await store.createJob({ prompt: "x", schedule: "every 5m" }))
+			.id;
+		await store.mutate((jobs) => {
+			const job = jobs.find((j) => j.id === id)!;
+			job.schedule = structuredClone(schedule);
+		});
+		return id;
+	}
 });
