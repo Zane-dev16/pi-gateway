@@ -908,6 +908,52 @@ in `../09-open-questions.md` (append-only).
   tsc clean for cluster scope; full-tree failures confined to sibling clusters'
   in-flight ntfy/ws/email files (zero cross-imports; kit/ and pi_gateway/
   untouched). Commit scoped to cluster paths only.
+
+- Stability round-2 fix cluster `email-r2` (2026-08-26): 10 findings, single-owner
+  pass over src/pi_platforms/email toward Hermes truth at
+  /tmp/hermes-upstream/plugins/platforms/email/adapter.py anchors. eml-1: smtp.quit()
+  after EVERY send and the connect-test finally (:771/:1194/:1320/:1398/:1466) —
+  quitSmtpBestEffort() chases a raising quit with close(); FakeSmtpServer models
+  sessions (openSessions/quit/close + quitFailuresArmed knob, leakedSessions audit)
+  so a skipped teardown is observable; connectSmtp now closes the handle on a
+  STARTTLS failure (_connect_smtp._connect parity). eml-2: sendDocument/
+  sendMultipleImages/sendImage ported (:1204-1386) — local files (file:// URLs AND
+  bare pi-pipeline paths) attach as MIMEBase('application','octet-stream') base64
+  parts with Content-Disposition filenames; remote scheme URLs link "Image: <url>"
+  in the body; multi-image lane skips unreadable files, document lane fails the
+  send; SentMailRecord.attachments captured on the fake. eml-3: config
+  skipAttachments short-circuits extractAttachments entirely (:565/:969).
+  eml-4: imap.logout() moved OUT of the failing try into a swallowed finally gated
+  on handle-open in BOTH connect() and fetchNewMessages (_close_imap parity
+  :115/:744/:919) — armed ImapLogoutAbortError can no longer mark successful
+  fetches failed or spur reconnect escalation. eml-5: FakeImapServer.deliver passes
+  scripted Message-ID/In-Reply-To through into StoredMail (synthesized
+  <fake-{uid}@mx.fake.example> only as fallback); replies cite real parents.
+  eml-6: esecretInt() = _esecret_int parity (:78-86) — blank/whitespace env values
+  treated unset before numeric parse; EMAIL_IMAP_PORT ''→993, SMTP→587, POLL
+  INTERVAL ''→15s (never port-0 connects / 0ms busy-loops). eml-7:
+  StoredMail.headerList ordered repeated-header wire (msg.get_all parity) feeds
+  verifySenderAuthentication first-instance trust with optional authserv-id pin;
+  Record kept only as the dict(msg.items()) last-wins view for single-value
+  consumers. eml-8: connect()'s SMTP test rides the SAME A21 ladder as sends via
+  shared connectSmtpWithLadder() (:630-648) — v6-blackhole connect recovers onto
+  IPv4; exhausted resolution retries IPv4-only ONCE before classifying retryable.
+  eml-9: body.slice(0, EMAIL_MAX_BODY_CHARS) removed from sendEmail's SMTP lane —
+  full MIMEText body ships; 50000 lives in deliverText policy chunking only
+  (:1506 metadata). eml-10: authservId falls back to secretReader('EMAIL_AUTHSERV_ID')
+  with trim+lowercase (:591-592); config extra wins; DEC-029 byte-parity unaffected.
+  NEW contracts: email.test.ts email-r2 describes (session-leak audit incl.
+  quit-failure chase and auth-dead quit-in-finally, octet-stream base64 byte
+  round-trips, batch+URL-link+missing-skip matrix, skipAttachments dispatch typing,
+  logout-abort immunity for fetch/reconnect, header passthrough + synthesis
+  fallback, blank/garbage/valid env matrix, duplicated-A-R wire order + pinned
+  injected-instance rejection, connect-ladder recovery + two-attempt exhaustion,
+  60k-char full-body ship, env authserv pin gate). Suite: email.test.ts 51/51,
+  email-rows + polling-rows 11/11 green; tsc clean for cluster files; layering +
+  secret-scope gates green; residual full-tree failures confined to sibling
+  clusters' ntfy/ws/irc/homeassistant/sms windows (verified identical with this
+  cluster stashed).
+
 - Stability round-2 fix cluster `agent-loop-repair-r2` (2026-08-26): pi_agent_core runner
   moved onto DEC-015's own placement contract ("immediately before EACH API call") —
   Hermes truth at /tmp/hermes-upstream agent/conversation_loop.py:run_conversation anchors
@@ -938,3 +984,190 @@ in `../09-open-questions.md` (append-only).
   (host.ts is still the sole SDK seam). Residual full-tree failures confined to sibling
   clusters' in-flight files (sms/ntfy/homeassistant conformance rows — zero pi_agent_core
   imports; tsc errors likewise ntfy-standalone only), verified unrelated to this change.
+
+- Stability round-2 fix cluster `cron-standalone-delivery` (2026-08-26): the
+  kit's out-of-process cron delivery hook moved from comment-only reservation
+  to WIRED seam (finding nthaha-10; Hermes anchors
+  plugins/platforms/{ntfy,homeassistant}/adapter.py:_standalone_send +
+  tools/send_message_tool.py:_send_via_adapter). kit/registration.ts gains
+  StandaloneSendArgs/StandaloneSendResult/StandaloneSenderFn (result-dict
+  parity: success arm {platform, chatId[, messageId]} vs {error};
+  _send_via_adapter admits exactly this disjunction), registerPlatform opts
+  .standaloneSenderFn stored on RegisteredPlatform, and
+  PluginContext.getStandaloneSender() for the cron/send-tool fallback lane;
+  cronDeliverEnvVar stays explicitly reserved. ntfy-standalone.ts ports
+  _standalone_send verbatim: publish_topic chain chat_id → extra.publish_topic
+  → NTFY_PUBLISH_TOPIC → extra.topic → NTFY_TOPIC (raw chat_id Python
+  truthiness; exhausted chain ⇒ "ntfy standalone send: NTFY_TOPIC not
+  configured"), server lane config→env→DEFAULT_SERVER with rstrip("/"),
+  text/plain; charset=utf-8 + X-Tags NTFY_ECHO_TAG + auth via the SHARED
+  buildAuthHeader (user:pass ⇒ Basic, strip rules — adapter.py shares
+  _build_auth_header between live and standalone precisely so both paths stay
+  identical), X-Markdown only when bool(extra.markdown) or env ∈
+  {1,true,yes}, body sliced at NTFY_MAX_MESSAGE_CHARS (no chunking), POST
+  under NTFY_PUBLISH_TIMEOUT_MS=15s; ≥300 ⇒ "ntfy HTTP {s}: {text[:200]}",
+  JSON id with uuid4().hex[:12] fallback, exceptions ⇒ "ntfy standalone send
+  failed: {e}". homeassistant-standalone.ts ports its _standalone_send:
+  hass_url = config.url or HASS_URL (NO default-URL fallback), token stripped,
+  either missing ⇒ the loud both-required error before any wire op; POST
+  {hass_url}{HA_REST_NOTIFY_NOTIFY} Bearer + payload {"message","target":
+  chat_id} — NO title key, NO truncation on this path — under new manifest
+  constant HA_STANDALONE_TIMEOUT_MS=30s (aiohttp ClientTimeout(total=30));
+  200/201 accepted ⇒ {success, platform, chatId}, others ⇒ "Home Assistant
+  API error ({s}): {body}", timeout ⇒ dedicated sentence, transport death ⇒
+  "Home Assistant send failed: {e}". registerNtfyPlatform /
+  registerHomeAssistantPlatform pass the hook through the seam (register(ctx)
+  parity); both lanes keep thread_id/media_files/force_document as accepted-
+  and-ignored signature parity, and every config lane preserves Python `or`
+  fall-through (set-but-empty defers). Transports are seams with sanctioned-
+  shape fetch defaults (wake.ts precedent); tests script them. NEW contracts:
+  ntfy-standalone.test.ts 17 rows + homeassistant-standalone.test.ts 10 rows
+  (wire shapes byte-level, precedence ladders incl. set-but-empty, auth
+  Basic/Bearer/absent matrix, markdown truth table, 4096-truncation vs HA's
+  no-truncation, exact reference error strings, ≥300 slicing at 200, id
+  fallback shapes, registration drivability through a REAL PluginContext).
+  Suite: full tree 223/223 files · 2738/2738 green (+27 delta); whole-tree
+  tsc clean; layering OK; secret-scope OK. Note: transient mid-flight
+  failures observed in sibling clusters' ntfy/HA conformance rows during this
+  window were independent (verified pre-existing before this cluster's test
+  files existed; siblings converged to green by window close).
+
+- Stability round-2 fix cluster `irc-sms-r2` (2026-08-26): irc + sms adapters moved onto
+  Hermes truth at /tmp/hermes-upstream anchors; 5 findings, zero new DECs (every change
+  REMOVES a divergence from source — DEC-026 satisfied by construction). ircsms-1: the
+  kit '(i/n)' label scaffold is DISABLED for IRC PRIVMSG bodies — Hermes send() emits
+  BARE _split_message chunks and truncate_message's '(i/n)' is never applied on IRC
+  (plugins/platforms/irc/adapter.py:293-297); IrcAdapter.deliverText now drives
+  splitMessageForIrc directly (no label-width reservation pass — planLabeledLines
+  deleted), so long replies no longer mutate wire-visible content. Shared row
+  egress.chunk-flood branches on a DECLARED subject datum chunkLabelStyle?():
+  "kit-labeled" (default, unchanged assertions incl. MarkdownV2 escape normalization) vs
+  "vendor-bare" (asserts label ABSENCE — a labeled line would be the divergence);
+  IrcSubject declares "vendor-bare"; no platform-name sniffing, undeclared subjects are
+  byte-identical to prior behavior. World row transport.irc.rate-paced-burst relaxed to
+  bare form: every wire line ≤64-char budget AND carries NO (i/n) tail (was ≤64+8 with
+  mandatory label). ircsms-2: parseIrcMessage pushes trailing bug-for-bug `if trailing:`
+  (adapter.py:104) — "PRIVMSG botnick :" yields params=[botnick] and the <2-param PRIVMSG
+  gate DROPS it, instead of text="" passing DM gates toward an empty dispatch; pinned by
+  a conforming parse test beside the existing _parse_irc_message parity cases. ircsms-4:
+  the Twilio REST wire contract is now EXPRESSED AND RECORDED — SmsRestTransport.
+  postMessages carries url + authorization; SmsAdapter.wireSend composes ONCE per send
+  (outside the chunk loop) `{TWILIO_API_BASE}/{account_sid}/Messages.json` +
+  twilioBasicAuthHeader = `Basic base64(sid:token)` ASCII (adapter.py:104-107/:194-197,
+  _basic_auth_header); TwilioRestBridge records both in SmsPostRecord and sms-rows rest
+  assertions verify URL+auth on EVERY post (was From/To/Body/status only). ircsms-6:
+  SMS_WEBHOOK_PORT / SMS_WEBHOOK_HOST / SMS_INSECURE_NO_SIGNATURE resolve via the scoped
+  secretReader with config-object override and documented defaults (__init__ os.getenv
+  parity adapter.py:95-100/:113): port via int-parse ladder to DEFAULT_WEBHOOK_PORT=8080,
+  host via string ladder to DEFAULT_WEBHOOK_HOST=127.0.0.1, insecure via exact
+  `.toLowerCase() === "true"` compare (no strip, Python parity) OR'd behind explicit
+  config precedence — env-only deployments can now bind port/host and REACH insecure
+  mode (connect refusal behavior no longer unreachable-config-bound); NEW delta row
+  transport.sms.env-only-deployment (rows 7→8, catalog list updated) proves env-only
+  resolution + connect-with-DISABLED-warning, config-beats-env refusal ladder, and the
+  no-env defaults triple. ircsms-7: whitespace-only content TRANSMITS the single
+  'PRIVMSG <target> :' empty-trailing line instead of short-circuit success silently
+  dropping it (adapter.py:359/:297 — _split_message returns [""] and send() puts it on
+  the wire); wireSend normalizes pure-whitespace chunks to "" at transmission (A19 scrub
+  has already turned control bytes into spaces) rather than skipping; NEW tests: door-1
+  whitespace send ⇒ exactly one empty-content wire op, markdown-stripped-to-"__" ships
+  verbatim (strip-at-send vendor order), paced deliverLongText lane collapses blank
+  content to the same empty-trailing shape. Removed now-unused IrcAdapter.nowMs().
+  Tests conformed to CONFORMING behavior only; contracts strengthened everywhere (bare
+  form asserted, URL/auth recorded+asserted, empty-trailing delivery required).
+  Suite: full tree 223/223 files · 2738/2738 green; whole-tree tsc clean; irc 21/21,
+  sms+irc rows 14/14; transient mid-flight failures seen in sibling ntfy/HA rows during
+  the window were those clusters' in-flight files and converged to green by close.
+
+- Stability round-2 fix cluster `ntfy-ha-r2` (2026-08-26): ntfy + Home Assistant
+  adapters moved onto Hermes truth at /tmp/hermes-upstream anchors (all six
+  findings; every change a convergence toward reference behavior — no DEC deltas
+  needed). nthaha-1: subscribe contract now carries authHeaders built via
+  buildAuthHeader on EVERY stream GET {server}/{topic}/json (adapter.py:_run_stream
+  :233-234) — FakeNtfyServer.subscribe(topic, authHeaders) models the vendor RESPONSE
+  as NtfySubscribeOutcome ({subscribed|refused·status·body}) and VALIDATES the
+  presented Authorization header against requiredAuthHeader before admitting any
+  reader (subscribeLog records every attempt + presented headers). nthaha-5:
+  openStream classifies fatality from the MODELED status code alone (401 ⇒ FATAL
+  ntfy_unauthorized, 404 ⇒ FATAL ntfy_topic_not_found, adapter.py:_consume_stream
+  :240-262) — authRejectMode knob DELETED and error-string-substring coupling
+  removed. nthaha-2: id-less events mint a UNIQUE per-event fallback dedup id
+  (randomUUID de-hyphenated = uuid4().hex parity, adapter.py:_on_message :334);
+  constant 'uuid-fallback' collision that dropped all but the first is dead.
+  nthaha-3: disconnect() ends with seenMessages.clear() (adapter.py:disconnect
+  :327) so reconnect generations re-dispatch server redelivery of ids seen under
+  the previous one. nthaha-4: ntfy deliverText issues ONE POST truncated to
+  content[:4096] with the vendor warning lane ("Message truncated from N to 4096
+  chars (ntfy limit)", warningLog + logger, adapter.py:send :429-439) — labeled
+  multi-publish planLabeledParagraphs/hardSplit lane DELETED despite
+  splitsLongMessages:false; inert per-chat utf16 budget descriptor removed (no
+  per-chat budgets on this source; line-r2 precedent). nthaha-8: HA deliverText
+  sends ONE persistent_notification/create POST with message=content[:4096] and
+  the byte-exact "Hermes Agent" title (branding datum untouched pending its DEC;
+  adapter.py:send :424-432) — chunkWithFenceCarry plan deleted from deliverText,
+  inert utf16 descriptor removed. Harness conformed via probe-driven exclusions
+  (LINE_NATIVE_SPLIT_TRUNCATES precedent): new manifest data NTFY_SEND_TRUNCATES /
+  HA_SEND_TRUNCATES=true exclude the kit LOSSLESS-split shared family
+  (egress.chunk-flood / egress.per-chat-length-pair) in ntfy-rows +
+  homeassistant-rows (exact-exclusion assertions kept); transport.ntfy.publish-shapes
+  rewritten to single-POST-truncation truth (+auth-positive leg: matching credential
+  admitted with buildAuthHeader output asserted on the wire GET); resubscribe-replay
+  leg remapped honestly (held-window losslessness + same-generation same-id
+  suppression; cross-generation redelivery re-dispatch = nthaha-3 contract, also
+  rowed in stream-dedup-window tail and ntfy.test disconnect-clears contract);
+  transport.ha.rest-send-shape extended with the deliverLongText oversized leg
+  (ONE create POST, message=4096 z's, byte-exact title); lying-fixture detail text
+  updated. New unit contracts: subscribe-authHeaders admission/refusal, modeled-401
+  fatal, fallback-id uniqueness ×3 events, disconnect clears map + redelivery
+  re-dispatch, one-post truncation ±warning. Subject gained token passthrough for
+  token-protected-topic rows. NOTE: concurrent cluster's untracked
+  ntfy-standalone.ts landed mid-window and reuses buildAuthHeader (compatible);
+  full tree 223/223 files · 2738/2738 green · whole-tree tsc clean at close.
+
+- Stability round-2 fix cluster `egress-router-r2` (2026-08-26): outbound
+  delivery/targets + media grammar + egress-door draft coordination moved onto
+  Hermes truth at /tmp/hermes-upstream (findings egress-5, stream-egress-6,
+  egress-8; no DEC deltas — pure convergence toward reference behavior).
+  egress-5: DeliveryRouter.deliverToPlatform ports the named-private-topic
+  branch of delivery.py:_deliver_to_platform — a NON-numeric thread id on a
+  positive (private-shape) chat id is a topic NAME resolved/created via
+  adapter.ensure_dm_topic BEFORE the send (RouterAdapter gains optional
+  ensureDmTopic(chatId, name, forceCreate?); absent capability or null
+  creation FAILS CLOSED pre-flight instead of sending a raw name to the wire
+  as message_thread_id), a legacy NUMERIC private topic requires
+  telegram_reply_to_message_id and stamps telegram_dm_topic_reply_fallback,
+  metadata thread keys win over the target string via membership checks
+  (`"thread_id" not in send_metadata` parity, not undefined-value checks), and
+  a "thread not found" failure on a created topic force-recreates ONCE
+  (force_create=true) then retries exactly once under the refreshed binding;
+  parseDeliveryTarget switched to split-at-first-two-colons semantics
+  (DeliveryTarget.parse maxsplit=2) so thread NAMES containing colons
+  ("telegram:123:Hermes API: Test") stay whole instead of truncating at the
+  third colon. stream-egress-6: MEDIA_TAG_CLEANUP_RE trailing wrapper class
+  gains the apostrophe ([`"'*_]{0,3}, base.py byte-parity) so a bare-path tag
+  followed by a stray ' cleans both wrappers instead of leaving visible
+  punctuation. egress-8: turnKey gains the thread-anchor tier of
+  relay/adapter.py:_draft_key (message ids → thread_ts/thread_id → bare chat)
+  so two identity-less same-chat turns in DIFFERENT threads stop sharing one
+  seal key, and openDraftByKey/sealedDraftByKey are FIFO-capped at
+  DRAFT_STATE_CAP=512 (_evict_oldest parity; Map insertion order = dict
+  update-in-place parity) so per-turn coordination state can no longer grow
+  unbounded for process life. Tests conformed to CONFORMING behavior + new
+  contracts: old "explicit thread id lands in thread metadata" row moved to a
+  group chat id (positive-chat + non-numeric thread now fails closed by
+  design); NEW named-topic describe pins create-before-send wire metadata,
+  fail-closed on missing capability/null creation, reply-fallback lane with
+  anchor, pre-flight failure without anchor (never dead-tracked), stale-topic
+  refresh+retry-once with refreshed thread id on attempt 2, retry-still-
+  failing surfacing the send error without marking the chat dead, metadata
+  thread-key/direct-messages-topic precedence, group chats bypassing the
+  ladder; NEW maxsplit=2 round-trip row; NEW apostrophe-wrapper cleanup row;
+  NEW turnKey tier table + cross-thread seal-key contract + 512 FIFO cap rows
+  for both coordination maps. Suite: scoped outbound/ + egress-door +
+  streaming/testing 212/212 across 10 files; layering + secret-scope clean;
+  cluster files tsc clean. Full tree at close: 2810/2812 green across 227
+  files — residual 2 failures (compression-tip) + 1 unhandled rejection
+  (telegram-topic-recovery, also carrying pre-existing tsc errors) confined
+  to ANOTHER concurrent cluster's in-flight resolution/pi_state files
+  (zero imports from this cluster's modules; those files were being edited
+  mid-run by the sibling agent), verified unrelated to this change.

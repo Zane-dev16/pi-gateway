@@ -39,6 +39,20 @@ describe("target-string grammar (DeliveryTarget.parse)", () => {
 		expect(t.isExplicit).toBe(true);
 	});
 
+	it("thread NAMES containing colons survive: split stops at the first two colons (maxsplit=2)", () => {
+		// A named Telegram DM topic like "Hermes API: Test" used to be truncated
+		// at the third colon, sending a bare NAME fragment as the thread id.
+		const t = parseDeliveryTarget("telegram:722341991:Hermes API: Test");
+		expect(t.platform).toBe("telegram");
+		expect(t.chatId).toBe("722341991");
+		expect(t.threadId).toBe("Hermes API: Test");
+		expect(t.isExplicit).toBe(true);
+		// Round-trip keeps every colon.
+		expect(deliveryTargetToString(t)).toBe(
+			"telegram:722341991:Hermes API: Test",
+		);
+	});
+
 	it("origin resolves against the RECORDED origin; falls back LOCAL when none", () => {
 		expect(parseDeliveryTarget("origin", ORIGIN_DM)).toEqual({
 			platform: "telegram",

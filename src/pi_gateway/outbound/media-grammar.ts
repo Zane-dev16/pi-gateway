@@ -156,7 +156,7 @@ export const MEDIA_TAG_CLEANUP_RE = new RegExp(
 		"))" +
 		"(?=[\\s`\"'*_,;:)\\]}\\[" +
 		CJK_TERMINATORS +
-		']|MEDIA:|\\.(?:\\s|$)|$)[`"*_]{0,3}\\.?',
+		"]|MEDIA:|\\.(?:\\s|$)|$)[`\"'*_]{0,3}\\.?",
 	"gi",
 );
 

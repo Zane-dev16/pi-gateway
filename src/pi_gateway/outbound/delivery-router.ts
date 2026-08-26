@@ -13,7 +13,12 @@
 //     chunking-capable ones;
 //   - substrate-level anti-loop: pure silence-narration tokens drop before
 //     egress; LOCAL delivery is never filtered;
-//   - relay home-channel sends re-attach user_id/scope_id metadata.
+//   - relay home-channel sends re-attach user_id/scope_id metadata;
+//   - Telegram private-chat threads: a non-numeric thread id is a topic NAME
+//     created via adapter.ensureDmTopic before sending (fail closed when the
+//     adapter lacks the capability), a legacy numeric one requires a reply
+//     anchor, and a "thread not found" failure on a created topic refreshes
+//     (force-create) and retries ONCE.
 //
 // Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
 //   gateway/delivery.py:MAX_PLATFORM_OUTPUT        → MAX_PLATFORM_OUTPUT
@@ -80,6 +85,18 @@ export interface RouterAdapter {
 	): Promise<SendResult>;
 	/** Relay-only capability advertisement. */
 	frontsPlatform?(platform: string): boolean;
+	/**
+	 * Named-DM-topic capability (telegram adapter.py:ensure_dm_topic): resolve
+	 * a private-chat DM-topic thread id by NAME, creating it when absent;
+	 * `forceCreate` rebuilds a stale/deleted topic. OPTIONAL — when absent,
+	 * named-topic deliveries FAIL CLOSED (delivery.py raises instead of
+	 * sending a raw topic name to the wire as message_thread_id).
+	 */
+	ensureDmTopic?(
+		chatId: string,
+		topicName: string,
+		forceCreate?: boolean,
+	): Promise<string | null>;
 }
 
 export interface SendResult {
@@ -290,20 +307,111 @@ export class DeliveryRouter {
 				if (home.scopeId !== undefined) metadata.scope_id = home.scopeId;
 			}
 		}
-		if (
-			target.threadId &&
-			metadata.thread_id === undefined &&
-			metadata.message_thread_id === undefined
-		) {
-			metadata.thread_id = target.threadId;
+
+		// Telegram private-chat thread ladder (_deliver_to_platform). A
+		// NON-numeric thread id on a positive chat id is a topic NAME — it is
+		// resolved/created via adapter.ensureDmTopic BEFORE the send (a raw name
+		// must never reach the wire as message_thread_id); a numeric one is a
+		// legacy forum-topic id that stays visible only with a reply anchor.
+		// Metadata thread keys WIN over the target string — membership checks,
+		// not value checks (`"thread_id" not in send_metadata` parity).
+		let isNamedPrivateTopic = false;
+		let namedTopicName: string | null = null;
+		if (target.threadId) {
+			const hasExplicitDirectTopic =
+				"direct_messages_topic_id" in metadata ||
+				"telegram_direct_messages_topic_id" in metadata;
+			const hasThreadKey =
+				"thread_id" in metadata || "message_thread_id" in metadata;
+			let targetThreadId: string = target.threadId;
+			isNamedPrivateTopic =
+				target.platform === TELEGRAM_PLATFORM &&
+				looksLikeTelegramPrivateChatId(target.chatId) &&
+				!looksLikeInt(targetThreadId) &&
+				!hasThreadKey &&
+				!hasExplicitDirectTopic;
+			if (isNamedPrivateTopic) {
+				namedTopicName = targetThreadId;
+				const ensureDmTopic = transport.adapter.ensureDmTopic;
+				if (typeof ensureDmTopic !== "function") {
+					throw new Error(
+						"Telegram adapter cannot create named private DM topics",
+					);
+				}
+				const createdThreadId = await ensureDmTopic.call(
+					transport.adapter,
+					target.chatId ?? "",
+					targetThreadId,
+				);
+				if (!createdThreadId) {
+					throw new Error(
+						`Failed to create Telegram private DM topic '${targetThreadId}'`,
+					);
+				}
+				targetThreadId = String(createdThreadId);
+				metadata.thread_id = targetThreadId;
+				metadata.telegram_dm_topic_created_for_send = true;
+			} else if (
+				target.platform === TELEGRAM_PLATFORM &&
+				looksLikeTelegramPrivateChatId(target.chatId) &&
+				!hasThreadKey &&
+				!hasExplicitDirectTopic
+			) {
+				// Legacy private topic/thread ids that were not created by this
+				// send path may still need a reply anchor to stay visible in the
+				// requested lane. Named targets are created above via
+				// createForumTopic and can use message_thread_id directly.
+				const replyAnchor = metadata.telegram_reply_to_message_id;
+				if (replyAnchor === undefined || replyAnchor === null) {
+					throw new Error(
+						"Telegram private DM topic delivery requires telegram_reply_to_message_id; " +
+							"send to the bare chat or provide a reply anchor",
+					);
+				}
+				metadata.thread_id = targetThreadId;
+				metadata.telegram_dm_topic_reply_fallback = true;
+			} else if (!hasThreadKey && !hasExplicitDirectTopic) {
+				metadata.thread_id = targetThreadId;
+			}
 		}
 
-		const sendResult = await transport.adapter.send(
-			target.platform,
-			target.chatId ?? "",
-			payload,
-			Object.keys(metadata).length > 0 ? metadata : undefined,
-		);
+		const wireSend = () =>
+			transport.adapter.send(
+				target.platform,
+				target.chatId ?? "",
+				payload,
+				Object.keys(metadata).length > 0 ? metadata : undefined,
+			);
+		let sendResult = await wireSend();
+		if (
+			!sendResult.success &&
+			isNamedPrivateTopic &&
+			namedTopicName !== null &&
+			isThreadNotFoundDeliveryError(sendResult.error)
+		) {
+			// Stale/deleted created topic: force-recreate ONCE and retry under
+			// the fresh thread id (delivery.py refresh ladder).
+			const ensureDmTopic = transport.adapter.ensureDmTopic;
+			if (typeof ensureDmTopic !== "function") {
+				throw new Error(
+					"Telegram adapter cannot refresh named private DM topics",
+				);
+			}
+			const refreshedThreadId = await ensureDmTopic.call(
+				transport.adapter,
+				target.chatId ?? "",
+				namedTopicName,
+				true,
+			);
+			if (!refreshedThreadId) {
+				throw new Error(
+					`Failed to refresh Telegram private DM topic '${namedTopicName}'`,
+				);
+			}
+			metadata.thread_id = String(refreshedThreadId);
+			metadata.telegram_dm_topic_created_for_send = true;
+			sendResult = await wireSend();
+		}
 		if (!sendResult.success) {
 			throw new Error(sendResult.error ?? `${target.platform} delivery failed`);
 		}
@@ -360,6 +468,32 @@ function targetKey(t: DeliverTargetInput): string {
 	if (t.chatId && t.threadId) return `${t.platform}:${t.chatId}:${t.threadId}`;
 	if (t.chatId) return `${t.platform}:${t.chatId}`;
 	return t.platform;
+}
+
+const TELEGRAM_PLATFORM = "telegram";
+
+/**
+ * True when chat_id is a positive int — Telegram's private-chat shape
+ * (delivery.py:looks_like_telegram_private_chat_id; groups/channels/
+ * supergroups use negative ids).
+ */
+function looksLikeTelegramPrivateChatId(chatId: string | undefined): boolean {
+	if (!chatId) return false;
+	const text = chatId.trim();
+	if (!/^[+-]?\d+$/.test(text)) return false; // Python int() strictness
+	return Number.parseInt(text, 10) > 0;
+}
+
+/** Python int() parseability (delivery.py:_looks_like_int). */
+function looksLikeInt(value: string): boolean {
+	return /^[+-]?\d+$/.test(value.trim());
+}
+
+/** delivery.py:_is_thread_not_found_delivery_error. */
+function isThreadNotFoundDeliveryError(
+	error: string | null | undefined,
+): boolean {
+	return !!error && error.toLowerCase().includes("thread not found");
 }
 
 /**

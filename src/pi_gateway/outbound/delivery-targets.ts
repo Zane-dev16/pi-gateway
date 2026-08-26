@@ -7,7 +7,9 @@
 //   local               → files under $HERMES_HOME/cron/output/ only
 //   telegram            → the platform HOME channel
 //   telegram:123456     → explicit chat id
-//   <plat>:<chat>:<thr> → explicit chat + thread
+//   <plat>:<chat>:<thr> → explicit chat + thread (split at the FIRST TWO
+//                         colons — DeliveryTarget.parse maxsplit=2 — so
+//                         thread names containing colons stay whole)
 //
 // Per-delivery precedence: EXPLICIT TARGET > HOME CHANNEL > ORIGIN > LOCAL.
 //
@@ -86,10 +88,13 @@ export function parseDeliveryTarget(
 	}
 
 	if (stripped.includes(":")) {
-		const parts = stripped.split(":", 3);
+		// Python maxsplit=2 parity: split at the FIRST TWO colons only, so a
+		// thread NAME containing colons stays whole in the third component
+		// ("telegram:123:Hermes API: Test" ⇒ thread "Hermes API: Test").
+		const parts = stripped.split(":");
 		const platformStr = (parts[0] ?? "").toLowerCase();
 		const chatId = parts[1];
-		const threadId = parts[2];
+		const threadId = parts.length > 2 ? parts.slice(2).join(":") : undefined;
 		if (!isPlatformToken(platformStr) || !chatId) {
 			return { platform: LOCAL_PLATFORM, isOrigin: false, isExplicit: false };
 		}

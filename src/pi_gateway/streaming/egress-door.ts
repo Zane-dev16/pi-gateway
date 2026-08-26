@@ -103,16 +103,50 @@ interface LaneIds {
 }
 
 /**
- * Turn-scoped draft key — parity of relay/adapter.py:_draft_key: per-(chat,
- * turn) identity from metadata message ids; bare-chat fallback for
- * identity-less callers.
+ * Turn-scoped draft key — parity of relay/adapter.py:_draft_key. Tier order:
+ *
+ *   1. PER-TURN identity — message ids (reply_to_message_id / message_id
+ *      carry the same event id);
+ *   2. thread anchor — thread_ts / thread_id (placement info for callers
+ *      that only have it); two identity-less turns in DIFFERENT threads of
+ *      one chat must not share a seal key;
+ *   3. bare chat — single-turn semantics last resort.
  */
 export function turnKey(chatId: string, md: Metadata | undefined): string {
 	const m = md ?? {};
 	const turn = m[REPLY_TO_METADATA_KEY] ?? m["message_id"];
-	return typeof turn === "string" && turn.length > 0
-		? `${chatId}|${turn}`
-		: `${chatId}|_`;
+	if (typeof turn === "string" && turn.length > 0) {
+		return `${chatId}|${turn}`;
+	}
+	const anchor =
+		firstTurnAnchor(m["thread_ts"]) ?? firstTurnAnchor(m["thread_id"]);
+	return anchor !== undefined ? `${chatId}|${anchor}` : `${chatId}|_`;
+}
+
+/** Python truthiness for an anchor slot: non-empty strings, non-zero numbers. */
+function firstTurnAnchor(value: unknown): string | undefined {
+	if (typeof value === "string" && value.length > 0) return value;
+	if (typeof value === "number" && value !== 0) return String(value);
+	return undefined;
+}
+
+/**
+ * Cap for the draft/seal coordination maps, matching the sibling bounded
+ * caches (relay/adapter.py:_DRAFT_STATE_CAP). Entries are per-turn keys; 512
+ * in-flight-or-recent turns per adapter is far beyond any real concurrency.
+ * The key embeds a per-turn identity, so an unbounded map grows one entry per
+ * turn for the life of the process — FIFO eviction matches the straggler
+ * window the tombstones exist for (seconds, not days).
+ */
+export const DRAFT_STATE_CAP = 512;
+
+/** FIFO-bound a coordination map in place (relay/adapter.py:_evict_oldest). */
+function evictOldest(d: Map<string, number>): void {
+	while (d.size > DRAFT_STATE_CAP) {
+		const oldest = d.keys().next();
+		if (oldest.done === true) break;
+		d.delete(oldest.value);
+	}
 }
 
 function contentPreview(text: string): string {
@@ -264,6 +298,7 @@ export class EgressChokepoint {
 	/** Arm interception for an emitted draft frame (post-admission). */
 	armOpenDraft(key: string, draftId: number): void {
 		this.openDraftByKey.set(key, draftId);
+		evictOldest(this.openDraftByKey);
 	}
 
 	// ── internals shared with the doors ────────────────────────────────────
@@ -314,6 +349,7 @@ export class EgressChokepoint {
 		}
 		this.openDraftByKey.delete(draftKey);
 		this.sealedDraftByKey.set(draftKey, draftId);
+		evictOldest(this.sealedDraftByKey);
 		const seal = await this.transport.transmitSeal(
 			draftKey,
 			chatId,

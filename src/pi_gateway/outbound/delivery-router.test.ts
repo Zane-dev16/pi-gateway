@@ -436,7 +436,7 @@ describe("per-target behavior", () => {
 		expect(calls[1]?.metadata?.user_id).toBeUndefined(); // unrelated target
 	});
 
-	it("explicit thread id lands in thread metadata when unset", async () => {
+	it("explicit thread id lands in thread metadata when unset (group chat ⇒ generic stamping)", async () => {
 		const { adapter, sent } = makeAdapter("tg");
 		const router = new DeliveryRouter(
 			CONFIG,
@@ -448,9 +448,9 @@ describe("per-target behavior", () => {
 			content: "hi",
 			targets: [
 				{
-					targetString: "telegram:3:T7",
+					targetString: "telegram:-1003:T7",
 					platform: "telegram",
-					chatId: "3",
+					chatId: "-1003",
 					threadId: "T7",
 					isExplicit: true,
 				},
@@ -458,5 +458,268 @@ describe("per-target behavior", () => {
 			now: INJECTED_NOW,
 		});
 		expect(sent[0]?.metadata?.thread_id).toBe("T7");
+	});
+});
+
+// Named Telegram private DM topics (delivery.py:_deliver_to_platform; egress-5).
+// A non-numeric thread id on a POSITIVE chat id is a topic NAME — resolved via
+// adapter.ensure_dm_topic BEFORE the send, never sent to the wire verbatim.
+describe("named Telegram private DM topics (_deliver_to_platform)", () => {
+	interface TopicCall {
+		chatId: string;
+		topicName: string;
+		forceCreate: boolean | undefined;
+	}
+
+	function topicAdapter(opts?: {
+		failFirstSendWith?: string;
+		ensureReturns?: string | null;
+	}) {
+		const sent: SentRecord[] = [];
+		const ensureCalls: TopicCall[] = [];
+		const adapter: RouterAdapter = {
+			name: "tg-topics",
+			send: async (platform, chatId, content, metadata) => {
+				// Snapshot metadata AT SEND TIME (Hermes RecordingAdapter parity:
+				// dict(metadata or {})) — the refresh ladder mutates the dict
+				// between attempt 1 and the retry.
+				sent.push({
+					platform,
+					chatId,
+					content,
+					metadata: metadata ? { ...metadata } : metadata,
+				});
+				if (opts?.failFirstSendWith !== undefined && sent.length === 1) {
+					return { success: false, error: opts.failFirstSendWith };
+				}
+				return { success: true } satisfies SendResult;
+			},
+			ensureDmTopic: async (chatId, topicName, forceCreate) => {
+				ensureCalls.push({ chatId, topicName, forceCreate });
+				return opts?.ensureReturns !== undefined
+					? opts.ensureReturns
+					: forceCreate
+						? "38064"
+						: "38049";
+			},
+		};
+		return { adapter, sent, ensureCalls };
+	}
+
+	function routerWith(adapter: RouterAdapter): DeliveryRouter {
+		return new DeliveryRouter(
+			CONFIG,
+			{ telegram: adapter },
+			new DeadTargetRegistry(),
+			outputDir,
+		);
+	}
+
+	const NAMED = {
+		targetString: "telegram:722341991:Hermes API Test",
+		platform: "telegram",
+		chatId: "722341991",
+		threadId: "Hermes API Test",
+		isExplicit: true,
+	};
+
+	it("named private topic is created BEFORE delivery; wire metadata carries the created thread id", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter();
+		const r = await routerWith(adapter).deliver({
+			content: "hello",
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(r[NAMED.targetString]?.success).toBe(true);
+		expect(ensureCalls).toEqual([
+			{
+				chatId: "722341991",
+				topicName: "Hermes API Test",
+				forceCreate: undefined,
+			},
+		]);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.metadata).toEqual({
+			thread_id: "38049",
+			telegram_dm_topic_created_for_send: true,
+		});
+	});
+
+	it("FAILS CLOSED when the adapter cannot create named topics — raw name never reaches the wire", async () => {
+		const bare = makeAdapter("tg-no-topics");
+		const r = await routerWith(bare.adapter).deliver({
+			content: "hello",
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(r[NAMED.targetString]?.success).toBe(false);
+		expect(r[NAMED.targetString]?.error).toContain(
+			"cannot create named private DM topics",
+		);
+		expect(bare.sent).toEqual([]); // no wire send with a NAME as thread_id
+	});
+
+	it("creation returning null fails closed", async () => {
+		const { adapter, sent } = topicAdapter({ ensureReturns: null });
+		const r = await routerWith(adapter).deliver({
+			content: "hello",
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(r[NAMED.targetString]?.error).toBe(
+			"Failed to create Telegram private DM topic 'Hermes API Test'",
+		);
+		expect(sent).toEqual([]);
+	});
+
+	it("legacy NUMERIC private topic WITH a reply anchor uses the reply-fallback lane", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter();
+		await routerWith(adapter).deliver({
+			content: "hello",
+			metadata: { telegram_reply_to_message_id: "9001" },
+			targets: [
+				{
+					targetString: "telegram:722341991:32344",
+					platform: "telegram",
+					chatId: "722341991",
+					threadId: "32344",
+					isExplicit: true,
+				},
+			],
+			now: INJECTED_NOW,
+		});
+		expect(ensureCalls).toEqual([]); // numeric id ⇒ no creation
+		expect(sent[0]?.metadata).toEqual({
+			telegram_reply_to_message_id: "9001",
+			thread_id: "32344",
+			telegram_dm_topic_reply_fallback: true,
+		});
+	});
+
+	it("legacy NUMERIC private topic WITHOUT a reply anchor fails closed pre-flight", async () => {
+		const { adapter, sent } = topicAdapter();
+		const r = await routerWith(adapter).deliver({
+			content: "hello",
+			targets: [
+				{
+					targetString: "telegram:722341991:32344",
+					platform: "telegram",
+					chatId: "722341991",
+					threadId: "32344",
+					isExplicit: true,
+				},
+			],
+			now: INJECTED_NOW,
+		});
+		expect(r["telegram:722341991:32344"]?.success).toBe(false);
+		expect(r["telegram:722341991:32344"]?.error).toContain(
+			"requires telegram_reply_to_message_id",
+		);
+		expect(sent).toEqual([]);
+		// Pre-flight failure is not a dead target (no forbidden/chat not_found).
+		expect(classifiesWholeChatDeath(r["telegram:722341991:32344"]?.error)).toBe(
+			false,
+		);
+	});
+
+	it("stale created topic: 'thread not found' failure refreshes (force_create) and retries ONCE", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter({
+			failFirstSendWith: "Bad Request: message thread not found",
+		});
+		const r = await routerWith(adapter).deliver({
+			content: "hello",
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(r[NAMED.targetString]?.success).toBe(true);
+		expect(ensureCalls).toEqual([
+			{
+				chatId: "722341991",
+				topicName: "Hermes API Test",
+				forceCreate: undefined,
+			},
+			{ chatId: "722341991", topicName: "Hermes API Test", forceCreate: true },
+		]);
+		expect(sent).toHaveLength(2); // exactly ONE retry
+		expect(sent[0]?.metadata?.thread_id).toBe("38049");
+		expect(sent[1]?.metadata?.thread_id).toBe("38064"); // refreshed binding
+		expect(sent[1]?.metadata?.telegram_dm_topic_created_for_send).toBe(true);
+	});
+
+	it("refresh retry failing too surfaces the send error; thread-level failure never marks the chat dead", async () => {
+		const registry = new DeadTargetRegistry();
+		const sent: SentRecord[] = [];
+		const adapter: RouterAdapter = {
+			name: "tg-always-stale",
+			ensureDmTopic: async () => "38099",
+			send: async (platform, chatId, content, metadata) => {
+				sent.push({ platform, chatId, content, metadata });
+				return {
+					success: false,
+					error: "Bad Request: message thread not found",
+				};
+			},
+		};
+		const router = new DeliveryRouter(
+			CONFIG,
+			{ telegram: adapter },
+			registry,
+			outputDir,
+		);
+		const r = await router.deliver({
+			content: "hello",
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(r[NAMED.targetString]?.success).toBe(false);
+		expect(sent).toHaveLength(2); // initial + one refresh retry, then give up
+		expect(registry.isDead("telegram", "722341991")).toBe(false);
+	});
+
+	it("metadata thread keys WIN over the target string: no creation, no stamping", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter();
+		await routerWith(adapter).deliver({
+			content: "hi",
+			metadata: { thread_id: "555" },
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(ensureCalls).toEqual([]);
+		expect(sent[0]?.metadata?.thread_id).toBe("555");
+		expect(
+			sent[0]?.metadata?.telegram_dm_topic_created_for_send,
+		).toBeUndefined();
+	});
+
+	it("explicit direct-messages-topic metadata bypasses the named-topic branch entirely", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter();
+		await routerWith(adapter).deliver({
+			content: "hi",
+			metadata: { direct_messages_topic_id: "777" },
+			targets: [NAMED],
+			now: INJECTED_NOW,
+		});
+		expect(ensureCalls).toEqual([]);
+		expect(sent[0]?.metadata?.direct_messages_topic_id).toBe("777");
+		expect(sent[0]?.metadata?.thread_id).toBeUndefined();
+	});
+
+	it("GROUP chats (negative ids) never enter the ladder — plain generic stamping", async () => {
+		const { adapter, sent, ensureCalls } = topicAdapter();
+		await routerWith(adapter).deliver({
+			content: "hi",
+			targets: [
+				{
+					targetString: "telegram:-100777:Hermes API Test",
+					platform: "telegram",
+					chatId: "-100777",
+					threadId: "Hermes API Test",
+					isExplicit: true,
+				},
+			],
+			now: INJECTED_NOW,
+		});
+		expect(ensureCalls).toEqual([]);
+		expect(sent[0]?.metadata).toEqual({ thread_id: "Hermes API Test" });
 	});
 });

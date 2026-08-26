@@ -377,4 +377,106 @@ describe("draft-frame admission (relay send_draft delegation)", () => {
 			turnKey("c2", { reply_to_message_id: "5" }),
 		);
 	});
+
+	it("turnKey gains the THREAD-ANCHOR tier between message ids and the bare chat (_draft_key tiers)", () => {
+		// Tier 2 alone: placement-only callers key per thread, not per chat.
+		expect(turnKey("c", { thread_ts: "1700000000.123456" })).toBe(
+			"c|1700000000.123456",
+		);
+		expect(turnKey("c", { thread_id: "20197" })).toBe("c|20197");
+		// thread_ts wins over thread_id (Python `or` order).
+		expect(turnKey("c", { thread_ts: "9.1", thread_id: "7" })).toBe("c|9.1");
+		// Tier 1 beats tier 2: message ids are turn identity.
+		expect(
+			turnKey("c", { message_id: "m1", thread_ts: "9.1", thread_id: "7" }),
+		).toBe("c|m1");
+		// Empty/zero anchors are falsy → next tier.
+		expect(turnKey("c", { thread_ts: "", thread_id: 0 })).toBe("c|_");
+		// Different threads of one chat ⇒ different keys; bare stays distinct.
+		expect(turnKey("c", { thread_id: "t1" })).not.toBe(
+			turnKey("c", { thread_id: "t2" }),
+		);
+	});
+
+	it("two identity-less same-chat turns in DIFFERENT threads stop sharing a seal key", async () => {
+		const { cp } = harness();
+		// Turn A streams in thread t1.
+		const vA = cp.draftAdmission({
+			chatId: "chat",
+			draftId: 31,
+			metadata: { thread_id: "t1" },
+		});
+		cp.armOpenDraft(vA.key, 31);
+		const seal = await cp.admit({
+			door: "send",
+			chatId: "chat",
+			content: "thread t1 final",
+			metadata: { thread_id: "t1" },
+		});
+		expect(seal.messageId).toMatch(/^sealed_/); // sealed stream A
+
+		// Turn B streams in thread t2 of the SAME chat: its frames must NOT be
+		// swallowed by A's tombstone (the old chat-wide key collapsed both).
+		const vB = cp.draftAdmission({
+			chatId: "chat",
+			draftId: 32,
+			metadata: { thread_id: "t2" },
+		});
+		expect(vB.key).not.toBe(vA.key);
+		expect(vB.swallow).toBe(false);
+		cp.armOpenDraft(vB.key, 32);
+		expect(cp.isOpenDraft("chat", { thread_id: "t2" })).toBe(true);
+		const sealB = await cp.admit({
+			door: "send",
+			chatId: "chat",
+			content: "thread t2 final",
+			metadata: { thread_id: "t2" },
+		});
+		expect(sealB.messageId).toMatch(/^sealed_/); // seals ITS OWN stream
+		// And each tombstone only covers its own draft id.
+		expect(cp.isSealedDraft("chat", { thread_id: "t1" })).toBe(true);
+		expect(cp.isSealedDraft("chat", { thread_id: "t2" })).toBe(true);
+	});
+
+	it("coordination maps are FIFO-capped at 512 entries (_DRAFT_STATE_CAP)", async () => {
+		const { cp } = harness();
+		for (let i = 0; i < 512; i++) {
+			cp.armOpenDraft(`chat|${i}`, i);
+		}
+		expect(cp.openDraftCount()).toBe(512);
+		cp.armOpenDraft("chat|512", 512); // 513th insert evicts the OLDEST
+		expect(cp.openDraftCount()).toBe(512);
+		expect(cp.openDraftByKey.has("chat|0")).toBe(false); // oldest evicted
+		expect(cp.openDraftByKey.has("chat|512")).toBe(true); // newest retained
+		// Re-arming an EXISTING key keeps its position (dict-update parity):
+		// JS Map preserves original insertion order on re-set, exactly like a
+		// Python dict, so "chat|10" evicts before keys inserted after it.
+		cp.armOpenDraft("chat|10", 10);
+		cp.armOpenDraft("chat|513", 513);
+		expect(cp.openDraftByKey.has("chat|1")).toBe(false); // next-oldest gone
+		expect(cp.openDraftByKey.has("chat|10")).toBe(true);
+
+		// sealedDraftByKey: seal 513 distinct turns ⇒ capped, first tombstone gone.
+		const cp2h = harness();
+		for (let i = 0; i < 513; i++) {
+			const v = cp2h.cp.draftAdmission({
+				chatId: "chat",
+				draftId: 1000 + i,
+				metadata: { reply_to_message_id: String(i) },
+			});
+			cp2h.cp.armOpenDraft(v.key, 1000 + i);
+			await cp2h.cp.admit({
+				door: "send",
+				chatId: "chat",
+				content: `final ${i}`,
+				metadata: { reply_to_message_id: String(i) },
+			});
+		}
+		expect(cp2h.cp.sealedDraftByKey.size).toBe(512);
+		expect(cp2h.cp.sealedDraftByKey.has("chat|0")).toBe(false); // oldest evicted
+		expect(
+			cp2h.cp.draftAdmission({ chatId: "chat", draftId: 1000 }).swallow,
+		).toBe(false); // evicted tombstone no longer swallows
+		expect(cp2h.cp.sealedDraftByKey.has("chat|512")).toBe(true); // newest kept
+	});
 });

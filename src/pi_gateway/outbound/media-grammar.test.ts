@@ -198,6 +198,12 @@ describe("tag parsing edge cases", () => {
 		expect(media.map((m) => m.path)).toEqual(["/a.png", "/b.png"]);
 	});
 
+	it("trailing wrapper class includes the apostrophe (base.py [`\"'*_]{0,3} parity): stray ' cleans with the tag", () => {
+		const { media, cleaned } = extract("report MEDIA:/x.pdf' attached");
+		expect(media.map((m) => m.path)).toEqual(["/x.pdf"]);
+		expect(cleaned).not.toContain("'");
+	});
+
 	it("markdown emphasis wrappers tolerated (**MEDIA:…**, *…*, _…_)", () => {
 		const { media } = extract(
 			"**MEDIA:/x.pdf** and *MEDIA:/y.docx* and _MEDIA:/z.epub_",
