@@ -1,6 +1,7 @@
 // Behavior contracts: happy-path final delivery, cache stability (byte-
 // identical system prompt + toolset across consecutive turns), DEC-015
-// alternation repair on the WIRE with persisted bytes untouched, the
+// alternation repair as a PRE-CALL chokepoint on the WIRE (every model call,
+// INCLUDING the freshly appended user turn; persisted bytes untouched), the
 // two-layer turn-lease prologue (02 §5 / DEC-004), the UNLIMITED turn-limit
 // default (config.py:TURN_LIMIT_UNLIMITED parity), and the periodic agent-
 // cache idle sweep (_session_expiry_watcher wiring).
@@ -149,13 +150,22 @@ describe("cache stability (05 §8)", () => {
 	});
 });
 
-describe("alternation repair PRE-REQUEST (DEC-015)", () => {
-	it("compacts a replayed user→user tail onto the wire; persisted rows untouched", async () => {
+describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
+	/** Flatten a wire user message's content to plain text. */
+	const userText = (content: unknown): string => {
+		if (typeof content === "string") return content;
+		return (content as Array<{ type: string; text?: string }>)
+			.filter((b) => b.type === "text")
+			.map((b) => b.text ?? "")
+			.join("");
+	};
+
+	it("compacts a crash-tail user→user→fresh-ask onto ONE wire user; persisted rows untouched", async () => {
 		const h = await createRunnerHarness();
 		try {
 			h.ensureSession("repair-sess");
-			// Seed malformed history DIRECTLY as rows (crash-between-appends shape):
-			// user, user adjacent.
+			// Seed malformed history DIRECTLY as rows (multi-queue replay shape):
+			// two durable users adjacent, neither ever answered.
 			await h.store.appendMessage({
 				sessionId: "repair-sess",
 				role: "user",
@@ -171,13 +181,6 @@ describe("alternation repair PRE-REQUEST (DEC-015)", () => {
 			const beforeRows = h.store.listMessages("repair-sess");
 
 			const wireUserContents: string[] = [];
-			const userText = (content: unknown): string => {
-				if (typeof content === "string") return content;
-				return (content as Array<{ type: string; text?: string }>)
-					.filter((b) => b.type === "text")
-					.map((b) => b.text ?? "")
-					.join("");
-			};
 			h.faux.setResponses([
 				(context: Context) => {
 					for (const m of context.messages) {
@@ -194,15 +197,14 @@ describe("alternation repair PRE-REQUEST (DEC-015)", () => {
 				routingKey: "rk",
 				text: "live third message",
 			});
-			expect(outcome.repairs).toBe(1); // one merge event
+			expect(outcome.repairs).toBe(2); // tail pair merge, then tail+fresh-ask merge
 			expect(outcome.exitReason).toBe("finalized");
 
-			// Wire copy repaired: exactly TWO user messages reach the model —
-			// the merged tail (both inputs preserved, blank-line joined) and the
-			// live message; NOT three adjacent users.
+			// Wire copy repaired at THE API CALL (conversation_loop parity): the
+			// chokepoint sees the freshly appended ask, so exactly ONE user
+			// message reaches the model — no input lost, NO user;user adjacency.
 			expect(wireUserContents).toEqual([
-				"first queued message\n\nsecond queued message",
-				"live third message",
+				"first queued message\n\nsecond queued message\n\nlive third message",
 			]);
 
 			// Persisted bytes UNTOUCHED: the two original rows keep their own
@@ -217,6 +219,163 @@ describe("alternation repair PRE-REQUEST (DEC-015)", () => {
 			expect(afterRows[1]!.id).toBe(beforeRows[1]!.id);
 			expect(afterRows[1]!.content).toBe("second queued message");
 			expect(afterRows[1]!.api_content).toBe("second queued message");
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("a SINGLE crash-orphaned user row merges WITH the fresh ask pre-request; every model call of the turn stays alternation-clean", async () => {
+		// The shape the old one-shot pre-append pass missed: repair ran before
+		// prompt() appended the live user turn, so a trailing durable row
+		// (crash between the user-row persist and the assistant reply) plus the
+		// new ask reached the provider as consecutive users.
+		const h = await createRunnerHarness();
+		try {
+			h.ensureSession("crash-tail");
+			await h.store.appendMessage({
+				sessionId: "crash-tail",
+				role: "user",
+				content: "queued before the crash",
+				apiContent: "queued before the crash",
+			});
+
+			const requestUserShapes: Array<Array<{ role: string; text: string }>> =
+				[];
+			const capture = (context: Context): void => {
+				requestUserShapes.push(
+					context.messages.map((m) => ({
+						role: m.role,
+						text: m.role === "user" ? userText(m.content) : "",
+					})),
+				);
+			};
+			h.faux.setResponses([
+				(context: Context) => {
+					capture(context);
+					return fauxAssistantMessage([
+						fauxToolCall("echo", { say: "step" }, { id: "tc-1" }),
+					]);
+				},
+				(context: Context) => {
+					capture(context);
+					return fauxAssistantMessage("done");
+				},
+			]);
+
+			const outcome = await h.runner.handleTurn({
+				sessionId: "crash-tail",
+				routingKey: "rk",
+				text: "live after restart",
+			});
+			expect(outcome.exitReason).toBe("finalized");
+			expect(outcome.repairs).toBeGreaterThanOrEqual(1);
+
+			// Request 1: orphaned tail + fresh ask merged into ONE user message.
+			expect(requestUserShapes[0]).toEqual([
+				{ role: "user", text: "queued before the crash\n\nlive after restart" },
+			]);
+			// Request 2 (post-toolResult): still exactly one, merged user — the
+			// chokepoint re-runs before EVERY model call.
+			expect(requestUserShapes[1]!.map((m) => m.role)).toEqual([
+				"user",
+				"assistant",
+				"toolResult",
+			]);
+			for (const shape of requestUserShapes) {
+				expect(shape.filter((m) => m.role === "user")).toEqual([
+					{
+						role: "user",
+						text: "queued before the crash\n\nlive after restart",
+					},
+				]);
+			}
+			for (const shape of requestUserShapes) {
+				for (let i = 1; i < shape.length; i++) {
+					expect(
+						shape[i]!.role === "user" && shape[i - 1]!.role === "user",
+						`adjacent user;user pair leaked into a request`,
+					).toBe(false);
+				}
+			}
+
+			// Durable rows stay byte-distinct: orphan row + this turn's own row.
+			const rows = h.store
+				.listMessages("crash-tail")
+				.filter((r) => r.role === "user");
+			expect(rows.map((r) => r.content)).toEqual([
+				"queued before the crash",
+				"live after restart",
+			]);
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("TWO-PROCESS interleave: a ghost process's crash tail discovered on lease-wait resume never reaches the wire as user;user", async () => {
+		// Cross-process shape for the same hazard: process A holds the durable
+		// turn lease, persists its user row, then dies without replying (the
+		// ghost release below models the crash); process B waits on the lease,
+		// resumes through the waited path (resume-tip re-resolve + transcript
+		// reload), appends its own ask — and the pre-call chokepoint must send
+		// ONE merged user, never the ghost tail + ask as consecutive users.
+		const h = await createRunnerHarness({
+			withTurnLeases: true,
+			leasePollIntervalSeconds: 0.05,
+		});
+		try {
+			h.ensureSession("interleave");
+			const ghost = structuredHolder("ghost-process", process.pid);
+			expect(h.store.leases.tryAcquire("interleave", ghost)).toBe(true);
+
+			const wireUserContents: string[] = [];
+			h.faux.setResponses([
+				(context: Context) => {
+					for (const m of context.messages) {
+						if (m.role === "user") {
+							wireUserContents.push(userText(m.content));
+						}
+					}
+					return fauxAssistantMessage("resumed cleanly");
+				},
+			]);
+
+			const turnPromise = h.runner
+				.handleTurn({
+					sessionId: "interleave",
+					routingKey: "rk",
+					text: "waiter ask",
+				})
+				.catch((err: unknown) => ({ error: err }));
+
+			// While the waiter polls, the ghost process's last acts land: its
+			// durable user row, then the crash (holder released, nothing replied).
+			await h.store.appendMessage({
+				sessionId: "interleave",
+				role: "user",
+				content: "ghost process ask",
+				apiContent: "ghost process ask",
+				timestamp: Date.now() / 1000,
+			});
+			h.store.leases.releaseHolder("interleave", ghost);
+
+			const result = (await turnPromise) as
+				| Awaited<ReturnType<RunnerHarness["runner"]["handleTurn"]>>
+				| { error: unknown };
+			if ("error" in result) throw result.error;
+			expect(result.exitReason).toBe("finalized");
+
+			// The waited turn reloaded the transcript (ghost tail present) and
+			// STILL merged it with the fresh ask before the request went out.
+			expect(wireUserContents).toEqual(["ghost process ask\n\nwaiter ask"]);
+
+			// Both processes' rows persist byte-distinct.
+			const rows = h.store
+				.listMessages("interleave")
+				.filter((r) => r.role === "user");
+			expect(rows.map((r) => r.content)).toEqual([
+				"ghost process ask",
+				"waiter ask",
+			]);
 		} finally {
 			await h.close();
 		}

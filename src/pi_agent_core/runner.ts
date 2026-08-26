@@ -7,10 +7,14 @@
 //   - cached agent instances (byte-stable system prompt + toolset per session)
 //     with LRU + DEC-021 memory-pressure shedding;
 //   - replay seeding from pi_state rows (persist-what-you-send sidecars);
-//   - alternation repair PRE-REQUEST on the live history (DEC-015) — the wire
-//     copy is derived from live history at request time by the host loop, so
-//     repairing state.messages pre-request repairs the wire; persisted bytes
-//     are never rewritten;
+//   - alternation repair as a PRE-CALL chokepoint over EACH model call
+//     (DEC-015: "immediately before EACH API call") — armed on the host
+//     loop's transformContext seam for the duration of prompt(), it repairs
+//     the exact context list the loop converts to the wire copy, INCLUDING
+//     the freshly appended user turn (conversation_loop.py parity: the
+//     repair fires inside run_conversation per API call, merging crash/
+//     interrupt user;user tails with the new ask); persisted bytes are never
+//     rewritten;
 //   - budget/grace iteration semantics + recorded exit reasons (05 §4.1),
 //     enforced over the host loop's turn_end event stream — the narrowest real
 //     SDK seam for "iterations" (each turn_end = one completed model call);
@@ -595,22 +599,44 @@ export class GatewayAgentRunner {
 			}, this.leaseRefreshIntervalMs);
 		}
 
-		// ---- PRE-REQUEST alternation repair on LIVE history (DEC-015) --------
-		// The host loop derives the wire copy from state.messages at request
-		// time; repairing here repairs both copies while persisted rows stay
-		// untouched.
+		// ---- Pre-call alternation repair CHOKEPOINT (DEC-015) ----------------
+		// DEC-015's own contract places the pass "immediately before EACH API
+		// call". Hermes anchors exactly that:
+		// agent/conversation_loop.py:run_conversation runs
+		// _sanitize_tool_call_arguments + repair_message_sequence_with_cursor
+		// INSIDE the per-API-call loop, over the message list INCLUDING the
+		// freshly appended user turn, before api_messages are built. A one-shot
+		// pre-append pass (what this replaced) repaired only the seeded history
+		// BEFORE prompt() appended the live user turn — so a trailing durable
+		// user row (crash/interrupt between the user-row persist and the
+		// assistant reply, or gateway multi-queue replay tails) reached the
+		// provider alongside the new ask as consecutive users.
+		//
+		// Host-loop seam: Agent.transformContext runs before EVERY model call,
+		// after steering/follow-up injection, over the exact context list the
+		// loop converts into the wire copy (pi-agent-core
+		// agent-loop.js:streamAssistantResponse) — the unconditional pre-send
+		// chokepoint parity seam. Repairs mutate that list in place
+		// (Hermes `messages[:] = merged` parity); gateway-owned durable rows
+		// are never touched here.
 		let repairs = 0;
-		const live = session.agent.state.messages as unknown as Message[];
-		repairs = repairMessageSequence(live);
-		// Companion pre-request sanitation (DEC-015 repair family):
-		// corrupted tool_call arguments JSON is repaired before the request
-		// goes out instead of silently degrading (sanitize_tool_call_arguments).
-		repairs += sanitizeToolCallArguments(live);
-		if (repairs > 0) {
-			session.agent.state.messages =
-				live as unknown as typeof session.agent.state.messages;
-		}
-		state.repairCount = repairs;
+		const hostAgent = session.agent;
+		const priorTransform = hostAgent.transformContext;
+		hostAgent.transformContext = async (messages) => {
+			try {
+				const loop = messages as unknown as Message[];
+				repairs += repairMessageSequence(loop);
+				// Companion pre-request sanitation (DEC-015 repair family):
+				// corrupted tool_call arguments JSON is repaired before the
+				// request goes out instead of silently degrading
+				// (sanitize_tool_call_arguments).
+				repairs += sanitizeToolCallArguments(loop);
+			} catch {
+				// Loop contract: transformContext must never reject — degrade to
+				// the unrepaired sequence rather than kill the turn.
+			}
+			return messages;
+		};
 
 		// ---- Persist user row BEFORE prompting (crash-safe ordering) --------
 		const userRowId = await this.store.appendMessage({
@@ -708,9 +734,19 @@ export class GatewayAgentRunner {
 		try {
 			await session.prompt(request.text);
 		} finally {
+			// Unarm the chokepoint: post-turn session work (auto-compaction,
+			// branch summaries) must not route through the turn's repair pass.
+			// Restore exactly what was armed before this turn (absent stays
+			// absent — exactOptionalPropertyTypes forbids assigning undefined).
+			if (priorTransform === undefined) {
+				delete hostAgent.transformContext;
+			} else {
+				hostAgent.transformContext = priorTransform;
+			}
 			unsubscribe();
 			this.inflight.delete(request.sessionId);
 		}
+		state.repairCount = repairs;
 
 		// ---- Exit reason (recorded, never silent) ----------------------------
 		// Precedence mirrors Hermes: an EXTERNAL interrupt wins; a budget abort

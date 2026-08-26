@@ -908,3 +908,33 @@ in `../09-open-questions.md` (append-only).
   tsc clean for cluster scope; full-tree failures confined to sibling clusters'
   in-flight ntfy/ws/email files (zero cross-imports; kit/ and pi_gateway/
   untouched). Commit scoped to cluster paths only.
+- Stability round-2 fix cluster `agent-loop-repair-r2` (2026-08-26): pi_agent_core runner
+  moved onto DEC-015's own placement contract ("immediately before EACH API call") —
+  Hermes truth at /tmp/hermes-upstream agent/conversation_loop.py:run_conversation anchors
+  (finding core-routing-8; no DEC deltas — pure convergence toward reference behavior).
+  core-routing-8: the one-shot pre-append pass repaired only the SEEDED history BEFORE
+  prompt() appended the live user turn, so a trailing durable user row (crash/interrupt
+  between the user-row persist and the assistant reply, or gateway multi-queue replay
+  tails) reached the provider alongside the new ask as consecutive users. Replaced with a
+  per-model-call pre-send chokepoint armed on the host loop's Agent.transformContext seam
+  (pi-agent-core agent-loop.js:streamAssistantResponse — runs before EVERY model call,
+  after steering/follow-up injection, over the exact context list convertToLlm maps to the
+  wire copy, INCLUDING the freshly appended ask): repairMessageSequence +
+  sanitizeToolCallArguments mutate that list in place (`messages[:] = merged` parity),
+  repairs accumulate across all of a turn's model calls into outcome.repairs/
+  state.repairCount, the hook never rejects (loop contract) and is un-armed in the prompt
+  finally so post-turn session work (auto-compaction/branch summaries) never routes
+  through it; gateway-owned durable rows stay byte-untouched (persist-stores-bytes
+  invariant intact). Tests conformed to CONFORMING behavior + two new contracts: the old
+  "compacts a replayed user→user tail" row had enshrined the bug (asserted TWO adjacent
+  wire users: merged-tail + live ask) — now asserts ONE merged user carrying tail+fresh
+  ask (repairs=2); NEW single crash-orphaned-row test proves request 1 AND the
+  post-toolResult request 2 each carry exactly one merged user (per-call re-run proof,
+  generic no-adjacent-user sweep over every captured request); NEW two-process interleave
+  test drives the waited-lease resume path (ghost process persists its user row then dies;
+  waiter's lease-wait ⇒ resume-tip re-resolve + transcript reload ⇒ fresh ask must merge
+  with the ghost tail pre-request). Suite: pi_agent_core 72/72 across 7 files (runner 16
+  incl. 3 DEC-015 chokepoint rows); tsc clean for cluster scope; layering untouched
+  (host.ts is still the sole SDK seam). Residual full-tree failures confined to sibling
+  clusters' in-flight files (sms/ntfy/homeassistant conformance rows — zero pi_agent_core
+  imports; tsc errors likewise ntfy-standalone only), verified unrelated to this change.
