@@ -39,7 +39,12 @@
 // gateway/run.py::_session_expiry_watcher (300s idle sweep of the agent cache).
 import type DatabaseType from "better-sqlite3";
 
-import { AgentInstanceCache, type AgentCacheOptions } from "./agent-cache.js";
+import {
+	AgentInstanceCache,
+	defaultAgentCacheMaxTotalBytes,
+	transcriptPersistenceCaughtUp,
+	type AgentCacheOptions,
+} from "./agent-cache.js";
 import {
 	repairMessageSequence,
 	sanitizeToolCallArguments,
@@ -70,6 +75,8 @@ import {
 import {
 	DEFAULT_TTL_SECONDS,
 	DEFAULT_WAIT_SECONDS,
+	SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
+	SessionTurnLeaseLostError,
 	isExplicitForkChildRow,
 	structuredHolder,
 } from "../pi_state/index.js";
@@ -115,6 +122,15 @@ export interface RunnerStore {
 	 * can omit it; StateStore satisfies this structurally via its `leases`.
 	 */
 	leases?: RunnerStoreLeases;
+	/**
+	 * Durable mid-turn activity heartbeat (hermes_state.py:
+	 * touch_session_activity — observation-only, never backwards). Optional;
+	 * failures never break a turn.
+	 */
+	touchSessionActivity?(
+		sessionId: string,
+		opts?: { ts?: number },
+	): void | Promise<void>;
 }
 
 /** Structural subset of pi_state's DbTurnLeaseStore the runner drives. */
@@ -202,6 +218,16 @@ export interface GatewayAgentRunnerOptions {
 
 interface CachedHostSession {
 	session: AgentSession;
+	/**
+	 * Flushed-through marker (run.py `_last_flushed_db_idx` parity): null
+	 * while the live transcript's durability is UNKNOWN — from turn start
+	 * until the assistant row lands durably — otherwise the live-loop message
+	 * count at the moment persistence was last fully caught up. Consulted by
+	 * transcriptPersistenceCaughtUp through the pressure-shedding gate; a
+	 * failed/lost write leaves it null, which blocks soft eviction of the
+	 * entry until the next successful turn re-stamps it (fail-closed).
+	 */
+	flushedDbIdx: number | null;
 }
 
 interface InflightTurn {
@@ -254,6 +280,8 @@ export class GatewayAgentRunner {
 	private readonly pool: TurnWorkerPool;
 	private readonly inflight = new Map<string, InflightTurn>();
 	private readonly generations = new Map<string, number>();
+	/** Per-session monotonic ms of the last durable activity stamp (60s gate). */
+	private readonly activityStamps = new Map<string, number>();
 	private readonly turnLeaseRegistry: RunnerTurnLeaseRegistry | null;
 	private readonly leaseTtlSeconds: number;
 	private readonly leaseWaitSeconds: number;
@@ -276,9 +304,26 @@ export class GatewayAgentRunner {
 		this.maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
 		this.memoryHooks = options.memoryHooks;
 		this.now = options.now ?? (() => Date.now());
-		this.cache = new AgentInstanceCache<CachedHostSession>(
-			options.cacheOptions,
-		);
+		// DEC-021 startup wiring (agent_cache_pressure.py "auto" bounds parity):
+		// absent an operator byte bound, the pressure budget is DERIVED from the
+		// cgroup quota / host memory (0.65 fraction, 512MB floor) so shedPressure
+		// is live on every production construction path — the resident size of
+		// the cached-agent core stays bounded without configuration.
+		//
+		// Evictability gates (run.py parity — GatewayRunner owns the closures,
+		// exactly as _sweep_agent_cache_under_pressure builds _is_evictable and
+		// _enforce_agent_cache_cap snapshots running_ids):
+		//  • pressure shedding admits an entry only when it is NOT mid-turn AND
+		//    its transcript persistence has caught up;
+		//  • the LRU entry-cap enforcer skips mid-turn holders only.
+		this.cache = new AgentInstanceCache<CachedHostSession>({
+			...options.cacheOptions,
+			maxTotalBytes:
+				options.cacheOptions?.maxTotalBytes ?? defaultAgentCacheMaxTotalBytes(),
+			isEvictable: (sessionId, cached) =>
+				!this.isTurnActive(sessionId) && transcriptPersistenceCaughtUp(cached),
+			isCapEvictable: (sessionId) => !this.isTurnActive(sessionId),
+		});
 		this.pool = new TurnWorkerPool({
 			maxWorkers: options.poolMaxWorkers ?? 10,
 		});
@@ -309,6 +354,24 @@ export class GatewayAgentRunner {
 	/** Diagnostics: current cache entry count / byte estimate total. */
 	get cacheStats(): { entries: number; bytes: number } {
 		return { entries: this.cache.size, bytes: this.cache.totalBytes };
+	}
+
+	/** Diagnostics: is this session's host agent instance currently cached? */
+	isCached(sessionId: string): boolean {
+		return this.cache.has(sessionId);
+	}
+
+	/**
+	 * Effective DEC-021 pressure bound the cache enforces — the operator byte
+	 * override when provided, else the startup-derived memory budget.
+	 */
+	get cacheByteBudget(): number {
+		return this.cache.byteBudget;
+	}
+
+	/** Diagnostics: cached session ids in LRU→MRU order. */
+	get cachedSessionIds(): string[] {
+		return this.cache.keys();
 	}
 
 	/** True while a turn occupies a worker slot for this session. */
@@ -571,6 +634,14 @@ export class GatewayAgentRunner {
 	): Promise<TurnOutcome> {
 		const host = await this.acquireHostSession(sessionId);
 		const session = host.session;
+		// Turn-start flush-cursor reset (run.py:_init_cached_agent_for_turn
+		// parity: "Reset the SessionDB flush cursor so the new turn's messages
+		// are fully persisted"). From here until the assistant row lands
+		// durably the entry is persistence-UNCAUGHT-UP, so pressure shedding
+		// cannot touch it even in the post-inflight window between prompt()
+		// resolving and the assistant-row append below; only a fully successful
+		// write re-stamps it.
+		host.flushedDbIdx = null;
 		if (waited) {
 			// "Session is free; loading the latest transcript..." parity: the
 			// cached history may predate the wait — reload from durable rows.
@@ -598,6 +669,23 @@ export class GatewayAgentRunner {
 				}
 			}, this.leaseRefreshIntervalMs);
 		}
+
+		// ---- Mid-turn activity heartbeat (hermes_state.py:
+		// touch_session_activity) -------------------------------------------
+		// Rate-limited (≥60s per session) durable last_activity_at stamp so
+		// freshest-of sibling ordering (_sql_session_last_active consumers like
+		// get_compression_tip) sees a LIVE session even before its next message
+		// row lands. Observation-only: failures never break a turn.
+		this.stampActivityIfDue(sessionId);
+
+		// Append-time lease-loss detection: the in-txn admission guard
+		// (_check_transcript_write_guards) may reject the assistant flush after
+		// another process reclaimed the lineage slot. Hermes' conversation_loop
+		// catches flush persistence errors and records the turn as failed
+		// (session_persistence_failed, cause "turn_lease") instead of crashing;
+		// the flag below folds this into the SAME recorded outcome shape the
+		// refresher-abort path produces.
+		let appendLeaseLost = false;
 
 		// ---- Pre-call alternation repair CHOKEPOINT (DEC-015) ----------------
 		// DEC-015's own contract places the pass "immediately before EACH API
@@ -639,11 +727,24 @@ export class GatewayAgentRunner {
 		};
 
 		// ---- Persist user row BEFORE prompting (crash-safe ordering) --------
+		// The append carries the turn's durable holder: admission is verified
+		// INSIDE the write txn (hermes_state.py:_check_transcript_write_guards
+		// via insertMessageInTx) — a >TTL-stalled writer whose lease another
+		// process reclaimed raises SessionTurnLeaseLostError here instead of
+		// interleaving its flush into the new owner's transcript. An expired-
+		// but-still-matching lease renews in that same txn (starved-refresher
+		// recovery without weakening the foreign-holder fence).
 		const userRowId = await this.store.appendMessage({
 			sessionId,
 			role: "user",
 			content: request.text,
 			apiContent: request.text,
+			...(dbHolder !== null
+				? {
+						turnLeaseHolder: dbHolder,
+						turnLeaseTtlSeconds: this.leaseTtlSeconds,
+					}
+				: {}),
 		});
 
 		// ---- Memory: prefetch ONCE before the tool loop ----------------------
@@ -758,7 +859,7 @@ export class GatewayAgentRunner {
 		const interrupted =
 			inflight.interruptRequested || lastStopReason === "aborted";
 		let exitReason: TurnExitReason;
-		if (leaseLost) {
+		if (leaseLost || appendLeaseLost) {
 			exitReason = "error";
 		} else if (inflight.interruptRequested) {
 			exitReason = "interrupted_by_user";
@@ -781,7 +882,11 @@ export class GatewayAgentRunner {
 
 		// ---- Memory sync leg (interrupted turns SKIP BOTH legs, #15218; a
 		// lost-lease abort protects the transcript and stays equally silent) --
-		if (exitReason !== "interrupted_by_user" && !leaseLost) {
+		if (
+			exitReason !== "interrupted_by_user" &&
+			!leaseLost &&
+			!appendLeaseLost
+		) {
 			if (request.text.length > 0 && finalText.length > 0) {
 				try {
 					await this.memoryHooks?.syncAll?.({
@@ -823,14 +928,34 @@ export class GatewayAgentRunner {
 				role: "assistant",
 				content: assistantMsg.content,
 			});
-			assistantRowId = await this.store.appendMessage({
-				sessionId,
-				role: "assistant",
-				content: finalText,
-				apiContent: wireBytes,
-				finishReason: assistantMsg.stopReason,
-				...(usageSnapshot ? { tokenCount: usageSnapshot.outputTokens } : {}),
-			});
+			try {
+				assistantRowId = await this.store.appendMessage({
+					sessionId,
+					role: "assistant",
+					content: finalText,
+					apiContent: wireBytes,
+					finishReason: assistantMsg.stopReason,
+					...(usageSnapshot ? { tokenCount: usageSnapshot.outputTokens } : {}),
+					...(dbHolder !== null
+						? {
+								turnLeaseHolder: dbHolder,
+								turnLeaseTtlSeconds: this.leaseTtlSeconds,
+							}
+						: {}),
+				});
+				// Flush-cursor advance on the FULLY SUCCESSFUL write
+				// (_flush_messages_to_session_db parity: _last_flushed_db_idx moves to
+				// len(messages) only here) — the live transcript is durable through
+				// its current length, re-arming pressure evictability for the idle
+				// session. A lease-lost refusal or a thrown write leaves the marker
+				// null ⇒ the entry stays un-evictable until a later turn succeeds.
+				host.flushedDbIdx = session.agent.state.messages.length;
+			} catch (err) {
+				if (!(err instanceof SessionTurnLeaseLostError)) throw err;
+				// Refused write: the reply must NOT be projected as durable when
+				// a newer turn owns the lineage slot (hermes flush-failure break).
+				appendLeaseLost = true;
+			}
 			if (usageSnapshot) {
 				this.store.queueTokenCounts(sessionId, {
 					inputTokens: usageSnapshot.inputTokens,
@@ -852,9 +977,10 @@ export class GatewayAgentRunner {
 			assistantRowId,
 			usage: usageSnapshot,
 		};
-		if (leaseLost) {
-			// The abort's generic "Request was aborted" must not mask the root
-			// cause: the transcript-protecting lease-loss abort.
+		if (leaseLost || appendLeaseLost) {
+			// The abort's generic "Request was aborted" (or a completed reply that
+			// could not be persisted) must not mask the root cause: the
+			// transcript-protecting lease-loss failure.
 			outcome.errorMessage =
 				"session turn lease lost; turn aborted to protect the transcript";
 		} else if (lastAssistantError !== undefined) {
@@ -864,6 +990,33 @@ export class GatewayAgentRunner {
 	}
 
 	// ------------------------------------------------------------------
+
+	/**
+	 * One durable heartbeat per 60s window per session (agent/session_activity.py:
+	 * SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS contract: MUST stay ≥30s;
+	 * Hermes ships 60s). The latch is set BEFORE the write — a failed stamp waits
+	 * out the window exactly like a landed one, so a contended store never turns
+	 * the observation into per-turn write pressure.
+	 */
+	private stampActivityIfDue(sessionId: string): void {
+		const touch = this.store.touchSessionActivity;
+		if (touch === undefined || !sessionId) return;
+		const nowMs = this.now();
+		const last = this.activityStamps.get(sessionId);
+		if (
+			last !== undefined &&
+			nowMs - last < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS * 1000
+		) {
+			return;
+		}
+		this.activityStamps.set(sessionId, nowMs);
+		try {
+			const result = touch.call(this.store, sessionId, { ts: nowMs / 1000 });
+			if (result instanceof Promise) result.catch(() => {});
+		} catch {
+			/* observation-only — never breaks a turn */
+		}
+	}
 
 	/** Cache get-or-build so consecutive turns reuse byte-identical prompt+tools. */
 	private async acquireHostSession(
@@ -909,7 +1062,13 @@ export class GatewayAgentRunner {
 		const { session } = await createAgentSession(createOptions);
 
 		await this.seedReplay(session, sessionId);
-		return { session };
+		// Freshly built from durable rows: the live transcript IS the persisted
+		// one, so the entry starts fully caught up (agent_init.py:1762 parity —
+		// a rebuilt agent never carries an unflushed tail).
+		return {
+			session,
+			flushedDbIdx: session.agent.state.messages.length,
+		};
 	}
 
 	/**

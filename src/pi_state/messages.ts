@@ -23,6 +23,11 @@
 
 import type Database from "better-sqlite3";
 
+import {
+	checkTurnLeaseWriteGuardOnConn,
+	DEFAULT_TTL_SECONDS,
+} from "./leases.js";
+
 /** Fixed replay projection — includes the sidecar column (02 §7.3 step 2). */
 const MESSAGE_PROJECTION = [
 	"id",
@@ -105,6 +110,17 @@ export interface NewMessage {
 	timestamp?: number;
 	displayKind?: string;
 	displayMetadata?: string;
+	/**
+	 * Turn-lease ADMISSION (hermes_state.py:_check_transcript_write_guards):
+	 * when presented, the write txn first verifies THIS holder still owns the
+	 * lineage-root lease — foreign/missing raises SessionTurnLeaseLostError
+	 * (fail-fast, never retried), an expired-but-matching lease is renewed in
+	 * the same txn. Absent ⇒ no ownership check (parity: appends without a
+	 * turn_lease_holder skip the guard).
+	 */
+	turnLeaseHolder?: string;
+	/** Renewal TTL for the admission leg (default 300s, 02 §5). */
+	turnLeaseTtlSeconds?: number;
 }
 
 /**
@@ -147,12 +163,23 @@ export function scrubSurrogates(text: string): string {
  * sidecar invariant requires (byte-exactness proven by round-trip tests over
  * astral/combining/ZWJ/RTL/CJK/NUL-bearing corpora).
  *
+ * When `m.turnLeaseHolder` is presented, the transcript-write ADMISSION guard
+ * runs FIRST inside this same transaction (hermes append_message ordering:
+ * _check_transcript_write_guards precedes the INSERT), so a >TTL-stalled
+ * writer whose lease another process reclaimed can NEVER land its flush.
+ *
  * Returns the new rowid.
  */
 export function insertMessageInTx(
 	conn: Database.Database,
 	m: NewMessage,
 ): number {
+	if (m.turnLeaseHolder !== undefined && m.turnLeaseHolder !== "") {
+		checkTurnLeaseWriteGuardOnConn(conn, m.sessionId, {
+			holder: m.turnLeaseHolder,
+			ttlSeconds: m.turnLeaseTtlSeconds ?? DEFAULT_TTL_SECONDS,
+		});
+	}
 	const info = conn
 		.prepare(
 			`INSERT INTO messages (

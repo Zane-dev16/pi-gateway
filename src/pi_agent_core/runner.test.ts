@@ -18,6 +18,10 @@ import {
 	type RunnerTurnLeaseRegistry,
 } from "./runner.js";
 import {
+	defaultAgentCacheMaxTotalBytes,
+	resetDefaultMaxTotalBytesForTests,
+} from "./agent-cache.js";
+import {
 	createRunnerHarness,
 	type RunnerHarness,
 } from "./testing/runner-harness.js";
@@ -876,6 +880,164 @@ describe("two-layer turn-lease prologue (02 §5)", () => {
 			// Memory stays silent for a lease-lost abort (#15218 posture).
 			expect(syncCalls).toBe(0);
 			gated.release();
+		} finally {
+			await h.close();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Transcript-write admission + mid-turn heartbeat (hermes _check_transcript_
+// write_guards / touch_session_activity parity) and DEC-021 budget wiring.
+// ---------------------------------------------------------------------------
+
+import { SessionTurnLeaseLostError } from "../pi_state/index.js";
+
+describe("in-txn transcript-write admission (core-routing-14)", () => {
+	it("a >TTL-stalled writer whose lease was reclaimed refuses to interleave its flush", async () => {
+		const h = await createRunnerHarness({ withTurnLeases: true });
+		try {
+			h.ensureSession("stall-window");
+			// Reproduce the race the 60s refresher cannot close: the writer is
+			// admitted, then stalls past the TTL while another process reclaims
+			// the lineage slot; the NEXT transcript write must be refused by the
+			// in-txn guard instead of landing into the new owner's transcript.
+			const store = h.store as unknown as {
+				appendMessage: (m: unknown) => Promise<number>;
+			};
+			const inner = store.appendMessage.bind(h.store);
+			let firstCall = true;
+			store.appendMessage = async (m: unknown) => {
+				if (firstCall) {
+					firstCall = false;
+					// Simulate takeover between our acquire and the write.
+					h.store.db
+						.prepare(
+							"DELETE FROM session_turn_leases WHERE conversation_id = 'stall-window'",
+						)
+						.run();
+					expect(
+						h.store.leases.tryAcquire(
+							"stall-window",
+							structuredHolder("thief", process.pid),
+						),
+					).toBe(true);
+				}
+				return inner(m);
+			};
+
+			h.faux.setResponses([fauxAssistantMessage("should never land")]);
+			await expect(
+				h.runner.handleTurn({
+					sessionId: "stall-window",
+					routingKey: "rk",
+					text: "stalled ask",
+				}),
+			).rejects.toBeInstanceOf(SessionTurnLeaseLostError);
+
+			// Nothing leaked into the thief's transcript; the thief still owns.
+			expect(h.store.listMessages("stall-window")).toHaveLength(0);
+			expect(h.store.leases.probeOwner("stall-window")?.holder).toContain(
+				"thief",
+			);
+		} finally {
+			await h.close();
+		}
+	});
+});
+
+describe("mid-turn activity heartbeat (touch_session_activity parity)", () => {
+	it("stamps durable last_activity_at once per turn, gated at the 60s cadence", async () => {
+		let nowMs = 1_000_000;
+		const h = await createRunnerHarness({
+			withTurnLeases: true,
+			now: () => nowMs,
+		});
+		try {
+			h.ensureSession("beat");
+			h.faux.setResponses([
+				fauxAssistantMessage("one"),
+				fauxAssistantMessage("two"),
+				fauxAssistantMessage("three"),
+			]);
+			const stampAt = () =>
+				(
+					h.store.db
+						.prepare("SELECT last_activity_at FROM sessions WHERE id = 'beat'")
+						.get() as { last_activity_at: number | null }
+				).last_activity_at;
+
+			await h.runner.handleTurn({
+				sessionId: "beat",
+				routingKey: "rk",
+				text: "t1",
+			});
+			expect(stampAt()).toBe(1_000); // first turn stamps (ms→s)
+
+			nowMs += 30_000; // inside the 60s window
+			await h.runner.handleTurn({
+				sessionId: "beat",
+				routingKey: "rk",
+				text: "t2",
+			});
+			expect(stampAt()).toBe(1_000); // rate-limited — no second write
+
+			nowMs += 61_000; // window elapsed
+			await h.runner.handleTurn({
+				sessionId: "beat",
+				routingKey: "rk",
+				text: "t3",
+			});
+			expect(stampAt()).toBe(1_091); // ms→s: (1_000_000+30_000+61_000)/1000
+		} finally {
+			await h.close();
+		}
+	});
+});
+
+describe("DEC-021 pressure-budget wiring (agent_cache_pressure auto bounds)", () => {
+	it("absent an operator byte bound, the runner carries the startup-derived budget", async () => {
+		resetDefaultMaxTotalBytesForTests();
+		const h = await createRunnerHarness();
+		try {
+			expect(h.runner.cacheByteBudget).toBe(defaultAgentCacheMaxTotalBytes());
+		} finally {
+			await h.close();
+			resetDefaultMaxTotalBytesForTests();
+		}
+	});
+
+	it("an operator byte override reaches the cache — shedding fires under the evictability gates", async () => {
+		const h = await createRunnerHarness({
+			cacheOptions: { maxTotalBytes: 1 }, // any real transcript exceeds this
+		});
+		try {
+			expect(h.runner.cacheByteBudget).toBe(1);
+			h.ensureSession("shed-1");
+			h.ensureSession("shed-2");
+			h.faux.setResponses([
+				fauxAssistantMessage("one"),
+				fauxAssistantMessage("two"),
+			]);
+			await h.runner.handleTurn({
+				sessionId: "shed-1",
+				routingKey: "rk",
+				text: "ask one",
+			});
+			// Mid-turn the just-built entry is protected (_is_evictable parity:
+			// never shed an agent in active use) even though the budget is tiny.
+			expect(h.runner.cacheStats.entries).toBe(1);
+
+			await h.runner.handleTurn({
+				sessionId: "shed-2",
+				routingKey: "rk",
+				text: "ask two",
+			});
+			// The second insert re-runs bounds enforcement: session one is no
+			// longer active and its persistence has caught up ⇒ it sheds; the
+			// hottest entry is spared by the protect-recent clamp.
+			expect(h.runner.cacheStats.entries).toBe(1);
+			expect(h.runner.cachedSessionIds).toEqual(["shed-2"]);
 		} finally {
 			await h.close();
 		}

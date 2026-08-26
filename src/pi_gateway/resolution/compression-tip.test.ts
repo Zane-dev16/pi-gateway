@@ -224,6 +224,137 @@ describe("getCompressionTip — live-tip walk (hermes_state.py:get_compression_t
 		}
 	});
 
+	it("orders stale-closed siblings by the THREE-LEG freshest-of recency (_sql_session_last_active), never raw last_activity_at", async () => {
+		const fx = await openFixture();
+		try {
+			const r = "recency-root";
+			fx.session({ id: r, endReason: "compression", endedAt: T0 + 5 });
+
+			// Sibling A: NEWER durable heartbeat, but its conversation went quiet
+			// long ago (last message at T0+10).
+			fx.session({
+				id: "hb_newer_msgs_older",
+				parent: r,
+				endedAt: null,
+				lastActivityAt: T0 + 50,
+			});
+			fx.db
+				.prepare(
+					"INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'old ask', ?)",
+				)
+				.run("hb_newer_msgs_older", T0 + 10);
+
+			// Sibling B: OLDER heartbeat that lags its fresh message tail — the
+			// rate-limited-heartbeat lag _sql_session_last_active exists for.
+			fx.session({
+				id: "hb_older_msgs_newer",
+				parent: r,
+				endedAt: null,
+				lastActivityAt: T0 + 20,
+			});
+			fx.db
+				.prepare(
+					"INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'fresh ask', ?)",
+				)
+				.run("hb_older_msgs_newer", T0 + 100);
+
+			// MAX(messages.timestamp) must beat a stale heartbeat: B wins even
+			// though A's heartbeat is newer (the old COALESCE(last_activity_at,
+			// started_at) ordering picked A here).
+			expect(getCompressionTip(fx.db, r)).toBe("hb_older_msgs_newer");
+		} finally {
+			await fx.close();
+		}
+	});
+
+	it("freshest-of legs: a NULL heartbeat must not erase the message leg; all-NULL falls back to started_at", async () => {
+		const fx = await openFixture();
+		try {
+			const r = "null-leg-root";
+			fx.session({ id: r, endReason: "compression", endedAt: T0 + 5 });
+
+			// Sibling N: NULL heartbeat, fresh messages (aggregate-MAX form must
+			// ignore the NULL leg instead of NULL-ing the whole comparison —
+			// SQLite scalar max() would return NULL here).
+			fx.session({
+				id: "null_hb_fresh_msgs",
+				parent: r,
+				endedAt: null,
+				lastActivityAt: null,
+				startedAt: T0 + 1, // oldest started_at — must NOT decide
+			});
+			fx.db
+				.prepare(
+					"INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'live', ?)",
+				)
+				.run("null_hb_fresh_msgs", T0 + 90);
+
+			// Sibling M: NULL heartbeat AND no messages ⇒ freshest-of falls
+			// through to started_at.
+			fx.session({
+				id: "all_null_started",
+				parent: r,
+				endedAt: null,
+				lastActivityAt: null,
+				startedAt: T0 + 2,
+			});
+
+			expect(getCompressionTip(fx.db, r)).toBe("null_hb_fresh_msgs");
+
+			// Pure started_at fallback between two LEG-LESS siblings (separate
+			// lineage so the message sibling above cannot dominate).
+			const r2 = "null-leg-root-2";
+			fx.session({ id: r2, endReason: "compression", endedAt: T0 + 5 });
+			fx.session({
+				id: "legless_older",
+				parent: r2,
+				endedAt: null,
+				lastActivityAt: null,
+				startedAt: T0 + 1,
+			});
+			fx.session({
+				id: "legless_newer",
+				parent: r2,
+				endedAt: null,
+				lastActivityAt: null,
+				startedAt: T0 + 2,
+			});
+			expect(getCompressionTip(fx.db, r2)).toBe("legless_newer");
+		} finally {
+			await fx.close();
+		}
+	});
+
+	it("a mid-turn activity heartbeat flips sibling ordering without any new message row", async () => {
+		const fx = await openFixture();
+		try {
+			const r = "touch-root";
+			fx.session({ id: r, endReason: "compression", endedAt: T0 + 5 });
+			fx.session({
+				id: "quiet_tip",
+				parent: r,
+				endedAt: null,
+				startedAt: T0 + 6,
+				lastActivityAt: T0 + 50,
+			});
+			fx.session({
+				id: "touched_live",
+				parent: r,
+				endedAt: null,
+				startedAt: T0 + 5, // older start, no heartbeat yet
+				lastActivityAt: null, // message-less live continuation
+			});
+			expect(getCompressionTip(fx.db, r)).toBe("quiet_tip");
+
+			// Mid-turn stamp (hermes touch_session_activity parity): the live
+			// continuation is WORKING right now — no message row yet.
+			await fx.store.touchSessionActivity("touched_live", { ts: T0 + 200 });
+			expect(getCompressionTip(fx.db, r)).toBe("touched_live");
+		} finally {
+			await fx.close();
+		}
+	});
+
 	it("cycle-safe and empty-input-safe", async () => {
 		const fx = await openFixture();
 		try {

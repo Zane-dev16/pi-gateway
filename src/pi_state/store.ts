@@ -28,6 +28,22 @@ import {
 	type InitStoreOptions,
 } from "./reconcile.js";
 import {
+	applyTelegramTopicMigration,
+	bindTelegramTopic,
+	type BindTelegramTopicArgs,
+	deleteTelegramTopicBinding,
+	disableTelegramTopicMode,
+	enableTelegramTopicMode,
+	getTelegramTopicBinding,
+	getTelegramTopicBindingBySession,
+	isTelegramSessionLinkedToTopic,
+	isTelegramTopicModeEnabled,
+	listTelegramTopicBindingsForChat,
+	type TelegramTopicBindingRow,
+	type TelegramTopicCapabilityFlags,
+	type TelegramTopicWriteOptions,
+} from "./telegram-topics.js";
+import {
 	TokenWriter,
 	updateTokenCounts,
 	type TokenDelta,
@@ -39,6 +55,27 @@ import {
 	type ExecuteWriteOptions,
 	type JournalMode,
 } from "./wal.js";
+
+/**
+ * Mid-turn activity heartbeat cadence floor (agent/session_activity.py:
+ * SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS): durable stamps MUST stay
+ * ≥60s apart per session — the write path is contended and the heartbeat is
+ * an observation-only projection that never justifies extra write pressure.
+ */
+export const SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS = 60;
+
+/** Description budget (agent/session_activity.py:ACTIVITY_DESCRIPTION_MAX). */
+export const ACTIVITY_DESCRIPTION_MAX = 120;
+
+/**
+ * hermes_state.py:bound_activity_description — clamp free-form activity text
+ * to the shared description budget.
+ */
+export function boundActivityDescription(description?: string | null): string {
+	const text = (description ?? "").trim();
+	if (text.length <= ACTIVITY_DESCRIPTION_MAX) return text;
+	return `${text.slice(0, ACTIVITY_DESCRIPTION_MAX - 1)}…`;
+}
 
 export interface StateStoreOptions {
 	/** Open read-only: never DDL, never flip journal modes (02 §3). */
@@ -155,6 +192,40 @@ export class StateStore {
 
 	// -- message / sidecar surface (byte-exact discipline lives in messages.ts)
 
+	/**
+	 * hermes_state.py:touch_session_activity — stamp durable mid-turn session
+	 * activity (observation-only). Never moves last_activity_at backwards; the
+	 * bounded description is written only when the timestamp advances. No-ops
+	 * when sessionId is empty or the row does not exist.
+	 *
+	 * Observation-only write: rides a SHORT sub-second busy budget
+	 * (_ACTIVITY_WRITE_PATIENCE_S = 0.5) instead of the full routine write
+	 * patience — under contention a heartbeat must not delay the response-
+	 * critical path it is merely observing.
+	 *
+	 * (pi's Phase-1 schema omits last_activity_provenance, so no provenance
+	 * column is written — the only label surface is last_activity_description.)
+	 */
+	async touchSessionActivity(
+		sessionId: string,
+		opts: { ts?: number; description?: string | null } = {},
+	): Promise<void> {
+		if (!sessionId) return;
+		const when = opts.ts ?? Date.now() / 1000;
+		const desc = boundActivityDescription(opts.description);
+		await this.withWrite(
+			(conn) => {
+				conn
+					.prepare(
+						"UPDATE sessions SET last_activity_at = ?, last_activity_description = ? " +
+							"WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+					)
+					.run(when, desc, sessionId, when);
+			},
+			{ patienceMs: 500 },
+		);
+	}
+
 	appendMessage(m: NewMessage): Promise<number> {
 		return this.withWrite((conn) => insertMessageInTx(conn, m));
 	}
@@ -219,6 +290,75 @@ export class StateStore {
 	/** Direct synchronous-path apply (rare: callers needing raised errors). */
 	updateTokenCounts(sessionId: string, delta: TokenDelta): Promise<void> {
 		return updateTokenCounts(this.db, sessionId, delta);
+	}
+
+	// -- telegram DM topic bindings (explicit opt-in migration; 02 §2 side tables)
+	// SessionDB surface parity: hermes_state.py:apply_telegram_topic_migration
+	// family. Startup reconcile NEVER creates these tables — only an explicit
+	// enable/bind does; readers degrade to false/[]/undefined until then.
+
+	applyTelegramTopicMigration(
+		opts?: TelegramTopicWriteOptions,
+	): Promise<void> {
+		return applyTelegramTopicMigration(this.db, opts);
+	}
+
+	enableTelegramTopicMode(
+		args: { chatId: string; userId: string } & TelegramTopicCapabilityFlags,
+		opts?: TelegramTopicWriteOptions,
+	): Promise<void> {
+		return enableTelegramTopicMode(this.db, args, opts);
+	}
+
+	disableTelegramTopicMode(
+		args: { chatId: string; clearBindings?: boolean },
+		opts?: TelegramTopicWriteOptions,
+	): Promise<void> {
+		return disableTelegramTopicMode(this.db, args, opts);
+	}
+
+	isTelegramTopicModeEnabled(args: {
+		chatId: string;
+		userId: string;
+	}): boolean {
+		return isTelegramTopicModeEnabled(this.db, args);
+	}
+
+	bindTelegramTopic(
+		args: BindTelegramTopicArgs,
+		opts?: TelegramTopicWriteOptions,
+	): Promise<void> {
+		return bindTelegramTopic(this.db, args, opts);
+	}
+
+	getTelegramTopicBinding(args: {
+		chatId: string;
+		threadId: string;
+	}): TelegramTopicBindingRow | undefined {
+		return getTelegramTopicBinding(this.db, args);
+	}
+
+	listTelegramTopicBindingsForChat(args: {
+		chatId: string;
+	}): TelegramTopicBindingRow[] {
+		return listTelegramTopicBindingsForChat(this.db, args);
+	}
+
+	getTelegramTopicBindingBySession(args: {
+		sessionId: string;
+	}): TelegramTopicBindingRow | undefined {
+		return getTelegramTopicBindingBySession(this.db, args);
+	}
+
+	isTelegramSessionLinkedToTopic(args: { sessionId: string }): boolean {
+		return isTelegramSessionLinkedToTopic(this.db, args);
+	}
+
+	deleteTelegramTopicBinding(
+		args: { chatId: string; threadId: string },
+		opts?: TelegramTopicWriteOptions,
+	): Promise<number> {
+		return deleteTelegramTopicBinding(this.db, args, opts);
 	}
 
 	/** Drain the token writer, then close the connection. */

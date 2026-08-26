@@ -55,6 +55,8 @@ export interface RunnerHarnessOptions {
 	leaseRefreshIntervalMs?: number;
 	cacheSweepIntervalMs?: number;
 	startInterval?: GatewayAgentRunnerOptions["startInterval"];
+	/** Injected runner clock (ms) — cache recency, turn timestamps, heartbeats. */
+	now?: GatewayAgentRunnerOptions["now"];
 }
 
 export async function createRunnerHarness(
@@ -74,6 +76,8 @@ export async function createRunnerHarness(
 		appendMessage: (m) => store.appendMessage(m),
 		queueTokenCounts: (sessionId, delta) =>
 			store.queueTokenCounts(sessionId, delta),
+		touchSessionActivity: (sessionId, opts) =>
+			store.touchSessionActivity(sessionId, opts),
 		...(options.withTurnLeases === true ? { leases: store.leases } : {}),
 	};
 	const runner = new GatewayAgentRunner({
@@ -108,6 +112,7 @@ export async function createRunnerHarness(
 		...(options.cacheSweepIntervalMs !== undefined
 			? { cacheSweepIntervalMs: options.cacheSweepIntervalMs }
 			: {}),
+		...(options.now !== undefined ? { now: options.now } : {}),
 		...(options.startInterval !== undefined
 			? { startInterval: options.startInterval }
 			: {}),

@@ -20,13 +20,37 @@ import type Database from "better-sqlite3";
 const MAX_TIP_HOPS = 100;
 
 /**
+ * hermes_state_common.py:_sql_session_last_active — session recency used for
+ * sibling ordering: freshest of `last_activity_at` (mid-turn activity
+ * heartbeat) and the latest message timestamp, falling back to `started_at`.
+ *
+ * Must not prefer a stale heartbeat over a newer message: durable heartbeats
+ * are rate-limited (~60s), so after a turn writes messages last_activity_at
+ * can lag MAX(messages.timestamp). The UNION-ALL + aggregate-MAX form is
+ * load-bearing: SQLite's SCALAR max() returns NULL when any argument is NULL,
+ * while the aggregate ignores NULLs — a NULL heartbeat must not erase a live
+ * message timestamp from the comparison.
+ */
+const SESSION_LAST_ACTIVE_SQL = `
+		  COALESCE(
+		    (SELECT MAX(_act_v.v) FROM (
+		       SELECT child.last_activity_at AS v
+		       UNION ALL
+		       SELECT (SELECT MAX(_act_m.timestamp) FROM messages _act_m
+		               WHERE _act_m.session_id = child.id)
+		     ) _act_v),
+		    child.started_at)
+		`.trim();
+
+/**
  * Walk the compression-continuation chain forward from `sessionId` and return
  * the tip (the input id when no continuation exists). Read-only; cycle- and
  * depth-bounded. Exclusion predicates match hermes_state.py:get_compression_tip:
  * `$._branched_from` / `$._delegate_from` markers in child.model_config and
  * source='tool' children are NOT continuations; ordering prefers
  * end_reason='compression' children, then still-live children, then stale
- * closed siblings by last activity.
+ * closed siblings by the three-leg freshest-of recency expression
+ * (_sql_session_last_active), never raw started_at.
  */
 export function getCompressionTip(
 	db: Database.Database,
@@ -48,7 +72,7 @@ export function getCompressionTip(
 		    WHEN child.ended_at IS NULL THEN 1
 		    ELSE 2
 		  END,
-		  COALESCE(child.last_activity_at, child.started_at) DESC,
+		  ${SESSION_LAST_ACTIVE_SQL} DESC,
 		  child.started_at DESC,
 		  child.id DESC
 		LIMIT 1

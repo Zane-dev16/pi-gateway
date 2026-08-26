@@ -1206,7 +1206,7 @@ in `../09-open-questions.md` (append-only).
   surface exposed on StateStore. pi_gateway/resolution: NEW telegram-topic-recovery.ts —
   recoverTelegramTopicThreadId (run.py:_recover_telegram_topic_thread_id matrix: telegram+dm+mode gates,
   lobby = ''/'1' only, non-lobby unknown thread ids NEVER rewritten #31086, newest-first same-user scan)
-  + TELEGRAM_GENERAL_TOPIC_IDS + telegramTopicGuardHooks factory over StateStore. guards/l1-adapter-guard:
+  - TELEGRAM_GENERAL_TOPIC_IDS + telegramTopicGuardHooks factory over StateStore. guards/l1-adapter-guard:
   handleMessage now runs the optional topicThreadRecovery+rebuildSessionKey hook pair BEFORE any keying/
   expected-key matching (base.py:_apply_topic_recovery ahead of build_session_key): telegram-DM-only gate,
   hook failure degrades to original key with warning, rewrite replaces event.source and RE-DERIVES the
@@ -1219,8 +1219,9 @@ in `../09-open-questions.md` (append-only).
   with exactly-one schema/version stamp; resolution telegram-topic-recovery.test.ts (8, real-store matrix);
   guards l1-topic-recovery.test.ts (10) — lane-key routing, identity preservation on no-op/#31086, group
   gate, post-recovery drop, hook-failure degradation, busy-lobby vs bound-lane isolation. Scoped suites:
-  guards/ + resolution/ + pi_state/ = 329+28 files green; tsc clean for all cluster files (residual tsc
-  errors confined to SIBLING clusters' uncommitted plaintext-coercion/slash-access test files).
+  guards/ + resolution/ + pi_state/ = 29 files / 347 tests green; FINAL CONVERGED TREE: 2944/2944 across
+  231 files, tsc --noEmit exit 0, check:layering OK, check:secret-scope OK (mid-flight rotating failures
+  in sibling clusters' files resolved within their own windows; zero residual failures this cluster).
 
 - Stability round-2 fix cluster `slash-access-and-busy-r2` (2026-08-26): 3 findings
   (core-routing-10/11/12), single-owner pass over src/pi_gateway/guards toward
@@ -1241,7 +1242,7 @@ in `../09-open-questions.md` (append-only).
   seam, and run.py ~17507 cold path as RunnerBusyGuard.checkColdPathSlashAccess
   (known-command precondition inside; NO pregate exemption on cold — Hermes
   parity). Denials log the run.py line shape via onWarning. core-routing-11:
-  base.py coerce_plaintext_gateway_command + _PLAINTEXT_GATEWAY_RESTART_PATTERNS
+  base.py coerce_plaintext_gateway_command +_PLAINTEXT_GATEWAY_RESTART_PATTERNS
   (3 anchored regexes) ported into guards/events.ts; wired at L1
   AdapterSessionGuard.handleMessage ENTRY (before topic recovery/key
   derivation/classification) when allow_gateway_control — DM-only STRICT
@@ -1274,3 +1275,85 @@ in `../09-open-questions.md` (append-only).
   cluster; tsc errors likewise confined to that file + pi_agent_core/
   pi_embedded/pi_state siblings mid-edit); tsc clean + layering OK + secret-
   scope OK for all cluster files. Commit scoped to cluster paths only.
+
+- STABILITY FIX CLUSTER `embedded-security-r2` (2026-08-26): round-2 findings
+  secops-11/secops-12 applied toward Hermes truth (/tmp/hermes-upstream
+  gateway/kanban_watchers.py + cron/jobs.py anchors). secops-11 kanban
+  dispatcher machine-global singleton (DEC-057 logged; replaces the unlogged
+  PROPOSED-DEC header note): new dispatcher-lock.ts holds an open BEGIN
+  IMMEDIATE txn on <kanbanHome>/kanban/.dispatcher.lock.db (DEC-027 idiom at
+  the kanban root) — non-blocking zero-busy-timeout acquire, contended ⇒
+  clean refuse BEFORE board open, unavailable ⇒ loud config-control-only
+  warning (flock-unavailable parity), held for service/process lifetime,
+  released on stop; path anchored via HERMES_KANBAN_HOME/kanbanHome option;
+  process-shared handle so the notifier merely consults ownership — pi rows
+  carry no profile stamp ⇒ all rows legacy-equivalent ⇒ ownsSingleton probe
+  gates the whole tick (include_unowned parity). secops-12 cron persisted-
+  error wedge recovery (t_8b5480b3 parity): getDueJobs detects recurring jobs
+  parked future with last_status=error and last_run_at older than cadence+
+  grace (fresh fire claim = live run, never re-armed underneath itself —
+  #62002; unknown cadence falls back to grace for the cadence half), re-arms
+  interval→now (lands DUE same tick) / cron→next legal occurrence (strictly
+  earlier check leaves correctly-parked values alone), appends one JSONL row
+  {job_id,name,previous_next_run_at,rearmed_at} to <cronDir>/
+  persisted_error_recoveries.jsonl + instance stats getter (probe parity);
+  DEC-039 tick lock untouched. New contracts: dispatcher-lock.test.ts (6),
+  service.test.ts DEC-057 block (5), notifier.test.ts ownsSingleton block,
+  store.test.ts wedge block (8). kanban+cron 208/208 green; full-tree vitest
+  - tsc verified at close (sibling clusters' in-flight files excluded from
+  this cluster's commit scope).
+
+- STABILITY FIX CLUSTER `resolution-state-r2` (2026-08-26): round-2 findings
+  core-routing-13/14/15 applied toward Hermes truth (/tmp/hermes-upstream
+  hermes_state_common.py + hermes_state.py + gateway/agent_cache_pressure.py
+  anchors) across src/pi_gateway/resolution + src/pi_state +
+  src/pi_agent_core. core-routing-13: get_compressionTip sibling ordering
+  replaced COALESCE(last_activity_at, started_at) with the THREE-LEG
+  freshest-of expression (_sql_session_last_active port: MAX of
+  last_activity_at and MAX(child messages.timestamp), started_at fallback;
+  UNION-ALL aggregate-MAX form is load-bearing — SQLite scalar max() NULLs on
+  any NULL argument) so a rate-limited heartbeat lag can never demote a
+  session with fresh message rows; optional leg landed too:
+  StateStore.touchSessionActivity (hermes touch_session_activity — observation-
+  only, never-backwards UPDATE, 120-char bounded description, 0.5s sub-second
+  busy patience vs routine 20s) driven per turn by GatewayAgentRunner behind a
+  60s/session latch (SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS ≥30s
+  contract); compression-tip contracts gained stale-heartbeat-vs-fresh-msg,
+  NULL-leg aggregate, pure-started_at-fallback and heartbeat-flip rows.
+  core-routing-14: insertMessageInTx now verifies lease ownership INSIDE the
+  write txn (_check_transcript_write_guards turn-lease leg):
+  checkTurnLeaseWriteGuardOnConn keys the admission on the lineage ROOT
+  (lineageRootOnDb extracted, shared with DbTurnLeaseStore), raises the new
+  first-class SessionTurnLeaseLostError (fail-fast — executeWrite's ladder
+  retries only busy/locked so fencing never loops) on foreign holder/missing
+  row, and RENEWS an expired-but-matching lease in that same txn
+  (starved-refresher recovery without weakening the foreign-holder fence);
+  NewMessage.turnLeaseHolder/turnLeaseTtlSeconds plumbed through
+  StateStore.appendMessage; runner passes dbHolder on BOTH transcript appends,
+  folding an append-time refusal into the recorded lease-lost outcome shape
+  (conversation_loop flush-catch parity: reply not projected as durable when a
+  newer turn owns the slot); user-append refusal propagates typed.
+  core-routing-15: agent-cache maxTotalBytes Infinity default REMOVED —
+  resolveAutoMaxTotalBytes derives the startup budget from cgroup v2 own-
+  cgroup-first memory.high→memory.max→root→v1 limit_in_bytes else host RAM at
+  _AUTO_BUDGET_FRACTION 0.65, switching the pass OFF below _AUTO_BUDGET_FLOOR_MB
+  512MB (resolve_memory_high_mb "auto" parity: sub-floor budgets are noise,
+  never clamped up); process-wide memoized default wired into the runner's
+  cache options when no operator byte bound is set (cacheByteBudget/
+  cachedSessionIds diagnostics exposed). NOTE: parse of the v1 sentinel is 2**62
+  exact — the naive JS `1 << 62` overflows to 0 and rejects EVERY real limit
+  (caught by the new ladder rows). Contracts: state.test.ts admission block
+  (owner/expired-renewal/foreign-refusal-no-partial-row/missing-row/skip-without-
+  holder/root-keyed-child-segment), touchSessionActivity block (4),
+  agent-cache.test.ts derivation + default-wiring blocks (7), runner.test.ts
+  >TTL-stalled-writer interleave refusal + 60s heartbeat cadence + budget
+  wiring rows; compression-tip 6→10 rows. Suites: resolution+pi_state+
+  pi_agent_core 268 green ×2 repeats (+wal heavy-process run); layering OK;
+  secret-scope OK. Full-tree tsc/vitest verified with concurrent sibling
+  clusters' in-flight files excluded (streaming/telegram-topics mid-edit,
+  zero cross-imports into this cluster's paths). Shared-file note: runner.ts /
+  agent-cache.ts(.test.ts) carry interleaved hunks from the concurrently
+  landing secops-13 evictability-gate cluster (isEvictable/isCapEvictable +
+  flushedDbIdx fail-closed cursor) — co-edited green at commit time. Commit
+  scoped to cluster paths (+ those shared files); pi_state/index.ts left
+  uncommitted (concurrent telegram-topics barrel line, file still in flight).

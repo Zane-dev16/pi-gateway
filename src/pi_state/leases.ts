@@ -10,7 +10,7 @@
 //
 // Hermes anchors (READ-ONLY reference; semantics ported, no code vendored —
 // production-quality port of the proven Phase-0 spike shape):
-//   hermes_state.py:_session_turn_lease_key_on_conn      → lineageRootOnConn
+//   hermes_state.py:_session_turn_lease_key_on_conn      → lineageRootOnConn / lineageRootOnDb
 //   hermes_state.py:_is_explicit_fork_child_row          → isExplicitForkChildRow
 //   hermes_state.py:try_acquire_session_turn_lease       → tryAcquire (atomic CAS in BEGIN IMMEDIATE)
 //   hermes_state.py:acquire_session_turn_lease           → acquireWait (bounded poll, on_wait, abort)
@@ -18,6 +18,9 @@
 //   hermes_state.py:release_session_turn_lease           → releaseHolder (holder-scoped delete = generation-safe release)
 //   hermes_state.py:_compression_lock_holder_process_is_dead (+ _COMPRESSION_LOCK_HOLDER_PID_RE)
 //                                                        → holderProcessIsDead / extractHolderPid
+//   hermes_state.py:SessionTurnLeaseLostError            → SessionTurnLeaseLostError
+//   hermes_state.py:_check_transcript_write_guards       → checkTurnLeaseWriteGuardOnConn
+//                                                          (turn-lease admission leg, in-txn)
 //
 // Defaults per 02 §5: TTL 300s; waiting acquire polls ≤1800s @1s with
 // on_wait(elapsed) notices and should_abort() bail-out.
@@ -41,6 +44,24 @@ export const DEFAULT_WAIT_NOTICE_INTERVAL_SECONDS = 15;
  * hermes_state.py:_COMPRESSION_LOCK_HOLDER_PID_RE: `(?:^|:)pid=(\d+)(?::|$)`.
  */
 const HOLDER_PID_RE = /(?:^|:)pid=(\d+)(?::|$)/;
+
+/**
+ * hermes_state.py:SessionTurnLeaseLostError — a transcript write presented a
+ * turn-lease holder that no longer owns it (foreign holder, released, or
+ * reclaimed). Fail-fast fencing: never retried by the write ladder; callers
+ * surface the first-class "turn_lease" persistence-failure category (02 §5),
+ * never silent interleaving with a newer turn.
+ */
+export class SessionTurnLeaseLostError extends Error {
+	readonly sessionId: string;
+	constructor(sessionId: string, detail?: string) {
+		super(
+			`Session turn lease lost; refusing transcript write for ${sessionId}${detail ? ` (${detail})` : ""}`,
+		);
+		this.name = "SessionTurnLeaseLostError";
+		this.sessionId = sessionId;
+	}
+}
 
 export function extractHolderPid(holder: string): number | null {
 	const m = HOLDER_PID_RE.exec(holder ?? "");
@@ -151,6 +172,93 @@ export function isExplicitForkChildRow(session: {
 }
 
 /**
+ * Standalone form of the lineage-root walk so IN-TRANSACTION guards on an
+ * arbitrary connection share ONE implementation with DbTurnLeaseStore
+ * (hermes_state.py:_session_turn_lease_key_on_conn is likewise connection-
+ * scoped, not store-scoped).
+ */
+export function lineageRootOnDb(
+	db: Database.Database,
+	sessionId: string,
+): string {
+	if (!sessionId) return sessionId;
+	const stmt = db.prepare(
+		`SELECT id, parent_session_id, source, model_config, end_reason
+		 FROM sessions WHERE id = ?`,
+	);
+	const rowFor = (sid: string): SessionRow | undefined =>
+		stmt.get(sid) as SessionRow | undefined;
+
+	let current = rowFor(sessionId);
+	const seen = new Set<string>([sessionId]);
+	while (current) {
+		const parentId = current.parent_session_id;
+		if (!parentId || seen.has(parentId) || isExplicitForkChildRow(current)) {
+			break;
+		}
+		const parent = rowFor(parentId);
+		if (!parent || parent.end_reason !== "compression") break;
+		seen.add(parentId);
+		current = parent;
+	}
+	return current ? String(current.id) : sessionId;
+}
+
+/**
+ * hermes_state.py:_check_transcript_write_guards (turn-lease leg) — transcript-
+ * write ADMISSION check run INSIDE the write transaction, on the SAME
+ * connection as the pending insert. When `holder` is presented:
+ *
+ *  • a missing row OR a foreign holder raises SessionTurnLeaseLostError —
+ *    landing this write would interleave a stale flush after another process
+ *    reclaimed the lineage slot (the >TTL-stalled-writer window the periodic
+ *    refresher cannot close);
+ *  • an EXPIRED but still-matching lease is RENEWED in this same transaction:
+ *    expiry makes the row reclaimable but does not prove a takeover occurred,
+ *    and BEGIN IMMEDIATE serializes this renewal with acquisition, so a
+ *    still-matching owner recovers from a starved refresher without weakening
+ *    the foreign-holder fence.
+ *
+ * Absent/empty `holder` skips the guard entirely (parity: appends without a
+ * turn_lease_holder run no ownership check — shutdown-recovery replays and
+ * user-initiated mutations keep working).
+ */
+export function checkTurnLeaseWriteGuardOnConn(
+	conn: Database.Database,
+	sessionId: string,
+	opts: {
+		holder?: string | null;
+		ttlSeconds?: number;
+		/** Injected wall clock in SECONDS (tests). Default Date.now()/1000. */
+		nowSeconds?: () => number;
+	},
+): void {
+	const holder = opts.holder;
+	if (!holder) return;
+	const conversationId = lineageRootOnDb(conn, sessionId); // same tx as the write
+	const now = (opts.nowSeconds ?? (() => Date.now() / 1000))();
+	const lease = conn
+		.prepare(
+			"SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+		)
+		.get(conversationId) as Pick<LeaseRow, "holder" | "expires_at"> | undefined;
+	if (lease === undefined || String(lease.holder) !== holder) {
+		throw new SessionTurnLeaseLostError(sessionId);
+	}
+	if (Number(lease.expires_at) <= now) {
+		conn
+			.prepare(
+				"UPDATE session_turn_leases SET expires_at = ? WHERE conversation_id = ? AND holder = ?",
+			)
+			.run(
+				now + Math.max(0.1, opts.ttlSeconds ?? DEFAULT_TTL_SECONDS),
+				conversationId,
+				holder,
+			);
+	}
+}
+
+/**
  * Cross-process turn leases over `session_turn_leases(conversation_id PK,
  * holder, acquired_at, expires_at)` (02 §2.1 DDL). Attach to an ALREADY-OPEN,
  * already-initialized connection (StateStore owns open/init/close).
@@ -187,27 +295,7 @@ export class DbTurnLeaseStore {
 	 * can retry — never swallow-and-fail-open.
 	 */
 	lineageRootOnConn(sessionId: string): string {
-		if (!sessionId) return sessionId;
-		const stmt = this.db.prepare(
-			`SELECT id, parent_session_id, source, model_config, end_reason
-			 FROM sessions WHERE id = ?`,
-		);
-		const rowFor = (sid: string): SessionRow | undefined =>
-			stmt.get(sid) as SessionRow | undefined;
-
-		let current = rowFor(sessionId);
-		const seen = new Set<string>([sessionId]);
-		while (current) {
-			const parentId = current.parent_session_id;
-			if (!parentId || seen.has(parentId) || isExplicitForkChildRow(current)) {
-				break;
-			}
-			const parent = rowFor(parentId);
-			if (!parent || parent.end_reason !== "compression") break;
-			seen.add(parentId);
-			current = parent;
-		}
-		return current ? String(current.id) : sessionId;
+		return lineageRootOnDb(this.db, sessionId);
 	}
 
 	/** Diagnostic/read-only walk (hermes_state.py:_session_turn_lease_key). */
