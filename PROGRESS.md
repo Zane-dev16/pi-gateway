@@ -1613,3 +1613,9 @@ in `../09-open-questions.md` (append-only).
   FULL vitest 3096/3096 × 237 files TWICE consecutively (12:00Z/12:02Z) ·
   tokenlock spec solo ×5 stable. 5 DEC proposals await owner logging
   (three contest "065"); do NOT self-log per DEC-026.
+
+- SETTLE-CLOSED (2026-08-26): residual campaign SETTLED on first wave — all
+  xref residuals adjudicated (FIXED or DEC'd), drift regions cleared,
+  tokenlock harness flake killed (engine TOCTOU ratified upstream-faithful per
+  DEC-068), suite 3096/3096 @237 files x2. DEC-065..069 logged by orchestrator
+  (numbering collision resolved per suggested order). Tree stable.
