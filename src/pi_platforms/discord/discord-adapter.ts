@@ -2069,20 +2069,31 @@ export class DiscordNativeStreamLatch {
 // ── pure helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Thread-name derivation (`_derive_auto_thread_name` :7200-7216): strip
- * mention/channel refs, collapse whitespace, cap at 80 UTF-16 CODE UNITS
- * (77 + "..."), fall back to the platform default when empty.
+ * Thread-name derivation (`_derive_auto_thread_name`, adapter.py:7200-7216).
+ * BYTE-PARITY NOTES (closed under the discord-8 defer sweep):
+ *   - Mention/channel strips are NUMERIC-ID ONLY — <@123>, <@!123>, <@&123>,
+ *     <#123>. Upstream leaves non-numeric text like `<@team>` alone; a broader
+ *     [^>]+ strip eats real content Hermes keeps.
+ *   - The [:80] / [:77]+"..." slices are PYTHON code-point semantics (str[n]
+ *     never splits a surrogate pair). An emoji-heavy opener stays WHOLE even
+ *     though its UTF-16 budget overruns 80 units — that is upstream's own
+ *     accepted derive-path behavior, and exactly why the RENAME path exists:
+ *     rename_thread (:7287-7290) + run.py:_sanitize_discord_thread_title
+ *     re-truncate with utf16 helpers before any semantic rename lands. That
+ *     consumer rides the deferred session-title lane (see XREF-REPORT §6 /
+ *     proposed DEC for discord-8); this function keeps derive-path fidelity.
  */
 export function deriveThreadName(content: string): string {
 	const stripped = content
-		.replace(/<@!?[^>]+>/g, "")
-		.replace(/<@&[^>]+>/g, "")
-		.replace(/<#[^>]+>/g, "")
+		.trim()
+		.replace(/<@[!&]?\d+>/g, "")
+		.replace(/<#\d+>/g, "")
 		.replace(/\s+/g, " ")
 		.trim();
 	if (stripped.length === 0) return THREAD_NAME_FALLBACK;
-	if (utf16Len(stripped) <= THREAD_NAME_MAX_UTF16_UNITS) return stripped;
-	return `${stripped.slice(0, THREAD_NAME_MAX_UTF16_UNITS - 3)}...`;
+	const codePoints = Array.from(stripped);
+	if (codePoints.length <= THREAD_NAME_MAX_UTF16_UNITS) return stripped;
+	return `${codePoints.slice(0, THREAD_NAME_MAX_UTF16_UNITS - 3).join("")}...`;
 }
 
 /**

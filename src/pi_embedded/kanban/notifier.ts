@@ -44,6 +44,7 @@
 
 import { systemClock, type GatewayClock } from "./clock.js";
 import { resolveBoardSlug } from "./board.js";
+import { GATEWAY_SECRET_PATTERNS } from "../approvals/redact.js";
 import {
 	subKeyOf,
 	DEFAULT_DONE_SUB_RETENTION_DAYS,
@@ -70,6 +71,9 @@ export const NOTIFY_TERMINAL_KINDS = [
 	"unblocked",
 	"block_loop_detected",
 	"review_requested",
+	// kanban_watchers.py:TERMINAL_KINDS parity — a reviewer BLOCK in the
+	// review lane was never claimed, so such events pinged nobody.
+	"changes_requested",
 ] as const;
 
 export type NotifyTerminalKind = (typeof NOTIFY_TERMINAL_KINDS)[number];
@@ -113,9 +117,21 @@ function truncate(text: string, max: number): string {
 	return text.length > max ? text.slice(0, max) : text;
 }
 
+/** Raw [:max] slice of a string — parity Python str(x)[:max]. */
+function rawSlice(value: string, max: number): string {
+	return value.length > max ? value.slice(0, max) : value;
+}
+
+/** Python str.splitlines() separator set (UTF-8 source parity of the
+ * watcher's `.strip().splitlines()` handoff-line selection). */
+const SPLITLINES_RE = /\r\n|\r|\n|\v|\f|\x1c|\x1d|\x1e|\u0085|\u2028|\u2029/;
+
+/** First line of the stripped text clamped to max — but when stripping
+ * yields NO lines at all (whitespace-only input), upstream falls back to the
+ * RAW unstripped text [:max], so this does too. */
 function firstLine(text: string, max: number): string {
-	const lines = text.trim().split("\n");
-	return truncate(lines[0] ?? text, max);
+	const lines = text.trim().split(SPLITLINES_RE);
+	return truncate(lines[0] ?? "", max) || rawSlice(text, max);
 }
 
 function payloadString(
@@ -135,7 +151,16 @@ function whoTag(task: NotifyTaskView | null): string {
 	return task?.assignee ? `@${task.assignee} ` : "";
 }
 
-/** Render ONE terminal event into its user-facing message. */
+/** Render ONE terminal event into its user-facing message.
+ *
+ * Byte-parity of the current kanban_watchers.py notification text (drift
+ * re-audit vs /tmp/hermes-upstream@77001a6b): per-kind glyph prefixes
+ * (✔⏸✖✖⏱🔄👀🛑), RAW free-text slices where Hermes does not clamp
+ * (completed/blocked/gave_up/review_requested/block_loop reasons ride plain
+ * [:N] slices), clamped fields exactly where Hermes clamps (_safe_review_reason
+ * rides ONLY the changes_requested reason/reviewer/implementer triple), and the
+ * changes_requested composition WITHOUT the @assignee identity prefix.
+ */
 export function renderNotifyMessage(
 	event: NotifyEvent,
 	task: NotifyTaskView | null,
@@ -145,50 +170,76 @@ export function renderNotifyMessage(
 	const who = whoTag(task);
 	const title = truncate(task?.title ?? event.taskId, 120);
 	const head = `${tag}${who}Kanban ${event.taskId} `;
+	const headNoWho = `${tag}Kanban ${event.taskId} `;
 	switch (event.kind) {
 		case "completed": {
-			// Worker handoff first (payload summary), legacy task.result fallback.
+			// Worker handoff first (payload summary, [:200]), legacy task.result
+			// fallback carries the SHORTER [:160] slice (watcher parity).
 			const summary = payloadString(event.payload, "summary");
 			const handoffSource = summary || task?.result || "";
+			const handoffLimit = summary ? 200 : 160;
 			const handoff = handoffSource
-				? `\n${truncate(firstLine(handoffSource, 200), 200)}`
+				? `\n${truncate(firstLine(handoffSource, handoffLimit), handoffLimit)}`
 				: "";
-			return `${head}done — ${title}${handoff}`;
+			return `✔ ${head}done — ${title}${handoff}`;
 		}
 		case "blocked": {
 			const reason = payloadString(event.payload, "reason");
-			return `${head}blocked${reason ? `: ${truncate(reason, 160)}` : ""}`;
+			return `⏸ ${head}blocked${reason ? `: ${rawSlice(reason, 160)}` : ""}`;
 		}
 		case "gave_up": {
 			const err = payloadString(event.payload, "error");
-			return `${head}gave up after repeated spawn failures${err ? `\n${truncate(err, 200)}` : ""}`;
+			return `✖ ${head}gave up after repeated spawn failures${err ? `\n${truncate(err, 200)}` : ""}`;
 		}
 		case "crashed":
-			return `${head}worker crashed (pid gone); dispatcher will retry`;
+			return `✖ ${head}worker crashed (pid gone); dispatcher will retry`;
 		case "timed_out": {
 			const rawLimit = event.payload?.["limit_seconds"];
 			const limit =
 				typeof rawLimit === "number" && Number.isFinite(rawLimit)
 					? Math.trunc(rawLimit)
 					: 0;
-			return `${head}timed out (max_runtime=${limit}s); will retry`;
+			return `⏱ ${head}timed out (max_runtime=${limit}s); will retry`;
 		}
 		case "status": {
 			const status = payloadString(event.payload, "status");
-			return `${head}\u2192 ${status}`;
+			return `🔄 ${head}\u2192 ${status}`;
 		}
 		case "review_requested": {
+			// RAW multi-line summary slice — NOT whitespace-collapsed and not
+			// run through the external-delivery clamp (Hermes sends it raw).
 			const summary = payloadString(event.payload, "summary");
-			return `${head}ready for review — ${title}${summary ? `\n${truncate(summary, 200)}` : ""}`;
+			return `👀 ${head}ready for review — ${title}${summary ? `\n${rawSlice(summary, 200)}` : ""}`;
+		}
+		case "changes_requested": {
+			// kanban_watchers.py:changes_requested branch — a reviewer BLOCKed
+			// (or requested changes on) work still under review. The ONLY kind
+			// whose free-text fields ride _safe_review_reason (reason clamped at
+			// the default 160, identities at 48); the composed string itself is
+			// NOT re-clamped. The @assignee prefix is deliberately absent here.
+			const reason = payloadString(event.payload, "reason");
+			const reviewer = safeReviewReason(
+				payloadString(event.payload, "reviewer") || null,
+				48,
+			);
+			const implementer = safeReviewReason(
+				payloadString(event.payload, "implementer") || null,
+				48,
+			);
+			const reasonText =
+				safeReviewReason(reason) || "reviewer feedback requires changes";
+			let provenance = "";
+			if (reviewer) provenance += ` — reviewer @${reviewer}`;
+			if (implementer) provenance += ` → implementer @${implementer}`;
+			return `🛑 ${headNoWho}review requested changes/BLOCK: ${reasonText}${provenance}`;
 		}
 		case "block_loop_detected": {
 			const reason = payloadString(event.payload, "reason");
 			const recurrences = event.payload?.["recurrences"];
-			const rc =
-				typeof recurrences === "number" && Number.isFinite(recurrences)
-					? ` (blocked ${Math.trunc(recurrences)}x for the same cause)`
-					: "";
-			return `${head}routed to TRIAGE — needs a human decision${rc}${reason ? `: ${truncate(reason, 160)}` : ""}`;
+			const rc = recurrences
+				? ` (blocked ${String(recurrences)}x for the same cause)`
+				: "";
+			return `🛑 ${head}routed to TRIAGE — needs a human decision${rc}${reason ? `: ${rawSlice(reason, 160)}` : ""}`;
 		}
 		default:
 			// Silent kinds never render (guarded by SILENT_EVENT_KINDS upstream);
@@ -196,6 +247,39 @@ export function renderNotifyMessage(
 			// crashing the tick.
 			return `${head}${event.kind}`;
 	}
+}
+
+// ── external-delivery hygiene (kanban_watchers.py:_safe_review_reason) ───────────
+
+/** kanban_watchers.py:_LOCAL_PATH_RE — absolute machine paths must not ride
+ * notifications to a chat surface (they leak filesystem topology). */
+const LOCAL_PATH_RE =
+	/(?<![\w:/])(?:\/(?:Users|home|private|tmp|var|etc|workspace)\/[^\s,;]+|[A-Za-z]:\\[^\s,;]+)/g;
+const URL_CREDENTIALS_RE = /(https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi;
+
+/** Redact + clamp free-text meant for EXTERNAL delivery (review reasons,
+ * reviewer handles). force-style secret scrub (gateway pattern belt) first —
+ * an error or miss here is the failure direction that leaks; then URL
+ * credentials ([REDACTED]@), local paths ([local path]), whitespace collapse,
+ * and the ellipsis clamp. Never throws. */
+export function safeReviewReason(value: unknown, limit = 160): string {
+	let reason = value === null || value === undefined ? "" : String(value);
+	try {
+		for (const pattern of GATEWAY_SECRET_PATTERNS) {
+			reason = reason.replace(pattern, (_match, group1?: string) =>
+				typeof group1 === "string" ? `${group1}[REDACTED]` : "[REDACTED]",
+			);
+		}
+	} catch {
+		/* pattern pass is belt-and-suspenders — degrade to raw tail handling */
+	}
+	reason = reason.replace(URL_CREDENTIALS_RE, "$1[REDACTED]@");
+	reason = reason.replace(LOCAL_PATH_RE, "[local path]");
+	reason = reason.split(/\s+/).filter(Boolean).join(" ");
+	if (reason.length > limit) {
+		reason = `${reason.slice(0, limit - 1).replace(/\s+$/, "")}\u2026`;
+	}
+	return reason;
 }
 
 // ── one deterministic tick ────────────────────────────────────────────────

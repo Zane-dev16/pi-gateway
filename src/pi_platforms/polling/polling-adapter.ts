@@ -47,7 +47,9 @@ import {
 	extractRetryAfterSeconds,
 	resolveEnablement,
 	type LockAcquisition,
+	type CallbackTapContext,
 } from "../kit/index.js";
+import type { ParsedCallback } from "../kit/callback-grammar.js";
 import type { AdapterStatusSnapshot } from "../kit/lifecycle-state.js";
 import type { LengthUnit } from "../kit/length-policy.js";
 import type {
@@ -267,7 +269,7 @@ export class PollingAdapterCore
 				appr: this.appr,
 				clarify: this.clarify,
 			},
-			authorizer: () => this.allowAllClickers,
+			authorizer: (tap, family) => this.authorizeCallbackClicker(tap, family),
 			onExecApproval: async (sessionKey) => {
 				this.resolvedFamilies.push("ea");
 				this.routerResolved.push(`ea:${sessionKey}`);
@@ -310,6 +312,24 @@ export class PollingAdapterCore
 	}
 	setClickerAuthorization(allow: boolean): void {
 		this.allowAllClickers = allow;
+	}
+
+	/**
+	 * tg-11 seam (adapter.py:_is_callback_user_authorized :1171 — "unauthorized
+	 * taps are ANSWERED and NOT resolved — fail-closed"): the clicker predicate
+	 * the kit router consults BEFORE any gated family resolves. The reference
+	 * engine's default IS the shared conformance switch (allowAllClickers, the
+	 * `setClickerAuthorization` fixture control) so cross-platform rows keep
+	 * their explicit authorization fixtures; production adapters OVERRIDE this
+	 * hook with their genuine authorization posture — Telegram wires the full
+	 * session-authz decision chain here (telegram-adapter.ts).
+	 */
+	protected authorizeCallbackClicker(
+		tap: CallbackTapContext,
+		_family: ParsedCallback["family"],
+	): boolean {
+		void tap;
+		return this.allowAllClickers;
 	}
 
 	// ══════════════════════════════════════════════════════════════════════

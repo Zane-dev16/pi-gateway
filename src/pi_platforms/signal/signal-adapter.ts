@@ -1030,6 +1030,11 @@ export class SignalAdapter extends BasePlatformAdapter {
 		content: string,
 		_metadata: Metadata,
 	): Promise<SendResult> {
+		// Blank-content no-op (signal.py:send, cbc8d1804): nothing to deliver ⇒
+		// success WITHOUT an empty-body RPC hitting the vendor CLI.
+		if (!content || !content.trim()) {
+			return { success: true, messageId: null };
+		}
 		await this.stopTypingIndicator(chatId);
 		// The §6.1 plain-text fallback lane carries ORIGINAL chunk bytes by
 		// contract — dialect conversion is SKIPPED for that envelope (its prefix
@@ -1752,6 +1757,12 @@ export class SignalAdapter extends BasePlatformAdapter {
 			} finally {
 				this.activeChunkStyles = null;
 			}
+			// Chunk-loop bail (signal.py:send — the per-chunk loop RETURNS the
+			// failing SendResult immediately): a failed chunk aborts the REMAINING
+			// chunks so a dead session cannot leave a half-conversation whose
+			// tail arrives after recovery. Redelivery covers the gap.
+			const last = results.at(-1);
+			if (last !== undefined && last.success === false) break;
 		}
 		return results;
 	}

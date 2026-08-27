@@ -545,8 +545,12 @@ describe("components round-trip through kit machinery (DEC-016)", () => {
 });
 
 describe("auto-thread continuity — DEC-028 effective-thread-slot predicate at the wire level", () => {
+	// NUMERIC bot snowflake: real Discord mentions are always <@digits>; the
+	// 'bot-self' shorthand would leak into the derived thread name now that
+	// deriveThreadName strips numeric-id mentions only (adapter.py:7209-7212).
+	const BOT_ID = "444000111";
 	it("initiator keys via prospective thread slot; in-thread follow-ups BYTE-MATCH; predicate agrees by construction", async () => {
-		const world = makeDiscordWorld({ name: "autothread" });
+		const world = makeDiscordWorld({ name: "autothread", botUserId: BOT_ID });
 		const { engine, subject, wire } = world;
 		await world.connectAndAwaitLive();
 
@@ -555,7 +559,7 @@ describe("auto-thread continuity — DEC-028 effective-thread-slot predicate at 
 			channelId: "chan-9",
 			guildId: "g1",
 			authorId: "user-2",
-			content: "<@bot-self> please investigate the flaky pipeline",
+			content: `<@${BOT_ID}> please investigate the flaky pipeline`,
 		});
 		await eventually(() => subject.turns().length >= 1);
 		await eventually(() => engine.threadCreations.length >= 1);
@@ -579,7 +583,7 @@ describe("auto-thread continuity — DEC-028 effective-thread-slot predicate at 
 			channelId: creation?.threadId ?? "",
 			guildId: "g1",
 			authorId: "user-3",
-			content: "<@bot-self> logs attached",
+			content: `<@${BOT_ID}> logs attached`,
 			isThread: true,
 			threadId: creation?.threadId,
 		});
@@ -1187,18 +1191,37 @@ describe("manifest data transcription (vendor ground truth)", () => {
 		}
 	});
 
-	it("thread-name derivation: mention strip, collapse, UTF-16 cap 80 with … fallback", () => {
+	it('thread-name derivation strips NUMERIC mentions only, collapses, and caps at 80 PYTHON CODE POINTS with [:77]+"..." on overflow (adapter.py:7200-7216)', () => {
+		// Vendor mention forms — user <@123> / nickname <@!123> / role <@&123> /
+		// channel <#123> — strip; collapse normalizes runs of whitespace.
 		expect(deriveThreadName("<@123> <@!456> fix   the   bug")).toBe(
 			"fix the bug",
 		);
+		expect(deriveThreadName("<@&789> ship   it")).toBe("ship it");
+		expect(deriveThreadName("look <#555> here")).toBe("look here");
+		// NON-numeric bracket text is literal content upstream survives:
+		// the regexes match digits ONLY (adapter.py:7209-7212).
+		expect(deriveThreadName("<@team> rally time")).toBe("<@team> rally time");
 		expect(deriveThreadName("   ")).toBe(THREAD_NAME_FALLBACK);
 		const long = "x".repeat(120);
 		const named = deriveThreadName(long);
 		expect(named.length).toBe(80);
 		expect(named.endsWith("...")).toBe(true);
-		// UTF-16 code-unit math: astral chars count DOUBLE.
+		// Python str[:77] code-point semantics: astral chars never split. A
+		// 50-codepoint emoji opener stays WHOLE even though its UTF-16 budget
+		// overruns 80 units — upstream's accepted derive-path quirk, redressed
+		// only at rename time by its utf16 helpers (:7287-7290).
 		const astral = "🎉".repeat(50); // 100 utf16 units / 50 codepoints
-		expect(deriveThreadName(astral).length).toBe(80);
+		expect([...deriveThreadName(astral)]).toHaveLength(50);
+		expect(deriveThreadName(astral)).toBe(astral);
+		// Boundary: exactly 80 PYTHON code points passes whole (its UTF-16 unit
+		// count is irrelevant on this path); one more code point truncates.
+		const edge = "🎉".repeat(30) + "y".repeat(50); // 80 codepoints / 110 units
+		expect([...deriveThreadName(edge)]).toHaveLength(80);
+		const overEdge = `${edge}z`; // 81 codepoints
+		const cut = deriveThreadName(overEdge);
+		expect([...cut]).toHaveLength(80); // 77 + ".".repeat(3)
+		expect(cut.endsWith("...")).toBe(true);
 	});
 
 	it("streaming-edit truncation caps at 2000 codepoints with saturated marker", () => {

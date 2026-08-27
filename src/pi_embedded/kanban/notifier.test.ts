@@ -232,10 +232,25 @@ describe("renderNotifyMessage — message-shape parity", () => {
 			task,
 			"default",
 		);
-		expect(msg).toBe("[default] @alice Kanban t1 done — Ship the thing\nline1");
+		// ✔ prefix + board/identity tags are watcher parity
+		// (kanban_watchers.py drift re-audit vs upstream@77001a6b).
+		expect(msg).toBe(
+			"✔ [default] @alice Kanban t1 done — Ship the thing\nline1",
+		);
 	});
 
-	it("blocked includes the block reason", () => {
+	it("completed task.result fallback slices at 160, not 200 (watcher parity)", () => {
+		const msg = renderNotifyMessage(
+			{ id: 1, taskId: "t1", kind: "completed", payload: null, createdAt: 0 },
+			{ ...task, result: "r".repeat(180) },
+			null,
+		);
+		expect(msg).toBe(
+			`✔ @alice Kanban t1 done — Ship the thing\n${"r".repeat(160)}`,
+		);
+	});
+
+	it("blocked includes the block reason (raw 160 slice, no clamp)", () => {
 		const msg = renderNotifyMessage(
 			{
 				id: 2,
@@ -247,7 +262,23 @@ describe("renderNotifyMessage — message-shape parity", () => {
 			null,
 			null,
 		);
-		expect(msg).toBe("Kanban t1 blocked: needs creds");
+		expect(msg).toBe("⏸ Kanban t1 blocked: needs creds");
+		// Reasons beyond 160 chars are SLICED raw — no whitespace collapse and
+		// no [local path]/[REDACTED] scrub on this kind (watcher parity).
+		const long = "a ".repeat(120);
+		expect(
+			renderNotifyMessage(
+				{
+					id: 2,
+					taskId: "t1",
+					kind: "blocked",
+					payload: { reason: long },
+					createdAt: 0,
+				},
+				null,
+				null,
+			),
+		).toContain(`blocked: ${long.slice(0, 160)}`);
 	});
 
 	it("gave_up / crashed / timed_out / status shapes", () => {
@@ -263,14 +294,16 @@ describe("renderNotifyMessage — message-shape parity", () => {
 				task,
 				null,
 			),
-		).toContain("gave up after repeated spawn failures");
+		).toContain("✖ @alice Kanban t1 gave up after repeated spawn failures");
 		expect(
 			renderNotifyMessage(
 				{ id: 4, taskId: "t1", kind: "crashed", payload: null, createdAt: 0 },
 				task,
 				null,
 			),
-		).toContain("worker crashed (pid gone); dispatcher will retry");
+		).toContain(
+			"✖ @alice Kanban t1 worker crashed (pid gone); dispatcher will retry",
+		);
 		expect(
 			renderNotifyMessage(
 				{
@@ -283,7 +316,7 @@ describe("renderNotifyMessage — message-shape parity", () => {
 				task,
 				null,
 			),
-		).toContain("timed out (max_runtime=600s); will retry");
+		).toContain("⏱ @alice Kanban t1 timed out (max_runtime=600s); will retry");
 		expect(
 			renderNotifyMessage(
 				{
@@ -296,23 +329,26 @@ describe("renderNotifyMessage — message-shape parity", () => {
 				task,
 				null,
 			),
-		).toContain("\u2192 review");
+		).toContain("🔄 @alice Kanban t1 \u2192 review");
 	});
 
-	it("review_requested wakes with summary; block_loop pings TRIAGE loudly", () => {
-		expect(
-			renderNotifyMessage(
-				{
-					id: 7,
-					taskId: "t1",
-					kind: "review_requested",
-					payload: { summary: "ready!" },
-					createdAt: 0,
-				},
-				task,
-				null,
-			),
-		).toContain("ready for review — Ship the thing");
+	it("review_requested wakes with RAW summary; block_loop pings TRIAGE loudly", () => {
+		// 👀 + the RAW multi-line summary slice — no whitespace collapse, no
+		// external-delivery clamp (kanban_watchers.py sends it raw).
+		const review = renderNotifyMessage(
+			{
+				id: 7,
+				taskId: "t1",
+				kind: "review_requested",
+				payload: { summary: "line a\nline b" },
+				createdAt: 0,
+			},
+			task,
+			null,
+		);
+		expect(review).toBe(
+			"👀 @alice Kanban t1 ready for review — Ship the thing\nline a\nline b",
+		);
 		const triage = renderNotifyMessage(
 			{
 				id: 8,
@@ -324,9 +360,9 @@ describe("renderNotifyMessage — message-shape parity", () => {
 			task,
 			null,
 		);
-		expect(triage).toContain("routed to TRIAGE");
-		expect(triage).toContain("(blocked 3x for the same cause)");
-		expect(triage).toContain(": flaky");
+		expect(triage).toBe(
+			"🛑 @alice Kanban t1 routed to TRIAGE — needs a human decision (blocked 3x for the same cause): flaky",
+		);
 	});
 
 	it("long titles truncate at 120 chars (chat-legibility parity)", () => {
@@ -348,6 +384,9 @@ describe("terminal-event vocabulary", () => {
 				"archived",
 				"block_loop_detected",
 				"blocked",
+				// kanban_watchers.py:TERMINAL_KINDS now includes the review-lane
+				// reviewer-BLOCK kind — unclaimed, it pinged nobody.
+				"changes_requested",
 				"completed",
 				"crashed",
 				"gave_up",
@@ -357,6 +396,66 @@ describe("terminal-event vocabulary", () => {
 				"unblocked",
 			].sort(),
 		);
+	});
+
+	it("renders changes_requested with redacted reason + provenance (kanban_watchers.py parity)", () => {
+		const event: NotifyEvent = {
+			id: 1,
+			taskId: "t_chg",
+			kind: "changes_requested",
+			payload: {
+				reason:
+					"see /home/alice/secrets.txt for the failing case, token sk-abcdefghijklmnopqrstuvwx",
+				reviewer: "reviewer-person",
+				implementer: "worker-person",
+			},
+			createdAt: 0,
+		};
+		const out = renderNotifyMessage(event, null, null);
+		expect(out).toContain("review requested changes/BLOCK:");
+		expect(out).toContain("[local path]");
+		expect(out).toContain("[REDACTED]");
+		expect(out).toContain("— reviewer @reviewer-person");
+		expect(out).toContain("→ implementer @worker-person");
+		// The default reason flows through the same clamp when payload is bare.
+		const bare = renderNotifyMessage({ ...event, payload: null }, null, null);
+		expect(bare).toContain("reviewer feedback requires changes");
+	});
+
+	it("changes_requested drops the @assignee tag; other kinds keep it (watcher parity)", () => {
+		const task: NotifyTaskView = {
+			id: "t_chg",
+			title: "Review me",
+			status: "review",
+			assignee: "alice",
+			result: null,
+		};
+		// Upstream composes the 🛑 line WITHOUT {tag} — the reviewer/implementer
+		// provenance already names the parties.
+		const event: NotifyEvent = {
+			id: 2,
+			taskId: "t_chg",
+			kind: "changes_requested",
+			payload: { reason: "s" },
+			createdAt: 0,
+		};
+		expect(renderNotifyMessage(event, task, "default")).toMatch(
+			/^🛑 \[default\] Kanban t_chg review requested changes\/BLOCK: s/,
+		);
+		// …while completed/blocked/etc. DO carry the identity prefix.
+		expect(
+			renderNotifyMessage(
+				{
+					id: 3,
+					taskId: "t_chg",
+					kind: "blocked",
+					payload: null,
+					createdAt: 0,
+				},
+				task,
+				null,
+			),
+		).toMatch(/^⏸ @alice Kanban t_chg blocked/);
 	});
 
 	it("archived/unblocked are claimed-but-SILENT (cursor hygiene)", () => {
@@ -790,7 +889,9 @@ describe("startKanbanNotifier — optional-stage service contracts", () => {
 			// Wait for a tick to elapse WITHOUT ownership: no rows claimed, no
 			// deliveries, cursor untouched — silent skip (include_unowned parity).
 			expect(r.sent).toHaveLength(0);
-			expect(store.subs.get("t1\u0000telegram\u000042\u0000")!.lastEventId).toBe(0);
+			expect(
+				store.subs.get("t1\u0000telegram\u000042\u0000")!.lastEventId,
+			).toBe(0);
 
 			// The dispatcher role lands on THIS gateway ⇒ next tick delivers.
 			owns = true;

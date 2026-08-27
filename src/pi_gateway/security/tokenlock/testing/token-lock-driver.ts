@@ -106,11 +106,21 @@ async function main(): Promise<void> {
 		}
 		case "refuse-then-poll": {
 			// First attempt happens WHILE A LIVES (refusal recorded), then poll
-			// until the lock frees. elapsedMs = true kill-to-reclaim latency.
+			// until the lock frees. Optional --go-poll-marker opens the TIMED
+			// window only when the parent writes it — i.e. after both children
+			// are confirmed live (ready/attempted markers) AND after the holder
+			// kill — so elapsedMs stays kill→reclaim ONLY. Pre-kill harness
+			// latency (cold-cache child boot, starved vitest-worker detection
+			// of the attempted marker — DEC-041 host stall class) otherwise
+			// lands inside the measured window and pollutes the <2s wall bound.
+			// Omitting the marker keeps the previous untimed-gate behavior.
 			const mgr = new engine.ScopedTokenLockManager({ dir });
 			const first = mgr.tryAcquire(scope, identity, owner);
 			const refusedFirst = !first.acquired;
 			signal(String(args["attempted-marker"]), { refusedFirst });
+			if (args["go-poll-marker"] !== undefined) {
+				waitForMarker(String(args["go-poll-marker"]));
+			}
 			const deadline = Date.now() + Number(args["timeout-ms"] ?? 5000);
 			let acquired = false;
 			const start = Date.now();
@@ -125,11 +135,12 @@ async function main(): Promise<void> {
 			return;
 		}
 		case "race": {
-			// Barrier start: the PARENT gates both racers behind a go-marker so
-			// they contend SIMULTANEOUSLY while both processes are alive (raw
-			// spawn order lets the first racer boot, win, and EXIT before the
-			// second even loads — the second would then rightly reclaim the
-			// dead holder's lock per §5 liveness, not violate exclusion).
+			// Per-racer go-marker gate: the PARENT un-gates each racer
+			// individually once its predecessor's claim has resolved. Boot is
+			// simultaneous (both signal ready before ANY go), so contention set-
+			// up overlaps; attempt sequencing stays parent-disciplined so the
+			// single-winner outcome is deterministic against the inherited
+			// upstream tombstone window (see two-process.test.ts + reports).
 			signal(String(args["ready-marker"]));
 			waitForMarker(String(args["go-marker"]));
 			// One immediate attempt — two of these against a stale record must
@@ -142,9 +153,19 @@ async function main(): Promise<void> {
 			});
 			signal(String(args["done-marker"]));
 			if (result.acquired) {
-				// Hold long enough that the loser observes a LIVE holder (a real
-				// gateway holds its credential lock for its whole lifetime).
-				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+				// The WINNER must stay alive until the PARENT releases it: both
+				// racers must attempt WHILE the winner holds (§10 "racing starters"
+				// = simultaneous live contenders on ONE stale record). A fixed hold
+				// raced the sibling's cold boot — under DEC-041-class load the loser
+				// can arrive after the winner already exited, then LEGITIMATELY
+				// reclaim the winner's corpse record per §5 liveness ⇒ false "two
+				// winners". Marker-held release makes simultaneity structural.
+				if (args["release-marker"] !== undefined) {
+					waitForMarker(String(args["release-marker"]));
+					result.lock.release();
+				} else {
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+				}
 			}
 			return;
 		}

@@ -153,6 +153,16 @@ export interface AdapterGuardDeps {
 		sessionKey: string,
 	) => Promise<boolean>;
 	/**
+	 * Turn-failure report fired when a spawned/in-band turn RAISES or is
+	 * CANCELLED before the user-facing error notice (upstream
+	 * plugins/platforms/slack/adapter.py:_handle_slack_message thin wrapper,
+	 * #95417/39a5838f0: a claim taken by an invocation that then fails must
+	 * be unwindable by the failing platform's own bookkeeping — neither a
+	 * transport retry nor a user edit may stay suppressed forever).
+	 * Best-effort: rejections are contained by the guard.
+	 */
+	onTurnFailure?: ((event: IncomingEvent) => void | Promise<void>) | undefined;
+	/**
 	 * Telegram DM topic-recovery hook (base.py:set_topic_recovery_fn — the
 	 * runner installs run.py:_recover_telegram_topic_thread_id). Called with
 	 * event.source BEFORE any keying/matching; a non-null return rewrites
@@ -241,6 +251,9 @@ export class AdapterSessionGuard {
 	private readonly busySessionHandler:
 		| ((event: IncomingEvent, sessionKey: string) => Promise<boolean>)
 		| null;
+	private readonly onTurnFailure:
+		| ((event: IncomingEvent) => void | Promise<void>)
+		| null;
 	private readonly topicThreadRecovery:
 		| ((source: SessionSource) => string | null | undefined)
 		| null;
@@ -264,6 +277,7 @@ export class AdapterSessionGuard {
 		this.busyTextMode = deps.busyTextMode ?? "interrupt";
 		this.hasPendingClarify = deps.hasPendingClarify ?? null;
 		this.busySessionHandler = deps.busySessionHandler ?? null;
+		this.onTurnFailure = deps.onTurnFailure ?? null;
 		// The pair is only meaningful together (rewrite + re-key).
 		this.topicThreadRecovery =
 			deps.topicThreadRecovery !== undefined &&
@@ -746,6 +760,13 @@ export class AdapterSessionGuard {
 		} catch (err) {
 			if (err instanceof TaskCancelledError || currentTask.cancelRequested()) {
 				// Cancelled turns unwind silently (no user-facing error notice).
+				// The failure report still fires (cancellation is a BaseException
+				// for upstream's except-clause — claims must not outlive frames).
+				try {
+					await this.onTurnFailure?.(event);
+				} catch {
+					/* contained */
+				}
 				return;
 			}
 			await this.handleTurnError(event, sessionKey, err);
@@ -788,6 +809,14 @@ export class AdapterSessionGuard {
 		err: unknown,
 	): Promise<null> {
 		const errorType = err instanceof Error ? err.constructor.name : typeof err;
+		// Let the ADAPTER unwind per-invocation bookkeeping FIRST (upstream
+		// _handle_slack_message wrapper releases a failed invocation's fresh
+		// claim before anything else observes the failure). Best-effort.
+		try {
+			await this.onTurnFailure?.(event);
+		} catch {
+			/* contained — never break the error notice path */
+		}
 		const detail = String(err instanceof Error ? err.message : err).slice(
 			0,
 			300,

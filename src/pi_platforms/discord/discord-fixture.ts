@@ -56,6 +56,10 @@ export interface MakeDiscordWorldOptions {
 	ladder?: ReconnectLadderOptions | undefined;
 	rateGate?: boolean | undefined;
 	historyProvider?: HistoryProvider | undefined;
+	/** READY d.user.id — pass a NUMERIC snowflake to model real Discord
+	 * mention wire truth (`<@123>`); the default 'bot-self' shorthand violates
+	 * the vendor's numeric mention syntax and leaks into derived thread names. */
+	botUserId?: string | undefined;
 }
 
 /** A full discord world: subject + engine + gateway fake + injected clock. */
@@ -63,7 +67,10 @@ export function makeDiscordWorld(
 	opts: MakeDiscordWorldOptions = {},
 ): DiscordWorld {
 	const clock = new ManualClock();
-	const gateway = new DiscordGatewayFake({ nowMs: clock.nowMs });
+	const gateway = new DiscordGatewayFake({
+		nowMs: clock.nowMs,
+		...(opts.botUserId === undefined ? {} : { botUserId: opts.botUserId }),
+	});
 	if (opts.heartbeatIntervalMs !== undefined)
 		gateway.heartbeatIntervalMs = opts.heartbeatIntervalMs;
 	const wire = new FakePlatformWire();

@@ -4,7 +4,13 @@
 // probe evidence chain. Anchors: 01 §3.2, 08 §1.1 stage 4.
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	realpathSync as nodeRealpathSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -17,6 +23,7 @@ import {
 	isRuntimeLockActive,
 	pidFilePath,
 	readPidFile,
+	recordHomeMatches,
 	removePidFile,
 	writePidFile,
 } from "./instance-guard.js";
@@ -183,6 +190,36 @@ describe("live-instance probe (get_running_pid evidence chain)", () => {
 			expect(existsSync(pidFilePath(home))).toBe(false);
 		}
 		lock.release();
+	});
+
+	// Destructive-action authority check (#89315 parity): --replace must not
+	// signal a target whose OWNERSHIP the persisted record cannot prove.
+	describe("recordHomeMatches (--replace ownership authority, #89315)", () => {
+		it("exact same home proves ownership", () => {
+			expect(recordHomeMatches({ pi_home: home }, home)).toBe(true);
+		});
+
+		it("a FOREIGN profile's live gateway is never owned by this home", () => {
+			expect(recordHomeMatches({ pi_home: "/home/other-profile" }, home)).toBe(
+				false,
+			);
+		});
+
+		it("a LEGACY record without pi_home stamping is unprovable ⇒ fail closed", () => {
+			expect(recordHomeMatches({}, home)).toBe(false);
+			expect(recordHomeMatches({ pi_home: "   " }, home)).toBe(false);
+			expect(recordHomeMatches({ pi_home: 1234567890 }, home)).toBe(false);
+		});
+
+		it("symlink/realpath differences of the SAME directory still match", () => {
+			let real = "";
+			try {
+				real = nodeRealpathSync(home);
+			} catch {
+				real = home;
+			}
+			expect(recordHomeMatches({ pi_home: real }, home)).toBe(true);
+		});
 	});
 });
 

@@ -55,6 +55,16 @@ export interface CallbackTapContext {
 	/** Platform user id of the clicker ("" when absent — fail-closed). */
 	userId: string;
 	chatId?: string | undefined;
+	/** Host-message chat shape as delivered by the wire ("private" | "group"
+	 * | "supergroup" | "channel" …). Untouched by the router itself — adapters
+	 * with real authorization postures (tg-11: Telegram's
+	 * `_is_callback_user_authorized` SessionSource construction :1183) map it
+	 * onto their authz source vocabulary and need thread ids / display names
+	 * for that mapping. Always OPTIONAL so every existing tap builder keeps
+	 * compiling; absent fields simply carry no authorization signal. */
+	chatType?: string | undefined;
+	threadId?: string | undefined;
+	userName?: string | undefined;
 }
 
 /** Fail-closed clicker authorization against user allowlists (§9.1). */

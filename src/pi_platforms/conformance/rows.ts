@@ -487,6 +487,10 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 			s.registerClarifyPending(103, "sk-cl");
 			s.registerApprPending(104, "sk-appr");
 
+			// Premise: an operator-configured gateway where the clicker IS
+			// authorized (tg-11 — Telegram's real authz chain deny-by-default,
+			// armed/allowed via the fixture switch; allow-all engines no-op).
+			s.setClickerAuthorization(true);
 			const cases: Array<[string, string]> = [
 				["ea", buildExecApprovalCallback("once", 101)],
 				["sc", buildSlashConfirmCallback("always", 102)],
@@ -571,6 +575,10 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 		async (s) => {
 			const router = s.callbackRouter();
 			if (!router) throw new Error("no router");
+			// tg-11 premise: the clicker passes authorization (fixture switch;
+			// real engines evaluate their own chain) so UNKNOWN/STALE are what's
+			// under test — not the unauthorized gate.
+			s.setClickerAuthorization(true);
 			const unknown = await router.route("zz:bogus:data", { userId: "user-1" });
 			expectTrue(
 				unknown.kind === "unknown" && unknown.answerText.length > 0,

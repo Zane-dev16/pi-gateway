@@ -402,11 +402,17 @@ export class PersistentWsAdapter
 
 	// ── runner wiring passthrough (subject/test attaches the guard) ────────
 
+	// Pure passthrough — the widened deps shape (incl. the optional
+	// best-effort onTurnFailure failure-report hook) stays in lockstep with
+	// BasePlatformAdapter.attachGuard so subject wiring keeps compiling.
 	attachGuard(
 		deps: {
 			registry: CommandRegistry;
 			messageHandler: MessageHandler;
 			sendReply: (chatId: string, text: string) => Promise<void>;
+			onTurnFailure?:
+				| ((event: IncomingEvent) => void | Promise<void>)
+				| undefined;
 		},
 		opts: {
 			spawner?: TaskSpawner | undefined;

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { governingTier, type PluginContext } from "../kit/index.js";
+import { buildExecApprovalCallback } from "../kit/index.js";
 import {
 	TELEGRAM_ALLOWED_UPDATES,
 	TELEGRAM_CHAT_ACTION,
@@ -341,18 +342,22 @@ describe("telegram-wire-r2 pure helpers (tg2-x)", () => {
 				telegram_direct_messages_topic_id: 2,
 			}),
 		).toBe("2");
-		expect(metadataReplyToMessageId({ telegram_reply_to_message_id: "9" })).toBe(
-			9,
-		);
+		expect(
+			metadataReplyToMessageId({ telegram_reply_to_message_id: "9" }),
+		).toBe(9);
 	});
 
 	it("tg2-4 threadKwargsForSend routes forum vs DM-topic lanes", () => {
 		// Forum topic id ships as message_thread_id.
 		expect(threadKwargsForSend("7", {}, null)).toEqual({ messageThreadId: 7 });
 		// General-topic '1' maps away on sends.
-		expect(threadKwargsForSend("1", {}, null)).toEqual({ messageThreadId: null });
+		expect(threadKwargsForSend("1", {}, null)).toEqual({
+			messageThreadId: null,
+		});
 		// Explicit DM-topic id pairs with an OMITTED thread id.
-		expect(threadKwargsForSend(null, { direct_messages_topic_id: 5 }, null)).toEqual({
+		expect(
+			threadKwargsForSend(null, { direct_messages_topic_id: 5 }, null),
+		).toEqual({
 			messageThreadId: null,
 			directMessagesTopicId: 5,
 		});
@@ -401,9 +406,7 @@ describe("telegram-wire-r2 pure helpers (tg2-x)", () => {
 		expect(fitsRichLimits("x".repeat(32768))).toBe(true);
 		expect(fitsRichLimits("x".repeat(32769))).toBe(false);
 		// Details+math crash shape skips rich (TDesktop #30808).
-		expect(
-			isRichEligibleContent("<details>$$x$$</details>"),
-		).toBe(false);
+		expect(isRichEligibleContent("<details>$$x$$</details>")).toBe(false);
 	});
 
 	it("tg2-6 rich linebreak normalization protects code fences and tables", () => {
@@ -577,5 +580,316 @@ describe("fake Bot API server — engine plane over mixed-kind updates", () => {
 		expect(tg.sendKwargs[0]?.["parse_mode"]).toBe("MarkdownV2");
 		expect(tg.sendKwargs[0]?.["disable_notification"]).toBe(true);
 		expect(tg.editKwargs[0]?.["parse_mode"]).toBe("MarkdownV2");
+	});
+
+	it("sendMessageDraft captures FULL kwargs with no message id on success (tg-13)", async () => {
+		const tg = new TelegramBotApiFake();
+		const ok = await tg.sendMessageDraft({
+			chat_id: 42,
+			draft_id: 7,
+			text: "partial *bold*",
+			parse_mode: "MarkdownV2",
+		});
+		expect(ok.success).toBe(true);
+		expect(ok.messageId).toBeUndefined(); // drafts carry NO message id (:6207)
+		expect(tg.draftKwargs[0]?.["chat_id"]).toBe(42);
+		expect(tg.draftKwargs[0]?.["draft_id"]).toBe(7);
+		expect(tg.draftKwargs[0]?.["parse_mode"]).toBe("MarkdownV2");
+
+		tg.scriptDraft({
+			kind: "fail",
+			error: "Bad Request: can't parse entities",
+		});
+		const failed = await tg.sendMessageDraft({
+			chat_id: 1,
+			draft_id: 2,
+			text: "x",
+		});
+		expect(failed.success).toBe(false);
+		expect(tg.draftKwargs.length).toBe(2); // failed attempts stay assertable
+	});
+
+	it("deleteMessage captures {chat_id, message_id} and scripts failures (tg-12)", async () => {
+		const tg = new TelegramBotApiFake();
+		await tg.deleteMessage({ chat_id: 4242, message_id: 88 });
+		expect(tg.deleteOps).toEqual([{ chatId: "4242", messageId: "88", seq: 1 }]);
+
+		tg.scriptDelete({
+			kind: "fail",
+			error: "Bad Request: message to delete not found",
+		});
+		const failed = await tg.deleteMessage({ chat_id: 4242, message_id: 89 });
+		expect(failed.success).toBe(false);
+		expect(tg.deleteOps.length).toBe(1); // failed call NOT captured
+	});
+});
+
+describe("telegram closures wave (tg-11/tg-12/tg-13 — Hermes-truth contracts)", () => {
+	function makeAdapterHere(): TelegramAdapter {
+		return new TelegramAdapter({
+			wire: new TelegramBotApiFake(),
+			clock: new ManualPollingClock(),
+			secretReader: () => "tok",
+		});
+	}
+	function makeAdapterWith(botWire: TelegramBotApiFake): TelegramAdapter {
+		return new TelegramAdapter({
+			wire: botWire,
+			clock: new ManualPollingClock(),
+			secretReader: () => "tok",
+		});
+	}
+
+	/** Env control helper (multiplex OFF ⇒ authz accessors read process.env;
+	 * same sanctioned pattern as security/authz/decision.test.ts). ASYNC-AWARE:
+	 * the save/restore MUST bracket the ENTIRE awaited body — a sync try/finally
+	 * restores env the moment the body hits its first await, so any env read
+	 * performed AFTER that suspension (e.g. a SECOND route() in one block)
+	 * observes already-emptied vars and fails closed against nothing. */
+	async function withAuthzEnv<T>(
+		vars: Record<string, string | undefined>,
+		fn: () => T,
+	): Promise<Awaited<T>> {
+		const KEYS = [
+			"TELEGRAM_ALLOWED_USERS",
+			"TELEGRAM_GROUP_ALLOWED_USERS",
+			"TELEGRAM_GROUP_ALLOWED_CHATS",
+			"TELEGRAM_ALLOW_ALL_USERS",
+			"GATEWAY_ALLOWED_USERS",
+			"GATEWAY_ALLOW_ALL_USERS",
+		];
+		const saved = new Map<string, string | undefined>();
+		for (const k of KEYS) saved.set(k, process.env[k]);
+		for (const k of KEYS) delete process.env[k];
+		try {
+			for (const [k, v] of Object.entries(vars)) {
+				if (v !== undefined) process.env[k] = v;
+			}
+			return await fn();
+		} finally {
+			for (const [k, v] of saved) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+		}
+	}
+
+	it("tg-11: NO callback resolution without session authorization (fail-closed default)", async () => {
+		await withAuthzEnv({}, async () => {
+			const adapter = makeAdapterHere();
+			adapter.approvals.register(11, "sk-tg11");
+			const answer = await adapter.router.route(
+				buildExecApprovalCallback("once", 11),
+				{ userId: "31337", chatId: "77", chatType: "private" },
+			);
+			// Unconfigured gateway ⇒ _is_callback_user_authorized parity DENY:
+			// answered ⛔ (spinner clears) but NEVER resolved (#24457).
+			expect(answer.kind).toBe("unauthorized");
+			expect(answer.answerText).toContain("not authorized");
+			expect(answer.hostEdit).toBeNull();
+			expect(adapter.approvals.has(11)).toBe(true); // NOT popped
+		});
+	});
+
+	it("tg-11: TELEGRAM_ALLOWED_USERS / '*' / ALLOW_ALL opt-ins authorize like message ingress", async () => {
+		await withAuthzEnv({ TELEGRAM_ALLOWED_USERS: "42,999" }, async () => {
+			const adapter = makeAdapterHere();
+			adapter.approvals.register(12, "sk-tg11a");
+			const ok = await adapter.router.route(
+				buildExecApprovalCallback("once", 12),
+				{ userId: "42", chatId: "77", chatType: "dm" },
+			);
+			expect(ok.kind).toBe("resolved");
+		});
+		await withAuthzEnv({ TELEGRAM_ALLOWED_USERS: "*" }, async () => {
+			const adapter = makeAdapterHere();
+			adapter.approvals.register(13, "sk-tg11w");
+			const wildcard = await adapter.router.route(
+				buildExecApprovalCallback("always", 13),
+				{ userId: "anyone", chatType: "private" },
+			);
+			expect(wildcard.kind).toBe("resolved");
+		});
+		await withAuthzEnv({ GATEWAY_ALLOW_ALL_USERS: "yes" }, async () => {
+			const adapter = makeAdapterHere();
+			adapter.approvals.register(14, "sk-tg11g");
+			const open = await adapter.router.route(
+				buildExecApprovalCallback("deny", 14),
+				{ userId: "555", chatType: "dm" },
+			);
+			expect(open.kind).toBe("resolved");
+		});
+	});
+
+	it("tg-11: empty clicker id fails closed EVEN under '*'; supergroup+thread maps to forum scope", async () => {
+		await withAuthzEnv(
+			{
+				TELEGRAM_ALLOWED_USERS: "*",
+				TELEGRAM_GROUP_ALLOWED_CHATS: "-10099",
+			},
+			async () => {
+				const adapter = makeAdapterHere();
+				adapter.approvals.register(15, "sk-tg11e");
+				const emptyUser = await adapter.router.route(
+					buildExecApprovalCallback("session", 15),
+					{ userId: "", chatType: "private" },
+				);
+				expect(emptyUser.kind).toBe("unauthorized");
+
+				// A forum-topic tap in an allowed GROUP chat authorizes through
+				// gate 2 (group_chat_allowlist) even though its sender is not in
+				// the platform-wide allowlist — SessionSource chat_type mapping.
+				adapter.approvals.register(16, "sk-tg11f");
+				const forumTap = await adapter.router.route(
+					buildExecApprovalCallback("once", 16),
+					{
+						userId: "not-listed",
+						chatId: "-10099",
+						chatType: "supergroup",
+						threadId: "9",
+					},
+				);
+				expect(forumTap.kind).toBe("resolved");
+			},
+		);
+	});
+
+	it("tg-11: forced fixture override wins over the real chain (shared conformance rows)", async () => {
+		await withAuthzEnv({}, async () => {
+			const adapter = makeAdapterHere();
+			adapter.approvals.register(17, "sk-tg11f");
+			adapter.setClickerAuthorization(false);
+			const denied = await adapter.router.route(
+				buildExecApprovalCallback("once", 17),
+				{ userId: "42", chatType: "private" },
+			);
+			expect(denied.kind).toBe("unauthorized");
+		});
+	});
+
+	it("tg-12: deleteMessage normalizes ids on the wire and NEVER throws on failure", async () => {
+		const tg = new TelegramBotApiFake();
+		const adapter = makeAdapterWith(tg);
+		await expect(adapter.deleteMessage("4242", "88")).resolves.toBe(true);
+		expect(tg.deleteOps[0]?.chatId).toBe("4242");
+		expect(tg.deleteOps[0]?.messageId).toBe("88");
+
+		tg.scriptDelete({
+			kind: "fail",
+			error: "Bad Request: message to delete not found",
+		});
+		await expect(adapter.deleteMessage("4242", "89")).resolves.toBe(false);
+		await expect(adapter.deleteMessage("@channelname", "90")).resolves.toBe(
+			true,
+		);
+		expect(tg.deleteOps.at(-1)?.chatId).toBe("@channelname");
+	});
+
+	it("tg-13: legacy draft frames are sendMessageDraft calls, MarkdownV2-first with one plain retry", async () => {
+		const tg = new TelegramBotApiFake();
+		const adapter = makeAdapterWith(tg);
+
+		// First frame: MarkdownV2 conversion + parse_mode stamp; NO message id.
+		const first = await adapter.sendDraft({
+			chatId: "4242",
+			draftId: 4001,
+			content: "Part **one** <b>& raw",
+		});
+		expect(first.success).toBe(true);
+		expect(first.messageId).toBeUndefined();
+		expect(tg.draftKwargs[0]?.["chat_id"]).toBe(4242); // normalized int
+		expect(tg.draftKwargs[0]?.["draft_id"]).toBe(4001);
+		expect(tg.draftKwargs[0]?.["parse_mode"]).toBe("MarkdownV2");
+		expect(String(tg.draftKwargs[0]?.["text"])).toContain("*one*");
+
+		// BadRequest parse failure degrades THIS frame to raw text (no flag).
+		tg.scriptDraft({
+			kind: "fail",
+			error: "Bad Request: can't parse entities",
+		});
+		const retried = await adapter.sendDraft({
+			chatId: "4242",
+			draftId: 4002,
+			content: "plain tail **b**",
+		});
+		expect(retried.success).toBe(true);
+		expect(tg.draftKwargs[1]?.["parse_mode"]).toBe("MarkdownV2"); // failed MD attempt
+		expect(tg.draftKwargs[2]?.["parse_mode"]).toBeUndefined(); // plain retry
+		expect(tg.draftKwargs[2]?.["text"]).toBe("plain tail **b**"); // RAW bytes
+
+		// Non-BadRequest failures surface immediately — no doomed retry.
+		tg.scriptDraft({ kind: "fail", error: "socket hang up" });
+		const transient = await adapter.sendDraft({
+			chatId: "4242",
+			draftId: 4003,
+			content: "x",
+		});
+		expect(transient.success).toBe(false);
+		expect(transient.error).toContain("socket hang up");
+		expect(tg.draftKwargs.filter((k) => k["draft_id"] === 4003)).toHaveLength(
+			1,
+		);
+	});
+
+	it("tg-13: oversized drafts ship FIRST-CHUNK bytes (utf16 budget, label kept) and stay RAW when rich preview governs", async () => {
+		const oversize = "a".repeat(TELEGRAM_MAX_MESSAGE_UNITS + 10);
+		const adapter = makeAdapterHere();
+		await adapter.sendDraft({
+			chatId: "chat-tg13-long",
+			draftId: 4004,
+			content: oversize,
+		});
+		const kwargs = adapter.bot.draftKwargs.at(-1) as Record<string, unknown>;
+		// :6176 = truncate_message(len_fn=utf16_len)[0] — the first chunk of the
+		// SHARED chunker: indicator-reserved body budget (4096−10), fence-aware
+		// split, " (1/N)" label kept. Never a plain byte-cut, never split into
+		// multiple frames. (The :6175 fit check itself is codepoint-based — an
+		// astral-heavy draft under 4096 codepoints would pass through whole.)
+		// The shipped bytes are the MARKDOWNV2 ATTEMPT: the conversion escapes
+		// the synthesized label's parens exactly like regular chunked sends
+		// ("… (1/2)" → "… \\(1/2\\)").
+		expect(kwargs["text"]).toBe(
+			`${"a".repeat(TELEGRAM_MAX_MESSAGE_UNITS - 10)} \\(1/2\\)`,
+		);
+		expect(String(kwargs["parse_mode"])).toBe("MarkdownV2"); // MDV2 attempt still stamped
+
+		// A draft whose CODEPOINT count fits passes through UNCHANGED even when
+		// its UTF-16 length exceeds the cap (upstream `len(content)` quirk).
+		const astralOnly = "🎉".repeat(2048); // 2048 codepoints, 4096 UTF-16 units
+		await adapter.sendDraft({
+			chatId: "chat-tg13-long",
+			draftId: 4005,
+			content: astralOnly,
+		});
+		const passthrough = adapter.bot.draftKwargs.at(-1) as Record<
+			string,
+			unknown
+		>;
+		expect(passthrough["text"]).toBe(astralOnly);
+
+		// rich_messages ON but rich_drafts OFF + rich-rendering-needed content:
+		// the ephemeral preview stays RAW (plain_rich_preview :6185).
+		const envOf = (k: string): string | undefined => {
+			if (k === "TELEGRAM_RICH_MESSAGES") return "true";
+			if (k === "TELEGRAM_RICH_DRAFTS") return "false";
+			return undefined;
+		};
+		const richPreviewAdapter = new TelegramAdapter({
+			wire: new TelegramBotApiFake(),
+			secretReader: () => "tok",
+			optionalEnvReader: envOf,
+		});
+		const table = "| a | b |\n| - | - |\n| 1 | 2 |";
+		await richPreviewAdapter.sendDraft({
+			chatId: "c",
+			draftId: 1,
+			content: table,
+		});
+		const last = richPreviewAdapter.bot.draftKwargs.at(-1) as Record<
+			string,
+			unknown
+		>;
+		expect(last["text"]).toBe(table); // untouched pipe-table bytes
+		expect(last["parse_mode"]).toBeUndefined(); // no MDV2 attempt either
 	});
 });

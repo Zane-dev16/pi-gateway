@@ -33,7 +33,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	processAlive,
 	processStartTime,
@@ -325,6 +325,38 @@ export function isRuntimeLockActive(homeOrPath: string): boolean {
 export interface RunningInstance {
 	pid: number;
 	record: PidRecord;
+}
+
+/** status.py:_same_hermes_home parity — normcase'd canonical comparison (on
+ * POSIX, os.path.normcase is the identity). */
+function normcase(p: string): string {
+	return process.platform === "win32"
+		? p.replace(/\//g, "\\").toLowerCase()
+		: p;
+}
+
+export interface HomeOwnershipRecord {
+	pi_home?: unknown;
+}
+
+/**
+ * Destructive-action authority check for `--replace`
+ * (run.py:_replace_target_belongs_to_other_profile, #89315): the PID file is
+ * home-scoped, but a poisoned/misplanted record can name ANOTHER profile's
+ * LIVE gateway — signaling it starts the cross-profile SIGTERM restart loop.
+ * Ownership is decided by the persisted identity record ALONE (exact pi-home
+ * equality; the record is already bound to the live target by exact pid +
+ * start-time identity via {@link getRunningPid}). Missing or legacy records
+ * (no pi_home stamping) are UNPROVABLE ⇒ refuse — fail closed.
+ */
+export function recordHomeMatches(
+	record: HomeOwnershipRecord,
+	home: string,
+): boolean {
+	const recorded =
+		typeof record.pi_home === "string" ? record.pi_home.trim() : "";
+	if (recorded === "") return false; // legacy: unprovable ownership
+	return normcase(resolve(recorded)) === normcase(resolve(home));
 }
 
 export interface GetRunningPidOptions {

@@ -1593,3 +1593,23 @@ in `../09-open-questions.md` (append-only).
   worktree). High fixes verified end-to-end: transformContext pre-call repair,
   stripMediaDirectivesForDisplay at every emission+comparison boundary,
   gchat updateMask computation. Full ledger: reports/XREF-REPORT.md.
+
+## Residual-settle pass (2026-08-27) — VERDICT: SETTLED
+
+- Closure waves verified & closed: tg-11/12/13 FIXED toward upstream
+  (real authz callback gating, deleteMessage, sendMessageDraft legacy lane;
+  reports/TELEGRAM-DEFERS-CLOSURE-REPORT.md), discord-8 adjudicated (carriers
+  byte-parity + rename tail behind proposed DEC; reports/DISCORD-8-DEFER-
+  CLOSURE-REPORT.md); upstream drift re-audit vs clone HEAD 77001a6b
+  (reports/XREF-DRIFT-REAUDIT.md — kanban R1 fixed, obligations/multiplex
+  unwired-constraint DECs proposed, slack inbound extraction flagged).
+  Tokenlock SIGKILL flake KILLED harness-only (marker-gated timing);
+  inherited tombstone TOCTOU engine race found + DEC-proposed, contract
+  narrowed to deterministic core.
+- Verifier corrections: PersistentWsAdapter.attachGuard passthrough gained
+  optional onTurnFailure (shadowed-base tsc error no owner picked up);
+  signal-engine blank-guard row uses structural cast over protected wireSend.
+- Gates of record: tsc 0 errors tree-wide · layering OK · secret-scope OK ·
+  FULL vitest 3096/3096 × 237 files TWICE consecutively (12:00Z/12:02Z) ·
+  tokenlock spec solo ×5 stable. 5 DEC proposals await owner logging
+  (three contest "065"); do NOT self-log per DEC-026.

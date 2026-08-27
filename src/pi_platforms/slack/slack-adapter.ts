@@ -59,13 +59,10 @@
 import type {
 	Metadata,
 	SendResult,
-	StreamLogger,
 	EditOptions,
 } from "../../pi_gateway/streaming/adapter-seam.js";
 import type {
 	IncomingEvent,
-	TaskSpawner,
-	MessageHandler,
 	CommandRegistry,
 } from "../../pi_gateway/guards/index.js";
 import type {
@@ -77,7 +74,6 @@ import type {
 } from "../persistent-ws/fake-ws.js";
 import {
 	PersistentWsAdapter,
-	type AdapterClock,
 	type PersistentWsAdapterDeps,
 	type RestPlane,
 } from "../persistent-ws/persistent-ws-adapter.js";
@@ -582,8 +578,6 @@ export class SlackAdapter extends PersistentWsAdapter {
 		outcome?: "success" | "failure" | undefined;
 	}> = [];
 
-	private readonly hooks: SlackRenderHooks;
-
 	private slackLadderInst: FormattingLadder | null = null;
 	private slackLadderChatId = "";
 
@@ -656,7 +650,6 @@ export class SlackAdapter extends PersistentWsAdapter {
 		this.selfUserId = deps.botUserId ?? "bot-self";
 		this.botIdentityInjected = deps.botUserId !== undefined;
 		this.slackTransport = rawTransport;
-		this.hooks = hooks;
 		hooks.richBlocksEnabled = () => this.richBlocks;
 		hooks.onBlocksDroppedOnRetry = () => {
 			this.blockRetryAudit.droppedOnRetries += 1;
@@ -784,7 +777,16 @@ export class SlackAdapter extends PersistentWsAdapter {
 	// ── ingress: socket-mode event pipeline (shape delta) ──────────────────
 
 	/** Bounded original-ts → processed-at record (:985/:6855). */
+	/** Claim bookkeeping for routed-original-ts (:6855); value = claim time.
+	 */
 	private readonly processedMessageTs = new Map<string, number>();
+
+	/** Fresh claims indexed by ENVELOPE id so the guard's asynchronous
+	 * onTurnFailure hook can unwind exactly the failed invocation even though
+	 * turns run inside a spawned frame (pi containment parity of upstream
+	 * adapter.py:_handle_slack_message thin-wrapper, 39a5838f0). Same bound
+	 * as the ts map. */
+	private readonly freshClaimByMessageId = new Map<string, string>();
 
 	/** 👀→✅/❌ swap anchor: message ts → channel that received 👀. */
 	private readonly pendingReactions = new Map<string, string>();
@@ -822,6 +824,42 @@ export class SlackAdapter extends PersistentWsAdapter {
 			if (oldest.done) break;
 			this.processedMessageTs.delete(oldest.value);
 		}
+	}
+
+	/** Remember (envelope → original-ts) so a later asynchronous turn failure
+	 * can unwind THIS invocation's claim via onGuardTurnFailure. Entries live
+	 * until their single outcome fires or LRU-trim bounds them (dedup means
+	 * one envelope has at most ONE turn outcome, so surviving success-marker
+	 * entries are inert). */
+	private trackFreshClaim(ts: string, messageId: string): void {
+		this.markProcessedMessageTs(ts);
+		if (ts !== "" && messageId !== "") {
+			this.freshClaimByMessageId.set(messageId, ts);
+		}
+		while (this.freshClaimByMessageId.size > SLACK_PROCESSED_MESSAGE_TS_MAX) {
+			const oldest = this.freshClaimByMessageId.keys().next();
+			if (oldest.done) break;
+			this.freshClaimByMessageId.delete(oldest.value);
+		}
+	}
+
+	/** Failure unwind for ONE invoked claim; pre-existing claims untouched. */
+	private noteFailedInvocation(messageId: string): void {
+		const originalTs = this.freshClaimByMessageId.get(messageId);
+		if (originalTs === undefined) return;
+		this.freshClaimByMessageId.delete(messageId);
+		if (this.processedMessageTs.delete(originalTs)) {
+			this.logger?.warn?.(
+				`${this.manifestName}: turn failed after claiming ts=${originalTs}; claim released so a retry or edit can re-drive`,
+			);
+		}
+	}
+
+	/** Guard seam (AdapterSessionGuard opts.onTurnFailure): turn RAISED or was
+	 * CANCELLED (cancellation is BaseException territory for upstream's
+	 * except-clause) — release the failed invocation's fresh claim. */
+	onGuardTurnFailure(event: IncomingEvent): void {
+		this.noteFailedInvocation(String(event.messageId ?? ""));
 	}
 
 	/**
@@ -925,15 +963,23 @@ export class SlackAdapter extends PersistentWsAdapter {
 		// Reactions anchor at the TRIGGERING message's own ts (message_id=ts
 		// parity; on_processing_start :4256-4263).
 		const reactionAnchor = env.ts ?? evt.id;
+		// Routed-original-ts bookkeeping lands BEFORE dispatch (:6855 —
+		// even a failed turn marks its message addressed). Failure-path
+		// guard (adapter.py:_handle_slack_message thin wrapper): if THIS
+		// invocation freshly claimed the ts and the turn later RAISES or
+		// is CANCELLED, onGuardTurnFailure releases it — a held-by-a-
+		// failed-invocation claim would permanently swallow the message
+		// (neither a Slack retry nor a user edit could re-drive it).
+		// Pre-existing claims from an earlier successful turn are never
+		// released.
+		const claimTs = typeof env.ts === "string" && env.ts !== "" ? env.ts : null;
 		try {
 			this.sessionKeysSeen.push(sessionKey);
 			await this.onProcessingStart(String(env.chatId), reactionAnchor);
 			// Turn-start processing indicator (adapter.py:send_typing —
 			// assistant.threads.setStatus "is thinking..."); cleared at finalize.
 			await this.sendTyping(String(env.chatId), { thread_id: threadRoot });
-			// Routed-original-ts bookkeeping lands BEFORE dispatch (:6855 —
-			// even a failed turn marks its message addressed).
-			if (typeof env.ts === "string") this.markProcessedMessageTs(env.ts);
+			if (claimTs !== null) this.trackFreshClaim(claimTs, evt.id);
 			await this.dispatchIncoming(
 				{
 					messageId: evt.id,
@@ -949,6 +995,9 @@ export class SlackAdapter extends PersistentWsAdapter {
 				sessionKey,
 			);
 		} catch (err) {
+			// Synchronous dispatch failures unwind through the same rule as the
+			// asynchronous guard hook: only THIS invocation's claim goes.
+			this.noteFailedInvocation(evt.id);
 			this.logger?.error?.(
 				`${this.manifestName}: dispatch failed for ${evt.id}: ${err instanceof Error ? err.message : String(err)}`,
 			);
@@ -961,6 +1010,9 @@ export class SlackAdapter extends PersistentWsAdapter {
 		this.cursor.advance(evt.id); // THE Socket-Mode ack point
 		// ✅ completion swap (adapter.py:on_processing_complete :4265-4284).
 		await this.onProcessingComplete(reactionAnchor, "success");
+		// NO index purge here: the spawned turn frame may STILL fail and invoke
+		// onGuardTurnFailure afterwards (that is exactly the upstream release
+		// window the thin wrapper owns).
 		// Turn-finalized: Slack auto-clears the status on a posted reply; the
 		// explicit clear covers contained failures and non-reply turns
 		// (adapter.py:stop_typing / _clear_thread_status_quietly).

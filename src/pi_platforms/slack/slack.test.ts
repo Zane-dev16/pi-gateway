@@ -29,7 +29,10 @@ import {
 } from "../../pi_embedded/approvals/delivery.js";
 import type { GatewayClock } from "../../pi_embedded/approvals/clock.js";
 import { ManualClock } from "../persistent-ws/manual-clock.js";
-import { SlackSocketModeServer, type SlackEnvelopeEvent } from "./fake-socket-mode.js";
+import {
+	SlackSocketModeServer,
+	type SlackEnvelopeEvent,
+} from "./fake-socket-mode.js";
 import {
 	isSlackReactionsEnabled,
 	SLACK_PROCESSED_MESSAGE_TS_MAX,
@@ -833,57 +836,10 @@ function SLACK_MANifest_capabilities() {
 	return SLACK_MANIFEST.capabilities;
 }
 
-/** Structural DeliveryTarget slice over the real adapter (exact-optional
- * narrowing of SendResult → ApprovalSendResult for the bridge seam). */
-function asDeliveryTarget(engine: SlackAdapter): {
-	typedCommandPrefix: string;
-	send(
-		chatId: string,
-		text: string,
-		metadata?: unknown,
-	): Promise<{
-		success: boolean;
-		messageId?: string | null;
-		error?: string | null;
-	}>;
-	sendExecApproval(
-		args: Parameters<SlackAdapter["sendExecApproval"]>[0],
-	): Promise<{
-		success: boolean;
-		messageId?: string | null;
-		error?: string | null;
-	}>;
-} {
-	return {
-		typedCommandPrefix: engine.typedCommandPrefix,
-		send: async (chatId, text, metadata) => {
-			const r = await engine.send(
-				chatId,
-				text,
-				undefined,
-				(metadata ?? {}) as never,
-			);
-			return {
-				success: r.success,
-				messageId: r.messageId ?? null,
-				error: r.error ?? null,
-			};
-		},
-		sendExecApproval: async (args) => {
-			const r = await engine.sendExecApproval(args);
-			return {
-				success: r.success,
-				messageId: r.messageId ?? null,
-				error: r.error ?? null,
-			};
-		},
-	};
-}
-
 describe("per-turn emoji lifecycle (ws-6: reactions.add/remove, SLACK_REACTIONS)", () => {
 	it("👀 lands on the triggering message at processing start; removed + white_check_mark at completion", async () => {
 		const world = makeSlackWorld({ name: "slack-react-success" });
-		const { engine, socketServer } = world;
+		const { engine } = world;
 		const capturing = world.wire as unknown as SlackCapturingWire;
 		await world.connectAndAwaitLive();
 
@@ -1174,7 +1130,9 @@ describe("message_changed envelopes (ws-11: edits normalize onto changed-ts-dedu
 		await eventually(() => engine.cursor.value === editEvt.id);
 		expect([...subject.turns()]).toEqual(["edited body v2"]);
 		// Same session/thread root as the original message (its own ts).
-		expect(engine.sessionKeysSeen.at(-1)).toBe("slack-edit-fresh:C1:1700000000.000301");
+		expect(engine.sessionKeysSeen.at(-1)).toBe(
+			"slack-edit-fresh:C1:1700000000.000301",
+		);
 	});
 
 	it("redelivery of a DISPATCHED edit is absorbed by the processed-original-ts guard before any re-dispatch", async () => {
@@ -1252,7 +1210,7 @@ describe("message_changed envelopes (ws-11: edits normalize onto changed-ts-dedu
 
 	it("edits to ALREADY-addressed messages are dropped (no duplicate response); a second distinct edit is likewise absorbed", async () => {
 		const world = makeSlackWorld({ name: "slack-edit-addressed" });
-		const { engine, subject } = world;
+		const { subject } = world;
 		await world.connectAndAwaitLive();
 
 		const originalTs = "1700000000.000501";
@@ -1301,5 +1259,47 @@ describe("message_changed envelopes (ws-11: edits normalize onto changed-ts-dedu
 		expect(subject.turns().filter((t) => t.includes("edit"))).toHaveLength(1);
 		void edit1;
 		expect(SLACK_PROCESSED_MESSAGE_TS_MAX).toBe(5000);
+	});
+
+	it("a FAILED turn releases its fresh processed-ts claim so an edit can re-drive (adapter.py:_handle_slack_message guard)", async () => {
+		const world = makeSlackWorld({ name: "slack-failed-claim-release" });
+		const { engine, subject } = world;
+		await world.connectAndAwaitLive();
+
+		let failFirstTurn = true;
+		engine.turnDriver = async (_event, text) => {
+			if (failFirstTurn) throw new Error("injected dispatch failure");
+			return `ok:${text}`;
+		};
+
+		world.socketServer.pushMessage({
+			channel: "C1",
+			user: "user-1",
+			text: "doomed turn",
+			ts: "1700000000.000777",
+		});
+		await eventually(() => subject.turns().includes("doomed turn"));
+		await new Promise<void>((r) => setTimeout(r, 12));
+
+		// The guard released the failed invocation's FRESH claim — otherwise
+		// this edit would be swallowed forever by the processed-original-ts
+		// guard (:875). A pre-existing claim from an earlier SUCCESSFUL turn is
+		// never released (the addressed-edit suppression above pins that side).
+		failFirstTurn = false;
+		const editEvt = world.pushMessageChanged({
+			channel: "C1",
+			user: "user-1",
+			text: "retried body after failure",
+			originalTs: "1700000000.000777",
+			eventTs: "1700000000.000907",
+		});
+		await eventually(() => engine.cursor.value === editEvt.id);
+		// The failed attempt stayed in the turn log but the EDIT re-drove a
+		// fresh turn — proof the processed-ts claim was not held by the dead
+		// invocation (the :875 guard would have swallowed it otherwise).
+		expect([...subject.turns()]).toEqual([
+			"doomed turn",
+			"retried body after failure",
+		]);
 	});
 });

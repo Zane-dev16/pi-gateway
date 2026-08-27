@@ -105,11 +105,11 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 		),
 		mk(
 			"tg.edit-send-reconciliation",
-			"telegram: edit-vs-send reconciliation through the chokepoint — drafts RAW prefix-stable, mid-stream edits RAW with NO parse_mode, finalize edits FULL MarkdownV2 + parse_mode stamp (#25710/tg-3), edit FloodWait never blocks",
+			"telegram: edit-vs-send reconciliation through the chokepoint — draft frames are REAL sendMessageDraft calls with MarkdownV2-first text (tg-13), mid-stream edits RAW with NO parse_mode, finalize edits FULL MarkdownV2 + parse_mode stamp (#25710/tg-3), edit FloodWait never blocks",
 			() => f().editVsSendReconciliation(),
 			(r) => {
-				if (r.draftRawPrefixStable !== true)
-					return "native draft frames must ship RAW bytes (§10.2 native-stream rule)";
+				if (r.draftLaneSendMessageDraftMarkdownV2 !== true)
+					return "native draft frames must be sendMessageDraft calls carrying {chat_id, draft_id, text, parse_mode:MarkdownV2} with the send-path conversion applied (tg-13, adapter.py:send_draft :6116)";
 				if (r.midStreamEditRaw !== true)
 					return "mid-stream progressive edits must stay RAW prefix-stable";
 				if (r.finalizeConvertedEscaped !== true)
@@ -125,7 +125,7 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 		),
 		mk(
 			"tg.callback-roundtrip-64b",
-			"telegram: callback_data builder→door-keyboard→callback_query→router→resolver round-trip within 64 bytes; spinner always answered; consumed keyboard stripped; unauthorized ignored",
+			"telegram: callback_data builder→door-keyboard→callback_query→router→resolver round-trip within 64 bytes; spinner always answered; consumed keyboard stripped; unauthorized ignored; production-default clicker authz FAILS CLOSED (tg-11)",
 			() => f().callbackRoundTrip(),
 			(r) => {
 				if (r.keyboardAttachedToDoorSend !== true)
@@ -142,6 +142,8 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 					return "double-tap answered stale, resolved exactly once";
 				if (r.unauthorizedNotResolved !== true)
 					return "unauthorized clicker answered but NEVER resolved";
+				if (r.defaultClosedUnauthorizedNotResolved !== true)
+					return "with no forced override and no authz env, a fresh subject must DENY taps through the real chain (_is_callback_user_authorized parity, tg-11)";
 				return null;
 			},
 		),
@@ -319,7 +321,7 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 		),
 		mk(
 			"tg.edit-not-modified-noop",
-			"telegram tg2-1: \"message is not modified\" edits map to SendResult(success=true) no-ops on EVERY lane (mid-stream raw, finalize raw, finalize converted) so REQUIRES_EDIT_FINALIZE redundant finalize edits never route into sendFallbackContinuation full-text duplicates (adapter.py:edit_message :5737/:5757/:5929)",
+			'telegram tg2-1: "message is not modified" edits map to SendResult(success=true) no-ops on EVERY lane (mid-stream raw, finalize raw, finalize converted) so REQUIRES_EDIT_FINALIZE redundant finalize edits never route into sendFallbackContinuation full-text duplicates (adapter.py:edit_message :5737/:5757/:5929)',
 			() => f().editNotModifiedNoop(),
 			(r) => {
 				if (r.midStreamNoOpSuccess !== true)
@@ -337,8 +339,22 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 			},
 		),
 		mk(
+			"tg.stream-delete-retraction",
+			"telegram tg-12: stream-consumer retraction rides the REAL Bot API deleteMessage lane — intentional-silence finals and stale edit-path previews delete their preview through adapter.deleteMessage (best-effort, non-fatal; stream_consumer.py:_suppress_silence_marker / abandon :6064 port), and no silence-marker text ever ships",
+			() => f().streamDeleteRetraction(),
+			(r) => {
+				if (r.silenceMarkerPreviewDeleted !== true)
+					return "the silence-marker final must retract its streamed preview via a REAL {chat_id, message_id} deleteMessage capture (tg-12)";
+				if (r.stalePreviewAbandonDeleted !== true)
+					return "a run gone stale must abandon its edit-path preview through the same best-effort delete seam";
+				if (r.noSilenceMarkerTextOnWire !== true)
+					return "retraction deletes the preview instead of delivering any marker text";
+				return null;
+			},
+		),
+		mk(
 			"tg.post-connect-housekeeping",
-			"telegram tg2-3: post-connect housekeeping OFF the connect path — set_my_commands for Default/AllPrivateChats/AllGroupChats (per-scope failure tolerated), opt-in set_my_short_description status indicator, DM-topic create/load/rename with cache, lazy BotCommandScopeChat(chat_id) for forum chats (:4078/:4110/:4953/:3759/:3873/:9645)",
+			"telegram tg2-3: post-connect housekeeping OFF the connect path — set_my_commands for Default/AllPrivateChats/AllGroupChats (per-scope failure tolerated), opt-in set_my_short_description status indicator with the :5177 offline stamp on clean disconnect, DM-topic create/load/rename with cache, lazy BotCommandScopeChat(chat_id) for forum chats (:4078/:4110/:4953/:3759/:3873/:9645)",
 			() => f().postConnectHousekeeping(),
 			(r) => {
 				if (r.coldBootMenuScopesExactOrder !== true)
@@ -349,6 +365,8 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 					return "forum-scope registration is once-per-chat and DM-topic creation once-per-name";
 				if (r.statusIndicatorOptIn !== true)
 					return "status indicator fires only when opted in, with the configured online text (default off)";
+				if (r.offlineStampOnDisconnect !== true)
+					return "disconnect must stamp the Offline short description when opted in and NOTHING in a default-off world (:5172-5184)";
 				if (r.dmTopicCreatedAndCached !== true)
 					return "persisted topics load without API calls; missing ones create exactly once and cache";
 				if (r.dmTopicRenamed !== true)
@@ -400,7 +418,7 @@ export function makeTelegramShapeRows(): ConformanceRow[] {
 		),
 		mk(
 			"tg.rich-extras-lane",
-			"telegram tg2-6: Bot API 10.1 rich extras behind the wireRich seam — default worlds NEVER attempt rich; rich_messages opt-in drives sendRichMessage {chat_id, rich_message, reply_parameters…} on eligible RAW markdown; ineligible content skips silently; expect_edits skips; capability errors latch ONCE; transient failures never legacy-resend; sendRichMessageDraft needs BOTH extras with its own latch; eligible finalize edits carry rich_message (:2229/:2336/:2430)",
+			"telegram tg2-6: Bot API 10.1 rich extras behind the wireRich seam — default worlds NEVER attempt rich; rich_messages opt-in drives sendRichMessage {chat_id, rich_message, reply_parameters…} on eligible RAW markdown; ineligible content skips silently; expect_edits skips; capability errors latch ONCE; transient failures never legacy-resend; sendRichMessageDraft needs BOTH extras with its own latch, falling back to REAL sendMessageDraft calls (tg-13); eligible finalize edits carry rich_message (:2229/:2336/:2430)",
 			() => f().richExtrasLane(),
 			(r) => {
 				if (r.defaultOffNeverAttemptsRich !== true)

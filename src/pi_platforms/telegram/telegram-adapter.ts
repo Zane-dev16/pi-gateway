@@ -33,6 +33,17 @@
 //     on every poll (tg-1); ::_notification_kwargs important-mode silence
 //     (tg-4); ::_thread_kwargs_for_send/_should_thread_reply thread+reply
 //     anchors (tg-5/tg-6); ::send_image_file/... media family w/ fallbacks (tg-9).
+//   ::_is_callback_user_authorized (:1171) — EVERY gated callback tap passes
+//     the session-authz decision chain before resolution; unauthorized taps
+//     answer ⛔ but NEVER resolve; empty clicker ids fail closed (#24457)
+//     (tg-11 closure via isUserAuthorized + forced fixture override).
+//   ::delete_message (:6064, openclaw#72038) — best-effort deleteMessage for
+//     the stream consumer's fresh-final cleanup / stale-preview retraction;
+//     failures are debug-class and never throw (tg-12 closure).
+//   ::send_draft (:6116) legacy lane — draft frames are REAL sendMessageDraft
+//     Bot API calls {chat_id, draft_id, text, parse_mode?, …thread kwargs},
+//     MarkdownV2-first with one plain-text retry on BadRequest; rich drafts
+//     ride sendRichMessageDraft (tg2-6) ahead of it (tg-13 closure).
 
 import type {
 	Metadata,
@@ -44,9 +55,12 @@ import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
 import type { ProcessingOutcome } from "../../pi_gateway/guards/index.js";
 import {
 	buildExecApprovalCallback,
+	chunkWithFenceCarry,
+	codePointLen,
 	extractRetryAfterSeconds,
 	PLAIN_TEXT_FALLBACK_PREFIX,
 	type CallbackAnswer,
+	type CallbackTapContext,
 	type PluginContext,
 } from "../kit/index.js";
 import {
@@ -73,17 +87,13 @@ import {
 	metadataThreadId,
 	notificationKwargs,
 	resolveTelegramNotificationsMode,
-	threadIdForSend,
 	threadIdForTyping,
 	threadKwargsForSend,
 	type TelegramNotificationsMode,
 } from "./manifest.js";
 import { isPlainLaneContent, toTelegramMarkdownV2Full } from "./markdown-v2.js";
 import { normalizeTelegramChatId } from "./telegram-ids.js";
-import {
-	isRichEligibleContent,
-	richMessagePayload,
-} from "./rich-messages.js";
+import { isRichEligibleContent } from "./rich-messages.js";
 import {
 	normalizeMessageEditedEvent,
 	type NormalizedEditedEvent,
@@ -108,6 +118,8 @@ import type {
 	TgWireUpdate,
 	TelegramBotApiFake,
 } from "./telegram-fake-server.js";
+import { isUserAuthorized } from "../../pi_gateway/security/authz/index.js";
+import { needsRichRendering, richMessagePayload } from "./rich-messages.js";
 import type { DraftFrameArgs } from "../../pi_gateway/streaming/adapter-seam.js";
 import { BUILTIN_COMMAND_ROWS } from "../../pi_gateway/commands/builtins.js";
 
@@ -197,6 +209,18 @@ function richFailureClass(
 	return "transient";
 }
 
+/**
+ * tg-13 helper — adapter.py send_draft :6174-6177 trim: oversized draft text
+ * is the FIRST CHUNK of THE chat's chunking resolution — literally
+ * `truncate_message(content, MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]`
+ * (previews are ephemeral, never split). Pi ports that exactly through the ONE
+ * shared chunker (kit/chunking chunkWithFenceCarry over §6.3's per-chat pair:
+ * utf16 × TELEGRAM_MAX_MESSAGE_UNITS), preserving its INDICATOR_RESERVE
+ * budget, fence-carry scaffolding and the " (1/N)" label — no hand-rolled
+ * trim. Upstream quirk kept byte-honest: the FIT CHECK is CODEPOINT-based
+ * (`len(content) <= MAX`), only the SPLIT measures utf16 units.
+ */
+
 interface ResolvedCallbackAuditEntry {
 	callbackQueryId: string;
 	data: string;
@@ -272,6 +296,15 @@ export class TelegramAdapter extends PollingAdapterCore {
 
 	/** Callback taps routed through the ONE query handler (§9.1 audit). */
 	readonly callbackAudit: ResolvedCallbackAuditEntry[] = [];
+
+	/**
+	 * tg-11 forced authorization fixture. The inherited `setClickerAuthorization`
+	 * switch stays the SHARED conformance-row control: once armed it FORCES the
+	 * clicker verdict (false ⇒ always deny, true ⇒ always allow) exactly like
+	 * every other polling engine. Production never arms it, so the real
+	 * authorization chain below runs instead.
+	 */
+	private forcedClickAuthorization: boolean | undefined;
 
 	/** Monotonic approval ids (64-byte callback_data ⇒ ints, never uuids). */
 	private approvalSeq = 1000;
@@ -374,6 +407,26 @@ export class TelegramAdapter extends PollingAdapterCore {
 		return ok;
 	}
 
+	/**
+	 * adapter.py :5172-5184 clean-shutdown parity: mark the bot "Offline" in
+	 * its short description while the HTTP client is still alive (opt-in
+	 * extra.status_indicator; best-effort, non-fatal — a hard crash leaves the
+	 * last-known status, which is the expected limitation of a profile-text
+	 * indicator).
+	 */
+	override async disconnect(): Promise<void> {
+		if (this.statusIndicatorEnabled && this.connected) {
+			try {
+				await this.bot.setMyShortDescription({
+					short_description: this.statusOfflineText,
+				});
+			} catch {
+				// indicator failures are debug-class (:4961)
+			}
+		}
+		await super.disconnect();
+	}
+
 	// ════════════════════════════════════════════════════════════════
 	// Post-connect housekeeping (tg2-3; adapter.py:_start_post_connect_
 	// housekeeping :4078 / _run_post_connect_housekeeping :4110)
@@ -449,7 +502,10 @@ export class TelegramAdapter extends PollingAdapterCore {
 		const source =
 			this.menuCommandsProvider ?? (() => defaultTelegramMenuCommands());
 		return source()
-			.slice(0, Math.min(TELEGRAM_MENU_MAX_COMMANDS, TELEGRAM_BOT_API_MAX_COMMANDS))
+			.slice(
+				0,
+				Math.min(TELEGRAM_MENU_MAX_COMMANDS, TELEGRAM_BOT_API_MAX_COMMANDS),
+			)
 			.map((c) => ({
 				command: c.command.replace(/-/g, "_"),
 				description: c.description,
@@ -522,9 +578,7 @@ export class TelegramAdapter extends PollingAdapterCore {
 		const cached = this.dmTopics.get(cacheKey);
 		if (cached !== undefined && !forceCreate) return String(cached);
 
-		let entryTopics:
-			| DmTopicConfigEntry["topics"]
-			| undefined;
+		let entryTopics: DmTopicConfigEntry["topics"] | undefined;
 		let chatEntry: DmTopicConfigEntry | undefined;
 		for (const entry of this.dmTopicsConfig) {
 			if (String(entry.chatId) !== String(chatId)) continue;
@@ -571,7 +625,10 @@ export class TelegramAdapter extends PollingAdapterCore {
 			for (const topicConf of entry.topics) {
 				if (!topicConf.name) continue;
 				if (topicConf.threadId !== undefined) {
-					this.dmTopics.set(`${String(entry.chatId)}:${topicConf.name}`, topicConf.threadId);
+					this.dmTopics.set(
+						`${String(entry.chatId)}:${topicConf.name}`,
+						topicConf.threadId,
+					);
 					continue;
 				}
 				await this.ensureDmTopic(entry.chatId, topicConf.name);
@@ -672,10 +729,65 @@ export class TelegramAdapter extends PollingAdapterCore {
 		// returns None for types without a wired contract).
 	}
 
+	setClickerAuthorization(allow: boolean): void {
+		this.forcedClickAuthorization = allow;
+		super.setClickerAuthorization(allow);
+	}
+
+	/**
+	 * tg-11 closure — adapter.py:_is_callback_user_authorized (:1171) parity:
+	 * NO callback tap resolves without passing the session authorization chain,
+	 * and an unauthorized tap is answered ⛔ (router-side) but NEVER resolved.
+	 *
+	 * 1. Empty user id ⇒ DENY unconditionally (:1177 — #24457 fail-closed).
+	 * 2. Session-runner auth first: Hermes builds a SessionSource from the
+	 * callback snapshot (chat_id = host chat ?? user; chat_type mapped:
+	 * private→dm, supergroup→forum when a thread id is present else group) and
+	 * calls the runner's `_is_user_authorized` (:1183). Pi's port of THAT
+	 * chain is security/authz `isUserAuthorized`, invoked here with
+	 * platform="telegram" so TELEGRAM_ALLOWED_USERS / TELEGRAM_GROUP_ALLOWED_* /
+	 * TELEGRAM_ALLOW_ALL_USERS / pairing grants / GATEWAY_ALLOW_ALL_USERS all
+	 * authorize exactly like message ingress on this platform.
+	 * 3. The adapter's env-only fallback (:1216 `_scoped_gate_env`) is SUBSUMED
+	 * by the full chain — its allowlist + allow-all branches are gates 9/5/8
+	 * there, "*" wildcard included.
+	 */
+	protected override authorizeCallbackClicker(
+		tap: CallbackTapContext,
+	): boolean {
+		if (this.forcedClickAuthorization !== undefined) {
+			return this.forcedClickAuthorization;
+		}
+		const userId = String(tap.userId ?? "").trim();
+		if (userId === "") return false;
+		// Chat-type mapping mirrors the SessionSource construction :1192.
+		const rawType = String(tap.chatType ?? "")
+			.trim()
+			.toLowerCase();
+		let chatType = rawType === "" ? "dm" : rawType;
+		if (chatType === "private") chatType = "dm";
+		else if (chatType === "supergroup") {
+			chatType =
+				tap.threadId !== undefined && tap.threadId !== "" ? "forum" : "group";
+		}
+		const record = isUserAuthorized({
+			platform: "telegram",
+			userId,
+			chatId:
+				tap.chatId !== undefined && tap.chatId !== "" ? tap.chatId : userId,
+			userName: tap.userName,
+			...(chatType !== "" ? { chatType } : {}),
+		});
+		return record.allowed;
+	}
+
 	/**
 	 * adapter.py:_handle_callback_query parity via the kit router: EVERY tap
 	 * answers (spinner clears), resolutions strip the host keyboard, and no
-	 * tap ever dispatches a turn.
+	 * tap ever dispatches a turn. The tap context carries the FULL
+	 * authorization source shape (`_is_callback_user_authorized` :1192 builds
+	 * its SessionSource from chat/thread/user snapshot of the callback query)
+	 * — the router forwards it untouched to this adapter's authorizer.
 	 */
 	private async routeCallbackQuery(cbq: TgWireCallbackQuery): Promise<void> {
 		let answer: CallbackAnswer;
@@ -684,6 +796,15 @@ export class TelegramAdapter extends PollingAdapterCore {
 				userId: String(cbq.from?.id ?? ""),
 				...(cbq.message !== undefined
 					? { chatId: String(cbq.message.chat.id) }
+					: {}),
+				...(cbq.message !== undefined
+					? { chatType: String(cbq.message.chat.type ?? "") }
+					: {}),
+				...(cbq.message?.message_thread_id !== undefined
+					? { threadId: String(cbq.message.message_thread_id) }
+					: {}),
+				...(cbq.from?.first_name !== undefined
+					? { userName: cbq.from.first_name }
 					: {}),
 			});
 		} catch (err) {
@@ -1004,7 +1125,7 @@ export class TelegramAdapter extends PollingAdapterCore {
 			metadata["forceFormattingError"] === true &&
 			!content.startsWith(PLAIN_TEXT_FALLBACK_PREFIX)
 		) {
-			return { success: false, error: "Bad Request: can\'t parse entities" };
+			return { success: false, error: "Bad Request: can't parse entities" };
 		}
 		const plain = isPlainLaneContent(content, metadata["parse_mode"]);
 		const text = plain ? content : toTelegramMarkdownV2Full(content);
@@ -1064,7 +1185,10 @@ export class TelegramAdapter extends PollingAdapterCore {
 			// the stale binding so future sends stop steering into the dead
 			// topic. Private/created DM-topic lanes never fall out silently.
 			const effectiveThreadId = routing.effectiveThreadId();
-			if (effectiveThreadId !== undefined && blob.includes("thread not found")) {
+			if (
+				effectiveThreadId !== undefined &&
+				blob.includes("thread not found")
+			) {
 				if (
 					routing.privateDmTopicSend ||
 					metadata["telegram_dm_topic_created_for_send"] === true
@@ -1139,12 +1263,10 @@ export class TelegramAdapter extends PollingAdapterCore {
 			replyToSource !== null &&
 			this.consumedReplyAnchors.get(chatId) === replyToSource;
 		let anchored: number | null =
-			replyToSource !== null && !alreadyConsumed
-				? Number(replyToSource)
-				: null;
+			replyToSource !== null && !alreadyConsumed ? Number(replyToSource) : null;
 		if (anchored !== null && !Number.isFinite(anchored)) anchored = null;
 
-		let kwargs = threadKwargsForSend(threadRaw, metadata, anchored);
+		const kwargs = threadKwargsForSend(threadRaw, metadata, anchored);
 
 		// DM-topic fail-loud: refuse to transmit outside the requested topic.
 		const failLoud: SendResult | null =
@@ -1420,7 +1542,92 @@ export class TelegramAdapter extends PollingAdapterCore {
 			}
 			// transient - legacy draft this frame
 		}
-		return super.wireDraft(args);
+		return this.sendLegacyNativeDraft(args);
+	}
+
+	/**
+	 * tg-13 helper — adapter.py send_draft :6174-6177 trim: oversized draft
+	 * text is the FIRST CHUNK of THE chat's chunking resolution — literally
+	 * `truncate_message(content, MAX_MESSAGE_LENGTH, len_fn=utf16_len)[0]`
+	 * (previews are ephemeral, never split). Pi ports that exactly through the
+	 * ONE shared chunker (kit/chunking chunkWithFenceCarry over §6.3's per-chat
+	 * pair: utf16 × TELEGRAM_MAX_MESSAGE_UNITS), preserving INDICATOR_RESERVE,
+	 * fence-carry scaffolding and the " (1/N)" label — no hand-rolled trim.
+	 * Upstream quirk kept byte-honest: the FIT CHECK is CODEPOINT-based
+	 * (`len(content) <= MAX`), only the SPLIT measures utf16 units.
+	 */
+	private firstDraftChunk(content: string, chatId: string): string {
+		if (codePointLen(content) <= TELEGRAM_MAX_MESSAGE_UNITS) return content;
+		return (
+			chunkWithFenceCarry(content, this.chatLengthPolicyForChat(chatId))
+				.chunks[0] ?? content
+		);
+	}
+
+	/**
+	 * tg-13 closure — adapter.py:send_draft (:6116) legacy plain-text lane.
+	 * DM draft frames are REAL Bot API calls named `sendMessageDraft`
+	 * carrying {chat_id, draft_id, text, parse_mode?, ...thread kwargs}:
+	 *   · MarkdownV2-FIRST — the same format_message-style conversion the
+	 *     regular send path uses, parse_mode stamped (adapter.py :6191-6200)
+	 *     so the animated preview matches the final message's formatting;
+	 *   · a BadRequest on that attempt retries ONCE as raw text (:6200-6208,
+	 *     mirroring the (True, False) retry the streaming send loop uses);
+	 *   · when rich messages are enabled but rich DRAFTS are not and the
+	 *     content needs rich rendering (`plain_rich_preview` :6185-6190),
+	 *     drafts stay RAW — the legacy formatter would rewrite pipe tables
+	 *     into bullet groups inside an ephemeral preview;
+	 *   · oversized text ships as the FIRST CHUNK of the shared chunker at the
+	 *     chat's §6.3 pair (utf16 × 4096) — :6176 truncate_message with
+	 *     utf16_len takes [0]; never split, " (1/N)" label kept (:6175 fit
+	 *     check stays codepoint-based);
+	 *   · success carries NO message id — drafts have none (:6207/… returns
+	 *     SendResult(success=True, message_id=None)). The seal/final lane is
+	 *     UNTOUCHED (DEC-034 chokepoint; Hermes has no Bot API to promote a
+	 *     draft — the final sendMessage/sendRichMessage is what persists).
+	 */
+	private async sendLegacyNativeDraft(
+		args: DraftFrameArgs,
+	): Promise<SendResult> {
+		const text = this.firstDraftChunk(args.content, args.chatId);
+		const plainRichPreview =
+			this.richMessagesEnabled &&
+			!this.richDraftsEnabled &&
+			needsRichRendering(text);
+		const kwargs = threadKwargsForSend(
+			metadataThreadId(args.metadata as never),
+			args.metadata as never,
+			null,
+		);
+		const threadArgs: Record<string, unknown> = {};
+		if (
+			kwargs.messageThreadId !== null &&
+			kwargs.messageThreadId !== undefined
+		) {
+			threadArgs["message_thread_id"] = kwargs.messageThreadId;
+		}
+		if (kwargs.directMessagesTopicId !== undefined) {
+			threadArgs["direct_messages_topic_id"] = kwargs.directMessagesTopicId;
+		}
+		const modes: readonly boolean[] = plainRichPreview
+			? [false]
+			: [true, false];
+		let lastError: string | null = null;
+		for (const useMarkdown of modes) {
+			const res = await this.bot.sendMessageDraft({
+				chat_id: normalizeTelegramChatId(args.chatId),
+				draft_id: args.draftId,
+				text: useMarkdown ? toTelegramMarkdownV2Full(text) : text,
+				...(useMarkdown ? { parse_mode: "MarkdownV2" } : {}),
+				...threadArgs,
+			});
+			if (res.success) return { success: true }; // drafts carry NO id
+			lastError = res.error ?? "draft rejected";
+			// Only BadRequest-class failures degrade to the plain attempt
+			// (adapter.py _is_bad_request_error); anything else surfaces now.
+			if (!lastError.toLowerCase().includes("bad request")) break;
+		}
+		return { success: false, error: lastError ?? "draft rejected" };
 	}
 
 	/**
@@ -1437,6 +1644,34 @@ export class TelegramAdapter extends PollingAdapterCore {
 			...metadata,
 			[TELEGRAM_RICH_LANE_CHAT_KEY]: chatId,
 		});
+	}
+
+	/**
+	 * tg-12 closure — adapter.py:delete_message (:6064, openclaw#72038 port):
+	 * delete a previously sent bot message via the Bot API `deleteMessage`
+	 * (works for bot-posted messages of the last 48 h). Best-effort BY
+	 * CONTRACT — the stream consumer's fresh-final cleanup (silence-marker
+	 * suppression `suppressSilenceMarker` and stale-preview retraction
+	 * `abandonStream`) calls it defensively through the adapter-seam probe,
+	 * leaves the preview in place on failure, and logs at debug level; a
+	 * raise here would wedge the consumer lane. The message id passes through
+	 * VERBATIM (:6081 int(message_id) is Python's wire typing, not a
+	 * transform); chat_id normalization mirrors :6082 exactly.
+	 */
+	async deleteMessage(chatId: string, messageId: string): Promise<boolean> {
+		try {
+			const res = await this.bot.deleteMessage({
+				chat_id: normalizeTelegramChatId(chatId),
+				message_id: messageId,
+			});
+			// pi wire contract: failures ride SendResult(success=false) (the pi
+			// fake never raises); slack-adapter deleteMessage is the same boolean
+			// idiom (`result?.success === true`). Upstream parity: any failure ⇒
+			// false, the caller leaves the preview in place.
+			return res.success === true;
+		} catch {
+			return false;
+		}
 	}
 
 	// ════════════════════════════════════════════════════════════════
@@ -1474,7 +1709,10 @@ export class TelegramAdapter extends PollingAdapterCore {
 				? opts.threadId
 				: metadataThreadId(md);
 		const routed = threadKwargsForSend(threadRaw, md, null);
-		if (routed.messageThreadId !== null && routed.messageThreadId !== undefined) {
+		if (
+			routed.messageThreadId !== null &&
+			routed.messageThreadId !== undefined
+		) {
 			kwargs["message_thread_id"] = routed.messageThreadId;
 		}
 		if (routed.directMessagesTopicId !== undefined) {
@@ -1499,12 +1737,20 @@ export class TelegramAdapter extends PollingAdapterCore {
 	 */
 	private async transmitMediaWithDmTopicRetry(
 		chatId: string,
-		method: "sendPhoto" | "sendDocument" | "sendVoice" | "sendAudio" | "sendVideo" | "sendAnimation",
+		method:
+			| "sendPhoto"
+			| "sendDocument"
+			| "sendVoice"
+			| "sendAudio"
+			| "sendVideo"
+			| "sendAnimation",
 		args: Record<string, unknown>,
 		opts: MediaSendOptions,
 	): Promise<SendResult> {
 		const md = opts.metadata as Record<string, unknown> | undefined;
-		const first = await (this.bot[method] as (a: Record<string, unknown>) => Promise<SendResult>)(args);
+		const first = await (
+			this.bot[method] as (a: Record<string, unknown>) => Promise<SendResult>
+		)(args);
 		if (first.success || md?.["telegram_dm_topic_reply_fallback"] !== true) {
 			return first;
 		}
@@ -1523,8 +1769,8 @@ export class TelegramAdapter extends PollingAdapterCore {
 		const anchorDropped =
 			args["reply_to_message_id"] !== undefined &&
 			errLower.includes("message to be replied not found");
-		const topicDropped = hasTopicMetadata &&
-			topicMarkers.some((m) => errLower.includes(m));
+		const topicDropped =
+			hasTopicMetadata && topicMarkers.some((m) => errLower.includes(m));
 		if (!anchorDropped && !topicDropped) return first;
 
 		const retryArgs = { ...args };
@@ -1536,7 +1782,9 @@ export class TelegramAdapter extends PollingAdapterCore {
 		if (droppedThread !== undefined && Number.isFinite(Number(droppedThread))) {
 			this.pruneStaleDmTopicBinding(chatId, Number(droppedThread));
 		}
-		return (this.bot[method] as (a: Record<string, unknown>) => Promise<SendResult>)(retryArgs);
+		return (
+			this.bot[method] as (a: Record<string, unknown>) => Promise<SendResult>
+		)(retryArgs);
 	}
 
 	/**
@@ -1549,11 +1797,16 @@ export class TelegramAdapter extends PollingAdapterCore {
 		source: string,
 		opts: MediaSendOptions = {},
 	): Promise<SendResult> {
-		const photo = await this.transmitMediaWithDmTopicRetry(chatId, "sendPhoto", {
-			chat_id: normalizeTelegramChatId(chatId),
-			photo: source,
-			...this.mediaKwargs(opts),
-		}, opts);
+		const photo = await this.transmitMediaWithDmTopicRetry(
+			chatId,
+			"sendPhoto",
+			{
+				chat_id: normalizeTelegramChatId(chatId),
+				photo: source,
+				...this.mediaKwargs(opts),
+			},
+			opts,
+		);
 		if (photo.success) return photo;
 		// Document fallback — no dimension limit, only the 50MB size cap.
 		return this.sendDocument(chatId, source, {
@@ -1568,12 +1821,17 @@ export class TelegramAdapter extends PollingAdapterCore {
 		source: string,
 		opts: MediaSendOptions & { fileName?: string | undefined } = {},
 	): Promise<SendResult> {
-		return this.transmitMediaWithDmTopicRetry(chatId, "sendDocument", {
-			chat_id: normalizeTelegramChatId(chatId),
-			document: source,
-			filename: opts.fileName ?? basenameOf(source),
-			...this.mediaKwargs(opts),
-		}, opts);
+		return this.transmitMediaWithDmTopicRetry(
+			chatId,
+			"sendDocument",
+			{
+				chat_id: normalizeTelegramChatId(chatId),
+				document: source,
+				filename: opts.fileName ?? basenameOf(source),
+				...this.mediaKwargs(opts),
+			},
+			opts,
+		);
 	}
 
 	/** adapter.py:send_video parity — native video message. */
@@ -1582,11 +1840,16 @@ export class TelegramAdapter extends PollingAdapterCore {
 		source: string,
 		opts: MediaSendOptions = {},
 	): Promise<SendResult> {
-		return this.transmitMediaWithDmTopicRetry(chatId, "sendVideo", {
-			chat_id: normalizeTelegramChatId(chatId),
-			video: source,
-			...this.mediaKwargs(opts),
-		}, opts);
+		return this.transmitMediaWithDmTopicRetry(
+			chatId,
+			"sendVideo",
+			{
+				chat_id: normalizeTelegramChatId(chatId),
+				video: source,
+				...this.mediaKwargs(opts),
+			},
+			opts,
+		);
 	}
 
 	/**

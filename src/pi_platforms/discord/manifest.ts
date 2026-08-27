@@ -90,8 +90,13 @@ export { SLACK_ACK_WINDOW_MS as INTERACTION_ACK_WINDOW_MS } from "../kit/index.j
 export const THREAD_AUTO_ARCHIVE_VALID = [60, 1440, 4320, 10080] as const;
 export const THREAD_AUTO_ARCHIVE_DEFAULT = 1440;
 /**
- * Thread name cap measured in UTF-16 CODE UNITS; over-cap names truncate to
- * first 77 units + `"..."`. adapter.py:7200-7216 (derive), :7276-7279 (rename).
+ * Thread name vendor cap — 80, in BOTH upstream budgets but different units:
+ * derive path (:7200-7216) caps at 80 PYTHON CODE POINTS, the semantic-rename
+ * path (:7276-7279 + run.py:_sanitize_discord_thread_title) at 80 UTF-16 CODE
+ * UNITS truncated via utf16 helpers. The constant names the rename budget
+ * (the lane that will consume it when the deferred session-title consumer
+ * lands); deriveThreadName applies it under code-point semantics with the
+ * quirk documented at the call site.
  */
 export const THREAD_NAME_MAX_UTF16_UNITS = 80;
 export const THREAD_NAME_FALLBACK = "Pi";

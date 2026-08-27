@@ -57,7 +57,9 @@ export function makeTelegramWorld(
 		 * status extras). TELEGRAM_REACTIONS rides reactionsEnv separately. */
 		env?: Record<string, string | undefined> | undefined;
 		/** Post-connect DM-topic config (tg2-3 housekeeping rows). */
-		dmTopicsConfig?: readonly import("./telegram-adapter.js").DmTopicConfigEntry[] | undefined;
+		dmTopicsConfig?:
+			| readonly import("./telegram-adapter.js").DmTopicConfigEntry[]
+			| undefined;
 	} = {},
 ): TelegramWorld & { stickerDir: string } {
 	const clock = new ManualPollingClock();
@@ -255,16 +257,28 @@ export interface TelegramShapeFixture {
 
 	/**
 	 * Edit-vs-send reconciliation through the streaming chokepoint: draft
-	 * frames stay RAW prefix-stable bytes; the finalize edit carries FULL
-	 * MarkdownV2 conversion (#25710); edit-site FloodWait NEVER blocks.
+	 * frames are REAL sendMessageDraft calls with MarkdownV2-first text
+	 * (tg-13); the finalize edit carries FULL MarkdownV2 conversion (#25710);
+	 * edit-site FloodWait NEVER blocks.
 	 */
 	editVsSendReconciliation(): Promise<{
-		draftRawPrefixStable: boolean;
+		draftLaneSendMessageDraftMarkdownV2: boolean;
 		finalizeConvertedEscaped: boolean;
 		midStreamEditRaw: boolean;
 		finalizeParseModeStamped: boolean;
 		editFloodNonBlocking: boolean;
 		editFloodErrorSurface: string;
+	}>;
+
+	/**
+	 * tg-12: the stream consumer's retraction lanes (silence-marker
+	 * suppression + stale edit-path preview abandon) ride adapter.deleteMessage
+	 * and land on the Telegram Bot API fake as REAL deleteMessage captures.
+	 */
+	streamDeleteRetraction(): Promise<{
+		silenceMarkerPreviewDeleted: boolean;
+		stalePreviewAbandonDeleted: boolean;
+		noSilenceMarkerTextOnWire: boolean;
 	}>;
 
 	/** builder → door send w/ keyboard → callback_query → router → resolver. */
@@ -276,6 +290,7 @@ export interface TelegramShapeFixture {
 		hostMarkupStripped: boolean;
 		doubleTapStaleAnswered: boolean;
 		unauthorizedNotResolved: boolean;
+		defaultClosedUnauthorizedNotResolved: boolean;
 	}>;
 
 	/** A1 ack lifecycle: opt-in gate, 👀→👍/👎 swap, cancel clears. */
@@ -541,19 +556,22 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 
 		async editVsSendReconciliation() {
 			const world = makeTelegramWorld({ name: "tg-shape-edit" });
-			const { subject, wire, clock } = world;
+			const { subject, wire, clock, tg } = world;
 			const chatId = "chat-edit";
 			subject.adapter.markStreamIsMessage(chatId);
 
-			// Native draft lane: RAW prefix-stable frames (DEC-034 parity).
-			// armOpenNativeStream emits frame 0 (""); OUR payload is frame 1.
+			// tg-13: native draft frames are REAL sendMessageDraft calls
+			// (adapter.py:send_draft :6116) — MarkdownV2-FIRST text conversion,
+			// parse_mode stamped, drafts carry NO message id. armOpenNativeStream
+			// emits frame 0 (""); OUR payload is frame 1.
 			await subject.armOpenNativeStream(chatId, 4001);
 			await subject.adapter.sendDraft({
 				chatId,
 				draftId: 4001,
 				content: "Part **one** <b>& raw",
 			});
-			const draftOp = wire.draftsOf(chatId)[1];
+			const openFrame = tg.draftKwargs[0];
+			const payloadFrame = tg.draftKwargs[1];
 
 			// Mid-stream progressive EDIT stays RAW.
 			await subject.adapter.editMessage(
@@ -588,7 +606,14 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			void sleepsSnapshot;
 
 			return {
-				draftRawPrefixStable: draftOp?.content === "Part **one** <b>& raw",
+				draftLaneSendMessageDraftMarkdownV2:
+					openFrame?.text === "" &&
+					payloadFrame?.chat_id === chatId &&
+					payloadFrame?.draft_id === 4001 &&
+					payloadFrame?.parse_mode === "MarkdownV2" &&
+					// structural markdown collapsed by the send-path conversion
+					typeof payloadFrame?.text === "string" &&
+					(payloadFrame?.text as string).includes("*one*"),
 				finalizeConvertedEscaped:
 					finalEdit?.content.includes("*bold*") === true &&
 					finalEdit?.content.includes("a\\_b") === true &&
@@ -620,6 +645,12 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			const data = buildExecApprovalCallback("once", prompt.approvalId);
 			const hostMessageId = String(prompt.messageId ?? "0");
 
+			// tg-11 closure: production default DENIES unconfigured clickers, so
+			// the authorized segments model an operator-configured gateway — the
+			// forced allow-all override stands in for TELEGRAM_ALLOWED_USERS/
+			// GATEWAY_ALLOW_ALL_USERS being set (unit tests cover the real env
+			// path). Production never arms the override; then the REAL chain runs.
+			subject.setClickerAuthorization(true);
 			// The clicker taps THROUGH the wire shape.
 			tg.pushCallbackUpdate({
 				hostChatId: 4242,
@@ -667,6 +698,24 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					e.reply_markup === null &&
 					e.parse_mode === "MarkdownV2",
 			);
+
+			// tg-11 closure, production default: an UNTOUCHED subject (no forced
+			// override, no authz env configured) DENIES a clicker through the real
+			// session-authz chain — answered ⛔ so the spinner clears, never resolved.
+			const closedWorld = makeTelegramWorld({ name: "tg-shape-cb-closed" });
+			await closedWorld.engine.connect({ isReconnect: false });
+			const closedPrompt = await (
+				closedWorld.engine as import("./telegram-adapter.js").TelegramAdapter
+			).sendExecApprovalPrompt("chat-closed", "sk-cb-default-deny");
+			closedWorld.tg.pushCallbackUpdate({
+				hostChatId: 5151,
+				hostMessageId: String(closedPrompt.messageId ?? "0"),
+				data: buildExecApprovalCallback("once", closedPrompt.approvalId),
+				clickerId: 31337,
+			});
+			await settleTelegramCycle(closedWorld);
+			await eventually(() => closedWorld.tg.callbackAnswers.length >= 1);
+
 			return {
 				keyboardAttachedToDoorSend:
 					typeof keyboardOp?.metadata["reply_markup"] === "object" &&
@@ -680,6 +729,13 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				doubleTapStaleAnswered: (answers[1]?.text.length ?? 0) > 0,
 				unauthorizedNotResolved:
 					subject.resolvedFamilies().filter((f) => f === "ea").length === 1,
+				// Production-default fail-closed (tg-11):
+				defaultClosedUnauthorizedNotResolved:
+					closedWorld.tg.callbackAnswers.length >= 1 &&
+					closedWorld.tg.callbackAnswers.every((a) =>
+						a.text.includes("not authorized"),
+					) &&
+					!closedWorld.subject.resolvedFamilies().includes("ea"),
 			};
 		},
 
@@ -1093,15 +1149,13 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					convertedOp?.metadata["parse_mode"] === "MarkdownV2" &&
 					convertedOp?.content.includes("*there*") === true &&
 					convertedOp?.content.includes("a\\_b\\.") === true,
-				chunkMarkerEscaped:
-					markerOp?.content === "chunked body \\(1/2\\)",
+				chunkMarkerEscaped: markerOp?.content === "chunked body \\(1/2\\)",
 				plainLaneRawNoParseMode:
 					plainOp?.metadata["parse_mode"] === undefined &&
 					plainOp?.content.endsWith("**raw** stays!") === true &&
 					explicitNoneOp?.metadata["parse_mode"] === undefined &&
 					explicitNoneOp?.content === "**explicit none**",
-				silentByDefault:
-					silentOp?.metadata["disable_notification"] === true,
+				silentByDefault: silentOp?.metadata["disable_notification"] === true,
 				notifyOverrideRings:
 					notifyOp?.metadata["disable_notification"] === undefined,
 				allModeNeverSilences:
@@ -1156,10 +1210,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			tg.pushTextUpdate(4242, "after-webhook-fail");
 			tg.scriptWebhook({ kind: "fail", error: "getaddrinfo ENOTFOUND" });
 			await engine.connect({ isReconnect: true });
-			await eventually(
-				() => deliveredTurn(world, "after-webhook-fail"),
-				5_000,
-			);
+			await eventually(() => deliveredTurn(world, "after-webhook-fail"), 5_000);
 
 			return {
 				coldBootDeleteCaptured: firstDelete !== undefined,
@@ -1196,8 +1247,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			await adapter.sendImageFile("chat-m2", "/tmp/fallback.png", {
 				caption: "fb",
 			});
-			const byMethod = (m: string) =>
-				tg.mediaOps.filter((o) => o.method === m);
+			const byMethod = (m: string) => tg.mediaOps.filter((o) => o.method === m);
 
 			// Voice extension routing.
 			await adapter.sendVoice("chat-m3", "/tmp/note.ogg");
@@ -1284,9 +1334,11 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					mdFirstOp?.args["parse_mode"] === "MarkdownV2" &&
 					mdFirstOp?.args["caption"] === "hello *world*",
 				voicePlainRetryAfterParseRejection:
-					// failed attempts are NOT recorded as ops; exactly one op
-					// proves the plain retry succeeded after the parse rejection.
+					// failed attempts are NOT recorded as ops; exactly one op beyond
+					// the pre-ladder count proves the plain retry succeeded after
+					// the parse rejection.
 					capVoiceOps.length === 1 &&
+					byMethod("sendVoice").length === voiceOpsBeforeCaptionLadder + 2 &&
 					capVoiceOps[0]?.args["parse_mode"] === undefined &&
 					capVoiceOps[0]?.args["caption"] === "hello **world**",
 				photoFailureFallsBackToDocument:
@@ -1356,7 +1408,10 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				{ finalize: true },
 			);
 
-			wire.script("edit", { kind: "fail", error: "Bad Request: chat not found" });
+			wire.script("edit", {
+				kind: "fail",
+				error: "Bad Request: chat not found",
+			});
 			const realFail = await subject.adapter.editMessage(
 				"chat-nm",
 				"wire-1",
@@ -1404,6 +1459,77 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					wire.sendsOf("chat-nm-live").length === 1 &&
 					wire.editsOf("chat-nm-live").length >= 2,
 				realFailuresStillFail: realFail.success === false,
+			};
+		},
+
+		/**
+		 * tg-12: the stream consumer's retraction lanes (silence-marker
+		 * suppression + stale edit-path preview abandon) ride adapter.deleteMessage
+		 * and land on the Telegram Bot API fake as REAL deleteMessage captures.
+		 */
+		async streamDeleteRetraction() {
+			const world = makeTelegramWorld({ name: "tg-shape-delete-retract" });
+			const { subject, wire, tg, clock } = world;
+
+			// Lane 1 — intentional-silence final RETRACTS the streamed preview via
+			// the real adapter.deleteMessage (stream_consumer.py:_suppress_silence_marker).
+			const silenceConsumer = new GatewayStreamConsumer(
+				subject.streamAdapter(),
+				"chat-del-1",
+				{
+					transport: "edit",
+					editIntervalMs: 50,
+					bufferThreshold: 1,
+					now: () => clock.nowMs(),
+				},
+			);
+			const silenceRun = silenceConsumer.run();
+			silenceConsumer.onDelta("analyzing the repo");
+			await eventually(() => wire.sendsOf("chat-del-1").length >= 1);
+			await eventually(() => silenceConsumer.message_id !== null);
+			const previewId = String(silenceConsumer.message_id);
+			silenceConsumer.finish("NO_REPLY", { agentResult: { failed: false } });
+			await silenceRun;
+			await eventually(() => tg.deleteOps.length >= 1);
+
+			// Lane 2 — a run gone stale (/new|/stop parity) abandons the edit-path
+			// preview: same best-effort delete seam, distinct capture.
+			const state = { current: true };
+			const staleConsumer = new GatewayStreamConsumer(
+				subject.streamAdapter(),
+				"chat-del-2",
+				{
+					transport: "edit",
+					editIntervalMs: 50,
+					bufferThreshold: 1,
+					now: () => clock.nowMs(),
+					runStillCurrent: () => state.current,
+				},
+			);
+			const staleRun = staleConsumer.run();
+			staleConsumer.onDelta("partial answer");
+			await eventually(() => wire.sendsOf("chat-del-2").length >= 1);
+			await eventually(() => staleConsumer.message_id !== null);
+			const stalePreviewId = String(staleConsumer.message_id);
+			state.current = false;
+			clock.advance(100);
+			staleConsumer.onDelta(" STALE"); // wakes the parked drain, dropped unprocessed
+			await staleRun;
+			await eventually(() => tg.deleteOps.length >= 2);
+
+			return {
+				silenceMarkerPreviewDeleted:
+					tg.deleteOps[0]?.chatId === "chat-del-1" &&
+					tg.deleteOps[0]?.messageId === previewId &&
+					silenceConsumer.finalResponseSent === false &&
+					silenceConsumer.finalContentDelivered === false,
+				stalePreviewAbandonDeleted:
+					tg.deleteOps.some(
+						(op) =>
+							op.chatId === "chat-del-2" && op.messageId === stalePreviewId,
+					) === true,
+				noSilenceMarkerTextOnWire:
+					wire.ops.every((op) => op.content !== "NO_REPLY") === true,
 			};
 		},
 
@@ -1460,14 +1586,18 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				(op) => op.scope.type === "chat" && op.scope.chat_id === 555,
 			).length;
 
-			// Default-OFF world: NO status indicator ever fires.
+			// Default-OFF world: NO status indicator ever fires (connect or
+			// disconnect — the extra gates BOTH stamps). Its disconnect runs in the
+			// return-shape block below AFTER every other surface is captured.
 			const offWorld = makeTelegramWorld({ name: "tg-shape-housekeeping-off" });
 			await offWorld.engine.connect({ isReconnect: false });
 			await eventually(() => offWorld.engine.polledOnce);
 
 			// Per-scope tolerance: a failing Default scope leaves the other two
 			// scopes registered and polling still starts.
-			const failWorld = makeTelegramWorld({ name: "tg-shape-housekeeping-fail" });
+			const failWorld = makeTelegramWorld({
+				name: "tg-shape-housekeeping-fail",
+			});
 			failWorld.tg.scriptCommands({
 				kind: "fail",
 				error: "getaddrinfo ENOTFOUND",
@@ -1478,16 +1608,38 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				(op) => op.scope.type,
 			);
 
+			// :5172-5184 clean-shutdown parity — verified on a DEDICATED opt-in
+			// world so every other surface's capture above stays pristine: while
+			// disconnecting, the indicator stamps Online→Offline (best-effort,
+			// non-fatal); a default-off world keeps ZERO short-description ops on
+			// both lifecycle edges.
+			const stampWorld = makeTelegramWorld({
+				name: "tg-shape-housekeeping-stamp",
+				env: { TELEGRAM_STATUS_INDICATOR: "true" },
+			});
+			await stampWorld.engine.connect({ isReconnect: false });
+			// The online stamp rides post-connect housekeeping OFF the connect
+			// path (#46298) — wait for it so order is deterministic.
+			await eventually(() => stampWorld.tg.shortDescriptions.length >= 1);
+			await stampWorld.engine.disconnect();
+			const statusTexts = stampWorld.tg.shortDescriptions.map((op) => op.text);
+			const statusTextsExactOrder =
+				JSON.stringify(statusTexts) === JSON.stringify(["Online", "Offline"]);
+			await offWorld.engine.disconnect();
+
 			return {
 				coldBootMenuScopesExactOrder,
 				menuCommandCount: tg.myCommandsOps[0]?.commands.length ?? 0,
 				reconnectDoesNotDoubleSchedule:
 					forumScopeOps === 1 &&
-					tg.forumTopicCreates.filter((c) => c.name === "Auditor").length ===
-						1,
+					tg.forumTopicCreates.filter((c) => c.name === "Auditor").length === 1,
 				statusIndicatorOptIn:
-					indicatorOps.length === 1 &&
+					indicatorOps.filter((op) => op.text === "Gateway Online").length ===
+						1 &&
 					indicatorOps[0]?.text === "Gateway Online" &&
+					offWorld.tg.shortDescriptions.length === 0,
+				offlineStampOnDisconnect:
+					statusTextsExactOrder === true &&
 					offWorld.tg.shortDescriptions.length === 0,
 				dmTopicCreatedAndCached:
 					createsBefore === 1 &&
@@ -1556,8 +1708,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					topicOp?.metadata["message_thread_id"] === undefined,
 				aliasMetadataKeyHonored:
 					aliasOp?.metadata["direct_messages_topic_id"] === 43 &&
-					aliasOp?.metadata["telegram_direct_messages_topic_id"] ===
-						undefined,
+					aliasOp?.metadata["telegram_direct_messages_topic_id"] === undefined,
 				fallbackAnchorAttachedEveryChunk:
 					chunkResults.every((r) => r.success) &&
 					chunkSends.length >= 2 &&
@@ -1609,9 +1760,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			const leakedKeys =
 				noisyOp === undefined
 					? ["missing-op"]
-					: Object.keys(noisyOp.metadata).filter(
-							(k) => !ALLOWED.includes(k),
-						);
+					: Object.keys(noisyOp.metadata).filter((k) => !ALLOWED.includes(k));
 
 			// Built args still ship: notify rings, MDV2 conversion stamped.
 			await sendThroughDoor(world, "778", "**rings**", { notify: true });
@@ -1647,10 +1796,12 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				usernameChatIdPreserved: unameOp?.metadata["chat_id"] === "@room",
 				linkPreviewKwargsGated:
 					noisyOp?.metadata["link_preview_options"] !== undefined &&
-					(noisyOp?.metadata["link_preview_options"] as unknown as Record<
-						string,
-						unknown
-					>)["is_disabled"] === true,
+					(
+						noisyOp?.metadata["link_preview_options"] as unknown as Record<
+							string,
+							unknown
+						>
+					)["is_disabled"] === true,
 				linkPreviewOffByDefault:
 					defOp?.metadata["link_preview_options"] === undefined,
 			};
@@ -1677,7 +1828,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					TELEGRAM_RICH_DRAFTS: "true",
 				},
 			});
-			const { adapter, wire, tg } = world;
+			const { adapter, tg } = world;
 			const richOk = await world.subject.deliverLongText("chat-r1", TABLE, {
 				notify: true,
 				reply_to_message_id: "31",
@@ -1686,7 +1837,10 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			const richCountAfterFirst = tg.richOps.length;
 
 			// Ineligible prose skips tier 1 SILENTLY (fallback-class, no latch).
-			const prose = await world.subject.deliverLongText("chat-r2", "plain prose");
+			const prose = await world.subject.deliverLongText(
+				"chat-r2",
+				"plain prose",
+			);
 			const richCountAfterProse = tg.richOps.length;
 
 			// expect_edits previews skip rich too (ladder gate parity).
@@ -1723,6 +1877,8 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			const legacySendsAfterTransient = tWorld.wire.sendsOf("chat-rt").length;
 
 			// Rich DRAFT frames require BOTH extras (messages-only world: none).
+			// tg-13: the legacy fallback lane is REAL sendMessageDraft on the Bot
+			// API fake — captured in draftKwargs, never a nameless harness op.
 			const msgOnlyWorld = makeTelegramWorld({
 				name: "tg-shape-rich-msgonly",
 				env: { TELEGRAM_RICH_MESSAGES: "true" },
@@ -1735,7 +1891,9 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			const msgOnlyRichDrafts = msgOnlyWorld.tg.richOps.filter(
 				(o) => o.method === "sendRichMessageDraft",
 			).length;
-			const msgOnlyLegacyDrafts = msgOnlyWorld.wire.draftsOf("chat-rd1").length;
+			const msgOnlyLegacyDrafts = msgOnlyWorld.tg.draftKwargs.filter(
+				(k) => k["chat_id"] === "chat-rd1",
+			).length;
 
 			// Both extras: eligible frames go sendRichMessageDraft.
 			await adapter.sendDraft({
@@ -1747,7 +1905,8 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				(o) => o.method === "sendRichMessageDraft",
 			).length;
 
-			// Draft capability failure latches its OWN flag; frame falls back.
+			// Draft capability failure latches its OWN flag; frame falls back
+			// to the REAL legacy draft lane (tg-13 sendMessageDraft).
 			tg.scriptRich("sendRichMessageDraft", {
 				kind: "fail",
 				error: "sendRichMessageDraft: method not found",
@@ -1757,7 +1916,9 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				draftId: 4022,
 				content: TABLE,
 			});
-			const draftFallbackLegacy = wire.draftsOf("chat-rd3").length;
+			const draftFallbackLegacy = tg.draftKwargs.filter(
+				(k) => k["chat_id"] === "chat-rd3",
+			).length;
 			await adapter.sendDraft({
 				chatId: "chat-rd4",
 				draftId: 4032,
@@ -1782,16 +1943,15 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					richOk.every((r) => r.success === true) &&
 					richOp !== undefined &&
 					richOp.args["chat_id"] === "chat-r1" &&
-					(richOp.args["rich_message"] as Record<string, unknown>)
-						.markdown !== undefined &&
+					(richOp.args["rich_message"] as Record<string, unknown>).markdown !==
+						undefined &&
 					(richOp.args["reply_parameters"] as Record<string, unknown>)
 						.message_id === 31 &&
 					richOp.args["disable_notification"] === undefined,
 				ineligibleContentSkipsSilently:
 					prose.every((r) => r.success === true) &&
 					richCountAfterProse === richCountAfterFirst,
-				expectEditsSkipsRich:
-					richCountAfterExpectEdits === richCountAfterProse,
+				expectEditsSkipsRich: richCountAfterExpectEdits === richCountAfterProse,
 				capabilityErrorLatchesOnce:
 					latchResult.every((r) => r.success === true) &&
 					attemptsAfterLatchSend === attemptsBeforeLatch + 1 &&
@@ -1808,8 +1968,9 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 					richDraftOpsAfterLatch === 1,
 				richFinalizeEditApplied:
 					richEditKwargs !== undefined &&
-					(richEditKwargs["rich_message"] as Record<string, unknown> | undefined) !==
-						undefined &&
+					(richEditKwargs["rich_message"] as
+						| Record<string, unknown>
+						| undefined) !== undefined &&
 					richEditKwargs["chat_id"] === "chat-r6" &&
 					richEditKwargs["message_id"] === 55,
 			};
@@ -1869,15 +2030,11 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 				kind: "fail",
 				error: "Bad Request: message to be replied not found",
 			});
-			const noFlagDeadAnchor = await adapter.sendVideo(
-				"4546",
-				"/tmp/r5.mp4",
-				{
-					metadata: {
-						telegram_reply_to_message_id: 88,
-					},
+			const noFlagDeadAnchor = await adapter.sendVideo("4546", "/tmp/r5.mp4", {
+				metadata: {
+					telegram_reply_to_message_id: 88,
 				},
-			);
+			});
 
 			// Non-topic BadRequests surface as-is (photo→document chain runs).
 			tg.scriptMedia("sendPhoto", {
@@ -1889,8 +2046,7 @@ export function makeTelegramShapeFixture(): TelegramShapeFixture {
 			});
 			const docFallbackFired = tg.mediaOps.some(
 				(o) =>
-					o.method === "sendDocument" &&
-					o.args["document"] === "/tmp/r4.png",
+					o.method === "sendDocument" && o.args["document"] === "/tmp/r4.png",
 			);
 
 			return {

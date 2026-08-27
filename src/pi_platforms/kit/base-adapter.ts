@@ -200,6 +200,9 @@ export abstract class BasePlatformAdapter {
 			registry: CommandRegistry;
 			messageHandler: MessageHandler;
 			sendReply: (chatId: string, text: string) => Promise<void>;
+			onTurnFailure?:
+				| ((event: IncomingEvent) => void | Promise<void>)
+				| undefined;
 		},
 		opts: {
 			spawner?: TaskSpawner | undefined;
@@ -221,6 +224,9 @@ export abstract class BasePlatformAdapter {
 				return deps.messageHandler(event, ctx);
 			},
 			sendReply: deps.sendReply,
+			...(deps.onTurnFailure !== undefined
+				? { onTurnFailure: deps.onTurnFailure }
+				: {}),
 			...(opts.spawner !== undefined ? { spawner: opts.spawner } : {}),
 			...(opts.hasPendingClarify !== undefined
 				? { hasPendingClarify: opts.hasPendingClarify }

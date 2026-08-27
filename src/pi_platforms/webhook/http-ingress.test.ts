@@ -48,6 +48,8 @@ interface HarnessOpts {
 	globalSecret?: string | null | undefined;
 	/** Harness rate limit (default 3 keeps trip tests cheap). */
 	rateLimit?: number | undefined;
+	/** Served-profile set (multiplex); omitted = single-profile gateway. */
+	profilesAllowed?: ReadonlySet<string> | undefined;
 }
 
 function makePipeline(opts: HarnessOpts = {}) {
@@ -64,6 +66,9 @@ function makePipeline(opts: HarnessOpts = {}) {
 	];
 	let parseCalls = 0;
 	const pipeline = new WebhookIngressPipeline({
+		...(opts.profilesAllowed !== undefined
+			? { profilesAllowed: opts.profilesAllowed }
+			: {}),
 		trust: webhookTrustBoundary(),
 		routes: new Map(routes.map((r) => [r.name, r])),
 		rateLimiter: new SlidingWindowRateLimiter({
@@ -125,9 +130,25 @@ describe("pipeline check ORDER (webhook.py:_handle_webhook parity)", () => {
 		expect(res?.json).toEqual({ error: "Unknown route: nope" });
 	});
 
+	it("foreign prefix → 404 unconfigured-profile envelope (fail closed, #91583 defect 2)", async () => {
+		// Single-profile gateway (no served set): a prefix naming ANY profile —
+		// including one bound to the route elsewhere — must NOT fall through to
+		// the default bot's routes. Upstream webhook.py:_resolve_profile_prefix
+		// rejects _PROFILE_REJECTED with this exact envelope.
+		const h = makePipeline({
+			routes: [{ name: "ci", secret: SECRET, profiles: ["team-a"] }],
+		});
+		const res = await h.pipeline.handle(
+			h.request("{}", {}, "/p/other/webhooks/ci"),
+		);
+		expect(res?.status).toBe(404);
+		expect(res?.json).toEqual({ error: "Unknown or unconfigured profile" });
+	});
+
 	it("profile mismatch answers the SAME unknown-route shape (anti-enumeration)", async () => {
 		const h = makePipeline({
 			routes: [{ name: "ci", secret: SECRET, profiles: ["team-a"] }],
+			profilesAllowed: new Set(["other"]),
 		});
 		const mismatch = await h.pipeline.handle(
 			h.request("{}", {}, "/p/other/webhooks/ci"),

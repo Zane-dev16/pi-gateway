@@ -35,6 +35,10 @@ export interface TgWireUser {
 	id: number;
 	is_bot: boolean;
 	username?: string | undefined;
+	/** Display name Telegram always sends on real payloads
+	 * (adapter.py:_is_callback_user_authorized reads it as the authz source's
+	 * user_name); optional on the fake so old fixtures keep compiling. */
+	first_name?: string | undefined;
 }
 
 export interface TgWireChat {
@@ -268,6 +272,20 @@ export class TelegramBotApiFake {
 	readonly sendKwargs: Array<Record<string, unknown>> = [];
 	/** FULL editMessageText kwargs, in call order (parse_mode truth). */
 	readonly editKwargs: Array<Record<string, unknown>> = [];
+	/**
+	 * tg-13: FULL sendMessageDraft kwargs in call order — the LEGACY native
+	 * draft lane is a real Bot API method with {chat_id, draft_id, text,
+	 * parse_mode?, message_thread_id?, direct_messages_topic_id?}. Capture
+	 * holds EVERY attempt incl. the plain-text retry so the MarkdownV2-first
+	 * ladder (adapter.py:send_draft :6191-6208) is arg-level assertable.
+	 */
+	readonly draftKwargs: Array<Record<string, unknown>> = [];
+	/** tg-12: deleteMessage capture — {chat_id, message_id} per call. */
+	readonly deleteOps: Array<{
+		chatId: string;
+		messageId: string;
+		seq: number;
+	}> = [];
 	/** set_my_commands capture (tg2-3 housekeeping + lazy forum scopes). */
 	readonly myCommandsOps: TgMyCommandsOp[] = [];
 	/** set_my_short_description capture (status indicator, tg2-3). */
@@ -316,6 +334,18 @@ export class TelegramBotApiFake {
 		const queue = this.richScripts.get(method) ?? [];
 		queue.push(...behaviors);
 		this.richScripts.set(method, queue);
+	}
+
+	/** tg-13: script the legacy sendMessageDraft lane (fail/flood classes). */
+	private draftScripts: TgBehavior[] = [];
+	scriptDraft(...behaviors: TgBehavior[]): void {
+		this.draftScripts.push(...behaviors);
+	}
+
+	/** tg-12: script the deleteMessage lane (fail/flood classes). */
+	private deleteScripts: TgBehavior[] = [];
+	scriptDelete(...behaviors: TgBehavior[]): void {
+		this.deleteScripts.push(...behaviors);
 	}
 
 	scriptForumTopics(...behaviors: TgBehavior[]): void {
@@ -378,7 +408,11 @@ export class TelegramBotApiFake {
 	}
 
 	/** Convenience: a text message from a FORUM supergroup chat (tg2-3). */
-	pushForumTextUpdate(chatId: number, text: string, senderId = 7001): TgWireUpdate {
+	pushForumTextUpdate(
+		chatId: number,
+		text: string,
+		senderId = 7001,
+	): TgWireUpdate {
 		return this.pushRawUpdate({
 			message: {
 				message_id: this.nextMessageId++,
@@ -396,19 +430,38 @@ export class TelegramBotApiFake {
 		hostMessageId: string | number;
 		data: string;
 		clickerId?: number | undefined;
+		/** tg-11: host chat shape for authorization-source coverage. */
+		hostChatType?: TgWireChat["type"] | undefined;
+		/** tg-11: host-message forum thread id (supergroup → forum mapping). */
+		hostThreadId?: number | undefined;
+		/** tg-11: clicker display name (Hermes reads first_name as user_name). */
+		clickerName?: string | undefined;
 	}): TgWireUpdate {
 		const clickerId = opts.clickerId ?? 7001;
 		const hostIdNum = Number(opts.hostMessageId);
 		return this.pushRawUpdate({
 			callback_query: {
 				id: `cbq${this.nextCallbackQueryId++}`,
-				from: { id: clickerId, is_bot: false, username: `user${clickerId}` },
+				from: {
+					id: clickerId,
+					is_bot: false,
+					username: `user${clickerId}`,
+					...(opts.clickerName !== undefined
+						? { first_name: opts.clickerName }
+						: {}),
+				},
 				message: {
 					message_id: Number.isFinite(hostIdNum)
 						? hostIdNum
 						: opts.hostMessageId,
-					chat: { id: opts.hostChatId, type: "private" },
+					chat: {
+						id: opts.hostChatId,
+						type: opts.hostChatType ?? "private",
+					},
 					date: 1760000000,
+					...(opts.hostThreadId !== undefined
+						? { message_thread_id: opts.hostThreadId }
+						: {}),
 				},
 				data: opts.data,
 			},
@@ -941,6 +994,73 @@ export class TelegramBotApiFake {
 		opts: Record<string, unknown>,
 	): Promise<SendResult> {
 		return this.transmitRich("sendRichMessageDraft", opts);
+	}
+
+	// ── Bot API draft + delete lanes (tg-13 / tg-12) ────────────────────────
+
+	/**
+	 * sendMessageDraft — the LEGACY native draft method (tg-13,
+	 * adapter.py:send_draft :6201 self._bot.send_message_draft). Full kwarg
+	 * capture in call order; scripted behaviors support the BadRequest parse
+	 * class ("can't parse entities") that drives the MarkdownV2-first → plain
+	 * retry ladder. Success carries NO message id — drafts have none.
+	 */
+	async sendMessageDraft(opts: {
+		chat_id: number | string;
+		draft_id: number;
+		text: string;
+		parse_mode?: string | undefined;
+		message_thread_id?: number | null | undefined;
+		direct_messages_topic_id?: number | undefined;
+	}): Promise<SendResult> {
+		this.assertReachable("general", "sendMessageDraft");
+		const behavior =
+			this.draftScripts.shift() ?? ({ kind: "ok" } as TgBehavior);
+		if (behavior.kind === "fail") {
+			this.draftKwargs.push({ ...opts }); // failed attempts stay assertable
+			return { success: false, error: behavior.error };
+		}
+		if (behavior.kind === "flood") {
+			this.draftKwargs.push({ ...opts });
+			return {
+				success: false,
+				error: `Too Many Requests: retry after ${behavior.retryAfter}`,
+				retryAfter: behavior.retryAfter,
+			};
+		}
+		this.opSeq += 1;
+		this.draftKwargs.push({ ...opts });
+		return { success: true }; // no messageId — drafts carry none (:6207)
+	}
+
+	/**
+	 * deleteMessage — Bot API retraction surface (tg-12,
+	 * adapter.py:delete_message :6064 calling _bot.delete_message). Best-effort
+	 * at the adapter; failures are scripted and captured like every other lane.
+	 */
+	async deleteMessage(opts: {
+		chat_id: number | string;
+		message_id: number | string;
+	}): Promise<SendResult> {
+		this.assertReachable("general", "deleteMessage");
+		const behavior =
+			this.deleteScripts.shift() ?? ({ kind: "ok" } as TgBehavior);
+		if (behavior.kind === "fail")
+			return { success: false, error: behavior.error };
+		if (behavior.kind === "flood") {
+			return {
+				success: false,
+				error: `Too Many Requests: retry after ${behavior.retryAfter}`,
+				retryAfter: behavior.retryAfter,
+			};
+		}
+		this.opSeq += 1;
+		this.deleteOps.push({
+			chatId: String(opts.chat_id),
+			messageId: String(opts.message_id),
+			seq: this.opSeq,
+		});
+		return { success: true };
 	}
 
 	// ── internals (reference-fake parity) ────────────────────────────────

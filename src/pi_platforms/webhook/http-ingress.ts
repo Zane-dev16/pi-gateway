@@ -159,11 +159,14 @@ export class WebhookIngressPipeline {
 
 		const routeConfig = this.deps.routes.get(parsed.routeName);
 
-		// Multi-profile resolution: an UNKNOWN profile rejects distinctly, but a
-		// route↔profile MISMATCH answers with the unknown-route shape so
-		// callers cannot enumerate route bindings (webhook.py parity).
+		// Multi-profile resolution — FAIL CLOSED on every un-served prefix
+		// (webhook.py:_resolve_profile_prefix, #91583 defect 2): historically
+		// ignoring a foreign prefix served the gateway owner's config under
+		// another profile's URL. Only a prefix naming a SERVED profile may
+		// proceed; when `profilesAllowed` is undefined this gateway declares no
+		// multiplex surface, so any prefix rejects as unconfigured.
 		if (parsed.profile !== undefined) {
-			const allowed = this.deps.profilesAllowed?.has(parsed.profile) ?? true;
+			const allowed = this.deps.profilesAllowed?.has(parsed.profile) ?? false;
 			if (!allowed) {
 				return jsonResponse(404, {
 					error: "Unknown or unconfigured profile",

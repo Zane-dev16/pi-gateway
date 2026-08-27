@@ -304,6 +304,7 @@ export class SlackSubject implements ConformanceSubject {
 				sendReply: async (_chatId: string, replyText: string) => {
 					adapter.replyLog.push(replyText);
 				},
+				onTurnFailure: (event) => adapter.onGuardTurnFailure(event),
 			},
 			{
 				// The harness-stamped deterministic scheduler drives task

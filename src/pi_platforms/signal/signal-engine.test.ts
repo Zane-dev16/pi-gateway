@@ -47,6 +47,10 @@ import {
 	validateSendResult,
 } from "./signal-adapter.js";
 import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
+import type {
+	Metadata,
+	SendResult,
+} from "../../pi_gateway/streaming/adapter-seam.js";
 
 /** A full engine world: adapter + fake daemon + injected clock + tmp dirs. */
 function makeWorld(
@@ -964,6 +968,42 @@ describe("deliverText converts whole message first, splits converted text", () =
 		expect(sends).toHaveLength(1);
 		expect(sends[0]?.params["message"]).toBe("bold intro");
 		expect(sends[0]?.params["textStyle"]).toBe("0:4:BOLD");
+	});
+
+	it("a failed chunk aborts remaining chunks (signal.py:send loop bail)", async () => {
+		const w = makeWorld({ scalarMaxUnits: 40 });
+		const content = `start ${"x".repeat(30)} end ${"y".repeat(30)} tail`; // >1 chunk
+		// First send RPC fails; WITHOUT the bail, chunks 2+ would still leave
+		// (and the final result would read success).
+		w.daemon.scriptRpcFailure("send", { code: -1, message: "socket gone" });
+
+		const results = await w.adapter.deliverText("chat-abort", content);
+		expect(results).toHaveLength(1);
+		expect(results[0]?.success).toBe(false);
+		// Exactly ONE send RPC left the adapter: every remaining chunk was
+		// abandoned so recovery cannot inherit a half-conversation.
+		expect(w.daemon.callsOf("send")).toHaveLength(1);
+	});
+
+	it("blank content succeeds WITHOUT an empty-body RPC (signal.py:send guard, cbc8d1804)", async () => {
+		const w = makeWorld();
+		// wireSend is protected (kit contract); the blank-guard row asserts it
+		// directly, so expose just that member structurally for this test.
+		const wireSend = (
+			w.adapter as unknown as {
+				wireSend: (
+					chatId: string,
+					content: string,
+					metadata: Metadata,
+				) => Promise<SendResult>;
+			}
+		).wireSend.bind(w.adapter);
+		for (const blank of ["", "   "] as const) {
+			const r = await wireSend("chat-blank", blank, {});
+			expect(r).toEqual({ success: true, messageId: null });
+		}
+		const sends = w.daemon.callsOf("send");
+		expect(sends).toHaveLength(0); // no RPC hit the daemon at all
 	});
 });
 

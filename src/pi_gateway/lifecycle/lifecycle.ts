@@ -42,6 +42,7 @@ import {
 import {
 	RuntimeLock,
 	getRunningPid,
+	recordHomeMatches,
 	removePidFile,
 	writePidFile,
 	type RunningInstance,
@@ -637,6 +638,25 @@ export class GatewayLifecycle {
 			throw new LifecycleError(
 				"duplicate_instance",
 				`another gateway instance is already running (pid ${existing.pid}); use --replace or stop it first`,
+			);
+		}
+		// Destructive-action authority check (#89315 parity) — see
+		// recordHomeMatches. Refusals name the competing home loudly.
+		if (!recordHomeMatches(existing.record, ctx.home)) {
+			const recordedHome =
+				typeof existing.record.pi_home === "string"
+					? existing.record.pi_home.trim()
+					: "";
+			ctx.log.error?.(
+				recordedHome === ""
+					? `refusing --replace: pid record predates pi_home stampings; ownership of pid ${existing.pid} unprovable`
+					: `refusing --replace: pid record belongs to a different pi home (${recordedHome}, ours ${ctx.home}); remove the stale pid record or stop the owning profile explicitly`,
+			);
+			throw new LifecycleError(
+				"replace_refused",
+				recordedHome === ""
+					? `could not prove ownership of running instance (pid ${existing.pid}): legacy pid record without pi_home`
+					: `running instance (pid ${existing.pid}) belongs to another pi home (${recordedHome})`,
 			);
 		}
 		ctx.log.info("replacing existing gateway instance", {
