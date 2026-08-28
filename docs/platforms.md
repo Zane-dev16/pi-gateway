@@ -1,8 +1,9 @@
 # Platforms
 
 Pi Gateway ships 31 platform surfaces. Every adapter implements one of three
-transport shapes, and every adapter — reference or census port — passes the
-same executable conformance suite before merge (spec 04 §8, DEC-002).
+transport shapes, and every adapter, whether a reference adapter or a census
+port, passes the same executable conformance suite before merge (spec 04 §8,
+DEC-002).
 
 ## Transport shapes
 
@@ -13,10 +14,10 @@ same executable conformance suite before merge (spec 04 §8, DEC-002).
 | Webhook | Stateless HTTP ingress with HMAC signature verification and explicit trust boundaries (DEC-017) | `src/pi_platforms/webhook/` |
 
 The three reference adapters are the seam proof: the remaining census ports
-inherit their fixtures and obligations. Shape-specific duties include, for
-polling, preserving server-side update queues across reconnects and evicting
-zombie sessions on 409 conflict; for webhooks, constant-time signature
-compares, ±300s replay windows, and bounded body/concurrency limits.
+inherit their fixtures and obligations. Polling adapters must preserve
+server-side update queues across reconnects and evict zombie sessions on 409
+conflict. Webhook adapters use constant-time signature compares, a ±300s
+replay window, and bounded body and concurrency limits.
 
 ## Supported surfaces
 
@@ -79,17 +80,18 @@ Once an adapter passes conformance, platform mechanics are shared, not
 per-platform: two-guard routing and the two-layer turn lease (DEC-004/005),
 the streaming draft contract where the platform supports edits (DEC-006),
 chunking and send-retry ladders (`retry_after` is server-authoritative;
-timeout-classified failures are never retried — DEC-046), the command
+timeout-classified failures are never retried, DEC-046), the command
 registry and busy policies (spec 07 §1), the delivery-obligations ledger
 (DEC-053/054), pairing and allowlist authorization (spec 06 §2), and
 token-lock protection for unique credentials (spec 06 §5).
 
 ## Configuring a surface
 
-1. Provide the secrets the manifest declares in `requiresEnv` (missing secrets
-   **loudly disable** the adapter — the log names the missing key).
-2. Set the authorization knobs you want
-   (`{P}_ALLOWED_USERS`, `{P}_GROUP_ALLOWED_CHATS`, policies) — see
+1. Provide the secrets the manifest declares in `requiresEnv`. A missing
+   required secret disables the adapter loudly, and the log names the
+   missing key.
+2. Set the authorization knobs you want (`{P}_ALLOWED_USERS`,
+   `{P}_GROUP_ALLOWED_CHATS`, policies). See
    [docs/configuration.md](configuration.md).
 3. Restart (`pi gateway run --replace` takes over a running instance) and
    check `/status` for the adapter's connection state.
@@ -104,7 +106,7 @@ reference fixture, declare manifest data, pass the conformance gate.
 
 ## See also
 
-- [docs/configuration.md](configuration.md) — secrets and policies
-- [docs/architecture.md](architecture.md) — the shared mechanics
-- [docs/troubleshooting.md](troubleshooting.md) — adapter diagnostics
-- [README.md](../README.md) — project hub
+[docs/configuration.md](configuration.md) covers secrets and policies,
+[docs/architecture.md](architecture.md) describes the shared mechanics, and
+[docs/troubleshooting.md](troubleshooting.md) collects adapter diagnostics.
+The project hub is [README.md](../README.md).

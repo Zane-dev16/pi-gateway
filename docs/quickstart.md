@@ -8,10 +8,11 @@ For background on how the gateway is put together, see
 
 ## Prerequisites
 
-- **Node.js 26+** and npm
-- **git**
-- A **pi** installation — the gateway reuses the host pi agent loop directly
-  (DEC-023); you need a model/provider configured for pi before turns can run
+- Node.js 26+ and npm
+- git
+- A pi installation with a model/provider configured. The gateway reuses the
+  host pi agent loop directly (DEC-023), so turns cannot run until pi can
+  reach a provider.
 
 ## 1. Install
 
@@ -24,13 +25,14 @@ npm ci
 npm run build        # type check; must exit clean
 ```
 
-Full requirements and `PI_HOME` layout: [docs/installation.md](installation.md).
+Full requirements and the `PI_HOME` layout:
+[docs/installation.md](installation.md).
 
 ## 2. Configure one platform
 
 Every adapter declares its required secrets in a manifest (spec 04 §4). The
-Telegram adapter, for example, requires `TELEGRAM_BOT_TOKEN` (Bot API
-long-polling, the polling transport shape — DEC-024).
+Telegram adapter requires `TELEGRAM_BOT_TOKEN` (Bot API long-polling, the
+polling transport shape; DEC-024).
 
 Provide the secret through your shell environment or the profile's `.env`
 store under `PI_HOME`:
@@ -39,8 +41,8 @@ store under `PI_HOME`:
 export TELEGRAM_BOT_TOKEN="123456:ABC..."
 ```
 
-Also set a sender allowlist so only you can drive the bot — authorization is
-deny-by-default (spec 06 §2):
+Then set a sender allowlist. Authorization is deny-by-default (spec 06 §2),
+so only listed users can drive the bot:
 
 ```sh
 export TELEGRAM_ALLOWED_USERS="your-telegram-user-id"
@@ -53,9 +55,9 @@ pi gateway run
 ```
 
 This composition root (DEC-058) records a boot fingerprint, claims the PID
-file and runtime lock, opens/repairs `state.db`, starts the embedded services
-(cron, handoff, kanban, hooks), and connects your configured adapters. A
-missing secret disables an adapter **loudly** — check the log for the
+file and runtime lock, opens or repairs `state.db`, starts the embedded
+services (cron, handoff, kanban, hooks), and connects your configured
+adapters. A missing secret disables an adapter loudly: check the log for the
 `adapter_disabled` reason rather than wondering why a platform never comes up.
 
 Stop with `Ctrl-C`: shutdown drains ingress, lets active turns finish, flushes
@@ -63,15 +65,15 @@ delivery obligations, and exits (spec 08 §1.2).
 
 ## 4. Say hello
 
-Message your bot from an allowed user. A turn runs through the two-level
-busy guard and the two-layer turn lease (DEC-004/005); streaming edits a
-draft message in place where the platform supports it, then seals the final
+Message your bot from an allowed user. A turn runs through the two-level busy
+guard and the two-layer turn lease (DEC-004/005); streaming edits a draft
+message in place where the platform supports it, then seals the final
 response.
 
 Useful first commands in chat:
 
-- `/help` — commands, derived from the single central registry (spec 07 §1)
-- `/status` — adapters, worker-pool depth, lease table, delivery backlog
+- `/help`: commands, derived from the single central registry (spec 07 §1)
+- `/status`: adapters, worker-pool depth, lease table, delivery backlog
 
 ## 5. Verify state on disk
 
@@ -95,6 +97,6 @@ Everything lands under your profile home (default `~/.pi`, override with
 
 ## See also
 
-- [docs/installation.md](installation.md) — deployment details
-- [docs/configuration.md](configuration.md) — secrets, policies, allowlists
-- [README.md](../README.md) — project hub
+- [docs/installation.md](installation.md): deployment details
+- [docs/configuration.md](configuration.md): secrets, policies, allowlists
+- [README.md](../README.md): project hub
