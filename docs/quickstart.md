@@ -19,19 +19,19 @@ Install as a pi package (no manual `npm ci` needed — `pi install` runs it
 for you):
 
 ```sh
-pi install npm:pi-gateway
+pi install npm:@irellzane/pi-gateway
 ```
 
-Before the npm publish, install from git instead:
+Or from git (same code, no registry):
 
 ```sh
-pi install git:github.com/IrellZane/pi-gateway
+pi install git:github.com/Zane-dev16/pi-gateway
 ```
 
 For local development see [CONTRIBUTING.md](../CONTRIBUTING.md):
 
 ```sh
-git clone https://github.com/IrellZane/pi-gateway
+git clone https://github.com/Zane-dev16/pi-gateway
 cd pi-gateway
 pi install . -l       # links the checkout into pi
 npm run build        # type check; must exit clean (dev only)

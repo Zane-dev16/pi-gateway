@@ -16,13 +16,13 @@ For a five-minute first run, start with [docs/quickstart.md](quickstart.md).
 ## Install as a pi package (recommended)
 
 ```sh
-pi install npm:pi-gateway
+pi install npm:@irellzane/pi-gateway
 ```
 
-Before the npm publish, install from git instead:
+Or from git (same code, no registry):
 
 ```sh
-pi install git:github.com/IrellZane/pi-gateway
+pi install git:github.com/Zane-dev16/pi-gateway
 ```
 
 `pi install` resolves `package.json` and runs `npm install` for you, then
@@ -30,7 +30,7 @@ loads the extension at `extensions/pi-gateway.ts` (DEC-058) via the
 `pi.extensions` manifest. After install, `pi gateway run` and the in-pi
 `/gateway` slash command are available. See `pi list` / `pi remove`
 / `pi update` in `pi/packages.md`. If you installed from git, `pi update`
-does not move the pinned ref — use `pi install git:github.com/IrellZane/pi-gateway@<new-ref>` to update.
+does not move the pinned ref — use `pi install git:github.com/Zane-dev16/pi-gateway@<new-ref>` to update.
 
 ## Install from source (development)
 
@@ -38,7 +38,7 @@ For contributors or local iteration, clone and link the checkout so pi
 loads it from disk:
 
 ```sh
-git clone https://github.com/IrellZane/pi-gateway
+git clone https://github.com/Zane-dev16/pi-gateway
 cd pi-gateway
 pi install . -l        # link current checkout into pi (writes .pi/settings.json)
 npm ci                # only needed for direct tsc/vitest without pi
@@ -120,7 +120,7 @@ with exit 1 rather than reporting healthy (spec 08 §8). Receipts land in
 Stop the gateway (graceful drain), then remove the package:
 
 ```sh
-pi remove npm:pi-gateway        # or pi remove git:github.com/IrellZane/pi-gateway
+pi remove npm:@irellzane/pi-gateway        # or pi remove git:github.com/Zane-dev16/pi-gateway
 # for a linked checkout: pi remove ./pi-gateway  then rm -rf the clone
 ```
 

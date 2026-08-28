@@ -81,5 +81,5 @@ and the 31-surface platform census.
   [CONTRIBUTING.md](CONTRIBUTING.md)). Specs that spawn real OS child
   processes run serialized under full-suite execution (DEC-041).
 
-[Unreleased]: https://github.com/IrellZane/pi-gateway/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/IrellZane/pi-gateway/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Zane-dev16/pi-gateway/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Zane-dev16/pi-gateway/releases/tag/v0.1.0

@@ -20,20 +20,20 @@ run until pi can reach a provider — plus Node.js 26+ at runtime
 1. Install as a pi package:
 
    ```sh
-   pi install npm:pi-gateway
+   pi install npm:@irellzane/pi-gateway
    ```
 
-   Before the npm publish, install from git instead:
+   Or from git (same code, no registry):
 
    ```sh
-   pi install git:github.com/IrellZane/pi-gateway
+   pi install git:github.com/Zane-dev16/pi-gateway
    ```
 
    For local development, clone and link instead (see
    [CONTRIBUTING.md](CONTRIBUTING.md)):
 
    ```sh
-   git clone https://github.com/IrellZane/pi-gateway
+   git clone https://github.com/Zane-dev16/pi-gateway
    cd pi-gateway
    pi install . -l
    ```

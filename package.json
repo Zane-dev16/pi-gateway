@@ -1,5 +1,5 @@
 {
-  "name": "pi-gateway",
+  "name": "@irellzane/pi-gateway",
   "version": "0.1.0",
   "type": "module",
   "description": "Messaging gateway for the pi coding agent (Hermes Gateway parity).",
