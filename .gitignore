@@ -1,4 +1,6 @@
-node_modules/
 dist/
+local-docs/
+node_modules/
+reports/
 *.tsbuildinfo
 .vite/
