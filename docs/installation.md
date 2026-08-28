@@ -5,23 +5,44 @@ For a five-minute first run, start with [docs/quickstart.md](quickstart.md).
 
 ## Requirements
 
-- Node.js 26+ (better-sqlite3 13.x is the SQLite driver, installed via npm)
-- npm and git
 - A pi installation with a working model/provider; the gateway reuses the
   host pi agent loop directly, never a re-implementation (DEC-023)
+- Node.js 26+ at runtime (better-sqlite3 13.x is the native SQLite driver,
+  installed automatically by `pi install`)
 - OS: Linux and macOS fully supported; Windows supported with OS-parity
   semantics (detached spawns, tree-kill takeover, no-`ps` forensics;
   spec 01 §2.3, spec 08 §1.3)
 
-## Install from source
+## Install as a pi package (recommended)
 
-Pi Gateway ships as source; run it from a checkout:
+```sh
+pi install npm:pi-gateway
+```
+
+Before the npm publish, install from git instead:
+
+```sh
+pi install git:github.com/IrellZane/pi-gateway
+```
+
+`pi install` resolves `package.json` and runs `npm install` for you, then
+loads the extension at `extensions/pi-gateway.ts` (DEC-058) via the
+`pi.extensions` manifest. After install, `pi gateway run` and the in-pi
+`/gateway` slash command are available. See `pi list` / `pi remove`
+/ `pi update` in `pi/packages.md`. If you installed from git, `pi update`
+does not move the pinned ref — use `pi install git:github.com/IrellZane/pi-gateway@<new-ref>` to update.
+
+## Install from source (development)
+
+For contributors or local iteration, clone and link the checkout so pi
+loads it from disk:
 
 ```sh
 git clone https://github.com/IrellZane/pi-gateway
 cd pi-gateway
-npm ci            # exact lockfile; includes the native SQLite driver
-npm run build     # tsc --noEmit must be clean
+pi install . -l        # link current checkout into pi (writes .pi/settings.json)
+npm ci                # only needed for direct tsc/vitest without pi
+npm run build         # tsc --noEmit must be clean
 ```
 
 Optional self-checks before first run (also enforced in CI, see
@@ -82,10 +103,11 @@ service manager. Semantics that matter for unit files (spec 08 §1–§2):
 
 The updater does not fight deployment models it does not own (spec 08 §5):
 
-| Install kind       | Update behavior                                                            |
-| ------------------ | -------------------------------------------------------------------------- |
-| git checkout       | in-place pull, the only in-place kind                                      |
-| docker / nix / apt | prints the right external command and exits 1 before mutating anything     |
+| Install kind              | Update behavior                                                            |
+| ------------------------- | -------------------------------------------------------------------------- |
+| pi package (`npm:`/`git:`) | `pi update --extensions` / `pi install <source>@<ref>` (pi reconciles)     |
+| git checkout (linked dev) | in-place pull, the only in-place kind                                      |
+| docker / nix / apt        | prints the right external command and exits 1 before mutating anything     |
 
 Updates themselves are transactional: plan → snapshot → apply →
 restart-per-kind → verify → receipt. A mixed-version fleet fails verification
@@ -95,9 +117,15 @@ with exit 1 rather than reporting healthy (spec 08 §8). Receipts land in
 
 ## Uninstall
 
-Stop the gateway (graceful drain), then remove the checkout. State under
-`PI_HOME` (`state.db`, logs, snapshots) is user data; delete it only if you
-do not need session history, pairing grants, or cron jobs.
+Stop the gateway (graceful drain), then remove the package:
+
+```sh
+pi remove npm:pi-gateway        # or pi remove git:github.com/IrellZane/pi-gateway
+# for a linked checkout: pi remove ./pi-gateway  then rm -rf the clone
+```
+
+State under `PI_HOME` (`state.db`, logs, snapshots) is user data; delete it
+only if you do not need session history, pairing grants, or cron jobs.
 
 ## See also
 

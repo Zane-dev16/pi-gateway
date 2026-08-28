@@ -12,16 +12,30 @@ a TypeScript port of the
 
 ## Quick start: chat app in 5 minutes
 
-You need Node.js 26+ with npm and git, plus a working pi installation with a
-model/provider configured: the gateway reuses the host pi agent loop directly
-(DEC-023), so turns cannot run until pi can reach a provider.
+You need a working pi installation with a model/provider configured — the
+gateway reuses the host pi agent loop directly (DEC-023), so turns cannot
+run until pi can reach a provider — plus Node.js 26+ at runtime
+(better-sqlite3 native driver).
 
-1. Clone and build:
+1. Install as a pi package:
+
+   ```sh
+   pi install npm:pi-gateway
+   ```
+
+   Before the npm publish, install from git instead:
+
+   ```sh
+   pi install git:github.com/IrellZane/pi-gateway
+   ```
+
+   For local development, clone and link instead (see
+   [CONTRIBUTING.md](CONTRIBUTING.md)):
 
    ```sh
    git clone https://github.com/IrellZane/pi-gateway
    cd pi-gateway
-   npm ci && npm run build
+   pi install . -l
    ```
 
 2. Set one platform secret. This example uses Telegram; every adapter declares

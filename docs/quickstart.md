@@ -8,21 +8,33 @@ For background on how the gateway is put together, see
 
 ## Prerequisites
 
-- Node.js 26+ and npm
-- git
 - A pi installation with a model/provider configured. The gateway reuses the
   host pi agent loop directly (DEC-023), so turns cannot run until pi can
   reach a provider.
+- Node.js 26+ at runtime (the SQLite driver is native).
 
 ## 1. Install
 
-Pi Gateway runs from a source checkout:
+Install as a pi package (no manual `npm ci` needed — `pi install` runs it
+for you):
+
+```sh
+pi install npm:pi-gateway
+```
+
+Before the npm publish, install from git instead:
+
+```sh
+pi install git:github.com/IrellZane/pi-gateway
+```
+
+For local development see [CONTRIBUTING.md](../CONTRIBUTING.md):
 
 ```sh
 git clone https://github.com/IrellZane/pi-gateway
 cd pi-gateway
-npm ci
-npm run build        # type check; must exit clean
+pi install . -l       # links the checkout into pi
+npm run build        # type check; must exit clean (dev only)
 ```
 
 Full requirements and the `PI_HOME` layout:
