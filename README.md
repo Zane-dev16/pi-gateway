@@ -1,7 +1,5 @@
 # Pi Gateway
 
-[![tests](https://img.shields.io/badge/tests-3096%20passing-brightgreen)](CHANGELOG.md)
-[![fidelity](https://img.shields.io/badge/fidelity-Hermes%20parity-blue)](#fidelity)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 Pi Gateway is a messaging gateway for the
