@@ -1,10 +1,10 @@
 // pi_state/reconcile.ts — declarative schema reconcile, storage-version
-// tracking, title-uniqueness dedup repair, FTS ensure/backfill, and the
+// tracking, title-uniqueness dedup repair, the DEC-070 FTS retreat, and the
 // whole-open jittered-patience wrapper.
 //
 // Spec: /root/pi-gateway/02-session-and-state.md
-//   §2.2 two-tier storage-version tracking (schema_version advances freely;
-//        FTS layout version opt-in via state_meta['fts_storage_version'])
+//   §2.2 storage-version tracking (schema_version advances freely on
+//        writable open)
 //   §3   "Migration Style: Declarative Reconcile" — startup steps 1–7, the
 //        error taxonomy for ALTER races, and "read-only opens never DDL"
 //   §9   title partial unique index ensured at every open with self-healing
@@ -14,7 +14,8 @@
 //   hermes_state_schema.py:_reconcile_columns            → reconcileColumns
 //   hermes_state_schema.py:schema_read_probe_statements  → readProbeStatements
 //   hermes_state_schema.py:_init_schema (title dedup)    → ensureTitleUniqueIndex
-//   hermes_state_schema.py:_ensure_fts_schema            → ensureFtsObjects
+//   hermes_state_schema.py:_ensure_fts_schema            → REMOVED (DEC-070):
+//        retreatFtsObjects drops the FTS objects that parity created
 //   hermes_state_schema.py:_heal_gateway_routing_pk      → healGatewayRoutingPk
 //   SessionDB._connect_and_init_with_lock_patience       → connectAndInitWithPatience
 
@@ -22,17 +23,10 @@ import type Database from "better-sqlite3";
 
 import {
 	DEFERRED_INDEX_SQL,
-	FTS_CJK_TABLE_SQL,
-	FTS_CJK_VIEW_SQL,
-	FTS_REBUILD_HIGH_WATER_KEY,
-	FTS_REBUILD_PROGRESS_KEY,
-	FTS_STORAGE_VERSION,
-	FTS_STORAGE_VERSION_KEY,
 	SCHEMA_TABLES_SQL,
 	SCHEMA_TIER1_INDEXES_SQL,
 	SCHEMA_VERSION,
 	TITLE_UNIQUE_INDEX_SQL,
-	buildFtsDdl,
 	declaredSchemaTables,
 	type TableColumns,
 } from "./schema.js";
@@ -230,174 +224,88 @@ export function repairDuplicateTitles(db: Database.Database): void {
 }
 
 // ---------------------------------------------------------------------------
-// Steps 5/6 — FTS objects per storage-version gate + bounded backfill (02 §2.2)
+// Step 5 — FTS retreat (DEC-070 item 9): drop-if-present, no-op when absent
 // ---------------------------------------------------------------------------
 
-export interface FtsStatus {
-	/** FTS5 available in the linked SQLite build. */
-	available: boolean;
-	/** Optional CJK view+table created (tokenizer present). */
-	cjkAvailable: boolean;
-	/** Backfill finished this open (version may be stamped only when true). */
-	complete: boolean;
-}
+/** state_meta keys the legacy FTS rebuild/version machinery wrote. */
+const LEGACY_FTS_META_KEYS = [
+	"fts_rebuild_high_water",
+	"fts_rebuild_progress",
+	"fts_storage_version",
+] as const;
 
-const DEFAULT_FTS_CHUNK_ROWS = 2000;
+/**
+ * Legacy FTS objects follow the exact Hermes-parity family: the two
+ * external-content tables, the optional CJK pair (VIEW + virtual table), and
+ * the rebuild-gated triggers on `messages`. Names come from sqlite_master and
+ * are interpolated into DDL (identifiers cannot be bound parameters), so
+ * anything outside this exact set is refused loudly instead of dropped.
+ */
+const LEGACY_FTS_OBJECT_NAMES: ReadonlySet<string> = new Set([
+	"messages_fts",
+	"messages_fts_trigram",
+	"messages_fts_cjk",
+	"messages_fts_cjk_src",
+	"messages_fts_ai",
+	"messages_fts_ad",
+	"messages_fts_au",
+	"messages_fts_trigram_ai",
+	"messages_fts_trigram_ad",
+	"messages_fts_trigram_au",
+]);
 
-interface RebuildBookkeeping {
-	highWater: number;
-	progress: number;
-	freshStart: boolean;
-}
-
-function readRebuildBookkeeping(db: Database.Database): RebuildBookkeeping {
-	const hwRaw = getMeta(db, FTS_REBUILD_HIGH_WATER_KEY);
-	const progRaw = getMeta(db, FTS_REBUILD_PROGRESS_KEY);
-	if (hwRaw === null && progRaw === null)
-		return { highWater: -1, progress: -1, freshStart: true };
-	return {
-		highWater: hwRaw === null ? -1 : Number.parseInt(hwRaw, 10),
-		progress: progRaw === null ? -1 : Number.parseInt(progRaw, 10),
-		freshStart: false,
-	};
+function isLegacyFtsObjectName(name: string): boolean {
+	return LEGACY_FTS_OBJECT_NAMES.has(name);
 }
 
 /**
- * One bounded chunk of the crash-safe backfill. The gating triggers make any
- * interruption consistent: rows above high_water flow in live; rows at/below
- * progress are already owned by the index (their mutation triggers fire); rows
- * in between are skipped by triggers until their chunk lands (02 §2.1).
+ * Retreat the FTS full-text search surface (DEC-070 item 9 — the owner
+ * authorized this DDL retreat; the reconcile machinery itself stays CORE):
+ * DROP the legacy external-content FTS tables (`messages_fts`,
+ * `messages_fts_trigram`), the optional CJK pair (`messages_fts_cjk` + its
+ * `messages_fts_cjk_src` VIEW), their rebuild-gated triggers, and any
+ * residual `fts_*` state_meta bookkeeping keys.
+ *
+ * Retreat semantics: drop-if-present, no-op when absent — idempotent in both
+ * directions. Every writable open of a pre-retreat store heals it; fresh and
+ * already-retreated stores skip all work (probe matches nothing). Individual
+ * drops are guarded so one bad object cannot strand the rest, and any failure
+ * logs and never aborts an open (§9 rule). Returns the number of legacy
+ * objects dropped (0 when the store is clean).
  */
-function backfillChunk(
-	db: Database.Database,
-	fromExclusive: number,
-	toInclusive: number,
-): void {
-	db.prepare(
-		`INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
-		 SELECT id, content, tool_name, tool_calls FROM messages
-		 WHERE id > ? AND id <= ? AND role <> 'tool'`,
-	).run(fromExclusive, toInclusive);
-	db.prepare(
-		`INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-		 SELECT id, content, tool_name, tool_calls FROM messages
-		 WHERE id > ? AND id <= ? AND role <> 'tool'`,
-	).run(fromExclusive, toInclusive);
-}
-
-/**
- * Ensure FTS objects exist and are consistent with fts_storage_version
- * (02 §2.2): matching version ⇒ idempotent ensure; legacy/mismatched version ⇒
- * seed bookkeeping keys and run a BOUNDED chunked backfill (crash-safe across
- * opens via high-water/progress keys; keys deleted on completion). FTS5 being
- * unavailable never aborts an open — it only blocks the version stamp (step 6:
- * "claiming current schema would be a lie").
- */
-export function ensureFtsObjects(
-	db: Database.Database,
-	opts: { cjk?: boolean; chunkRows?: number; maxChunksPerOpen?: number } = {},
-): FtsStatus {
-	// Availability probe inside a savepoint so a failed CREATE leaves no residue.
-	let available = false;
+export function retreatFtsObjects(db: Database.Database): number {
 	try {
-		db.exec("SAVEPOINT fts_probe");
-		db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)");
-		db.exec("DROP TABLE IF EXISTS _fts5_probe");
-		db.exec("RELEASE fts_probe");
-		available = true;
-	} catch {
-		try {
-			db.exec("ROLLBACK TO fts_probe");
-			db.exec("RELEASE fts_probe");
-		} catch {
-			/* probe savepoint cleanup best-effort */
-		}
-	}
-	if (!available) {
-		return { available: false, cjkAvailable: false, complete: false };
-	}
-
-	db.exec(buildFtsDdl());
-
-	let cjkAvailable = false;
-	if (opts.cjk === true) {
-		try {
-			db.exec("SAVEPOINT cjk_probe");
-			db.exec(FTS_CJK_VIEW_SQL);
-			db.exec(FTS_CJK_TABLE_SQL);
-			db.exec("RELEASE cjk_probe");
-			cjkAvailable = true;
-		} catch (err) {
-			try {
-				db.exec("ROLLBACK TO cjk_probe");
-				db.exec("RELEASE cjk_probe");
-			} catch {
-				/* best-effort */
+		const rows = db
+			.prepare(
+				"SELECT name, type FROM sqlite_master " +
+					"WHERE name LIKE 'messages_fts%' ORDER BY rowid DESC",
+			)
+			.all() as Array<{ name: string; type: string }>;
+		let dropped = 0;
+		for (const row of rows) {
+			if (!isLegacyFtsObjectName(row.name)) {
+				console.warn(
+					`[pi_state] fts retreat: refusing to drop unexpected object ${row.type} ${row.name}`,
+				);
+				continue;
 			}
-			// Optional feature (02 §2.1): stock SQLite lacks cjk_unicode61.
-			console.warn(
-				`[pi_state] optional CJK FTS unavailable; continuing without it: ${errMessage(err)}`,
-			);
+			try {
+				db.exec(`DROP ${row.type.toUpperCase()} IF EXISTS "${row.name}"`);
+				dropped++;
+			} catch (err) {
+				console.warn(
+					`[pi_state] fts retreat: could not drop ${row.type} ${row.name}: ${errMessage(err)}`,
+				);
+			}
 		}
+		for (const key of LEGACY_FTS_META_KEYS) deleteMeta(db, key);
+		return dropped;
+	} catch (err) {
+		console.warn(
+			`[pi_state] fts retreat failed; continuing without it: ${errMessage(err)}`,
+		);
+		return 0;
 	}
-
-	const stampedVersion = getMeta(db, FTS_STORAGE_VERSION_KEY);
-	if (stampedVersion === String(FTS_STORAGE_VERSION)) {
-		return { available: true, cjkAvailable, complete: true };
-	}
-
-	// Legacy or mid-rebuild store: seed bookkeeping on first sight, then chew
-	// bounded chunks per open until progress reaches high-water.
-	const book = readRebuildBookkeeping(db);
-	let highWater = book.highWater;
-	let progress = book.progress;
-	if (book.freshStart) {
-		const row = db
-			.prepare("SELECT COALESCE(MAX(id), -1) AS m FROM messages")
-			.get() as { m: number };
-		highWater = Number(row.m);
-		progress = -1;
-		setMeta(db, FTS_REBUILD_HIGH_WATER_KEY, String(highWater));
-		setMeta(db, FTS_REBUILD_PROGRESS_KEY, String(progress));
-	}
-
-	const chunkRows = opts.chunkRows ?? DEFAULT_FTS_CHUNK_ROWS;
-	const maxChunks = opts.maxChunksPerOpen ?? Number.POSITIVE_INFINITY;
-	let chunksDone = 0;
-	while (
-		progress < highWater &&
-		chunksDone < maxChunks &&
-		highWater !== undefined &&
-		Number.isFinite(highWater)
-	) {
-		const nextProgress = Math.min(progress + chunkRows, highWater);
-		if (nextProgress <= progress) break; // defensive against non-finite keys
-		backfillChunk(db, progress, nextProgress);
-		progress = nextProgress;
-		setMeta(db, FTS_REBUILD_PROGRESS_KEY, String(progress));
-		chunksDone++;
-	}
-
-	if (progress >= highWater) {
-		// Backfill complete: revert triggers to tautology (delete keys), stamp
-		// the layout version (02 §11 GC-hooks row; §2.2).
-		deleteMeta(db, FTS_REBUILD_HIGH_WATER_KEY);
-		deleteMeta(db, FTS_REBUILD_PROGRESS_KEY);
-		setMeta(db, FTS_STORAGE_VERSION_KEY, String(FTS_STORAGE_VERSION));
-		return { available: true, cjkAvailable, complete: true };
-	}
-	return { available: true, cjkAvailable, complete: false };
-}
-
-/** True when no rebuild bookkeeping is pending and the layout version matches. */
-export function ftsMigrationComplete(db: Database.Database): boolean {
-	if (getMeta(db, FTS_STORAGE_VERSION_KEY) !== String(FTS_STORAGE_VERSION)) {
-		return false;
-	}
-	return (
-		getMeta(db, FTS_REBUILD_HIGH_WATER_KEY) === null &&
-		getMeta(db, FTS_REBUILD_PROGRESS_KEY) === null
-	);
 }
 
 // ---------------------------------------------------------------------------
@@ -476,17 +384,17 @@ export interface InitReport {
 	reconciled: ReconcileResult;
 	titleIndexEnsured: boolean;
 	routingPkHealed: boolean;
-	fts: FtsStatus;
+	/** Legacy FTS objects dropped by the DEC-070 retreat (0 when clean). */
+	ftsRetreated: number;
 	versionBumped: boolean;
 }
 
 export interface InitStoreOptions {
-	/** Opt-in optional CJK FTS pair (02 §2.1 "Optional CJK"). Default off. */
-	ensureCjkFts?: boolean;
-	/** Backfill chunk size in rows. */
-	ftsChunkRows?: number;
-	/** Max backfill chunks to chew per open (bounded work per open). */
-	maxFtsChunksPerOpen?: number;
+	/**
+	 * Retreat legacy FTS objects at open (DEC-070 item 9): drop-if-present,
+	 * no-op when absent. Default true; false is a test hook only.
+	 */
+	dropLegacyFtsObjects?: boolean;
 }
 
 function bumpSchemaVersion(db: Database.Database): void {
@@ -506,9 +414,8 @@ function bumpSchemaVersion(db: Database.Database): void {
  *   2. column reconcile ('duplicate column' tolerated; locked/busy RE-RAISED)
  *   3. DEFERRED_INDEX_SQL                 (indexes on reconciled-in columns)
  *   4. unique title index w/ dedup repair
- *   5. FTS objects per storage-version gate
- *   6. bump schema_version — SKIPPED while FTS migrations are incomplete or
- *      FTS5 is unavailable (claiming current schema would be a lie)
+ *   5. FTS retreat — DEC-070 item 9: drop-if-present legacy FTS objects
+ *   6. bump schema_version (unconditional — no FTS gate remains)
  *   7. one-time structural heals (gateway_routing PK predating scope)
  *
  * Additive change = add a line to SCHEMA; destructive change = explicit
@@ -524,28 +431,17 @@ export function initStore(
 	db.exec(SCHEMA_TIER1_INDEXES_SQL); // step 1 (tier-1 indexes, post-reconcile)
 	db.exec(DEFERRED_INDEX_SQL); // step 3
 	const titleIndexEnsured = ensureTitleUniqueIndex(db); // step 4
-	const ftsOpts: {
-		cjk?: boolean;
-		chunkRows?: number;
-		maxChunksPerOpen?: number;
-	} = {};
-	if (opts.ensureCjkFts !== undefined) ftsOpts.cjk = opts.ensureCjkFts;
-	if (opts.ftsChunkRows !== undefined) ftsOpts.chunkRows = opts.ftsChunkRows;
-	if (opts.maxFtsChunksPerOpen !== undefined) {
-		ftsOpts.maxChunksPerOpen = opts.maxFtsChunksPerOpen;
-	}
-	const fts = ensureFtsObjects(db, ftsOpts); // step 5
-	let versionBumped = false;
-	if (fts.available && fts.complete) {
-		bumpSchemaVersion(db); // step 6
-		versionBumped = true;
-	}
+	const ftsRetreated =
+		opts.dropLegacyFtsObjects !== false
+			? retreatFtsObjects(db) // step 5 — DEC-070 DDL retreat (drop-if-present)
+			: 0;
+	bumpSchemaVersion(db); // step 6 (unconditional — no FTS gate remains)
 	return {
 		reconciled,
 		titleIndexEnsured,
 		routingPkHealed,
-		fts,
-		versionBumped,
+		ftsRetreated,
+		versionBumped: true,
 	};
 }
 

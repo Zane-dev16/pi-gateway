@@ -9,9 +9,13 @@
 //   §9    title-uniqueness partial index ensured OUTSIDE SCHEMA with dedup repair.
 //
 // Hermes anchors (READ-ONLY reference):
-//   hermes_state_common.py:SCHEMA_SQL / SCHEMA_VERSION (=26) / FTS_STORAGE_VERSION (=1)
+//   hermes_state_common.py:SCHEMA_SQL / SCHEMA_VERSION (=26)
 //   hermes_state_common.py:DEFERRED_INDEX_SQL (tier-2 indexes)
-//   hermes_state_schema.py:_ensure_fts_schema (external-content FTS + gated triggers)
+//
+// DEC-070 scope amendment: the FTS full-text search surface
+// (hermes_state_schema.py:_ensure_fts_schema parity — external-content FTS
+// tables + gated triggers + independent storage-version tracking) is REMOVED;
+// reconcile retreats legacy FTS objects at open (reconcile.ts:retreatFtsObjects).
 //
 // Additive change = add a line to SCHEMA_SQL; reconcile does the rest forever (02 §3).
 // Destructive change = explicit versioned migration, never reconcile.
@@ -21,18 +25,6 @@
  * Hermes parity value: hermes_state_common.py:SCHEMA_VERSION = 26.
  */
 export const SCHEMA_VERSION = 26;
-
-/**
- * FTS storage-layout version tracked independently in
- * state_meta['fts_storage_version'] (02 §2.2). 1 = external-content layout.
- * Hermes parity: hermes_state_common.py:FTS_STORAGE_VERSION = 1.
- */
-export const FTS_STORAGE_VERSION = 1;
-
-/** state_meta keys for the crash-safe FTS rebuild bookkeeping (02 §2.1). */
-export const FTS_REBUILD_HIGH_WATER_KEY = "fts_rebuild_high_water";
-export const FTS_REBUILD_PROGRESS_KEY = "fts_rebuild_progress";
-export const FTS_STORAGE_VERSION_KEY = "fts_storage_version";
 
 /**
  * Tier-1 schema: tables + indexes that are safe inside executescript at create
@@ -47,13 +39,6 @@ export const FTS_STORAGE_VERSION_KEY = "fts_storage_version";
  * IF NOT EXISTS-idempotent). SCHEMA_SQL remains the full concatenation for
  * fresh stores. This realizes §3's own contract — "additive change = add a
  * line to SCHEMA; reconcile does the rest forever" — on legacy DBs too.
- *
- * The rebuild-gating predicate used by the FTS triggers lives here as a shared
- * fragment: a row belongs in an index iff
- *   id > COALESCE(high_water,-1) OR id <= COALESCE(progress,-1)
- * where absent keys ⇒ tautology (COALESCE defaults admit everything above -1).
- * Firing an external-content 'delete' for a rowid the index never held corrupts
- * it — the gating makes chunked backfills crash-safe (02 §2.1, §2.2).
  */
 export const SCHEMA_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version      (version INTEGER NOT NULL);
@@ -197,89 +182,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
 export const TITLE_UNIQUE_INDEX_SQL =
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique " +
 	"ON sessions(title) WHERE title IS NOT NULL";
-
-/**
- * Optional CJK source VIEW (02 §2.1): rows mirrored into messages_fts_cjk.
- * The cjk_unicode61 tokenizer is not part of stock SQLite builds, so both
- * objects are created best-effort behind an availability probe — failure logs
- * once and continues without CJK search (never aborts an open, §9 rule).
- */
-export const FTS_CJK_VIEW_SQL =
-	"CREATE VIEW IF NOT EXISTS messages_fts_cjk_src AS " +
-	"SELECT id, content, tool_name, tool_calls FROM messages WHERE role <> 'tool'";
-export const FTS_CJK_TABLE_SQL =
-	"CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(" +
-	"content, tool_name, tool_calls, content='messages_fts_cjk_src', content_rowid='id', " +
-	"tokenize='cjk_unicode61')";
-
-interface GatedFtsSpec {
-	table: string;
-}
-
-const FTS_TABLES: readonly GatedFtsSpec[] = [
-	{ table: "messages_fts" },
-	{ table: "messages_fts_trigram" },
-];
-
-/**
- * Rebuild-predicate fragment (02 §2.1). Parameterized by NEW/OLD so insert and
- * delete trigger arms reference the right row. Absent keys ⇒ tautology.
- */
-function ftsGate(rowRef: "new" | "old"): string {
-	const r = rowRef;
-	const hw = `(SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = '${FTS_REBUILD_HIGH_WATER_KEY}')`;
-	const prog = `(SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = '${FTS_REBUILD_PROGRESS_KEY}')`;
-	return `(${r}.id > COALESCE(${hw}, -1) OR ${r}.id <= COALESCE(${prog}, -1))`;
-}
-
-function ftsTriggersFor(table: string): string {
-	const cols = "content, tool_name, tool_calls";
-	const colRefsNew = `new.id, new.content, new.tool_name, new.tool_calls`;
-	const colRefsOld = `old.id, old.content, old.tool_name, old.tool_calls`;
-	return `
-CREATE TRIGGER IF NOT EXISTS ${table}_ai AFTER INSERT ON messages BEGIN
-  INSERT INTO ${table}(rowid, ${cols})
-  SELECT ${colRefsNew}
-  WHERE new.role <> 'tool' AND ${ftsGate("new")};
-END;
-CREATE TRIGGER IF NOT EXISTS ${table}_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO ${table}(${table}, rowid, ${cols})
-  SELECT 'delete', ${colRefsOld}
-  WHERE old.role <> 'tool' AND ${ftsGate("old")};
-END;
-CREATE TRIGGER IF NOT EXISTS ${table}_au AFTER UPDATE OF content, tool_name, tool_calls, role ON messages BEGIN
-  INSERT INTO ${table}(${table}, rowid, ${cols})
-  SELECT 'delete', ${colRefsOld}
-  WHERE old.role <> 'tool' AND ${ftsGate("old")};
-  INSERT INTO ${table}(rowid, ${cols})
-  SELECT ${colRefsNew}
-  WHERE new.role <> 'tool' AND ${ftsGate("new")};
-END;
-`;
-}
-
-/**
- * External-content FTS5 layout, Hermes storage-layout version 1 (02 §2.1):
- * messages_fts + messages_fts_trigram (+ optional CJK over a VIEW), each with
- * AFTER INSERT/DELETE/UPDATE triggers gated by the rebuild predicate. Tool
- * rows are excluded via `role <> 'tool'`.
- */
-export function buildFtsDdl(): string {
-	let ddl = `
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-  content, tool_name, tool_calls, content='messages', content_rowid='id');
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
-  content, tool_name, tool_calls, content='messages', content_rowid='id',
-  tokenize='trigram');
-`;
-	for (const spec of FTS_TABLES) ddl += ftsTriggersFor(spec.table);
-	return ddl;
-}
-
-/** Trigger names owned by an FTS table (drop order during version-gated rebuilds). */
-export function ftsTriggerNames(table: string): string[] {
-	return [`${table}_ai`, `${table}_ad`, `${table}_au`];
-}
 
 // ---------------------------------------------------------------------------
 // Declared-column derivation (reconcile diff + read-probe statements, 02 §3)

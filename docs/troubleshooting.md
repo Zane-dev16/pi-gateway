@@ -47,7 +47,6 @@ see [docs/operations.md](operations.md).
 | Symptom                                     | Cause and fix                                                              |
 | ------------------------------------------- | -------------------------------------------------------------------------- |
 | `SQLITE_BUSY` in logs                       | Normal contention is retried with patience. Repeated BUSY under heavy load points to a second process on the same `state.db` |
-| Search returns nothing                      | FTS rebuild may be in progress (bounded chunks per open; progress keys in `state_meta`). It completes without a relational rebuild (spec 02 §3) |
 | Boot replays `pending_messages/*.json`      | A previous shutdown flushed un-persisted messages to disk; they're re-inserted on boot and the files removed. Structurally invalid files are preserved, never deleted (spec 08 §1.3) |
 
 ## Process health

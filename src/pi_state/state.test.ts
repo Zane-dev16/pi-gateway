@@ -7,22 +7,16 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-	FTS_STORAGE_VERSION,
-	SCHEMA_VERSION,
-	FTS_REBUILD_HIGH_WATER_KEY,
-	FTS_REBUILD_PROGRESS_KEY,
-	FTS_STORAGE_VERSION_KEY,
-} from "./schema.js";
+import { SCHEMA_VERSION } from "./schema.js";
 import {
 	assertStoreMatchesSchema,
 	connectAndInitWithPatience,
-	deleteMeta,
 	getMeta,
 	healGatewayRoutingPk,
 	initStore,
 	readProbeStatements,
 	reconcileColumns,
+	retreatFtsObjects,
 	StoreBehindSchemaError,
 } from "./reconcile.js";
 import { StateStore } from "./store.js";
@@ -285,8 +279,8 @@ describe("02 §3 read-probes — RO opens never DDL", () => {
 	});
 });
 
-describe("02 §2.2 two-tier storage-version tracking + FTS backfill gate", () => {
-	it("fresh store stamps schema_version and fts_storage_version; triggers exclude tool rows", async () => {
+describe("DEC-070 item 9 — FTS retreat (drop-if-present, no-op when absent)", () => {
+	it("fresh store stamps schema_version, bumps it unconditionally, and leaves zero FTS objects", async () => {
 		const store = await StateStore.open(dbPath());
 		try {
 			const v = store.db
@@ -295,129 +289,111 @@ describe("02 §2.2 two-tier storage-version tracking + FTS backfill gate", () =>
 				version: number;
 			};
 			expect(Number(v.version)).toBe(SCHEMA_VERSION);
-			expect(getMeta(store.db, FTS_STORAGE_VERSION_KEY)).toBe(
-				String(FTS_STORAGE_VERSION),
-			);
+			expect(store.initReport?.versionBumped).toBe(true);
 
-			store.db
+			// The FTS surface was removed under DEC-070 item 9 (02 §2.2 storage
+			// version tracking survives; the full-text index does not): a fresh
+			// store must carry NO FTS objects and NO fts_* bookkeeping keys.
+			const objects = store.db
 				.prepare(
-					"INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', 1)",
+					"SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'",
 				)
-				.run();
-			store.db
-				.prepare(
-					"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1', 'user', 'findable needle 🚀', 1)",
-				)
-				.run();
-			store.db
-				.prepare(
-					"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1', 'tool', 'tool output never indexed', 2)",
-				)
-				.run();
-			const hits = store.db
-				.prepare(
-					"SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'needle'",
-				)
-				.all() as Array<{ rowid: number }>;
-			expect(hits).toHaveLength(1);
-			const toolHits = store.db
-				.prepare(
-					"SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'indexed'",
-				)
-				.all() as unknown[];
-			expect(toolHits).toHaveLength(0); // role <> 'tool' exclusion held
+				.all() as Array<{ name: string }>;
+			expect(objects).toHaveLength(0);
+			for (const key of [
+				"fts_storage_version",
+				"fts_rebuild_high_water",
+				"fts_rebuild_progress",
+			]) {
+				expect(getMeta(store.db, key)).toBeNull();
+			}
+			// The retreat itself did nothing here (nothing to drop).
+			expect(store.initReport?.ftsRetreated).toBe(0);
 		} finally {
 			await store.close();
 		}
 	});
 
-	it("legacy store (no fts_storage_version): bounded chunked backfill completes across opens; version stamped ONLY when done; no double-indexing", async () => {
+	it("pre-retreat store: legacy FTS objects + fts_* keys dropped at open; store stays healthy", async () => {
 		const p = dbPath();
 		{
-			// Build a CURRENT-schema store, seed rows, then regress it to legacy
-			// FTS state: clear index contents + remove the layout-version stamp.
-			const store = await StateStore.open(p);
-			const insMsg = store.db.prepare(
-				"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('sX', 'user', ?, ?)",
-			);
+			// Build a CURRENT-schema store, then regress it to the pre-retreat
+			// shape: hand-run the legacy Hermes-parity FTS DDL (removed under
+			// DEC-070 item 9) and stamp the legacy bookkeeping keys.
+			const store = await StateStore.open(p, {
+				init: { dropLegacyFtsObjects: false },
+			});
+			store.db.exec(`
+				CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+				  content, tool_name, tool_calls, content='messages', content_rowid='id');
+				CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+				  content, tool_name, tool_calls, content='messages', content_rowid='id',
+				  tokenize='trigram');
+				CREATE VIEW IF NOT EXISTS messages_fts_cjk_src AS
+				  SELECT id, content, tool_name, tool_calls FROM messages WHERE role <> 'tool';
+				CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_cjk USING fts5(
+				  content, tool_name, tool_calls, content='messages_fts_cjk_src', content_rowid='id',
+				  tokenize='trigram');
+				CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+				  INSERT INTO messages_fts(rowid, content, tool_name, tool_calls)
+				  SELECT new.id, new.content, new.tool_name, new.tool_calls
+				  WHERE new.role <> 'tool';
+				END;
+			`);
+			for (const [k, v] of [
+				["fts_storage_version", "1"],
+				["fts_rebuild_high_water", "42"],
+				["fts_rebuild_progress", "17"],
+			]) {
+				store.db
+					.prepare("INSERT INTO state_meta (key, value) VALUES (?, ?)")
+					.run(k, v);
+			}
 			store.db
 				.prepare(
 					"INSERT INTO sessions (id, source, started_at) VALUES ('sX','cli',1)",
 				)
 				.run();
 			for (let i = 0; i < 25; i++) {
-				const body = "backfill target " + String(i); // bound parameter
-				insMsg.run(body, i);
+				store.db
+					.prepare(
+						"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('sX', 'user', ?, ?)",
+					)
+					.run("backfill target " + String(i), i);
 			}
-			store.db.exec(
-				"INSERT INTO messages_fts(messages_fts) VALUES('delete-all')",
-			);
-			store.db.exec(
-				"INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('delete-all')",
-			);
-			deleteMeta(store.db, FTS_STORAGE_VERSION_KEY);
 			await store.close();
 		}
 
-		// First open: budget ONE small chunk ⇒ backfill INCOMPLETE, version NOT bumped.
+		// Reopen: the retreat drops every legacy object, deletes the keys, and
+		// the store stays fully healthy.
 		{
-			const store = await StateStore.open(p, {
-				init: { ftsChunkRows: 10, maxFtsChunksPerOpen: 1 },
-			});
+			const store = await StateStore.open(p);
 			try {
-				expect(store.initReport?.fts.complete).toBe(false);
-				expect(store.initReport?.versionBumped).toBe(false);
-				expect(getMeta(store.db, FTS_STORAGE_VERSION_KEY)).toBeNull();
-				const progRaw = getMeta(store.db, FTS_REBUILD_PROGRESS_KEY);
-				expect(progRaw).not.toBeNull(); // bookkeeping persisted for next open
-				// Live traffic above high-water still indexed DURING backfill (gating).
+				expect(store.initReport?.ftsRetreated).toBe(5); // 2 tables + view + 2nd vtable + trigger
+				const objects = store.db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'",
+					)
+					.all() as Array<{ name: string }>;
+				expect(objects).toHaveLength(0);
+				for (const key of [
+					"fts_storage_version",
+					"fts_rebuild_high_water",
+					"fts_rebuild_progress",
+				]) {
+					expect(getMeta(store.db, key)).toBeNull();
+				}
+				// Relational data untouched; plain message CRUD works with no
+				// FTS triggers in the way.
+				const n = store.db
+					.prepare("SELECT COUNT(*) AS n FROM messages")
+					.get() as { n: number };
+				expect(Number(n.n)).toBe(25);
 				store.db
 					.prepare(
-						"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('sX', 'user', 'live during rebuild zebra', 99)",
+						"INSERT INTO messages (session_id, role, content, timestamp) VALUES ('sX', 'user', 'post-retreat insert', 99)",
 					)
 					.run();
-				const live = store.db
-					.prepare(
-						"SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'zebra'",
-					)
-					.all() as Array<{ rowid: number }>;
-				expect(live).toHaveLength(1);
-			} finally {
-				await store.close();
-			}
-		}
-
-		// Second open: finishes remaining chunks, deletes keys, stamps version.
-		{
-			const store = await StateStore.open(p, {
-				init: { ftsChunkRows: 1000 },
-			});
-			try {
-				expect(store.initReport?.fts.complete).toBe(true);
-				expect(store.initReport?.versionBumped).toBe(true);
-				expect(getMeta(store.db, FTS_STORAGE_VERSION_KEY)).toBe(
-					String(FTS_STORAGE_VERSION),
-				);
-				expect(getMeta(store.db, FTS_REBUILD_HIGH_WATER_KEY)).toBeNull();
-				expect(getMeta(store.db, FTS_REBUILD_PROGRESS_KEY)).toBeNull();
-
-				// Every seeded message indexed EXACTLY once (no double-indexing
-				// of the partially-backfilled range, no corruption).
-				const expected = Number(
-					(
-						store.db
-							.prepare(
-								"SELECT COUNT(*) AS n FROM messages WHERE role <> 'tool' AND content LIKE '%target%'",
-							)
-							.get() as { n: number }
-					).n,
-				);
-				const hits = store.db
-					.prepare(
-						"SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'target'",
-					)
-					.all() as Array<{ rowid: number }>;
-				expect(hits).toHaveLength(expected);
 				const integrity = store.db.pragma("integrity_check", {
 					simple: true,
 				}) as unknown as string;
@@ -425,6 +401,45 @@ describe("02 §2.2 two-tier storage-version tracking + FTS backfill gate", () =>
 			} finally {
 				await store.close();
 			}
+		}
+
+		// Third open: retreat is a no-op when nothing remains (idempotent both
+		// directions).
+		{
+			const store = await StateStore.open(p);
+			try {
+				expect(store.initReport?.ftsRetreated).toBe(0);
+				expect(() => assertStoreMatchesSchema(store.db)).not.toThrow();
+			} finally {
+				await store.close();
+			}
+		}
+	});
+
+	it("retreatFtsObjects is directly idempotent and never touches non-FTS objects", async () => {
+		const store = await StateStore.open(dbPath(), {
+			init: { dropLegacyFtsObjects: false },
+		});
+		try {
+			store.db.exec(
+				"CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content='messages', content_rowid='id')",
+			);
+			expect(retreatFtsObjects(store.db)).toBe(1);
+			expect(retreatFtsObjects(store.db)).toBe(0); // second call: no-op
+			// A same-prefix object OUTSIDE the legacy family is refused loudly,
+			// not dropped.
+			store.db.exec(
+				"CREATE TABLE messages_fts_keepalive (id INTEGER PRIMARY KEY)",
+			);
+			expect(retreatFtsObjects(store.db)).toBe(0);
+			const kept = store.db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE name = 'messages_fts_keepalive'",
+				)
+				.all();
+			expect(kept).toHaveLength(1);
+		} finally {
+			await store.close();
 		}
 	});
 });

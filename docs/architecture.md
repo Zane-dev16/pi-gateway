@@ -80,9 +80,7 @@ MessageEvent → [L1 adapter guard] → [L2 runner guard] → [turn lease ×2]
 
 One `state.db` per profile, SQLite in WAL mode with a guarded fallback ladder
 for exotic filesystems (spec 02 §1). Declarative schema with automatic column
-reconcile; FTS5 search over messages (`messages_fts` + trigram, optional CJK
-index) with an independent storage version so an FTS rebuild never forces a
-relational one. Lease and compression-lock tables; the delivery ledger; token
+reconcile. Lease and compression-lock tables; the delivery ledger; token
 usage coalesced through a background writer that never blocks a turn
 (spec 02 §7, DEC-011).
 
