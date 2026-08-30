@@ -846,6 +846,9 @@ export class GatewayAgentRunner {
 			}
 			unsubscribe();
 			this.inflight.delete(request.sessionId);
+			// Tear down the holder-scoped lease refresher with the turn; the
+			// daemon must not outlive the inflight entry it serves.
+			refresher?.cancel();
 		}
 		state.repairCount = repairs;
 
@@ -855,9 +858,20 @@ export class GatewayAgentRunner {
 		// payload (stopReason "stop" ⇒ the loop would have finalized anyway);
 		// provider errors surface as "error". A LOST durable lease overrides all
 		// of these — the turn was aborted to protect the transcript, not by the
-		// user or the budget.
+		// user or the budget. (Budget-cut error-shaped cycles re-bucket to
+		// budget_exhausted per DEC-071.)
 		const interrupted =
 			inflight.interruptRequested || lastStopReason === "aborted";
+		// Budget-cut cycles surface in TWO host shapes (DEC-071): (a) the cut-off
+		// call ends aborted (stopReason "aborted"); (b) the cut-off call ends as a
+		// provider-style error cycle whose only complaint is generic abort
+		// boilerplate (host ModelRuntime maps an in-flight abort through its
+		// lazyStream setup path to stopReason "error" / "This operation was
+		// aborted"). Shape (b) is only claimed when a budget abort actually fired.
+		const budgetAbortErrorShape =
+			inflight.budgetAborted &&
+			lastStopReason === "error" &&
+			isGenericAbortBoilerplate(lastAssistantError);
 		let exitReason: TurnExitReason;
 		if (leaseLost || appendLeaseLost) {
 			exitReason = "error";
@@ -865,8 +879,8 @@ export class GatewayAgentRunner {
 			exitReason = "interrupted_by_user";
 		} else if (
 			inflight.budgetAborted &&
-			lastStopReason !== "stop" &&
-			lastStopReason !== "error"
+			(budgetAbortErrorShape ||
+				(lastStopReason !== "stop" && lastStopReason !== "error"))
 		) {
 			exitReason = "budget_exhausted";
 		} else if (lastAssistantError || lastStopReason === "error") {
@@ -1215,6 +1229,22 @@ function decodeToolArguments(args: unknown): Record<string, unknown> {
 		return args as Record<string, unknown>;
 	}
 	return {};
+}
+
+/**
+ * True when the message is exactly the generic abort boilerplate the host
+ * emits for an in-flight abort (both the legacy "Request was aborted" text and
+ * the DOMException-derived "This operation was aborted"). Anything else — a
+ * provider message, a quota error, a timeout classification — is NOT abort
+ * boilerplate and must not be re-bucketed by the budget classifier.
+ */
+function isGenericAbortBoilerplate(message: string | undefined): boolean {
+	if (message === undefined) return false;
+	const normalized = message.trim().toLowerCase();
+	return (
+		normalized === "request was aborted" ||
+		normalized === "this operation was aborted"
+	);
 }
 
 function assistantText(msg: AssistantMessage | null): string {

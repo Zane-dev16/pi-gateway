@@ -85,8 +85,14 @@ describe("budget + grace semantics (05 §4.1)", () => {
 			});
 			expect(outcome.exitReason).toBe("budget_exhausted");
 			expect(outcome.iterations).toBe(3); // max + the single grace call
-			// The 4th (not-allowed) call was killed before completing.
-			expect(h.faux.getPendingResponseCount()).toBe(0);
+			// The 4th (not-allowed) call never completed: the budget gate aborted
+			// it mid-stream (old host shape — the aborted cycle still consumed the
+			// scripted response) or before its request was dispatched (new host
+			// shape — DEC-071: setup-path abort precedes provider dispatch, so the
+			// response stays queued). The CONTRACT is "the not-allowed call never
+			// completes and never counts"; where the host intercepts it is host
+			//-internal, so accept 0 or 1 pending — never a completed 4th call.
+			expect([0, 1]).toContain(h.faux.getPendingResponseCount());
 		} finally {
 			await h.close();
 		}
