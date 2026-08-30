@@ -36,7 +36,7 @@ export interface CommandDef {
 	busyPolicy?: BusyPolicy;
 	/**
 	 * Mid-run variant key (gateway/run.py:_dispatch_busy_slash_command step 1):
-	 * stop/new/queue/steer/goal/loop/start/egress have special busy handlers;
+	 * stop/new/queue/steer/goal/start/egress have special busy handlers;
 	 * model/codex-runtime/moa carry command-specific reject texts.
 	 */
 	busyHandler?: string;
@@ -118,7 +118,7 @@ export function bypassCommandNames(registry: CommandRegistry): Set<string> {
 /**
  * run.py:_dispatch_busy_slash_command special busy_handler keys (§5.4 table):
  * stop=new-style hard-kill family, queue=FIFO own-turns, steer=between-tool-
- * calls injection, goal/loop=control-verb whitelists, start=platform ping,
+ * calls injection, goal=control-verb whitelists, start=platform ping,
  * egress=status formatter.
  */
 export const SPECIAL_BUSY_HANDLERS: ReadonlySet<string> = new Set([
@@ -129,7 +129,6 @@ export const SPECIAL_BUSY_HANDLERS: ReadonlySet<string> = new Set([
 	"steer",
 	"egress",
 	"goal",
-	"loop",
 ]);
 
 /** Pre-gate commands answer before access gating (users always see state). */

@@ -21,9 +21,12 @@ import {
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count matches the hermes COMMAND_REGISTRY census exactly", () => {
 		// Pinned against /tmp/hermes-upstream hermes_cli/commands.py
-		// COMMAND_REGISTRY (99 CommandDef rows). Adding/removing a row is a
-		// conscious census change, never an accident.
-		expect(BUILTIN_COMMAND_ROWS).toHaveLength(99);
+		// COMMAND_REGISTRY (99 CommandDef rows), reduced by ONE under the
+		// DEC-070 scope amendment: the recurring in-session /loop wakeup
+		// surface (row + persistence + wake watcher) was removed with owner
+		// validation. Adding/removing a row is still a conscious census
+		// change, never an accident.
+		expect(BUILTIN_COMMAND_ROWS).toHaveLength(98);
 	});
 
 	it("every row validates against the CommandDef schema (registry accepts all)", () => {
@@ -85,7 +88,10 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {
 		for (const surface of ["cli", "gateway"] as const) {
 			const catalog = completionCatalog(rows, { surface });
-			expect(catalog.commands.length).toBeGreaterThanOrEqual(80);
+			// 80 completions before DEC-070 item 6 removed the /loop row and
+			// its `proactive` alias; the catalog still derives purely from the
+			// surviving census (98 rows ⇒ 78 completion keys).
+			expect(catalog.commands.length).toBeGreaterThanOrEqual(78);
 			expect(catalog.commands).toContain("/new");
 			expect(catalog.commands).toContain("/reset");
 			expect(catalog.subcommands.get("/kanban")?.length).toBeGreaterThan(20);

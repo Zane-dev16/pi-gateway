@@ -272,16 +272,6 @@ export const BUILTIN_COMMAND_ROWS: readonly CommandDef[] = [
 		argsHint: "[review instructions]",
 	},
 	{
-		name: "loop",
-		description: "Re-run a prompt on a recurring interval in this session",
-		category: "Session",
-		aliases: ["proactive"],
-		argsHint:
-			"[interval] <prompt> [--times N] [--until <condition>] | status | pause | resume | stop",
-		busyPolicy: "dispatch",
-		busyHandler: "loop",
-	},
-	{
 		name: "moa",
 		description:
 			"Run one prompt through the default Mixture of Agents preset, then restore your model",

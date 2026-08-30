@@ -18,10 +18,9 @@
 //                                        resolved provider)
 //   housekeeping/watchers bind ────────► stage 8 entries: embedded-extensions
 //                                        discovery (hooks/plugins), optional
-//                                        handoff / delegation / kanban
-//                                        watchers, extra sibling entries, and
-//                                        the supervised platform reconnect
-//                                        watcher (run.py:
+//                                        handoff / kanban watchers, extra
+//                                        sibling entries, and the supervised
+//                                        platform reconnect watcher (run.py:
 //                                        _platform_reconnect_watcher)
 //   adapters bind from manifests ──────► stage 9 AdapterEntry entries derived
 //                                        from pi_platforms PluginManifest
