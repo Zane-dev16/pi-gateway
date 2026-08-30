@@ -141,7 +141,7 @@ async function waitForMarker(name: string, timeoutMs = 15_000): Promise<void> {
 
 /** SIGKILL then reap, BOUNDED: a child wedged in D-state during teardown
  * (uninterruptible I/O under cold-cache/full-suite load — the same host stall
- * class bounded in delegation/two-process.test.ts) never emits "close", and
+ * class bounded in obligations/two-process.test.ts) never emits "close", and
  * the old uncapped await hung to the vitest timeout cap as an opaque failure.
  * Fail fast instead, naming /proc state, so environment vs engine is decided
  * by inspection. */

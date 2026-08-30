@@ -7,7 +7,7 @@
 // injected clocks. `systemClock` is the ONLY place Date.now appears.
 //
 // Shape-identical mirror of pi_embedded/handoff/clock.ts,
-// pi_embedded/cron/clock.ts and pi_gateway/delegation/clock.ts (same
+// pi_embedded/cron/clock.ts and pi_gateway/obligations/clock.ts (same
 // GatewayClock structure so a future shared seam is a type-compatible
 // drop-in).
 

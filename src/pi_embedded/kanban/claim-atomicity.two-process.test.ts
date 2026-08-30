@@ -73,7 +73,7 @@ describe("two-process claim atomicity (exactly one owner)", () => {
 	it("3 concurrent OS processes race one ready card ⇒ exactly one winner, others definitively lose", {
 		// child launches pay Node+TS-resolve startup under full-suite load
 		// (4 CPUs); isolation runs ~0.5s — headroom against fork starvation
-		// only (same disposition as delegation/two-process.test.ts).
+		// only (same disposition as obligations/two-process.test.ts).
 		timeout: 120_000,
 	}, async () => {
 		const opened = await openDatabase({ path: dbPath });

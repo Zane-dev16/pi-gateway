@@ -2,7 +2,7 @@
 // contracts. Run under RAW Node with pi_state/testing/node-ts-resolve.mjs
 // (maps ".js" specifiers to ".ts"). Emits a single `RESULT_JSON {...}` line;
 // multi-child scenarios coordinate via marker files (write = signal), the
-// proven delegation/obligations driver protocol.
+// proven obligations two-process driver protocol.
 //
 //   claim-and-hold <db> <sessionId> <platform> <claimedMarker>
 //       Seed a pending row, CLAIM it with this process's real clock, signal

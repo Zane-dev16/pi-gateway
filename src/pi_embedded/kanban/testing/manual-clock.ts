@@ -1,7 +1,7 @@
 // TEST INFRASTRUCTURE — manual clock for kanban dispatcher behavior
 // contracts. No wall-clock reads anywhere: time moves only when a test
 // advances it (required for the stale-claim reclaim boundary and breaker
-// timing assertions). Mirrors delegation/testing/manual-clock.ts.
+// timing assertions). Mirrors pi_embedded/handoff/testing/manual-clock.ts.
 
 import type { GatewayClock } from "../clock.js";
 

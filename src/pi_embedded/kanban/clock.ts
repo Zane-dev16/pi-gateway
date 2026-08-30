@@ -5,7 +5,7 @@
 // can drive claim TTLs, stale-claim reclaim boundaries, and breaker timing
 // deterministically (07 §6 tick shape; required contract test "stale-card
 // reclaim boundary (injected clock)"). `systemClock` is the ONLY place
-// Date.now appears. Mirror of pi_gateway/delegation/clock.ts and
+// Date.now appears. Mirror of pi_embedded/approvals/clock.ts and
 // pi_gateway/obligations/clock.ts (same GatewayClock shape so the seams are
 // type-compatible drop-ins).
 

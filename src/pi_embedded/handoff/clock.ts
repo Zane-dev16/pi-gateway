@@ -5,7 +5,7 @@
 // can drive time deterministically (2s poll cadence, 5s startup delay, 60s
 // CLI poll-block deadline). `systemClock` is the ONLY place Date.now appears.
 //
-// Shape-identical mirror of pi_gateway/delegation/clock.ts and
+// Shape-identical mirror of pi_embedded/approvals/clock.ts and
 // pi_gateway/obligations/clock.ts (same GatewayClock structure so a future
 // shared seam is a type-compatible drop-in).
 
