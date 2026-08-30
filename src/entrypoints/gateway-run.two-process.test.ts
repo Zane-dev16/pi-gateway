@@ -3,9 +3,9 @@
 // "verify with two-process startup/shutdown suites").
 //
 // A real second OS process runs runGateway() — the full composed stack:
-// engine stages, cron ticker over a real jobs store, embedded extensions
-// discovery, a manifest-derived adapter entry with a conforming
-// connect/disconnect surface, production drain overlays, and REAL installed
+// engine stages, cron ticker over a real jobs store, a manifest-derived
+// adapter entry with a conforming connect/disconnect surface, production
+// drain overlays, and REAL installed
 // signal handlers. The parent SIGTERMs it and asserts the supervisor
 // contract end-to-end (08 §1.2): exit 0, gateway_state=stopped persisted,
 // PID file released, .clean_shutdown receipt written, adapter disconnected,

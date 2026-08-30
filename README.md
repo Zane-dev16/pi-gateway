@@ -110,8 +110,8 @@ Platform adapters receive inbound events from messaging surfaces (Telegram,
 Discord, Slack, WhatsApp, …), pass them through a two-level busy guard into a
 two-layer turn lease (DEC-004), and stream agent output into platform-native
 drafts that are edited and sealed. Final responses flow through a delivery
-obligations store before egress (DEC-054). Cron, kanban, handoff, hooks, and
-plugins are embedded services inside the same process (spec 01 §4); CLI, TUI,
+obligations store before egress (DEC-054). Cron, kanban, and handoff are
+embedded services inside the same process (spec 01 §4); CLI, TUI,
 and dashboard are clients of the same `state.db`, never co-owners.
 
 1. An adapter normalizes an inbound event into a `MessageEvent`; the adapter's
@@ -161,7 +161,7 @@ pi-gateway/
     ├── pi_agent_core/  ← worker pool, agent runner, cache, alternation repair
     ├── pi_gateway/     ← guards, streaming, obligations, registry, security
     ├── pi_platforms/   ← adapters, kit, conformance suite
-    └── pi_embedded/    ← cron, kanban, handoff, hooks, update
+    └── pi_embedded/    ← cron, kanban, handoff, update
 ```
 
 Dependencies flow downward only (`pi_home → pi_state → … → entrypoints`);

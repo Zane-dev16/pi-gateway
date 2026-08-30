@@ -16,8 +16,7 @@
 //   cron provider bind ────────────────► stage 7 entry: cron-ticker (Hermes:
 //                                        cron-scheduler thread started by the
 //                                        resolved provider)
-//   housekeeping/watchers bind ────────► stage 8 entries: embedded-extensions
-//                                        discovery (hooks/plugins), optional
+//   housekeeping/watchers bind ────────► stage 8 entries: optional
 //                                        handoff / kanban watchers, extra
 //                                        sibling entries, and the supervised
 //                                        platform reconnect watcher (run.py:
@@ -103,11 +102,6 @@ import {
 	type KanbanDispatcherEntryDeps,
 	type KanbanNotifierEntryDeps,
 } from "../pi_embedded/kanban/index.js";
-import {
-	extensionsServiceEntry,
-	type StartupEmbeddedExtensionsOptions,
-} from "../pi_embedded/hooks/index.js";
-
 // kit/registration (PluginContext) and the per-platform adapter modules use
 // TypeScript parameter properties, which bare-node strip-only runners cannot
 // parse — so the composition root loads them LAZILY at stage-9 execution
@@ -209,14 +203,6 @@ export interface GatewayRunInput {
 	kanban?: {
 		dispatcher?: KanbanDispatcherEntryDeps;
 		notifier?: KanbanNotifierEntryDeps;
-	};
-	/**
-	 * Embedded extensions/hooks discovery options (stage 8, registered
-	 * unconditionally — Hermes discovers hooks/plugins on every boot). The
-	 * logger slot binds to the lifecycle logger here.
-	 */
-	embeddedExtensions?: Omit<StartupEmbeddedExtensionsOptions, "log"> & {
-		log?: StartupEmbeddedExtensionsOptions["log"];
 	};
 	/** Extra stage-8 entries from sibling subsystems (e.g. loop watchers). */
 	extraWatchers?: readonly EmbeddedServiceEntry[];
@@ -778,35 +764,21 @@ export function composeGatewayLifecycle(
 	}
 
 	// ── stage 8 + stage 9 bindings.
-	registerEmbeddedWatchers(input, lifecycle, logger);
+	registerEmbeddedWatchers(input, lifecycle);
 	for (const entry of derived.entries) lifecycle.registerAdapter(entry);
 
 	return composed;
 }
 
 /**
- * Stage-8 bindings: extensions discovery (unconditional — Hermes discovers
- * hooks/plugins on every boot), host-wired watchers, extra sibling entries,
- * and the supervised platform reconnect watcher (always last: it must observe
+ * Stage-8 bindings: host-wired watchers, extra sibling entries, and the
+ * supervised platform reconnect watcher (always last: it must observe
  * every enqueue the adapter stage makes after stage 9 runs).
  */
 function registerEmbeddedWatchers(
 	input: GatewayRunInput,
 	lifecycle: GatewayLifecycle,
-	logger: Logger,
 ): void {
-	const extensionLog = (input.embeddedExtensions?.log ?? {
-		info: (m: string, meta?: Record<string, unknown>) => logger.info(m, meta),
-		warn: (m: string, meta?: Record<string, unknown>) => logger.warn(m, meta),
-		error: (m: string, meta?: Record<string, unknown>) => logger.error(m, meta),
-	}) as StartupEmbeddedExtensionsOptions["log"];
-	lifecycle.registerService(
-		"embedded_watchers",
-		extensionsServiceEntry({
-			...(input.embeddedExtensions ?? {}),
-			log: extensionLog,
-		}),
-	);
 	if (input.handoffWatcher !== undefined) {
 		lifecycle.registerService(
 			"embedded_watchers",

@@ -156,7 +156,6 @@ describe("composeGatewayLifecycle — production stage entries", () => {
 			},
 			platforms: [driverHosting(events)],
 			secretReader: () => "tok",
-			embeddedExtensions: { log: spy.log },
 		});
 		const result = await composed.lifecycle.startup();
 		expect(result.ok).toBe(true);
@@ -185,7 +184,6 @@ describe("composeGatewayLifecycle — production stage entries", () => {
 			logger: spy.log,
 			platforms: [driverHosting(events)],
 			secretReader: () => undefined,
-			embeddedExtensions: { log: spy.log },
 		});
 		const result = await composed.lifecycle.startup();
 		expect(result.ok).toBe(true); // loud disable degrades, never blocks
@@ -220,7 +218,6 @@ describe("composeGatewayLifecycle — production stage entries", () => {
 				),
 			],
 			secretReader: () => "tok",
-			embeddedExtensions: { log: spy.log },
 		});
 		await composed.lifecycle.startup();
 		expect(composed.lifecycle.failedPlatforms.get("driver")).not.toBeNull();
@@ -244,7 +241,6 @@ describe("production drain overlays", () => {
 			home,
 			logger: spyLogger().log,
 			installSignals: false,
-			embeddedExtensions: { log: spyLogger().log },
 		});
 		await composed.lifecycle.startup();
 		const outcome = await composed.lifecycle.requestShutdown("planned_stop");
@@ -280,7 +276,6 @@ describe("production drain overlays", () => {
 			home,
 			logger: spyLogger().log,
 			installSignals: false,
-			embeddedExtensions: { log: spyLogger().log },
 		});
 		await composed.lifecycle.startup();
 		await composed.lifecycle.requestShutdown("planned_stop");
@@ -311,7 +306,6 @@ describe("production drain overlays", () => {
 			shutdownNoticeSender: async (key) => {
 				sent.push(key);
 			},
-			embeddedExtensions: { log: spy.log },
 		};
 		const composed = composeGatewayLifecycle(input);
 		await composed.lifecycle.startup();
@@ -329,7 +323,6 @@ describe("production drain overlays", () => {
 				home: home2,
 				logger: spy2.log,
 				installSignals: false,
-				embeddedExtensions: { log: spy2.log },
 			});
 			await composed2.lifecycle.startup();
 			await composed2.lifecycle.requestShutdown("planned_stop");
@@ -372,7 +365,6 @@ describe("boot sends — pending-obligation redelivery", () => {
 				sent.push(req);
 				return { ok: true };
 			},
-			embeddedExtensions: { log: spy.log },
 		});
 		await composed.lifecycle.startup();
 
@@ -414,7 +406,6 @@ describe("boot sends — pending-obligation redelivery", () => {
 				sends++;
 				return { ok: true };
 			},
-			embeddedExtensions: { log: spy.log },
 		});
 		await composed.lifecycle.startup();
 		expect(sends).toBe(0);
@@ -450,7 +441,6 @@ describe("runGateway — process contract", () => {
 				home,
 				logger: spyLogger().log,
 				installSignals: false,
-				embeddedExtensions: { log: spyLogger().log },
 			});
 			expect(exit.ran).toBe(false);
 			expect(exit.exitCode).toBe(1);

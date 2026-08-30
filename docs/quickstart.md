@@ -68,7 +68,7 @@ pi gateway run
 
 This composition root (DEC-058) records a boot fingerprint, claims the PID
 file and runtime lock, opens or repairs `state.db`, starts the embedded
-services (cron, handoff, kanban, hooks), and connects your configured
+services (cron, handoff, kanban), and connects your configured
 adapters. A missing secret disables an adapter loudly: check the log for the
 `adapter_disabled` reason rather than wondering why a platform never comes up.
 
