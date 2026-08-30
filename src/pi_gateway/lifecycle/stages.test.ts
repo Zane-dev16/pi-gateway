@@ -96,7 +96,6 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 				cron_scheduler: [recordingEntry("cron.ticker", timeline)],
 				embedded_watchers: [
 					recordingEntry("hooks.extensions", timeline),
-					recordingEntry("kanban.dispatcher", timeline),
 					recordingEntry("handoff.watcher", timeline),
 				],
 			},
@@ -124,7 +123,6 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 			"stage:open_state_db",
 			"service:cron.ticker",
 			"service:hooks.extensions",
-			"service:kanban.dispatcher",
 			"service:handoff.watcher",
 			"stage:platform_adapters",
 			"stage:runtime_identity",
@@ -133,11 +131,7 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 			captured.lines.find((l) => l.msg.includes(`service ${name} started`))
 				?.msg;
 		expect(started("cron.ticker")).toContain("(stage cron_scheduler)");
-		for (const name of [
-			"hooks.extensions",
-			"kanban.dispatcher",
-			"handoff.watcher",
-		]) {
+		for (const name of ["hooks.extensions", "handoff.watcher"]) {
 			expect(started(name)).toContain("(stage embedded_watchers)");
 		}
 	});
@@ -324,9 +318,12 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 				],
 				embedded_watchers: [
 					{
-						name: "kanban.dispatcher",
+						// Synthetic failing entry — the kanban surface itself is removed
+						// (DEC-070 item 1); what this test guards is the ENGINE's
+						// per-service degradation contract, so a neutral name carries it.
+						name: "watcher.alpha",
 						start: async () => {
-							timeline.push("service:kanban.dispatcher");
+							timeline.push("service:watcher.alpha");
 							return { ok: false, degraded: true, reason: "board refused" };
 						},
 					},
@@ -364,7 +361,7 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 			},
 			{
 				stage: "embedded_watchers",
-				service: "kanban.dispatcher",
+				service: "watcher.alpha",
 				reason: "board refused",
 			},
 		]);
@@ -380,7 +377,7 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 		expect(
 			loud.some(
 				(l) =>
-					l.msg.includes("kanban.dispatcher DEGRADED") &&
+					l.msg.includes("watcher.alpha DEGRADED") &&
 					l.msg.includes("board refused"),
 			),
 		).toBe(true);
@@ -389,7 +386,7 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 			timeline.indexOf("service:cron.ticker"),
 		);
 		expect(timeline.indexOf("service:handoff.watcher")).toBeGreaterThan(
-			timeline.indexOf("service:kanban.dispatcher"),
+			timeline.indexOf("service:watcher.alpha"),
 		);
 		expect(timeline).toContain("stage:platform_adapters");
 		expect(timeline).toContain("stage:runtime_identity");
@@ -412,10 +409,13 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 			logger: captured.logger,
 		});
 		lifecycle.registerService("embedded_watchers", {
-			name: "kanban.dispatcher",
+			// Synthetic disabled entry — the kanban surface is removed (DEC-070
+			// item 1); the guarded contract is the stage engine's DISABLED
+			// outcome handling, so a neutral name/reason carry the test.
+			name: "watcher.alpha",
 			start: async () => ({
 				ok: false,
-				reason: "disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+				reason: "disabled via env gate",
 			}),
 		});
 
@@ -425,7 +425,7 @@ describe("registered per-service entries: isolation + shutdown (DEC-040)", () =>
 		expect(lifecycle.degradedServices).toEqual([]);
 		const warns = captured.lines.filter((l) => l.level === "warn");
 		expect(
-			warns.some((l) => l.msg.includes("kanban.dispatcher not started")),
+			warns.some((l) => l.msg.includes("watcher.alpha not started")),
 		).toBe(true);
 		expect(captured.lines.some((l) => l.level === "error")).toBe(false);
 		expect(lateCtx[0]?.services.watchers).toEqual([]);
@@ -774,7 +774,7 @@ describe("stage-8 builtin command-registry assembly (07 §9)", () => {
 		}
 		const lifecycle = new GatewayLifecycle({ home, stageBodies: bodies });
 		lifecycle.registerService("embedded_watchers", {
-			name: "kanban.dispatcher",
+			name: "watcher.alpha",
 			start: async (ctx) => {
 				// Entries running inside stage 8 already see the registry.
 				expect(ctx.commands?.frozen).toBe(true);

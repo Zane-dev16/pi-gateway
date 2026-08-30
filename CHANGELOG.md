@@ -48,7 +48,7 @@ and the 31-surface platform census.
   stale detection, signed webhooks with explicit trust boundaries (spec 06
   §2–§8, DEC-017), and per-profile multiplex scoping.
 - Embedded services and updates: cron ticker with inactivity-based bound
-  (default 600s), kanban dispatcher and notifier, DB claim/re-bind/replay
+  (default 600s), DB claim/re-bind/replay
   handoff watcher (DEC-008), observer vs decision-bearing hooks (DEC-014),
   durable idle-gated delegation rail (DEC-018), and the transactional update
   pipeline (plan, snapshot, apply, fleet-wide drain-first restart, verify,

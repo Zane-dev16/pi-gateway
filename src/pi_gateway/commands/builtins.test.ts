@@ -21,12 +21,13 @@ import {
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count matches the hermes COMMAND_REGISTRY census exactly", () => {
 		// Pinned against /tmp/hermes-upstream hermes_cli/commands.py
-		// COMMAND_REGISTRY (99 CommandDef rows), reduced by ONE under the
+		// COMMAND_REGISTRY (99 CommandDef rows), reduced by TWO under the
 		// DEC-070 scope amendment: the recurring in-session /loop wakeup
-		// surface (row + persistence + wake watcher) was removed with owner
-		// validation. Adding/removing a row is still a conscious census
+		// surface (row + persistence + wake watcher, item 6) and the kanban
+		// multi-agent task board (row + subcommands, item 1) were removed with
+		// owner validation. Adding/removing a row is still a conscious census
 		// change, never an accident.
-		expect(BUILTIN_COMMAND_ROWS).toHaveLength(98);
+		expect(BUILTIN_COMMAND_ROWS).toHaveLength(97);
 	});
 
 	it("every row validates against the CommandDef schema (registry accepts all)", () => {
@@ -88,13 +89,12 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {
 		for (const surface of ["cli", "gateway"] as const) {
 			const catalog = completionCatalog(rows, { surface });
-			// 80 completions before DEC-070 item 6 removed the /loop row and
-			// its `proactive` alias; the catalog still derives purely from the
-			// surviving census (98 rows ⇒ 78 completion keys).
-			expect(catalog.commands.length).toBeGreaterThanOrEqual(78);
+			// 80 completions before DEC-070 removed the /loop (item 6) and
+			// /kanban (item 1) rows; the catalog still derives purely from the
+			// surviving census (97 rows ⇒ 77 completion keys).
+			expect(catalog.commands.length).toBeGreaterThanOrEqual(77);
 			expect(catalog.commands).toContain("/new");
 			expect(catalog.commands).toContain("/reset");
-			expect(catalog.subcommands.get("/kanban")?.length).toBeGreaterThan(20);
 			expect(catalog.subcommands.get("/voice")).toEqual([
 				"on",
 				"off",

@@ -29,7 +29,7 @@ const POISONED: Record<string, string> = {
 	TERMINAL_BACKEND: "poison-terminal",
 	API_SERVER_PORT: "9999",
 	PI_TELEGRAM_BATCH_DELAY: "77",
-	PI_KANBAN_BOARD: "poison-kanban-board",
+	PI_HOME: "poison-pi-home",
 	API_SERVER_KEY: "poison-api-key",
 	GATEWAY_RELAY_SECRET: "poison-relay-secret",
 };
@@ -141,12 +141,12 @@ describe("global-env carve-out (06 §3.1 / §10 row 4)", () => {
 			listener: getSecret("API_SERVER_PORT"),
 			prefix: getSecret("TERMINAL_BACKEND"),
 			tuning: getSecret("PI_TELEGRAM_BATCH_DELAY"),
-			exactPrefixFamily: getSecret("PI_KANBAN_BOARD"),
+			runtimeKnob: getSecret("PI_HOME"),
 		}));
 		expect(seen.listener).toBe("9999");
 		expect(seen.prefix).toBe("poison-terminal");
 		expect(seen.tuning).toBe("77");
-		expect(seen.exactPrefixFamily).toBe("poison-kanban-board"); // set below
+		expect(seen.runtimeKnob).toBe("poison-pi-home"); // set below
 	});
 
 	it("credentials are NOT carved out even when env-poisoned: API_SERVER_KEY / GATEWAY_RELAY_SECRET stay scoped", () => {

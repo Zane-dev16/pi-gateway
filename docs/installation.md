@@ -71,7 +71,7 @@ One home owns:
 ├── state/gateway.heartbeat # loop-liveness heartbeat, rewritten every 30s
 ├── config + .env store     # behavior config + secrets (see configuration doc)
 ├── logs/                   # agent.log, errors.log, gateway.log, update.log
-├── cron/  kanban/          # embedded-service state and locks
+├── cron/                   # embedded-service state and locks
 └── pending_messages/       # shutdown-flush recovery files (spec 08 §1.3)
 ```
 

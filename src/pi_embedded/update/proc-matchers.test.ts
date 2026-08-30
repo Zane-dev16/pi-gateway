@@ -115,7 +115,6 @@ describe("holderValueFlags — DERIVED from the declared option surface (#91869)
 
 describe("piHolderSubcommand — token-based, never substring (#90778)", () => {
 	it("finds the subcommand after skipping flags and their VALUES", () => {
-		expect(piHolderSubcommand("pi kanban serve")).toBe("kanban");
 		expect(piHolderSubcommand("/usr/bin/pi --reasoning high serve")).toBe(
 			"serve",
 		);
@@ -138,7 +137,7 @@ describe("piHolderSubcommand — token-based, never substring (#90778)", () => {
 		// `-m x serve`: model value consumed ⇒ real subcommand IS serve.
 		expect(piHolderSubcommand("pi -m x serve")).toBe("serve");
 		// But `--preserve-cache` (non-value flag) does not swallow the next token.
-		expect(piHolderSubcommand("pi kanban --preserve-cache")).toBe("kanban");
+		expect(piHolderSubcommand("pi gateway --preserve-cache")).toBe("gateway");
 	});
 });
 

@@ -2,7 +2,7 @@
 //
 // Port of agent/secret_scope.py:_GLOBAL_ENV_EXACT / _GLOBAL_ENV_PREFIXES.
 // These name deployment-level variables that ALWAYS read process env: runtime
-// knobs, OS vars, kanban paths, api-server LISTENER settings, relay ROUTING
+// knobs, OS vars, api-server LISTENER settings, relay ROUTING
 // stamps. Membership is exact-name OR prefix.
 //
 // Credentials are deliberately EXCLUDED even when prefixed (Hermes anchor:
@@ -39,10 +39,6 @@ export const GLOBAL_ENV_EXACT: ReadonlySet<string> = new Set([
 	"NODE_PATH",
 	"SSL_CERT_FILE",
 	"NODE_EXTRA_CA_CERTS",
-	// Kanban paths (per-board, not per-profile-secret)
-	"PI_KANBAN_DB",
-	"PI_KANBAN_WORKSPACES_ROOT",
-	"PI_KANBAN_BOARD",
 	// API-server LISTENER settings — deployment config (Docker compose
 	// `environment:` block, systemd Environment=), not profile secrets. The
 	// scoped runner reload (#64674) must keep seeing them or container
@@ -71,7 +67,6 @@ export const GLOBAL_ENV_EXACT: ReadonlySet<string> = new Set([
 ]);
 
 export const GLOBAL_ENV_PREFIXES: readonly string[] = [
-	"PI_KANBAN_",
 	"PI_TELEGRAM_", // tuning knobs (batch delays, fallback toggles) — NOT the token
 	"TERMINAL_", // terminal/sandbox backend settings
 ];

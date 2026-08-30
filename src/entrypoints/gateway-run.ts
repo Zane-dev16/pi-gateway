@@ -17,7 +17,7 @@
 //                                        cron-scheduler thread started by the
 //                                        resolved provider)
 //   housekeeping/watchers bind ────────► stage 8 entries: optional
-//                                        handoff / kanban watchers, extra
+//                                        handoff watcher, extra
 //                                        sibling entries, and the supervised
 //                                        platform reconnect watcher (run.py:
 //                                        _platform_reconnect_watcher)
@@ -96,12 +96,6 @@ import {
 	handoffWatcherServiceEntry,
 	type HandoffWatcher,
 } from "../pi_embedded/handoff/index.js";
-import {
-	kanbanDispatcherServiceEntry,
-	kanbanNotifierServiceEntry,
-	type KanbanDispatcherEntryDeps,
-	type KanbanNotifierEntryDeps,
-} from "../pi_embedded/kanban/index.js";
 // kit/registration (PluginContext) and the per-platform adapter modules use
 // TypeScript parameter properties, which bare-node strip-only runners cannot
 // parse — so the composition root loads them LAZILY at stage-9 execution
@@ -199,11 +193,6 @@ export interface GatewayRunInput {
 	cron?: CronHosting;
 	/** Handoff queue watcher (stage 8). create() throws ⇒ loud degrade. */
 	handoffWatcher?: { create: () => HandoffWatcher };
-	/** Kanban dispatcher/notifier (stage 8) — env/singleton gated internally. */
-	kanban?: {
-		dispatcher?: KanbanDispatcherEntryDeps;
-		notifier?: KanbanNotifierEntryDeps;
-	};
 	/** Extra stage-8 entries from sibling subsystems (e.g. loop watchers). */
 	extraWatchers?: readonly EmbeddedServiceEntry[];
 	/**
@@ -783,18 +772,6 @@ function registerEmbeddedWatchers(
 		lifecycle.registerService(
 			"embedded_watchers",
 			handoffWatcherServiceEntry(input.handoffWatcher),
-		);
-	}
-	if (input.kanban?.dispatcher !== undefined) {
-		lifecycle.registerService(
-			"embedded_watchers",
-			kanbanDispatcherServiceEntry(input.kanban.dispatcher),
-		);
-	}
-	if (input.kanban?.notifier !== undefined) {
-		lifecycle.registerService(
-			"embedded_watchers",
-			kanbanNotifierServiceEntry(input.kanban.notifier),
 		);
 	}
 	for (const entry of input.extraWatchers ?? []) {

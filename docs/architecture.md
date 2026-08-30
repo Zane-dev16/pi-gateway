@@ -8,7 +8,7 @@ the core. Citations like "02 §5, DEC-004" refer to the normative spec set
 ## The one-process rule
 
 Everything lives inside the gateway process (spec 01 §1.2): platform adapters,
-the runner, the embedded services (cron, kanban, handoff), and
+the runner, the embedded services (cron, handoff), and
 sole ownership of `state.db`. Clients (CLI, TUI, dashboard) are consumers of
 the same database and command registry, never co-owners; killing a client can
 never take down the messaging gateway (spec 01 §2.3).
@@ -21,7 +21,7 @@ Dependencies flow downward only; `scripts/check-layering.mjs` enforces this
 ```
 entrypoints      'pi gateway run' composition root (DEC-058)
 pi_platforms     adapters + kit + conformance (never import the runner)
-pi_embedded      cron, kanban, handoff, update
+pi_embedded      cron, handoff, update
 pi_gateway       guards, streaming, obligations, registry, security
 pi_agent_core    worker pool, agent runner, cache, alternation repair
 pi_state         schema, leases, messages, usage, WAL ladder
@@ -92,8 +92,6 @@ lock/claim story (spec 01 §4):
 | Service            | Tick     | Isolation                                                        |
 | ------------------ | -------- | ---------------------------------------------------------------- |
 | Cron ticker        | ~60s     | tick lock; inactivity timeout 600s default, not a wall clock     |
-| Kanban dispatcher  | ~60s     | machine-global singleton lock; auto-block after repeated failures |
-| Kanban notifier    | ~5s      | in-process board subscriptions                                   |
 | Handoff watcher    | 2s poll  | atomic DB row claim; re-bind + replay through the normal guards (DEC-008) |
 
 ## Startup and shutdown

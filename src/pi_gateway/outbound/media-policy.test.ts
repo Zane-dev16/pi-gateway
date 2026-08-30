@@ -388,9 +388,8 @@ describe("allowed roots collection shape", () => {
 		}
 	});
 
-	// se-7: per-profile cache roots + kanban attachment roots (base.py:
-	// _profile_cache_roots / _kanban_attachment_roots) so STRICT mode stops
-	// dropping MEDIA under profile caches and kanban attachments.
+	// se-7: per-profile cache roots (base.py:_profile_cache_roots) so STRICT
+	// mode stops dropping MEDIA under profile caches.
 
 	it("enumerates profiles/<name>/cache/<subdir> for every EXISTING profile", () => {
 		mustMkdir(join(piHome, "profiles", "work", "cache"));
@@ -424,66 +423,5 @@ describe("allowed roots collection shape", () => {
 				deps({ [MEDIA_DELIVERY_STRICT_ENV]: "1" }),
 			),
 		).toBeNull();
-	});
-
-	it("kanban attachment roots are allowlisted: default root, override, and per-board", () => {
-		// Default durable root under the pi home.
-		const attDir = mustMkdir(join(piHome, "kanban", "attachments"));
-		expect(collectAllowedRoots({ env: {}, home, piHome })).toContain(attDir);
-		const att = touch(join(attDir, "spec.pdf"), STALE);
-		expect(
-			validateMediaDeliveryPath(
-				att,
-				deps({ [MEDIA_DELIVERY_STRICT_ENV]: "1" }),
-			),
-		).not.toBeNull();
-
-		// HERMES_KANBAN_ATTACHMENTS_ROOT override wins over the default root.
-		const customDir = mustMkdir(join(root, "custom-attachments"));
-		const custom = touch(join(customDir, "shot.png"), STALE);
-		const overrideDeps = deps({
-			[MEDIA_DELIVERY_STRICT_ENV]: "1",
-			HERMES_KANBAN_ATTACHMENTS_ROOT: customDir,
-		});
-		expect(validateMediaDeliveryPath(custom, overrideDeps)).not.toBeNull();
-		// …and the default-root file no longer rides the (replaced) root.
-		expect(validateMediaDeliveryPath(att, overrideDeps)).toBeNull();
-
-		// Per-board attachments only for well-named boards OWNING a kanban.db.
-		const boards = join(piHome, "kanban", "boards");
-		writeFileSync(join(mustMkdir(join(boards, "alpha")), "kanban.db"), "");
-		const alphaAtt = mustMkdir(join(boards, "alpha", "attachments"));
-		mustMkdir(join(boards, "Bad_Name")); // uppercase ⇒ malformed name
-		mustMkdir(join(boards, "nodb")); // no kanban.db ⇒ not a board
-		const boardDeps = deps({ [MEDIA_DELIVERY_STRICT_ENV]: "1" });
-		const alphaFile = touch(join(alphaAtt, "task.png"), STALE);
-		expect(validateMediaDeliveryPath(alphaFile, boardDeps)).not.toBeNull();
-		expect(
-			validateMediaDeliveryPath(
-				touch(join(boards, "Bad_Name", "x.png"), STALE),
-				boardDeps,
-			),
-		).toBeNull();
-		expect(
-			validateMediaDeliveryPath(
-				touch(join(boards, "nodb", "y.png"), STALE),
-				boardDeps,
-			),
-		).toBeNull();
-		// The malformed/no-db board attachment dirs are NOT in the allowlist.
-		const allowed = collectAllowedRoots({ env: {}, home, piHome });
-		expect(allowed).not.toContain(join(boards, "Bad_Name", "attachments"));
-		expect(allowed).not.toContain(join(boards, "nodb", "attachments"));
-	});
-
-	it("HERMES_KANBAN_HOME relocates the kanban attachment root", () => {
-		const kanbanHome = mustMkdir(join(root, "alt-kanban-home"));
-		const attDir = mustMkdir(join(kanbanHome, "kanban", "attachments"));
-		const f = touch(join(attDir, "a.png"), STALE);
-		const d = deps({
-			[MEDIA_DELIVERY_STRICT_ENV]: "1",
-			HERMES_KANBAN_HOME: kanbanHome,
-		});
-		expect(validateMediaDeliveryPath(f, d)).not.toBeNull();
 	});
 });

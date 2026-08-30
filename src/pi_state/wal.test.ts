@@ -206,7 +206,7 @@ describe("02 §1.1 journal-mode ladder", () => {
 		);
 
 		await applyWalWithFallback(silentPort(), { dbLabel: "state.db" });
-		await applyWalWithFallback(silentPort(), { dbLabel: "kanban.db" });
+		await applyWalWithFallback(silentPort(), { dbLabel: "state.db.wal" });
 		expect(walWarningCount()).toBe(2); // once per label, not once per call
 
 		await expect(
