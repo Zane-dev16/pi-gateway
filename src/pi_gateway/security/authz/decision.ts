@@ -6,7 +6,8 @@
 // "deny → allowlist → allow-all → group policy" ordering was WRONG; the
 // verified order below is binding).
 //
-//   0. HOMEASSISTANT / WEBHOOK sources        → ALLOW (system-generated / HMAC)
+//   0. SYSTEM_PLATFORMS sources (webhook + formerly homeassistant, removed
+//      with its adapter under DEC-070) → ALLOW (system-generated / HMAC)
 //   1. Upstream-auth delegation               → ALLOW (relay-delivered event, or
 //                                                adapter authorization_is_upstream)
 //   2. Group chat-ID allowlists               → ALLOW if chat listed (runs BEFORE

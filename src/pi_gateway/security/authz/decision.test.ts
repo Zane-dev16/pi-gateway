@@ -75,11 +75,8 @@ describe("§2.1 decision order — table-driven matrix", () => {
 			source: { platform: "webhook", userId: "" },
 			expected: { allowed: true, gate: 0, reasonCode: "system_platform" },
 		},
-		{
-			name: "homeassistant event allows (system-generated, token-authenticated)",
-			source: { platform: "homeassistant", userId: "" },
-			expected: { allowed: true, gate: 0, reasonCode: "system_platform" },
-		},
+		// DEC-070: the homeassistant row (also gate-0 system_platform) was removed
+		// with its adapter; the surviving webhook row proves the same gate-0 mechanism.
 
 		// ── gate 1: upstream-auth delegation beats local allowlists ─────────
 		{

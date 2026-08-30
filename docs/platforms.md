@@ -1,6 +1,6 @@
 # Platforms
 
-Pi Gateway ships 31 platform surfaces. Every adapter implements one of three
+Pi Gateway ships 25 platform surfaces. Every adapter implements one of three
 transport shapes, and every adapter, whether a reference adapter or a census
 port, passes the same executable conformance suite before merge (spec 04 §8,
 DEC-002).
@@ -23,19 +23,18 @@ replay window, and bounded body and concurrency limits.
 
 Counted from each adapter's manifest (`transportShape`).
 
-### Polling (7 = 6 surfaces + 1 reference)
+### Polling (6 = 5 surfaces + 1 reference)
 
 | Surface             | Notes                                          |
 | ------------------- | ---------------------------------------------- |
 | `polling`           | generic reference adapter (Bot API long-poll)  |
 | `telegram`          | Bot API long-poll; first census port (DEC-024) |
-| `whatsapp-personal` | Personal WhatsApp bridge                       |
 | `matrix`            | Matrix homesync                                |
 | `weixin`            | WeChat personal bridge                         |
 | `email`             | IMAP/SMTP polling                              |
 | `buzz`              | Buzz polling bridge                            |
 
-### Persistent WebSocket (13 = 12 surfaces + 1 reference)
+### Persistent WebSocket (11 = 10 surfaces + 1 reference)
 
 | Surface             | Notes                                  |
 | ------------------- | -------------------------------------- |
@@ -48,12 +47,10 @@ Counted from each adapter's manifest (`transportShape`).
 | `feishu`            | Feishu/Lark ws + card ingress          |
 | `irc`               | IRC with formatting/budget modules     |
 | `qqbot`             | QQ bot ws                              |
-| `ntfy`              | ntfy subscribe (ws family)             |
 | `photon`            | Photon                                 |
-| `homeassistant`     | Home Assistant conversation API        |
 | `yuanbao`           | Yuanbao bridge                         |
 
-### Webhook (11 = 10 surfaces + 1 reference)
+### Webhook (9 = 8 surfaces + 1 reference)
 
 | Surface           | Notes                                         |
 | ----------------- | --------------------------------------------- |
@@ -62,10 +59,7 @@ Counted from each adapter's manifest (`transportShape`).
 | `google-chat`     | Google Chat push                              |
 | `teams`           | Microsoft Teams                               |
 | `msgraph-webhook` | Microsoft Graph subscriptions                 |
-| `bluebubbles`     | iMessage via BlueBubbles                      |
 | `sms`             | SMS webhook gateway                           |
-| `raft`            | Raft bridge (never spawned headless, DEC-062) |
-| `a2a`             | Agent-to-agent ingress (DEC-064)              |
 | `line`            | LINE Messaging API callbacks                  |
 | `wecom`           | WeCom (WeChat Work) callbacks                 |
 

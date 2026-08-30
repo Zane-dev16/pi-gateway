@@ -26,8 +26,12 @@ export const CHAT_TYPES_WITH_CHANNEL = new Set(["group", "forum", "channel"]);
 /** Chat shapes the scoped group-user/group-chat env reads (step 8/9) apply to. */
 export const CHAT_TYPES_GROUP_FORUM = new Set(["group", "forum"]);
 
+/**
+ * Chat platforms with token/HMAC-authenticated machine ingress (gate 0).
+ * homeassistant left under DEC-070 with its adapter; the gate-0 mechanism
+ * itself stays (webhook keeps exercising it).
+ */
 export const SYSTEM_PLATFORMS: ReadonlySet<string> = new Set([
-	"homeassistant",
 	"webhook",
 ]);
 
@@ -48,7 +52,6 @@ export const PLATFORM_ALLOWED_USERS_ENV: Readonly<Record<string, string>> = {
 	wecom: "WECOM_ALLOWED_USERS",
 	wecom_callback: "WECOM_CALLBACK_ALLOWED_USERS",
 	weixin: "WEIXIN_ALLOWED_USERS",
-	bluebubbles: "BLUEBUBBLES_ALLOWED_USERS",
 	qqbot: "QQ_ALLOWED_USERS",
 	yuanbao: "YUANBAO_ALLOWED_USERS",
 };
@@ -85,7 +88,6 @@ export const PLATFORM_ALLOW_ALL_ENV: Readonly<Record<string, string>> = {
 	wecom: "WECOM_ALLOW_ALL_USERS",
 	wecom_callback: "WECOM_CALLBACK_ALLOW_ALL_USERS",
 	weixin: "WEIXIN_ALLOW_ALL_USERS",
-	bluebubbles: "BLUEBUBBLES_ALLOW_ALL_USERS",
 	qqbot: "QQ_ALLOW_ALL_USERS",
 	yuanbao: "YUANBAO_ALLOW_ALL_USERS",
 };
@@ -132,7 +134,6 @@ export const PAIRING_ALLOWLIST_ENV: Readonly<Record<string, string>> = {
 	wecom: "WECOM_ALLOWED_USERS",
 	wecom_callback: "WECOM_CALLBACK_ALLOWED_USERS",
 	weixin: "WEIXIN_ALLOWED_USERS",
-	bluebubbles: "BLUEBUBBLES_ALLOWED_USERS",
 	qqbot: "QQ_ALLOWED_USERS",
 	yuanbao: "YUANBAO_ALLOWED_USERS",
 };

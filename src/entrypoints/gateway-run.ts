@@ -164,8 +164,8 @@ export interface PlatformHosting {
 	factory: PlatformFactory;
 	/**
 	 * register(ctx) parity (04 §4.2). Default: ctx.registerPlatform(manifest,
-	 * factory). Platforms with extra registration hooks (standalone senders —
-	 * ntfy / home-assistant) pass their own helper here.
+	 * factory). Platforms with extra registration hooks (standalone senders)
+	 * pass their own helper here.
 	 */
 	register?: (
 		ctx: PluginRegistrationContext,
