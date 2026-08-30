@@ -98,10 +98,6 @@ import {
 	type HandoffWatcher,
 } from "../pi_embedded/handoff/index.js";
 import {
-	delegationWatcherServiceEntry,
-	type DelegationWatcher,
-} from "../pi_embedded/delegation-watcher/index.js";
-import {
 	kanbanDispatcherServiceEntry,
 	kanbanNotifierServiceEntry,
 	type KanbanDispatcherEntryDeps,
@@ -209,8 +205,6 @@ export interface GatewayRunInput {
 	cron?: CronHosting;
 	/** Handoff queue watcher (stage 8). create() throws ⇒ loud degrade. */
 	handoffWatcher?: { create: () => HandoffWatcher };
-	/** Delegation completion watcher (stage 8). Same classify-on-throw rule. */
-	delegationWatcher?: { create: () => DelegationWatcher };
 	/** Kanban dispatcher/notifier (stage 8) — env/singleton gated internally. */
 	kanban?: {
 		dispatcher?: KanbanDispatcherEntryDeps;
@@ -817,12 +811,6 @@ function registerEmbeddedWatchers(
 		lifecycle.registerService(
 			"embedded_watchers",
 			handoffWatcherServiceEntry(input.handoffWatcher),
-		);
-	}
-	if (input.delegationWatcher !== undefined) {
-		lifecycle.registerService(
-			"embedded_watchers",
-			delegationWatcherServiceEntry(input.delegationWatcher),
 		);
 	}
 	if (input.kanban?.dispatcher !== undefined) {

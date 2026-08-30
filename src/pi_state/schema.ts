@@ -16,6 +16,9 @@
 // (hermes_state_schema.py:_ensure_fts_schema parity — external-content FTS
 // tables + gated triggers + independent storage-version tracking) is REMOVED;
 // reconcile retreats legacy FTS objects at open (reconcile.ts:retreatFtsObjects).
+// The async_delegations durable rail (02 §2.1 DDL + DEC-018/DEC-035) is also
+// REMOVED under the same amendment; reconcile retreats legacy rail objects at
+// open (reconcile.ts:retreatAsyncDelegationObjects).
 //
 // Additive change = add a line to SCHEMA_SQL; reconcile does the rest forever (02 §3).
 // Destructive change = explicit versioned migration, never reconcile.
@@ -115,17 +118,6 @@ CREATE TABLE IF NOT EXISTS compression_locks (session_id TEXT PRIMARY KEY, holde
                                 acquired_at REAL NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
                                   acquired_at REAL NOT NULL, expires_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS async_delegations (
-  delegation_id TEXT PRIMARY KEY,
-  origin_session TEXT NOT NULL, parent_session_id TEXT,
-  state TEXT NOT NULL, dispatched_at REAL NOT NULL,
-  completed_at REAL, updated_at REAL NOT NULL,
-  event_json TEXT, result_json TEXT, task_json TEXT,
-  delivery_state TEXT NOT NULL DEFAULT 'pending',
-  delivery_attempts INTEGER NOT NULL DEFAULT 0, delivered_at REAL,
-  owner_pid INTEGER, owner_started_at INTEGER,
-  delivery_claim TEXT, delivery_claimed_at REAL
-);
 
 CREATE TABLE IF NOT EXISTS delivery_obligations (
   obligation_id TEXT PRIMARY KEY,
@@ -158,7 +150,6 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
-CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery ON async_delegations(delivery_state, completed_at);
 `;
 
 /** Full tier-1 constant (fresh-store path): tables + their indexes. */

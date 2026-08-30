@@ -161,7 +161,7 @@ pi-gateway/
     ├── pi_agent_core/  ← worker pool, agent runner, cache, alternation repair
     ├── pi_gateway/     ← guards, streaming, obligations, registry, security
     ├── pi_platforms/   ← adapters, kit, conformance suite
-    └── pi_embedded/    ← cron, kanban, handoff, hooks, delegation, update
+    └── pi_embedded/    ← cron, kanban, handoff, hooks, update
 ```
 
 Dependencies flow downward only (`pi_home → pi_state → … → entrypoints`);

@@ -97,7 +97,6 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 				embedded_watchers: [
 					recordingEntry("hooks.extensions", timeline),
 					recordingEntry("kanban.dispatcher", timeline),
-					recordingEntry("delegation.watcher", timeline),
 					recordingEntry("handoff.watcher", timeline),
 				],
 			},
@@ -126,7 +125,6 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 			"service:cron.ticker",
 			"service:hooks.extensions",
 			"service:kanban.dispatcher",
-			"service:delegation.watcher",
 			"service:handoff.watcher",
 			"stage:platform_adapters",
 			"stage:runtime_identity",
@@ -138,7 +136,6 @@ describe("ten-stage startup order (01 §3.1 — order is binding)", () => {
 		for (const name of [
 			"hooks.extensions",
 			"kanban.dispatcher",
-			"delegation.watcher",
 			"handoff.watcher",
 		]) {
 			expect(started(name)).toContain("(stage embedded_watchers)");

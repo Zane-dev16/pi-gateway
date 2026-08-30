@@ -1,6 +1,7 @@
 // pi_state/reconcile.ts — declarative schema reconcile, storage-version
-// tracking, title-uniqueness dedup repair, the DEC-070 FTS retreat, and the
-// whole-open jittered-patience wrapper.
+// tracking, title-uniqueness dedup repair, the DEC-070 FTS retreat, the
+// DEC-070 async-delegation rail retreat, and the whole-open jittered-patience
+// wrapper.
 //
 // Spec: /root/pi-gateway/02-session-and-state.md
 //   §2.2 storage-version tracking (schema_version advances freely on
@@ -309,6 +310,56 @@ export function retreatFtsObjects(db: Database.Database): number {
 }
 
 // ---------------------------------------------------------------------------
+// Step 6.5 — DEC-070 async-delegation rail retreat (drop-if-present)
+// ---------------------------------------------------------------------------
+
+/**
+ * Retreat the async-delegation durability rail (DEC-070 item 5 — the owner
+ * authorized this DDL retreat; the reconcile machinery itself stays CORE):
+ * DROP the `async_delegations` table and its `idx_async_delegations_delivery`
+ * index — Hermes parity objects (`tools/async_delegation.py` persistence half,
+ * 02 §2.1 DDL) whose only consumers (pi_gateway/delegation rail +
+ * pi_embedded/delegation-watcher) were removed under the same amendment.
+ *
+ * Retreat semantics: drop-if-present, no-op when absent — idempotent in both
+ * directions, same contract as the FTS retreat above. Every writable open of
+ * a pre-retreat store heals it; fresh and already-retreated stores skip all
+ * work. Rail rows are deliberately NOT migrated anywhere: the feature is
+ * owner-excluded, its durability obligations end with it.
+ *
+ * Returns the number of legacy objects dropped (0 when the store is clean).
+ */
+export function retreatAsyncDelegationObjects(db: Database.Database): number {
+	try {
+		let dropped = 0;
+		const hasTable =
+			db.prepare(
+				"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'async_delegations'",
+			).get() !== undefined;
+		if (hasTable) {
+			db.exec("DROP TABLE IF EXISTS async_delegations");
+			dropped++;
+		}
+		const hasIndex =
+			db.prepare(
+				"SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_async_delegations_delivery'",
+			).get() !== undefined;
+		if (hasIndex) {
+			// DROP TABLE removes its own indexes; this only fires for a stray
+			// index orphaned by a hand-edited store.
+			db.exec("DROP INDEX IF EXISTS idx_async_delegations_delivery");
+			dropped++;
+		}
+		return dropped;
+	} catch (err) {
+		console.warn(
+			`[pi_state] async-delegation retreat failed; continuing without it: ${errMessage(err)}`,
+		);
+		return 0;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Step 7 — one-time structural heals
 // ---------------------------------------------------------------------------
 
@@ -386,6 +437,9 @@ export interface InitReport {
 	routingPkHealed: boolean;
 	/** Legacy FTS objects dropped by the DEC-070 retreat (0 when clean). */
 	ftsRetreated: number;
+	/** Legacy async-delegation rail objects dropped by the DEC-070 retreat (0
+	 *  when clean). */
+	delegationRetreated: number;
 	versionBumped: boolean;
 }
 
@@ -395,6 +449,12 @@ export interface InitStoreOptions {
 	 * no-op when absent. Default true; false is a test hook only.
 	 */
 	dropLegacyFtsObjects?: boolean;
+	/**
+	 * Retreat the async-delegation rail objects at open (DEC-070 item 5):
+	 * drop-if-present, no-op when absent. Default true; false is a test
+	 * hook only.
+	 */
+	dropLegacyDelegationObjects?: boolean;
 }
 
 function bumpSchemaVersion(db: Database.Database): void {
@@ -435,12 +495,17 @@ export function initStore(
 		opts.dropLegacyFtsObjects !== false
 			? retreatFtsObjects(db) // step 5 — DEC-070 DDL retreat (drop-if-present)
 			: 0;
+	const delegationRetreated =
+		opts.dropLegacyDelegationObjects !== false
+			? retreatAsyncDelegationObjects(db) // step 6.5 — DEC-070 DDL retreat
+			: 0;
 	bumpSchemaVersion(db); // step 6 (unconditional — no FTS gate remains)
 	return {
 		reconciled,
 		titleIndexEnsured,
 		routingPkHealed,
 		ftsRetreated,
+		delegationRetreated,
 		versionBumped: true,
 	};
 }

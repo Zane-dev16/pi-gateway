@@ -2,15 +2,13 @@ import { defineConfig } from "vitest/config";
 
 // DEC-041: spec files that spawn REAL OS child processes run SERIALIZED under
 // full-suite execution. On 4-CPU hosts, parallel fork load starves their
-// children of CPU/time (observed twice: the delegation-rail SIGKILL test
-// timing out at 120s then 300s while its isolation runtime is ~1.5s). The
+// children of CPU/time (observed twice; isolation runtimes are ~1.5s). The
 // dedicated "heavy-process" project pins fileParallelism:false for exactly
 // these specs; every other spec keeps the default parallel pool untouched.
 //
 // Membership = any src/**/*.test.ts that imports node:child_process to
 // spawn/execFile real OS children:
-//   *two-process*.test.ts          — the two-process contract suites (7 files)
-//   + delegation/restore.test.ts   — spawnSync boot driver
+//   *two-process*.test.ts          — the two-process contract suites
 //   + guards/lease-interplay       — spawn-based interplay harness
 //   + lifecycle/guard.test.ts      — execFile + spawn takeover fixtures
 //   + lifecycle/layering.test.ts   — execFile of check-layering.mjs
@@ -30,7 +28,6 @@ const SHARED = {
 
 const HEAVY_PROCESS_SPECS = [
 	"src/**/*two-process*.test.ts",
-	"src/pi_gateway/delegation/restore.test.ts",
 	"src/pi_gateway/guards/lease-interplay.test.ts",
 	"src/pi_gateway/lifecycle/guard.test.ts",
 	"src/pi_gateway/lifecycle/layering.test.ts",

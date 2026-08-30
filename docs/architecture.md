@@ -21,7 +21,7 @@ Dependencies flow downward only; `scripts/check-layering.mjs` enforces this
 ```
 entrypoints      'pi gateway run' composition root (DEC-058)
 pi_platforms     adapters + kit + conformance (never import the runner)
-pi_embedded      cron, kanban, handoff, hooks, delegation, update
+pi_embedded      cron, kanban, handoff, hooks, update
 pi_gateway       guards, streaming, obligations, registry, security
 pi_agent_core    worker pool, agent runner, cache, alternation repair
 pi_state         schema, leases, messages, usage, WAL ladder
@@ -97,9 +97,6 @@ lock/claim story (spec 01 §4):
 | Handoff watcher    | 2s poll  | atomic DB row claim; re-bind + replay through the normal guards (DEC-008) |
 | Hook registry      | event    | observer events never block; command hooks are decision-bearing (DEC-014) |
 | Plugin loader      | boot     | idempotent discovery; plugins never modify core files            |
-
-Background completions re-enter only via the durable idle-gated delegation
-rail, never injected into a dead or mid-tool session (DEC-018).
 
 ## Startup and shutdown
 

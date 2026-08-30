@@ -16,6 +16,7 @@ import {
 	initStore,
 	readProbeStatements,
 	reconcileColumns,
+	retreatAsyncDelegationObjects,
 	retreatFtsObjects,
 	StoreBehindSchemaError,
 } from "./reconcile.js";
@@ -435,6 +436,130 @@ describe("DEC-070 item 9 — FTS retreat (drop-if-present, no-op when absent)", 
 			const kept = store.db
 				.prepare(
 					"SELECT name FROM sqlite_master WHERE name = 'messages_fts_keepalive'",
+				)
+				.all();
+			expect(kept).toHaveLength(1);
+		} finally {
+			await store.close();
+		}
+	});
+});
+
+describe("DEC-070 item 5 — async-delegation rail retreat (drop-if-present, no-op when absent)", () => {
+	/** Regress a CURRENT-schema store to the pre-retreat rail shape. */
+	function seedLegacyRail(store: StateStore): void {
+		store.db.exec(`
+			CREATE TABLE IF NOT EXISTS async_delegations (
+			  delegation_id TEXT PRIMARY KEY,
+			  origin_session TEXT NOT NULL, parent_session_id TEXT,
+			  state TEXT NOT NULL, dispatched_at REAL NOT NULL,
+			  completed_at REAL, updated_at REAL NOT NULL,
+			  event_json TEXT, result_json TEXT, task_json TEXT,
+			  delivery_state TEXT NOT NULL DEFAULT 'pending',
+			  delivery_attempts INTEGER NOT NULL DEFAULT 0, delivered_at REAL,
+			  owner_pid INTEGER, owner_started_at INTEGER,
+			  delivery_claim TEXT, delivery_claimed_at REAL
+			);
+		`);
+		store.db
+			.prepare(
+				"INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at) VALUES ('d1', 'sX', 'pending', 1, 1)",
+			)
+			.run();
+	}
+
+	it("fresh store carries NO rail objects; delivery_obligations ledger stays intact", async () => {
+		const store = await StateStore.open(dbPath());
+		try {
+			// The rail was removed under DEC-070 item 5 (the delivery-obligations
+			// ledger is CORE and survives): a fresh store must have neither the
+			// legacy table nor a stray legacy index.
+			const objects = store.db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE name LIKE 'async_delegations%' OR name = 'idx_async_delegations_delivery'",
+				)
+				.all() as Array<{ name: string }>;
+			expect(objects).toHaveLength(0);
+			expect(store.initReport?.delegationRetreated).toBe(0);
+			// The SURVIVING ledger table still exists and probes clean.
+			store.db
+				.prepare(
+					"INSERT INTO delivery_obligations (obligation_id, session_key, platform, chat_id, content, state, created_at, updated_at) VALUES ('o1', 'k', 'telegram', 'c', 'hi', 'pending', 1, 1)",
+				)
+				.run();
+			expect(() => assertStoreMatchesSchema(store.db)).not.toThrow();
+		} finally {
+			await store.close();
+		}
+	});
+
+	it("pre-retreat store: table + rows + index dropped at open; rest of the store stays healthy", async () => {
+		const p = dbPath();
+		{
+			// Build a CURRENT-schema store, then regress it to the pre-retreat
+			// shape: hand-run the removed Hermes-parity rail DDL.
+			const store = await StateStore.open(p, {
+				init: { dropLegacyDelegationObjects: false },
+			});
+			seedLegacyRail(store);
+			await store.close();
+		}
+
+		// Reopen: the retreat drops the table (its index goes with it), and
+		// the store stays fully healthy.
+		{
+			const store = await StateStore.open(p);
+			try {
+				expect(store.initReport?.delegationRetreated).toBe(1);
+				const objects = store.db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name LIKE 'async_delegations%' OR name = 'idx_async_delegations_delivery'",
+					)
+					.all() as Array<{ name: string }>;
+				expect(objects).toHaveLength(0);
+				// Relational data untouched; integrity holds.
+				const integrity = store.db.pragma("integrity_check", {
+					simple: true,
+				}) as unknown as string;
+				expect(integrity).toBe("ok");
+				expect(() => assertStoreMatchesSchema(store.db)).not.toThrow();
+			} finally {
+				await store.close();
+			}
+		}
+
+		// Third open: retreat is a no-op when nothing remains (idempotent both
+		// directions).
+		{
+			const store = await StateStore.open(p);
+			try {
+				expect(store.initReport?.delegationRetreated).toBe(0);
+			} finally {
+				await store.close();
+			}
+		}
+	});
+
+	it("retreatAsyncDelegationObjects is directly idempotent and never touches other objects", async () => {
+		const store = await StateStore.open(dbPath(), {
+			init: { dropLegacyDelegationObjects: false },
+		});
+		try {
+			seedLegacyRail(store);
+			store.db.exec(
+				"CREATE INDEX idx_async_delegations_delivery ON async_delegations(delivery_state, completed_at)",
+			);
+			// One DROP (the table); its index goes with it — SQLite has no
+			// orphan-index state, so the defensive index branch stays dormant
+			// for consistent stores.
+			expect(retreatAsyncDelegationObjects(store.db)).toBe(1);
+			expect(retreatAsyncDelegationObjects(store.db)).toBe(0); // second call: no-op
+			// Unrelated objects are never touched.
+			store.db.exec("CREATE TABLE async_delegations_keepalive (id INTEGER PRIMARY KEY)");
+			expect(retreatAsyncDelegationObjects(store.db)).toBe(0);
+			const kept = store.db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE name = 'async_delegations_keepalive'",
 				)
 				.all();
 			expect(kept).toHaveLength(1);
