@@ -219,9 +219,10 @@ export const OPUS_VOICE_PLATFORMS: ReadonlySet<string> = new Set([
 	"telegram",
 	"matrix",
 	"feishu",
-	"whatsapp",
 	"signal",
 ]);
+// DEC-070: the "whatsapp" (personal bridge) row left with that adapter;
+// whatsapp-cloud's voice path is not Ogg/Opus-class, so the set has no WA row.
 
 /**
  * Platform-aware output path (base.py:build_auto_tts_output_path): opus-class

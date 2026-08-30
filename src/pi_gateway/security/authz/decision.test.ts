@@ -296,7 +296,10 @@ describe("§2.1 decision order — table-driven matrix", () => {
 		},
 		{
 			name: "live DM recheck overrides stale construction-time snapshot (revocation staleness)",
-			source: { platform: "whatsapp", userId: "15551234567@s.whatsapp.net" },
+			// DEC-070: rewritten from platform "whatsapp" (personal bridge, removed)
+			// to wecom — asserts the SURVIVING gate-8 live-recheck mechanism, not the
+			// removed adapter.
+			source: { platform: "wecom", userId: "555" },
 			deps: {
 				adapterView: (): AdapterAuthzView => ({
 					enforcesOwnAccessPolicy: true,
@@ -504,16 +507,19 @@ function writeMapping(
 }
 
 describe("WhatsApp identity aliases in the allowlist union", () => {
+	// DEC-070: these rows originally ran on platform "whatsapp" (the personal
+	// bridge, removed); they exercise the SURVIVING alias-expansion mechanism and
+	// now ride whatsapp_cloud — the remaining member of the isWhatsAppFamily.
 	it("a paired LID matches the phone-JID allowlist entry (02 §4.3 fork/deny class)", () => {
 		const sessionDir = join(dir, "wa-session");
 		writeMapping(sessionDir, "15551234567", "999999999999999");
 		writeMapping(sessionDir, "999999999999999", "15551234567", true);
 
 		const record = withEnv(
-			{ WHATSAPP_ALLOWED_USERS: "15551234567@s.whatsapp.net" },
+			{ WHATSAPP_CLOUD_ALLOWED_USERS: "15551234567@s.whatsapp.net" },
 			() =>
 				isUserAuthorized(
-					{ platform: "whatsapp", userId: "999999999999999@lid" },
+					{ platform: "whatsapp_cloud", userId: "999999999999999@lid" },
 					{ whatsappSessionDir: sessionDir },
 				),
 		);
@@ -541,11 +547,13 @@ describe("WhatsApp identity aliases in the allowlist union", () => {
 			sessionDir,
 		});
 		expect(expanded.size).toBe(1); // fresh install degrades to input
-		const record = withEnv({ WHATSAPP_ALLOWED_USERS: "15551234567" }, () =>
-			isUserAuthorized(
-				{ platform: "whatsapp", userId: "999999999999998@lid" },
-				{ whatsappSessionDir: sessionDir },
-			),
+		const record = withEnv(
+			{ WHATSAPP_CLOUD_ALLOWED_USERS: "15551234567" },
+			() =>
+				isUserAuthorized(
+					{ platform: "whatsapp_cloud", userId: "999999999999998@lid" },
+					{ whatsappSessionDir: sessionDir },
+				),
 		);
 		expect(record.allowed).toBe(false);
 		expect(record.reasonCode).toBe("default_deny");

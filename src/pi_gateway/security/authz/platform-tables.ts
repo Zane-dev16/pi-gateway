@@ -16,6 +16,9 @@
 // Platforms absent from these maps may supply their env-var names through the
 // plugin registry seam (`AuthzDeps.registryEntry`) — parity of the
 // gateway.platform_registry lookup inside _is_user_authorized.
+//
+// DEC-070: the "whatsapp" (personal bridge) and "bluebubbles" rows were
+// removed with those adapters; every other platform row stays.
 
 /** dm_policy / group_policy vocabulary (06 §2.2). */
 export type DmPolicy = "open" | "allowlist" | "disabled" | "pairing";
@@ -39,7 +42,6 @@ export const SYSTEM_PLATFORMS: ReadonlySet<string> = new Set([
 export const PLATFORM_ALLOWED_USERS_ENV: Readonly<Record<string, string>> = {
 	telegram: "TELEGRAM_ALLOWED_USERS",
 	discord: "DISCORD_ALLOWED_USERS",
-	whatsapp: "WHATSAPP_ALLOWED_USERS",
 	whatsapp_cloud: "WHATSAPP_CLOUD_ALLOWED_USERS",
 	slack: "SLACK_ALLOWED_USERS",
 	signal: "SIGNAL_ALLOWED_USERS",
@@ -75,7 +77,6 @@ export const PLATFORM_GROUP_CHAT_ENV: Readonly<Record<string, string>> = {
 export const PLATFORM_ALLOW_ALL_ENV: Readonly<Record<string, string>> = {
 	telegram: "TELEGRAM_ALLOW_ALL_USERS",
 	discord: "DISCORD_ALLOW_ALL_USERS",
-	whatsapp: "WHATSAPP_ALLOW_ALL_USERS",
 	whatsapp_cloud: "WHATSAPP_CLOUD_ALLOW_ALL_USERS",
 	slack: "SLACK_ALLOW_ALL_USERS",
 	signal: "SIGNAL_ALLOW_ALL_USERS",
@@ -121,7 +122,6 @@ export const PLATFORM_ALLOW_BOTS_ENV: Readonly<Record<string, string>> = {
 export const PAIRING_ALLOWLIST_ENV: Readonly<Record<string, string>> = {
 	telegram: "TELEGRAM_ALLOWED_USERS",
 	discord: "DISCORD_ALLOWED_USERS",
-	whatsapp: "WHATSAPP_ALLOWED_USERS",
 	whatsapp_cloud: "WHATSAPP_CLOUD_ALLOWED_USERS",
 	slack: "SLACK_ALLOWED_USERS",
 	signal: "SIGNAL_ALLOWED_USERS",
