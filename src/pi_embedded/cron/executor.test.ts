@@ -13,7 +13,6 @@ import {
 	cronSessionId,
 	isCronSessionContext,
 } from "./executor.js";
-import type { TimestampActivityLog } from "./inactivity.js";
 import {
 	awaitGatewayDecision,
 	HumanWaitAccounting,
@@ -160,8 +159,7 @@ describe("cron turns through the NORMAL runner pipeline (real host loop)", () =>
 });
 
 describe("ScheduledJobRunner adapter", () => {
-	it("maps finalized outcomes to ok + output and touches activity around the turn", async () => {
-		let nowCalls = 0;
+	it("maps finalized outcomes to ok + output through the normal turn pipeline", async () => {
 		const executor = new CronTurnExecutor({
 			handleTurn: async () => ({
 				exitReason: "finalized" as const,
@@ -174,22 +172,7 @@ describe("ScheduledJobRunner adapter", () => {
 			}),
 			interrupt: async () => true,
 		});
-		const runner = cronExecutorAsRunner(executor, {
-			clock: {
-				nowSeconds: () => {
-					nowCalls++;
-					return 777;
-				},
-				sleepMs: async () => undefined,
-			},
-		});
-		const touches: number[] = [];
-		const activity = {
-			touch: (t: number) => {
-				touches.push(t);
-			},
-			secondsSinceActivity: (): number => 0,
-		} as unknown as TimestampActivityLog; // structural probe stand-in
+		const runner = cronExecutorAsRunner(executor);
 		const outcome = await runner.run({
 			job: {
 				id: "j1",
@@ -201,12 +184,9 @@ describe("ScheduledJobRunner adapter", () => {
 				created_at: "",
 				next_run_at: null,
 			},
-			activity,
 		});
 		expect(outcome.ok).toBe(true);
 		expect(outcome.outputText).toBe("done!");
-		expect(touches.length).toBeGreaterThanOrEqual(2); // start + settle stamps
-		expect(nowCalls).toBeGreaterThanOrEqual(2); // stamps read the injected clock
 	});
 
 	it("interrupt routes to the job's session through the executor", async () => {

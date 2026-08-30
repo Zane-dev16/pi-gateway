@@ -14,7 +14,6 @@ import {
 	type CronJobRecord,
 } from "./store.js";
 import { CronScheduler, type ScheduledJobRunner } from "./scheduler.js";
-import type { TimestampActivityLog } from "./inactivity.js";
 import { Gate, ManualClock } from "./testing/manual-clock.js";
 import { TickLockAcquisitionError } from "./tick-lock.js";
 
@@ -70,7 +69,6 @@ describe("tickOnce happy path", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: scriptedRunner(async () => ({
 				ok: true,
 				outputText: "fresh data",
@@ -105,7 +103,6 @@ describe("tickOnce happy path", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: scriptedRunner(async () => ({
 				ok: false,
 				error: "provider down",
@@ -127,7 +124,6 @@ describe("tick gating", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: scriptedRunner(async () => {
 				throw new Error("must not run under estop");
 			}),
@@ -145,7 +141,6 @@ describe("tick gating", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: scriptedRunner(async () => ({ ok: true })),
 			tickLock: {
 				acquire: () => {
@@ -168,7 +163,6 @@ describe("tick gating", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: scriptedRunner(async () => ({ ok: true })),
 			tickLock: {
 				acquire: () => {
@@ -182,64 +176,25 @@ describe("tick gating", () => {
 	});
 });
 
-describe("true-inactivity runaway bound inside a tick", () => {
-	it("a wedged job is interrupted AT the inactivity bound and recorded interrupted", async () => {
-		const job = await dueIntervalJob();
-		const limitGate = new Gate();
-		const interrupts: string[] = [];
-		let runnerSawActivity: TimestampActivityLog | null = null;
-		const runner: ScheduledJobRunner = {
-			run: async ({ activity }) => {
-				runnerSawActivity = activity;
-				activity.touch(clock.nowSeconds());
-				await limitGate.wait; // wedge forever until the hard interrupt
-				return { ok: false, error: "aborted" };
-			},
-			interrupt: (jobId) => {
-				interrupts.push(jobId);
-				limitGate.open();
-				return Promise.resolve(true);
-			},
-		};
-		// Default limit: 600s (no HERMES_CRON_TIMEOUT in env).
-		const scheduler = new CronScheduler({ store, clock, env: {}, runner });
-
-		const report = await scheduler.tickOnce(); // monitor polls self-drive logical time
-
-		expect(report.results[0]?.status).toBe("interrupted");
-		expect(report.results[0]?.wroteResults).toBe(true);
-		expect(interrupts).toEqual([job.id]); // request_hard_interrupt parity
-		const after = await store.getJob(job.id);
-		expect(after?.last_status).toBe("interrupted");
-		// Re-arm forward despite the interruption (recurring job keeps its slot).
-		expect(after?.state).toBe("scheduled");
-		expect(isoAfter(after?.next_run_at)).toBe(clock.nowSeconds() + 600);
-		void runnerSawActivity;
-	});
-
-	it("HERMES_CRON_TIMEOUT=0 runs an unlimited job to completion", async () => {
+describe("unbounded run inside a tick (DEC-070: no inactivity kill)", () => {
+	it("a long-running job runs to completion; no watchdog ever interrupts it", async () => {
 		const job = await dueIntervalJob();
 		const runner: ScheduledJobRunner = {
-			run: async ({ activity }) => {
-				// Active the whole time: touch each poll cycle for 2 simulated hours.
-				for (let i = 0; i < 1440; i++) {
-					await clock.sleepMs(5000);
-					activity.touch(clock.nowSeconds());
-				}
+			run: async () => {
+				// Run for 2 simulated hours (DEC-070: no HERMES_CRON_TIMEOUT bound;
+				// the surviving claim-heartbeat poll keeps firing the whole time).
+				for (let i = 0; i < 1440; i++) await clock.sleepMs(5000);
 				return { ok: true, outputText: "finally done" };
 			},
 			interrupt: () => Promise.resolve(true),
 		};
-		const scheduler = new CronScheduler({
-			store,
-			clock,
-			env: { HERMES_CRON_TIMEOUT: "0" },
-			runner,
-		});
+		const scheduler = new CronScheduler({ store, clock, runner });
+
 		const report = await scheduler.tickOnce();
+
 		expect(report.results[0]?.status).toBe("ok");
 		expect((await store.getJob(job.id))?.last_status).toBe("ok");
-	}, 60_000);
+	});
 });
 
 describe("fire ownership: claim-loss interrupts the stale run WITHOUT double-write", () => {
@@ -250,8 +205,7 @@ describe("fire ownership: claim-loss interrupts the stale run WITHOUT double-wri
 		let interrupted = false;
 
 		const runner: ScheduledJobRunner = {
-			run: async ({ activity }) => {
-				activity.touch(clock.nowSeconds());
+			run: async () => {
 				// Mid-run, ANOTHER ticker wins the claim (our TTL lapsed during a
 				// stall). The record now names owner B.
 				if (!stole) {
@@ -273,7 +227,7 @@ describe("fire ownership: claim-loss interrupts the stale run WITHOUT double-wri
 				return Promise.resolve(true);
 			},
 		};
-		const scheduler = new CronScheduler({ store, clock, env: {}, runner });
+		const scheduler = new CronScheduler({ store, clock, runner });
 
 		const report = await scheduler.tickOnce();
 
@@ -298,8 +252,7 @@ describe("fire ownership: claim-loss interrupts the stale run WITHOUT double-wri
 		const job = await dueIntervalJob();
 		let ran = false;
 		const stealingRunner: ScheduledJobRunner = {
-			run: async (ctx) => {
-				ctx.activity.touch(clock.nowSeconds());
+			run: async () => {
 				ran = true;
 				// Owner swaps to a foreign ticker right as the run completes.
 				await store.mutate((jobs) => {
@@ -316,7 +269,6 @@ describe("fire ownership: claim-loss interrupts the stale run WITHOUT double-wri
 		const scheduler2 = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: stealingRunner,
 		});
 
@@ -342,7 +294,6 @@ describe("ticker loop lifecycle (#87644 backoff ownership)", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			intervalSeconds: 60,
 			runner: scriptedRunner(async () => ({ ok: true })),
 			tickLock: {
@@ -394,7 +345,6 @@ describe("ticker loop lifecycle (#87644 backoff ownership)", () => {
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			intervalSeconds: 3600,
 			runner: scriptedRunner(async () => ({ ok: true })),
 		});
@@ -415,7 +365,6 @@ describe("in-flight visibility (gateway shutdown-drain input, #60432/#82161)", (
 		const scheduler = new CronScheduler({
 			store,
 			clock,
-			env: {},
 			runner: {
 				run: async () => {
 					// The run must be visible to the drain WHILE it works…
@@ -460,8 +409,7 @@ describe("in-flight visibility (gateway shutdown-drain input, #60432/#82161)", (
 		let stole = false;
 		let sawInflight = false;
 		const runner: ScheduledJobRunner = {
-			run: async ({ activity }) => {
-				activity.touch(clock.nowSeconds());
+			run: async () => {
 				if (!stole) {
 					stole = true;
 					await store.mutate((jobs) => {
@@ -481,7 +429,7 @@ describe("in-flight visibility (gateway shutdown-drain input, #60432/#82161)", (
 				return Promise.resolve(true);
 			},
 		};
-		const scheduler = new CronScheduler({ store, clock, env: {}, runner });
+		const scheduler = new CronScheduler({ store, clock, runner });
 
 		// The bound's heartbeat poll detects the stolen claim and fires the
 		// interrupt itself (which opens the gate); monitor polls self-drive

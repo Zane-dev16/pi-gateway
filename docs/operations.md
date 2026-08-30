@@ -126,8 +126,9 @@ During updates the updater may pause gateways with a reversible drain marker
 - Token locks: a unique credential (e.g. one bot token) can be held by
   exactly one adapter. Contention is a fatal connect error naming the holder
   profile and PID (spec 06 §5).
-- Cron is bound by inactivity (default 600s), not wall-clock, so active jobs
-  may run for hours (spec 07 §5.2).
+- Cron jobs run to completion regardless of duration (DEC-070 removed the
+  inactivity bound); fire ownership is guarded by the claim heartbeat, not an
+  idle timeout (spec 07 §5.2).
 - Multiplex keeps per-profile secret scopes fail-closed; scope hygiene is
   asserted even when a turn body raises (spec 06 §3).
 

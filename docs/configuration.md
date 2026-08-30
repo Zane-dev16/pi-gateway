@@ -81,8 +81,6 @@ binds (spec 06 §8, DEC-017).
   recognized slash command is always wrong (spec 07 §1.4, DEC-005).
 - The worker pool is bounded (10 workers); correctness comes from leases,
   not thread counts (spec 01 §2.1).
-- Cron jobs run with an inactivity timeout, default 600s (`0` = unlimited).
-  An active job may run for hours; a hung one is interrupted (spec 07 §5.2).
 - Delivery obligations cap at 3 attempts / 24h staleness / 7d retention /
   500 rows; timeout-classified send failures are not retried inside platform
   ladders (DEC-046/053/054).

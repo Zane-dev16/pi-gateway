@@ -15,8 +15,9 @@
 //   • Deadline = approvals.timeout (config default 300 s), fixed at
 //     construction — DEC-013 forbids live config reload.
 //   • The wait polls in slices ≤1 s firing activity heartbeats every ~10 s so
-//     inactivity monitors see liveness while a human thinks; otherwise the
-//     watchdog kills a healthy agent mid-wait.
+//     human thinking time reports as agent liveness to downstream observers
+//     (DEC-070: the cron inactivity monitor that once consumed these is
+//     removed; the heartbeat itself is core parity and stays).
 //   • Interrupt-first: an interrupt signal resolves DENY so the loop unwinds
 //     via the normal denial path (#8697). A follower's interrupt denies ONLY
 //     the follower — the leader thread handles its own signal.

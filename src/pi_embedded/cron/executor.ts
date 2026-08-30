@@ -182,9 +182,6 @@ export class CronTurnExecutor {
 // ScheduledJobRunner adapter (bridges into the scheduler's runner seam)
 // -----------------------------------------------------------------------
 
-import type { CronClock } from "./clock.js";
-import { systemCronClock } from "./clock.js";
-import type { TimestampActivityLog } from "./inactivity.js";
 import type { RunnerOutcome, ScheduledJobRunner } from "./scheduler.js";
 
 export interface ExecutorRunnerAdapterOptions {
@@ -192,8 +189,6 @@ export interface ExecutorRunnerAdapterOptions {
 	ensureSession?: (sessionId: string) => void | Promise<void>;
 	/** Map a TurnOutcome to ok/output/error (default: finalized ⇒ ok). */
 	toOutcome?: (outcome: TurnOutcome) => RunnerOutcome;
-	/** Injected clock for activity stamps (same clock the scheduler runs on). */
-	clock?: CronClock;
 }
 
 function defaultToOutcome(outcome: TurnOutcome): RunnerOutcome {
@@ -214,19 +209,17 @@ function defaultToOutcome(outcome: TurnOutcome): RunnerOutcome {
 }
 
 /**
- * Adapt a CronTurnExecutor to the scheduler's ScheduledJobRunner: touches the
- * job's activity log at turn start AND settlement so the inactivity bound
- * sees real pipeline progress, and routes every turn through the NORMAL
- * runner pipeline (DEC-023) with the DEC-012 construction recorded.
+ * Adapt a CronTurnExecutor to the scheduler's ScheduledJobRunner: routes
+ * every turn through the NORMAL runner pipeline (DEC-023) with the DEC-012
+ * construction recorded. (DEC-070: the former activity-stamp liveness
+ * reporting for the removed inactivity bound is gone with it.)
  */
 export function cronExecutorAsRunner(
 	executor: CronTurnExecutor,
 	options: ExecutorRunnerAdapterOptions = {},
 ): ScheduledJobRunner {
-	const clock = options.clock ?? systemCronClock;
 	return {
-		async run({ job, activity }) {
-			activity.touch(clock.nowSeconds()); // turn started = activity
+		async run({ job }) {
 			const { outcome } = await executor.run({
 				jobId: job.id,
 				prompt: job.prompt,
@@ -234,7 +227,6 @@ export function cronExecutorAsRunner(
 					? { ensureSession: options.ensureSession }
 					: {}),
 			});
-			activity.touch(clock.nowSeconds());
 			const map = options.toOutcome ?? defaultToOutcome;
 			return map(outcome);
 		},

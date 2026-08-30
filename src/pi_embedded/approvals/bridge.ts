@@ -73,7 +73,7 @@ export interface ApprovalBridgeOptions {
 	/** HookRegistry-compatible observer emit (pre/post approval hooks). */
 	hooks?: { emit?: ObserverEmit };
 	isInterrupted?: () => boolean;
-	/** Activity sink (inactivity-monitor liveness while a human thinks). */
+	/** Activity sink (human thinking time reported as agent liveness). */
 	onActivity?: (note: string) => void;
 	/**
 	 * Answer-authorization override (bot-level ACL parity of

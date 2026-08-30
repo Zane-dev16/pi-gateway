@@ -63,15 +63,11 @@ export {
 } from "./tick-lock.js";
 
 export {
-	TimestampActivityLog,
-	resolveInactivityLimitSeconds,
-	runWithInactivityBound,
-	DEFAULT_CRON_INACTIVITY_SECONDS,
-	INACTIVITY_POLL_SECONDS,
-	type InactivityBoundResult,
-	type InactivityBoundOptions,
-	type InactivityProbe,
-} from "./inactivity.js";
+	runWithClaimHeartbeat,
+	CLAIM_HEARTBEAT_POLL_SECONDS,
+	type ClaimHeartbeatOptions,
+	type ClaimHeartbeatResult,
+} from "./claim-heartbeat.js";
 
 export {
 	applyWrap,

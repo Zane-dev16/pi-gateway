@@ -9,8 +9,8 @@
 //
 // Hermes anchors: cron/scheduler.py uses time.monotonic()/hermes_time.now();
 // cron/jobs.py:_hermes_now. Pi collapses both onto epoch seconds — all cron
-// bounds (grace windows, inactivity limits, fire-claim TTLs) compare epoch
-// seconds, never wall deltas.
+// bounds (grace windows, fire-claim TTLs) compare epoch seconds, never wall
+// deltas. (DEC-070: the inactivity bound and its limits were removed.)
 
 export interface CronClock {
 	/** Wall-clock seconds since the epoch (parity of hermes_time.now()). */

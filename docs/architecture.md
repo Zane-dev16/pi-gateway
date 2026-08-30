@@ -91,7 +91,7 @@ lock/claim story (spec 01 §4):
 
 | Service            | Tick     | Isolation                                                        |
 | ------------------ | -------- | ---------------------------------------------------------------- |
-| Cron ticker        | ~60s     | tick lock; inactivity timeout 600s default, not a wall clock     |
+| Cron ticker        | ~60s     | tick lock; claim-heartbeat fire-claim ownership (spec 07 §5.2)   |
 | Handoff watcher    | 2s poll  | atomic DB row claim; re-bind + replay through the normal guards (DEC-008) |
 
 ## Startup and shutdown

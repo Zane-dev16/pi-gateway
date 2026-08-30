@@ -115,7 +115,7 @@ export function isStaleRunningEntry(inputs: StaleRunningEntryInputs): boolean {
  * Env parsing for the grace value. Deviation note: Python float() would raise
  * on garbage and take the whole busy path down with it; a messaging gate must
  * not die on a bad env var, so unparseable values fail safe to the 3.0s
- * default (same posture as HERMES_CRON_TIMEOUT handling).
+ * default.
  */
 export function resolveFollowupGraceSeconds(
 	env: Record<string, string | undefined> = process.env,

@@ -11,8 +11,12 @@
 // skip; fd exhaustion ⇒ LOUD raise) → emergency-stop sentinel check (due
 // jobs wait; in-flight runs untouched) → get due jobs → advance recurring
 // next_run_at BEFORE execution (at-most-once) → per job: claim an execution
-// token → run under the true-inactivity bound with claim-heartbeat polling →
-// mark_job_run (fire-owner CAS discards stale completions) → deliver.
+// token → run under the claim-heartbeat watch → mark_job_run (fire-owner CAS
+// discards stale completions) → deliver.
+// DEC-070 scope note: the former true-inactivity runaway bound
+// (HERMES_CRON_TIMEOUT idle kill) was removed; cron jobs now run to
+// completion regardless of duration. The claim-heartbeat polling that
+// guards fire ownership (07 §5.2) survives unchanged.
 //
 // Lifecycle integration: this is a lifecycle OPTIONAL stage (#7
 // `cron_scheduler` — degrade LOUDLY per-service without blocking later
@@ -31,12 +35,7 @@ import type { CronClock } from "./clock.js";
 import { systemCronClock } from "./clock.js";
 import type { CronLogger } from "./logger.js";
 import { stderrLogger } from "./logger.js";
-import {
-	TimestampActivityLog,
-	resolveInactivityLimitSeconds,
-	runWithInactivityBound,
-	type InactivityProbe,
-} from "./inactivity.js";
+import { runWithClaimHeartbeat } from "./claim-heartbeat.js";
 import {
 	deliverCronResult,
 	type CronWrapConfig,
@@ -61,15 +60,11 @@ import {
 export const DEFAULT_TICK_INTERVAL_SECONDS = 60;
 
 /**
- * The runner surface the scheduler drives. `activity` is the job's stamp log:
- * touch it from every progress observation so the true-inactivity bound sees
- * liveness. Production adapter: executor.ts's cronExecutorAsRunner.
+ * The runner surface the scheduler drives. Production adapter:
+ * executor.ts's cronExecutorAsRunner.
  */
 export interface ScheduledJobRunner {
-	run(ctx: {
-		job: CronJobRecord;
-		activity: TimestampActivityLog;
-	}): Promise<RunnerOutcome>;
+	run(ctx: { job: CronJobRecord }): Promise<RunnerOutcome>;
 	interrupt(jobId: string): Promise<boolean>;
 }
 
@@ -109,8 +104,6 @@ export interface CronSchedulerOptions {
 	runner: ScheduledJobRunner;
 	clock?: CronClock;
 	logger?: CronLogger;
-	/** Env record for HERMES_CRON_TIMEOUT; defaults to process.env. */
-	env?: Record<string, string | undefined>;
 	/** Ticker cadence in seconds (Hermes builtin: 60). Read ONCE (DEC-013). */
 	intervalSeconds?: number;
 	/** Emergency-stop sentinel path (`hermes pause` analogue). */
@@ -120,11 +113,6 @@ export interface CronSchedulerOptions {
 	wrap?: CronWrapConfig;
 	mirror?: MirrorConfig;
 	appender?: MirrorAppender;
-	/**
-	 * Extra activity probes (e.g. session-row freshness). The job stays alive
-	 * while ANY probe reports fresh activity — the freshest wins.
-	 */
-	extraProbes?: (job: CronJobRecord) => ReadonlyArray<InactivityProbe>;
 	tickLock?: TickLock;
 }
 
@@ -142,31 +130,17 @@ export interface CronServiceHandle {
 	inflightCount(): number;
 }
 
-/** Fastest-activity composite: min idle across probes (any liveness counts). */
-function compositeProbe(
-	probes: ReadonlyArray<InactivityProbe>,
-): InactivityProbe {
-	return {
-		secondsSinceActivity: (nowSeconds) =>
-			Math.min(...probes.map((p) => p.secondsSinceActivity(nowSeconds))),
-	};
-}
-
 export class CronScheduler {
 	private readonly store: CronJobStore;
 	private readonly runner: ScheduledJobRunner;
 	private readonly clock: CronClock;
 	private readonly log: CronLogger;
-	private readonly env: Record<string, string | undefined>;
 	private readonly intervalSeconds: number;
 	private readonly estopPath: string;
 	private readonly deliverySink: DeliverySink | undefined;
 	private readonly wrapConfig: CronWrapConfig | undefined;
 	private readonly mirrorConfig: MirrorConfig | undefined;
 	private readonly appender: MirrorAppender | undefined;
-	private readonly extraProbes:
-		| ((job: CronJobRecord) => ReadonlyArray<InactivityProbe>)
-		| undefined;
 	private readonly tickLock: TickLock;
 
 	private running = false;
@@ -181,7 +155,6 @@ export class CronScheduler {
 		this.runner = options.runner;
 		this.clock = options.clock ?? systemCronClock;
 		this.log = options.logger ?? stderrLogger();
-		this.env = options.env ?? process.env;
 		this.intervalSeconds =
 			options.intervalSeconds ?? DEFAULT_TICK_INTERVAL_SECONDS;
 		this.estopPath =
@@ -190,7 +163,6 @@ export class CronScheduler {
 		this.wrapConfig = options.wrap;
 		this.mirrorConfig = options.mirror;
 		this.appender = options.appender;
-		this.extraProbes = options.extraProbes;
 		this.tickLock =
 			options.tickLock ?? new TickLock(options.store.paths.cronDir);
 	}
@@ -294,27 +266,10 @@ export class CronScheduler {
 		}
 		const owner = claimed.fire_claim.by;
 
-		const limitSeconds = resolveInactivityLimitSeconds(this.env, (raw) => {
-			this.log.warn(
-				`Invalid HERMES_CRON_TIMEOUT=${JSON.stringify(raw)}; using default 600s`,
-			);
-		});
-		const activity = new TimestampActivityLog(this.clock.nowSeconds());
-		const probes: ReadonlyArray<InactivityProbe> = [
-			activity,
-			...(this.extraProbes?.(claimed) ?? []),
-		];
-
 		try {
-			const bound = await runWithInactivityBound({
-				exec: () =>
-					this.runner.run({
-						job: claimed,
-						activity,
-					}),
+			const bound = await runWithClaimHeartbeat({
+				exec: () => this.runner.run({ job: claimed }),
 				interrupt: () => this.runner.interrupt(jobId),
-				probe: probes.length === 1 ? probes[0]! : compositeProbe(probes),
-				limitSeconds,
 				clock: this.clock,
 				shouldAbort: async (now) => {
 					// Claim heartbeat doubles as the claim-loss detector: when
@@ -338,24 +293,6 @@ export class CronScheduler {
 					status: "claim_lost",
 					fastForwarded: entry.fastForwarded,
 					wroteResults: false,
-				};
-			}
-
-			if (bound.timedOut) {
-				const idle = bound.idleAtBreach ?? limitSeconds;
-				const error = `Cron job '${claimed.name}' timed out (inactivity): idle ${Math.round(idle)}s >= limit ${limitSeconds}s`;
-				this.log.error(error, { job_id: jobId });
-				const marked = await this.store.markJobRun(jobId, {
-					success: false,
-					status: "interrupted",
-					error,
-					expectedFireOwner: owner,
-				});
-				return {
-					jobId,
-					status: "interrupted",
-					fastForwarded: entry.fastForwarded,
-					wroteResults: marked,
 				};
 			}
 
