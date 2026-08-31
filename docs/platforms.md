@@ -50,7 +50,7 @@ Counted from each adapter's manifest (`transportShape`).
 | `photon`            | Photon                                 |
 | `yuanbao`           | Yuanbao bridge                         |
 
-### Webhook (9 = 8 surfaces + 1 reference)
+### Webhook (8 = 7 surfaces + 1 reference)
 
 | Surface           | Notes                                         |
 | ----------------- | --------------------------------------------- |

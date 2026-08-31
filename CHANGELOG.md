@@ -12,13 +12,43 @@ logged entry before implementation (DEC-026).
 
 ## [Unreleased]
 
-Nothing yet.
+### Removed
+
+Scope reduction to the chat-application bridge (DEC-070 in
+[../09-open-questions.md](../09-open-questions.md); owner-validated
+OVERENGINEERED and POTENTIALLY tiers from the feature-tier analysis):
+
+- Kanban task board + dispatcher, `/kanban` command, and completion
+  notifications (the DEC-057 dispatcher-lock machinery included).
+- Cron inactivity runaway bound (the HERMES_CRON_TIMEOUT hard interrupt);
+  cron CORE — scheduling, tick lock, durability, delivery-to-chat — stays.
+- Fleet self-update machinery (`pi_embedded/update`: plan/snapshot/apply/
+  restart-per-kind/verify/receipts/latest.json/prune), the `/update`
+  command, the SIGHUP hangup protection, and the pause-for-update handshake.
+- Non-chat protocol connectors: `a2a`, `raft`, `homeassistant`, `ntfy`.
+- Personal/local chat connectors: `whatsapp-personal`, `bluebubbles`
+  (`whatsapp-cloud` stays).
+- The async delegation durability rail + delegation-watcher (idle-gated
+  re-entry).
+- Recurring in-session `/loop` wakeups (the `/loop` command).
+- File-drop hooks + plugin discovery runtime (the command-registry hook
+  seam stays).
+- FTS full-text message search (`messages_fts`, trigram/CJK index, triggers,
+  rebuild machinery); the schema retreat is authorized and idempotent
+  (DEC-070).
+
+Platform census: 31 → 25 surfaces. The test suite re-baselined from 3096
+tests across 237 files to 2536 tests across 187 files — the removed tests
+belong to the removed features; green remains the invariant, not the count
+(DEC-070).
 
 ## [0.1.0] - 2026-08-27
 
 Initial public release: the complete gateway spine, the three reference
 adapters, security and multiplex, the embedded services and update pipeline,
-and the 31-surface platform census.
+and the 31-surface platform census. (The DEC-070 scope amendment above
+subsequently removed the update pipeline and trimmed the census to 25
+surfaces — see [Unreleased].)
 
 ### Added
 

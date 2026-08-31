@@ -11,7 +11,7 @@ the `.env` store, and adapters also read well-known env vars for
 authorization knobs (below).
 
 Config is read once at boot per watcher/service. There is no live reload in
-v0.1: SIGHUP is not a reload signal (DEC-013). Restart the gateway to apply
+v0.1 (DEC-013). Restart the gateway to apply
 changes; see [docs/operations.md](operations.md) for the takeover handshake
 that makes this cheap.
 

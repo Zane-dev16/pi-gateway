@@ -114,7 +114,7 @@ speak JSON-RPC/REST to the same process.
 ## Fidelity and the decision log
 
 Deviations from Hermes behavior require a logged DEC before implementation
-(DEC-026). The spec set and decision log (DEC-001…069) live at
+(DEC-026). The spec set and decision log (DEC-001…071) live at
 [../09-open-questions.md](../../09-open-questions.md).
 
 ## See also

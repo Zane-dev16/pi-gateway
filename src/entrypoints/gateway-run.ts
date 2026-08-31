@@ -193,7 +193,7 @@ export interface GatewayRunInput {
 	cron?: CronHosting;
 	/** Handoff queue watcher (stage 8). create() throws ⇒ loud degrade. */
 	handoffWatcher?: { create: () => HandoffWatcher };
-	/** Extra stage-8 entries from sibling subsystems (e.g. loop watchers). */
+	/** Extra stage-8 entries from sibling subsystems (embedded services beyond cron and the handoff watcher). */
 	extraWatchers?: readonly EmbeddedServiceEntry[];
 	/**
 	 * Reconnect backend for the failed-platform queue. Default re-runs the

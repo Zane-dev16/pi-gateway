@@ -67,7 +67,7 @@ The full walkthrough, including shutdown behavior and what each file is, is
 
 ## At a glance
 
-- 31 platform surfaces across three transport shapes: polling, persistent
+- 25 platform surfaces across three transport shapes: polling, persistent
   WebSocket, and webhook (DEC-002), all gated by one executable conformance
   suite (spec 04 §8).
 - Turn serialization that holds under contention: in-process guard layers +
@@ -83,8 +83,6 @@ The full walkthrough, including shutdown behavior and what each file is, is
 - Fail-closed security: scoped secrets, deny-by-default authorization,
   pairing, per-credential token locks, and signed webhooks (spec 06,
   DEC-003/009).
-- Transactional operations: plan → snapshot → apply → restart-per-kind →
-  verify → receipt; a mixed-version fleet is never "healthy" (spec 08 §8).
 
 ## Documentation
 
@@ -94,7 +92,7 @@ The full walkthrough, including shutdown behavior and what each file is, is
 | [docs/installation.md](docs/installation.md)   | Requirements, `PI_HOME` layout, profiles, service installation  |
 | [docs/configuration.md](docs/configuration.md) | Config vs secrets, authorization env vars, platform manifests   |
 | [docs/architecture.md](docs/architecture.md)   | Layers, turn lifecycle, invariants, embedded services           |
-| [docs/platforms.md](docs/platforms.md)         | The 31 supported surfaces and their transport shapes            |
+| [docs/platforms.md](docs/platforms.md)         | The 25 supported surfaces and their transport shapes            |
 | [docs/adding-a-platform.md](docs/adding-a-platform.md) | Build a new adapter and pass the conformance gate       |
 | [docs/operations.md](docs/operations.md)       | Signals, health, logs, takeover                                 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → fix for common failure modes              |
@@ -143,7 +141,7 @@ recorded in the decision log before implementation; zero sanctioned silent
 drift (DEC-026).
 
 The specification lives in the parent workspace: the normative document set
-starts at [../README.md](../README.md), and the decision log (DEC-001…069) is
+starts at [../README.md](../README.md), and the decision log (DEC-001…071) is
 [../09-open-questions.md](../09-open-questions.md). Citations in these docs
 such as "02 §5, DEC-004" refer to that set.
 
@@ -169,9 +167,12 @@ Dependencies flow downward only (`pi_home → pi_state → … → entrypoints`)
 
 ## Status
 
-v0.1.0: the full spine plus the 31-surface platform census is implemented and
-covered by 3096 behavior-contract tests across 237 files. See
-[CHANGELOG.md](CHANGELOG.md) for what shipped.
+v0.1.0 shipped the full spine plus the then-31-surface platform census; the
+DEC-070 scope amendment (2026-08-30) then removed the OVERENGINEERED and
+POTENTIALLY feature tiers, leaving the chat-app bridge: the 25-surface
+census is implemented and covered by 2536 behavior-contract tests across 187
+files. See [CHANGELOG.md](CHANGELOG.md) for what shipped and what was
+removed.
 
 ## Contributing, support, conduct
 

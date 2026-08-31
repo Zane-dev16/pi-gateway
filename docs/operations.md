@@ -90,8 +90,8 @@ Locks and the PID file are always released before a hard exit.
 
 ## Operational rules worth knowing
 
-- There is no live config reload (DEC-013). SIGHUP is not a reload signal;
-  restart via `--replace` to apply changes.
+- There is no live config reload (DEC-013). Restart via `--replace` to apply
+  changes; the process installs no SIGHUP handler.
 - The gateway ships no self-update machinery (DEC-070 scope amendment):
   stop the gateway, update with the package tooling you installed it from,
   then start it again.

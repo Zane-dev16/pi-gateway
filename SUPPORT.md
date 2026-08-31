@@ -1,7 +1,7 @@
 # Support
 
 Pi Gateway is a messaging gateway for the [pi coding agent](README.md) that
-turns chat traffic from 31 platforms into serialized agent turns. This file
+turns chat traffic from 25 platforms into serialized agent turns. This file
 explains where to get help and how to report problems well.
 
 ## Where to ask

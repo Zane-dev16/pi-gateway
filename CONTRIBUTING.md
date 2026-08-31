@@ -14,7 +14,7 @@ git clone <your fork>
 cd pi-gateway
 npm ci                # installs exact lockfile deps (includes better-sqlite3)
 npm run build         # tsc --noEmit, must be clean
-npm test              # full vitest suite (~3096 tests, 237 files)
+npm test              # full vitest suite (~2536 tests, 187 files)
 ```
 
 ## Test suite
