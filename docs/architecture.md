@@ -21,7 +21,7 @@ Dependencies flow downward only; `scripts/check-layering.mjs` enforces this
 ```
 entrypoints      'pi gateway run' composition root (DEC-058)
 pi_platforms     adapters + kit + conformance (never import the runner)
-pi_embedded      cron, handoff, update
+pi_embedded      cron, handoff
 pi_gateway       guards, streaming, obligations, registry, security
 pi_agent_core    worker pool, agent runner, cache, alternation repair
 pi_state         schema, leases, messages, usage, WAL ladder
@@ -121,5 +121,5 @@ Deviations from Hermes behavior require a logged DEC before implementation
 
 - [docs/platforms.md](platforms.md): the adapter census
 - [docs/adding-a-platform.md](adding-a-platform.md): extend the edges
-- [docs/operations.md](operations.md): run and update it
+- [docs/operations.md](operations.md): run it
 - [README.md](../README.md): project hub

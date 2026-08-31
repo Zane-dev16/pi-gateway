@@ -167,10 +167,13 @@ describe("duplicate-instance takeover across OS processes (01 §3.2)", () => {
 	}, 30_000);
 
 	it("SIGUSR1 drain-first restart: real process drains, classifies service_restart, EXITS 75", async () => {
-		// The fleet updater (pi_embedded/update/restart.ts) signals SIGUSR1 and
-		// expects the gateway to disappear during the drain window. Against the
-		// REAL runtime this requires a live SIGUSR1 listener — without one Node
-		// opens the inspector and the survivor takes SIGTERM ⇒ exit 1.
+		// In-band service-restart contract (run.py:restart_signal_handler
+		// parity). The fleet updater that automated this signal was removed
+		// under DEC-070 item 3, but the in-band restart itself stays: a
+		// supervisor or operator signals SIGUSR1 and expects the gateway to
+		// disappear during the drain window. Against the REAL runtime this
+		// requires a live SIGUSR1 listener — without one Node opens the
+		// inspector and the survivor takes SIGTERM ⇒ exit 1.
 		const procA = spawnDriver({
 			scenario: "hold-running-sigusr1",
 			home,
@@ -194,7 +197,7 @@ describe("duplicate-instance takeover across OS processes (01 §3.2)", () => {
 			expect(outcomeA["exitCode"]).toBe(75);
 			expect(outcomeA["persistedStopped"]).toBe(true);
 
-			// Ownership released: the replacer/updater can claim immediately.
+			// Ownership released: a replacer can claim immediately.
 			expect(getRunningPid(home)).toBeNull();
 		} finally {
 			if (!procA.killed && procA.exitCode === null) procA.kill("SIGKILL");

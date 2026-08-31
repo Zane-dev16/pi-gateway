@@ -102,10 +102,10 @@ export function persistsStopped(klass: ShutdownClass): boolean {
  * Signal classification parity of run.py:shutdown_signal_handler (+ its
  * sibling restart_signal_handler): the takeover marker is consumed FIRST
  * regardless of signal name; SIGINT is an intentional foreground stop by
- * definition; SIGUSR1 IS the in-band restart signal by definition (the pi
- * fleet updater drains gateways via SIGUSR1 first — 08 §7 — so it classifies
- * as service_restart and exits 75); otherwise the planned-stop marker
- * decides; a bare unmarked signal is UNEXPECTED.
+ * definition; SIGUSR1 IS the in-band restart signal by definition (a
+ * supervisor or operator signals it for a drain-first restart — 08 §7 — so
+ * it classifies as service_restart and exits 75); otherwise the planned-stop
+ * marker decides; a bare unmarked signal is UNEXPECTED.
  *
  * `signalName` null means a programmatic stop (treated like a marked stop).
  */

@@ -96,7 +96,7 @@ The full walkthrough, including shutdown behavior and what each file is, is
 | [docs/architecture.md](docs/architecture.md)   | Layers, turn lifecycle, invariants, embedded services           |
 | [docs/platforms.md](docs/platforms.md)         | The 31 supported surfaces and their transport shapes            |
 | [docs/adding-a-platform.md](docs/adding-a-platform.md) | Build a new adapter and pass the conformance gate       |
-| [docs/operations.md](docs/operations.md)       | Signals, health, logs, takeover, update pipeline                |
+| [docs/operations.md](docs/operations.md)       | Signals, health, logs, takeover                                 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → fix for common failure modes              |
 | [CHANGELOG.md](CHANGELOG.md)                   | Release history                                                 |
 | [CONTRIBUTING.md](CONTRIBUTING.md)             | Dev setup, test gates, divergence rule, platform checklist      |
@@ -161,7 +161,7 @@ pi-gateway/
     ├── pi_agent_core/  ← worker pool, agent runner, cache, alternation repair
     ├── pi_gateway/     ← guards, streaming, obligations, registry, security
     ├── pi_platforms/   ← adapters, kit, conformance suite
-    └── pi_embedded/    ← cron, handoff, update
+    └── pi_embedded/    ← cron, handoff
 ```
 
 Dependencies flow downward only (`pi_home → pi_state → … → entrypoints`);

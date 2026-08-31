@@ -21,13 +21,14 @@ import {
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count matches the hermes COMMAND_REGISTRY census exactly", () => {
 		// Pinned against /tmp/hermes-upstream hermes_cli/commands.py
-		// COMMAND_REGISTRY (99 CommandDef rows), reduced by TWO under the
+		// COMMAND_REGISTRY (99 CommandDef rows), reduced by THREE under the
 		// DEC-070 scope amendment: the recurring in-session /loop wakeup
-		// surface (row + persistence + wake watcher, item 6) and the kanban
-		// multi-agent task board (row + subcommands, item 1) were removed with
-		// owner validation. Adding/removing a row is still a conscious census
-		// change, never an accident.
-		expect(BUILTIN_COMMAND_ROWS).toHaveLength(97);
+		// surface (row + persistence + wake watcher, item 6), the kanban
+		// multi-agent task board (row + subcommands, item 1), and the /update
+		// self-update row (item 3) were removed with owner validation.
+		// Adding/removing a row is still a conscious census change, never an
+		// accident.
+		expect(BUILTIN_COMMAND_ROWS).toHaveLength(96);
 	});
 
 	it("every row validates against the CommandDef schema (registry accepts all)", () => {
@@ -89,10 +90,10 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {
 		for (const surface of ["cli", "gateway"] as const) {
 			const catalog = completionCatalog(rows, { surface });
-			// 80 completions before DEC-070 removed the /loop (item 6) and
-			// /kanban (item 1) rows; the catalog still derives purely from the
-			// surviving census (97 rows ⇒ 77 completion keys).
-			expect(catalog.commands.length).toBeGreaterThanOrEqual(77);
+			// 80 completions before DEC-070 removed the /loop (item 6), /kanban
+			// (item 1), and /update (item 3) rows; the catalog still derives
+			// purely from the surviving census (96 rows ⇒ 76 completion keys).
+			expect(catalog.commands.length).toBeGreaterThanOrEqual(76);
 			expect(catalog.commands).toContain("/new");
 			expect(catalog.commands).toContain("/reset");
 			expect(catalog.subcommands.get("/voice")).toEqual([
@@ -130,7 +131,7 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 	const registry = createBuiltinCommandRegistry();
 	const resolver = BusyResolver.fromLookup(registry.lookup());
 
-	it("all 99 canonical rows project into the guard feed with valid policies", () => {
+	it("all 96 surviving canonical rows project into the guard feed with valid policies", () => {
 		const guardRows = toGuardRows(BUILTIN_COMMAND_ROWS);
 		expect(guardRows).toHaveLength(BUILTIN_COMMAND_ROWS.length);
 		const lookup = buildBusyLookup(guardRows);
@@ -153,7 +154,7 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 			expect(VALID_BUSY_POLICIES.has(policy as string)).toBe(true);
 			checked += 1;
 		}
-		expect(checked).toBeGreaterThan(110); // 99 names + aliases
+		expect(checked).toBeGreaterThan(110); // 96 names + aliases
 	});
 
 	it("interrupt-class routing covers the /stop, /new cancel-handoff class", () => {

@@ -47,11 +47,8 @@ and the 31-surface platform census.
   reason-coded denials, pairing handshake, per-credential token locks with
   stale detection, signed webhooks with explicit trust boundaries (spec 06
   §2–§8, DEC-017), and per-profile multiplex scoping.
-- Embedded services and updates: cron ticker, DB claim/re-bind/replay
-  handoff watcher (DEC-008), observer vs decision-bearing hooks (DEC-014),
-  durable idle-gated delegation rail (DEC-018), and the transactional update
-  pipeline (plan, snapshot, apply, fleet-wide drain-first restart, verify,
-  receipt) that fails closed on a stale fleet (spec 08 §5–§10).
+- Embedded services: cron ticker and the DB claim/re-bind/replay handoff
+  watcher (DEC-008).
 - Platform census: 31 surfaces shipped across the three transport shapes
   (7 polling, 13 WebSocket, 11 webhook), each passing all applicable
   conformance rows with zero deferred; `dingtalk` is an explicit, documented

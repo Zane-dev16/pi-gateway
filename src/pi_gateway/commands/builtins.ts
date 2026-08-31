@@ -761,12 +761,6 @@ export const BUILTIN_COMMAND_ROWS: readonly CommandDef[] = [
 		argsHint: "<path>",
 	},
 	{
-		name: "update",
-		description: "Update Hermes Agent to the latest version",
-		category: "Info",
-		busyPolicy: "dispatch",
-	},
-	{
 		name: "version",
 		description: "Show Hermes Agent version",
 		category: "Info",

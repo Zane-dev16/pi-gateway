@@ -91,8 +91,9 @@ async function holdRunning(): Promise<Record<string, unknown>> {
 
 /**
  * SIGUSR1 drain-first restart contract (run.py:restart_signal_handler parity):
- * the updater signals SIGUSR1, the gateway drains gracefully and EXITS with
- * the service-restart code 75 — never opening Node's inspector and never
+ * an in-band SIGUSR1 (supervisor/operator initiated since the fleet updater's
+ * removal under DEC-070 item 3) makes the gateway drain gracefully and EXIT
+ * with the service-restart code 75 — never opening Node's inspector and never
  * needing the SIGTERM escalation.
  */
 async function holdRunningSigusr1(): Promise<Record<string, unknown>> {

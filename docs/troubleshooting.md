@@ -56,7 +56,6 @@ see [docs/operations.md](operations.md).
 | Exit code 75, logs mention loop liveness    | The event loop froze; the watchdog dumped all thread stacks and exited for a supervisor restart (spec 08 §1.3). Bring the stack dump + `logs/gateway-shutdown-watchdog.log` |
 | Exit code 1 after "shutdown watchdog"       | The drain wedged past its budget; stack dump is in the watchdog log          |
 | `gateway-shutdown-diag.log` exists          | An unexpected external signal killed the gateway; the forensics probe recorded who/what (spec 08 §1.3) |
-| Gateway restarts after every `git pull`     | Intended: update runs are restart-per-kind and verify fleet versions; a stale gateway fails verification with exit 1 (spec 08 §8) |
 
 ## Where to look
 
@@ -67,7 +66,6 @@ see [docs/operations.md](operations.md).
 ├── logs/errors.log           # reason codes (start here)
 ├── logs/agent.log            # full activity
 ├── logs/gateway.log          # gateway-scoped records
-├── logs/update_receipts/     # JSON receipt per update run
 └── pending_messages/         # shutdown-flush recovery files
 ```
 
@@ -80,7 +78,7 @@ issue per [SUPPORT.md](../SUPPORT.md).
 
 ## See also
 
-- [docs/operations.md](operations.md): signals, backstops, updates
+- [docs/operations.md](operations.md): signals, backstops
 - [docs/configuration.md](configuration.md): policies and allowlists
 - [docs/installation.md](installation.md): layout and requirements
 - [README.md](../README.md): project hub

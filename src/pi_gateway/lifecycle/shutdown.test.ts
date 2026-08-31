@@ -22,7 +22,6 @@ import {
 	classifySignalForSelf,
 	cleanShutdownMarkerPath,
 	executeDrain,
-	incrementRestartFailureCounts,
 	readRestartFailureCounts,
 	writeCleanShutdownMarker,
 	normalizePendingPayload,
@@ -89,8 +88,10 @@ describe("signal classification (run.py:shutdown_signal_handler parity)", () => 
 	});
 
 	it("SIGUSR1 IS an in-band restart by definition ⇒ service_restart (exit 75)", () => {
-		// run.py:restart_signal_handler parity — the fleet updater drains
-		// gateways with SIGUSR1 first (08 §7); it must NEVER read as unexpected.
+		// run.py:restart_signal_handler parity — a supervisor or operator
+		// signals SIGUSR1 for a drain-first restart (08 §7); it must NEVER read
+		// as unexpected. (Surviving lifecycle contract after the fleet
+		// self-update machinery itself was removed under DEC-070 item 3.)
 		expect(classifySignalForSelf(home, "SIGUSR1")).toBe("service_restart");
 	});
 
@@ -449,6 +450,10 @@ describe("notify + pre-drain resume-pending phases (run.py:_stop_impl_body)", ()
 
 describe("SIGUSR1 in-band restart (restart_signal_handler parity)", () => {
 	it("handleSignal(SIGUSR1) drives the graceful drain to class service_restart / exit 75", async () => {
+		// (Surviving lifecycle contract after the fleet self-update machinery
+		// was removed under DEC-070 item 3: the in-band restart signal itself
+		// stays — a supervisor or operator can still request a drain-first
+		// restart; only the updater that automated it went.)
 		const lifecycle = runningLifecycle();
 		await lifecycle.startup();
 
@@ -773,7 +778,16 @@ describe("cron drain out of stop_ingress (#82161/#60432)", () => {
 		// config can never push the hard-exit boundary out (timer consistency).
 		expect(exits).toEqual([SHUTDOWN_EXIT_CODES.unexpected_signal]);
 		const raw = readFileSync(shutdownWatchdogDumpPath(home), "utf8");
-		const record = JSON.parse(raw.trim()) as Record<string, unknown>;
+		// The dump is machine-written; parse guarded so a malformed dump fails
+		// with the offending content instead of a bare parse exception.
+		let record: Record<string, unknown>;
+		try {
+			record = JSON.parse(raw.trim()) as Record<string, unknown>;
+		} catch (err) {
+			throw new Error(
+				`shutdown watchdog dump was not valid JSON (${String(err)}): ${raw.slice(0, 200)}`,
+			);
+		}
 		const snapshot = record["snapshot"] as Record<string, unknown>;
 		// active_cron_jobs parity: the post-mortem sees the stuck tick.
 		expect(snapshot["cron_jobs"]).toBe(1);

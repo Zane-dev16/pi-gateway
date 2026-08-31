@@ -1,7 +1,7 @@
 # Installation
 
-How to install Pi Gateway, where its state lives, and how to keep it updated.
-For a five-minute first run, start with [docs/quickstart.md](quickstart.md).
+How to install Pi Gateway and where its state lives. For a five-minute first
+run, start with [docs/quickstart.md](quickstart.md).
 
 ## Requirements
 
@@ -70,7 +70,7 @@ One home owns:
 ├── gateway_state.json      # runtime status snapshot (spec 08 §4)
 ├── state/gateway.heartbeat # loop-liveness heartbeat, rewritten every 30s
 ├── config + .env store     # behavior config + secrets (see configuration doc)
-├── logs/                   # agent.log, errors.log, gateway.log, update.log
+├── logs/                   # agent.log, errors.log, gateway.log
 ├── cron/                   # embedded-service state and locks
 └── pending_messages/       # shutdown-flush recovery files (spec 08 §1.3)
 ```
@@ -99,21 +99,12 @@ service manager. Semantics that matter for unit files (spec 08 §1–§2):
   hard-exits at drain-budget + 60s after dumping all thread stacks
   (spec 08 §1.3).
 
-## Deployment kinds and updates
+## Updating
 
-The updater does not fight deployment models it does not own (spec 08 §5):
-
-| Install kind              | Update behavior                                                            |
-| ------------------------- | -------------------------------------------------------------------------- |
-| pi package (`npm:`/`git:`) | `pi update --extensions` / `pi install <source>@<ref>` (pi reconciles)     |
-| git checkout (linked dev) | in-place pull, the only in-place kind                                      |
-| docker / nix / apt        | prints the right external command and exits 1 before mutating anything     |
-
-Updates themselves are transactional: plan → snapshot → apply →
-restart-per-kind → verify → receipt. A mixed-version fleet fails verification
-with exit 1 rather than reporting healthy (spec 08 §8). Receipts land in
-`logs/update_receipts/`. Details and operator procedures:
-[docs/operations.md](operations.md).
+The gateway ships no self-update machinery (DEC-070 scope amendment): update
+it with the package tooling you installed it from — `pi install <source>@<ref>`
+for the npm/git package, an in-place `git pull` for a linked dev checkout.
+Stop the gateway (graceful drain), apply the update, then start it again.
 
 ## Uninstall
 
@@ -131,5 +122,5 @@ only if you do not need session history, pairing grants, or cron jobs.
 
 - [docs/quickstart.md](quickstart.md): first run
 - [docs/configuration.md](configuration.md): config, secrets, profiles
-- [docs/operations.md](operations.md): signals, health, updates
+- [docs/operations.md](operations.md): signals, health, backstops
 - [README.md](../README.md): project hub

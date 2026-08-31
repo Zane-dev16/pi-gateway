@@ -1528,11 +1528,11 @@ export class GatewayLifecycle {
 	/**
 	 * Install SIGTERM/SIGINT/SIGUSR1 handlers driving handleSignal (parity of
 	 * the loop.add_signal_handler wiring in run.py:start_gateway — including
-	 * `loop.add_signal_handler(SIGUSR1, restart_signal_handler)` so the update
-	 * flow's drain-first SIGUSR1 works against the REAL process; without a
-	 * listener Node would open the inspector instead of draining).
-	 * SIGHUP is deliberately NOT handled: it is not a reload signal (DEC-013),
-	 * and Hermes installs SIGHUP→SIG_IGN only around update runs (Phase 5 scope).
+	 * `loop.add_signal_handler(SIGUSR1, restart_signal_handler)` so a supervisor
+	 * or operator signaling it in-band gets the drain-first service restart
+	 * (exit 75) against the REAL process; without a listener Node would open
+	 * the inspector instead of draining).
+	 * SIGHUP is deliberately NOT handled: it is not a reload signal (DEC-013).
 	 */
 	installSignalHandlers(): void {
 		process.on("SIGTERM", () => this.handleSignal("SIGTERM"));
@@ -1540,8 +1540,8 @@ export class GatewayLifecycle {
 		try {
 			process.on("SIGUSR1", () => this.handleSignal("SIGUSR1"));
 		} catch {
-			/* platform without SIGUSR1 support — drain-first restart degrades to
-			   the updater's SIGTERM escalation (08 §7 stop-after-window). */
+			/* platform without SIGUSR1 support — in-band service-restart requests
+			   degrade to a SIGTERM drain (08 §7 stop-after-window). */
 		}
 	}
 

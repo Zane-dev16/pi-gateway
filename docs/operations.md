@@ -1,8 +1,8 @@
 # Operations
 
-Running Pi Gateway day to day: lifecycle, health, logs, takeover, and the
-update pipeline. Spec 08 (Operations) specifies this behavior with parity
-anchors; the citations below refer to that document and the DEC log.
+Running Pi Gateway day to day: lifecycle, health, logs, and takeover. Spec
+08 (Operations) specifies this behavior with parity anchors; the citations
+below refer to that document and the DEC log.
 
 ## Starting and stopping
 
@@ -51,8 +51,8 @@ marker can't be used, startup fails without griefing an unrelated process.
 - `gateway_state.json` under `PI_HOME` is rewritten on every status
   transition. It records pid, argv, start time, state
   (`starting | running | draining | stopped …`), active agent count,
-  per-platform connection state, and the `code_sha`/`code_version` stamps the
-  update pipeline verifies against (spec 08 §4).
+  per-platform connection state, and the `code_sha`/`code_version` stamps of
+  the running code (spec 08 §4).
 - `state/gateway.heartbeat` is rewritten every 30s. A stale mtime means the
   process is alive but the loop is frozen, which is the external monitor's
   signal.
@@ -71,8 +71,6 @@ Under `PI_HOME/logs/` (spec 08 §3):
 | `agent.log`        | INFO+ catch-all: all agent/tool/session activity                         |
 | `errors.log`       | WARNING+ with reason codes (authz denials, lease loss, retries); the first triage stop |
 | `gateway.log`      | gateway-scoped records only                                              |
-| `update.log`       | stdout/stderr mirror of update runs                                      |
-| `update_receipts/` | one JSON receipt per update run + `latest.json`                          |
 
 All handlers rotate (~5 MiB), share one redacting formatter, and every
 denial/retry/fallback logs a machine-parsable reason code.
@@ -90,39 +88,13 @@ Three independent backstops (spec 08 §1.3):
 
 Locks and the PID file are always released before a hard exit.
 
-## Updates
-
-The update pipeline is transactional (spec 08 §8):
-
-```
-plan → snapshot → apply → restart-per-kind → verify → receipt
-```
-
-- The plan step inventories runtimes and refuses non-in-place kinds
-  (docker/nix/apt) with the right external command and exit 1 before mutating
-  anything.
-- The snapshot step writes per-profile state snapshots (identical critical
-  set, 1 GiB per-file cap, keep policy floors at 1) for file-loss recovery,
-  not code rollback.
-- Restart is fleet-wide and drain-first: every gateway unit on the host
-  restarts, not just the invoking profile. Surviving siblings on stale code
-  were historically the largest repeat-bug class.
-- Verify reads each live gateway's stamped `code_sha`; any provably stale
-  gateway fails the run as `partial` with exit 1. Mixed-version is never
-  "healthy".
-- Receipts are written on every terminal path, including refusals and
-  exceptions.
-
-During updates the updater may pause gateways with a reversible drain marker
-(pause-for-update) instead of tree-killing anything (spec 08 §10).
-
 ## Operational rules worth knowing
 
 - There is no live config reload (DEC-013). SIGHUP is not a reload signal;
-  restart via `--replace` to apply changes. Update runs install hangup
-  protection so package children survive terminal loss (DEC-042).
-- Process identity is never guessed from argv substrings. Only canonical,
-  parser-derived matchers count (spec 08 §9).
+  restart via `--replace` to apply changes.
+- The gateway ships no self-update machinery (DEC-070 scope amendment):
+  stop the gateway, update with the package tooling you installed it from,
+  then start it again.
 - Token locks: a unique credential (e.g. one bot token) can be held by
   exactly one adapter. Contention is a fatal connect error naming the holder
   profile and PID (spec 06 §5).
