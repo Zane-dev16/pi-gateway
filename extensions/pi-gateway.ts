@@ -12,12 +12,10 @@
  * second process; `PI_GATEWAY_AUTO_START=1` opts into auto-start.
  */
 
-// pi types resolve at runtime via the host pi installation (jiti); local tsc
-// gets them through the peerDependency. The // @ts-expect-error keeps a bare
-// `npm ci` tree (which omits peer deps) green — pi's own loader still
-// resolves the module.
-// @ts-expect-error: pi host provides this at runtime
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// pi types resolve at runtime via the host pi installation (jiti); tsc gets
+// them through the peerDependency branch that npm ci installs (package-lock
+// was aligned with package.json's peerDependencies in 71999d4).
+import type { ExtensionAPI, ExtensionCommandContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { composeGatewayLifecycle, type ComposedGateway } from "../src/entrypoints/gateway-run.js";
 
 export default function piGatewayExtension(pi: ExtensionAPI) {
@@ -59,20 +57,20 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 		return "gateway stopped";
 	}
 
-	pi.on("session_start", async (_event: unknown, ctx: { ui: { notify: (msg: string, level: string) => void } }) => {
+	pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
 		if (process.env.PI_GATEWAY_AUTO_START === "1") {
 			const msg = await startGateway();
 			ctx.ui.notify(msg, msg.startsWith("gateway running") ? "info" : "warning");
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event: SessionShutdownEvent) => {
 		if (gateway) await stopGateway();
 	});
 
 	pi.registerCommand("gateway", {
 		description: "pi-gateway — status / start / stop (Hermes parity, pi host loop)",
-		handler: async (args: string, ctx: { ui: { notify: (msg: string, level: string) => void } }) => {
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const sub = args.trim().split(/\s+/)[0] ?? "";
 			if (sub === "start") {
 				const home = args.trim().split(/\s+/)[1];
