@@ -26,6 +26,7 @@ export {
 	createAgentSession,
 	DefaultResourceLoader,
 	ModelRuntime,
+	resolveCliModel,
 	SessionManager,
 	SettingsManager,
 	defineTool,
