@@ -501,6 +501,26 @@ export class AdapterSessionGuard {
 			return;
 		}
 
+		// DEC-076 session-key backfill: production transport paths derive the
+		// key at the ingress seam (matrix sessionKeyOf over the chat) and
+		// pass it ONLY as the arg — TurnContext never carries it — while the
+		// production handler reads it SOLELY from metadata. Harness
+		// deliverInbound stamps it; the transport lane never did, so
+		// production turns derived "" → skipped the sessions-row ensure →
+		// FOREIGN KEY failure on the messages append. Backfill HERE, after
+		// the misrouting drop (a forged non-empty mismatch still drops) and
+		// stamp-only-when-empty (a matching forged key is untouched), so
+		// every downstream lane sees the key its ingress was derived for.
+		if (
+			sessionKey !== "" &&
+			String((event.metadata ?? {})["gateway_session_key"] ?? "").trim() === ""
+		) {
+			event.metadata = {
+				...(event.metadata ?? {}),
+				gateway_session_key: sessionKey,
+			};
+		}
+
 		// On-entry self-heal (§3.3) BEFORE the busy check.
 		if (this.activeSessions.has(sessionKey)) {
 			this.healStaleSessionLock(sessionKey);

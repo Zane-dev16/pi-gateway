@@ -14,7 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MatrixAdapterCore } from "../pi_platforms/matrix/matrix-adapter.js";
-import { FakeMatrixHomeserver } from "../pi_platforms/matrix/matrix-fake-server.js";
+import {
+	FakeMatrixHomeserver,
+	type MatrixTimelineEvent,
+} from "../pi_platforms/matrix/matrix-fake-server.js";
 import { TelegramAdapter } from "../pi_platforms/telegram/telegram-adapter.js";
 import { TelegramBotApiFake } from "../pi_platforms/telegram/telegram-fake-server.js";
 import { buildSessionKey } from "../pi_gateway/resolution/session-key.js";
@@ -439,5 +442,164 @@ describe("default reconnect backend re-wires before connect (DEC-074)", () => {
 				nextRetryAt: 0,
 			}),
 		).toBe(false);
+	});
+});
+
+describe("production session-key backfill (DEC-076)", () => {
+	// Production Matrix turns died with `SqliteError: FOREIGN KEY constraint
+	// failed` because the transport lane (sync → dispatchOrHold →
+	// handleIngress) passes the derived key ONLY as the arg while the
+	// production handler reads it SOLELY from
+	// `event.metadata["gateway_session_key"]` — which only the harness lane
+	// `deliverInbound` stamped. These contracts drive ingress WITHOUT
+	// `deliverInbound` against an FK-ENFORCING store (production sqlite
+	// builds carry DEFAULT_FOREIGN_KEYS, pinned below): the turn must reach
+	// the model and persist session+message rows, never the FK error notice.
+	// Production key shape is matrix-adapter.ts:sessionKeyOf (`mx:<chatId>`).
+	const prodKey = `mx:${ROOM}`;
+
+	function attachProduction(
+		adapter: MatrixAdapterCore,
+		h: RunnerHarness,
+		replies: string[],
+		seen?: Array<Record<string, unknown> | undefined>,
+	) {
+		const inner = buildProductionMessageHandler({
+			runner: h.runner,
+			store: h.store,
+		});
+		return tryAttachProductionGuard(adapter, {
+			registry: toGuardRegistry(createBuiltinCommandRegistry().rows()),
+			messageHandler: async (event, ctx) => {
+				seen?.push(event.metadata);
+				return inner(event, ctx);
+			},
+			sendReply: async (_chatId, text) => {
+				replies.push(text);
+			},
+		});
+	}
+
+	function sessionRow(h: RunnerHarness, key: string) {
+		return h.store.db
+			.prepare("SELECT id, source FROM sessions WHERE id = ?")
+			.get(key) as { id: string; source: string } | undefined;
+	}
+
+	function userMessageRow(h: RunnerHarness, key: string) {
+		return h.store.db
+			.prepare(
+				"SELECT session_id, role FROM messages WHERE session_id = ? AND role = 'user'",
+			)
+			.get(key) as { session_id: string; role: string } | undefined;
+	}
+
+	it("transport ingress (sync → dispatchOrHold, never deliverInbound) reaches the model and persists rows", async () => {
+		setEnv({ MATRIX_ALLOWED_USERS: HUMAN });
+		harness = await createRunnerHarness({ withTurnLeases: true });
+		const h = harness;
+		h.faux.setResponses([fauxAssistantMessage("TRANSPORT-OK")]);
+		// Precondition pin: the bug only bites with FK enforcement ON.
+		expect(
+			(
+				h.store.db.prepare("PRAGMA foreign_keys").get() as {
+					foreign_keys: number;
+				}
+			).foreign_keys,
+		).toBe(1);
+
+		const hs = new FakeMatrixHomeserver();
+		const adapter = new MatrixAdapterCore({
+			hs,
+			secretReader: hostedSecrets(),
+			freeRooms: new Set([ROOM]),
+			syncLongPollTimeoutMs: 25,
+		});
+		const replies: string[] = [];
+		expect(attachProduction(adapter, h, replies)).toBe(true);
+		try {
+			expect(await adapter.connect({ isReconnect: false })).toBe(true);
+			await waitFor(() => adapter.polledOnce);
+			hs.pushRoomMessage(ROOM, HUMAN, {
+				msgtype: "m.text",
+				body: "hello-transport",
+			});
+			await waitFor(() => replies.length > 0);
+			// The faux model answered — the turn ran PAST the user-row
+			// append where production died pre-fix (FK error notice).
+			expect(replies).toEqual(["TRANSPORT-OK"]);
+			expect(h.faux.state.callCount).toBe(1);
+			expect(sessionRow(h, prodKey)?.id).toBe(prodKey);
+			expect(sessionRow(h, prodKey)?.source).toBe("gateway");
+			expect(userMessageRow(h, prodKey)?.session_id).toBe(prodKey);
+		} finally {
+			await adapter.disconnect();
+		}
+	});
+
+	it("unstamped build output gains the ingress key at the guard seam (fallback pinned)", async () => {
+		setEnv({ MATRIX_ALLOWED_USERS: HUMAN });
+		harness = await createRunnerHarness({ withTurnLeases: true });
+		const h = harness;
+		h.faux.setResponses([fauxAssistantMessage("FALLBACK-OK")]);
+
+		const hs = new FakeMatrixHomeserver();
+		const adapter = new MatrixAdapterCore({
+			hs,
+			secretReader: hostedSecrets(),
+			freeRooms: new Set([ROOM]),
+		});
+		// Post-whoami state without opening the sync loop (this contract
+		// pins build+ingress, not transport polling).
+		adapter.ownUserId = "@pi-bot:fake.example";
+		const replies: string[] = [];
+		const seen: Array<Record<string, unknown> | undefined> = [];
+		expect(attachProduction(adapter, h, replies, seen)).toBe(true);
+
+		const raw: MatrixTimelineEvent = {
+			eventId: "$fallback1",
+			roomId: ROOM,
+			sender: HUMAN,
+			originServerTsMs: Date.now(),
+			type: "m.room.message",
+			content: { msgtype: "m.text", body: "hello-fallback" },
+			seq: 1,
+		};
+		const built = await adapter.buildIncomingFromRoomEvent(raw);
+		if (built === null) throw new Error("transport build filtered the event");
+		// Production build shape: NO stamped key (the gap DEC-076 closes
+		// downstream at the guard — not in the adapter build).
+		expect(String((built.metadata ?? {})["gateway_session_key"] ?? "")).toBe(
+			"",
+		);
+
+		// dispatchOrHold/redispatchHeldInbound call shape: key ONLY as arg.
+		await adapter.handleIngress(built, prodKey);
+		await waitFor(() => replies.length > 0);
+		expect(replies).toEqual(["FALLBACK-OK"]);
+		// The handler saw the ingress key through metadata (fallback).
+		expect(String((seen[0] ?? {})["gateway_session_key"] ?? "")).toBe(prodKey);
+		expect(sessionRow(h, prodKey)?.id).toBe(prodKey);
+		expect(userMessageRow(h, prodKey)?.session_id).toBe(prodKey);
+	});
+
+	it("harness deliverInbound keeps its stamped key (no behavior change)", async () => {
+		setEnv({ MATRIX_ALLOWED_USERS: HUMAN });
+		harness = await createRunnerHarness({ withTurnLeases: true });
+		const h = harness;
+		h.faux.setResponses([fauxAssistantMessage("HARNESS-OK")]);
+
+		const adapter = makeMatrixAdapter();
+		const replies: string[] = [];
+		const seen: Array<Record<string, unknown> | undefined> = [];
+		expect(attachProduction(adapter, h, replies, seen)).toBe(true);
+
+		const key = matrixKey(HUMAN);
+		await adapter.deliverInbound(matrixEvent(HUMAN, "hello-harness"), key);
+		await waitFor(() => replies.length > 0);
+		expect(replies).toEqual(["HARNESS-OK"]);
+		// The backfill is a no-op over a matching stamped key.
+		expect(String((seen[0] ?? {})["gateway_session_key"] ?? "")).toBe(key);
+		expect(sessionRow(h, key)?.id).toBe(key);
 	});
 });
