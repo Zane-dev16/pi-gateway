@@ -64,6 +64,7 @@ import {
 } from "../pi_gateway/obligations/index.js";
 import { kitScopedSecretReader } from "../pi_gateway/security/secretscope/wrapper.js";
 import { extractHolderPid } from "../pi_state/leases.js";
+import type { StateStore } from "../pi_state/index.js";
 import type { Database } from "better-sqlite3";
 
 import {
@@ -74,9 +75,19 @@ import {
 	type DrainHooks,
 	type Logger,
 	type ReconnectHooks,
+	type StageContext,
 } from "../pi_gateway/lifecycle/index.js";
 import type { TimerPort } from "../pi_gateway/lifecycle/watchdog.js";
 import type { CommandRegistry } from "../pi_gateway/commands/registry.js";
+import type { CommandRegistry as GuardCommandRegistry } from "../pi_gateway/guards/index.js";
+import {
+	buildAdapterSendReply,
+	buildProductionMessageHandler,
+	toGuardRegistry,
+	tryAttachProductionGuard,
+	type ChatTurnRunner,
+	type TurnRunnerFactory,
+} from "./guard-wiring.js";
 
 import type {
 	EmbeddedServiceEntry,
@@ -228,6 +239,17 @@ export interface GatewayRunInput {
 	selfPid?: number;
 	/** Command-registry override (engine default builds the shipped set). */
 	commandRegistry?: CommandRegistry;
+	/**
+	 * Production turn-runner factory (DEC-074 guard wiring). Stage 9 calls
+	 * it ONCE per process with the lifecycle-owned stage-6 store, then
+	 * attaches every hosted adapter's guard with the composed production
+	 * messageHandler (session-ensure → authz → runner turn). A factory —
+	 * not an instance — because the store does not exist at composition
+	 * time. Absent ⇒ adapters connect unwired (today's behavior) with a
+	 * loud guard_unwired line; ingress then keeps the explicit `no guard
+	 * attached` throw contract.
+	 */
+	turnRunnerFactory?: TurnRunnerFactory;
 	/** Host hook after READY, before parking on shutdown (see StartupOkHook). */
 	onStartupOk?: StartupOkHook;
 }
@@ -247,6 +269,13 @@ interface DerivedAdapters {
 	entries: AdapterEntry[];
 	/** Platforms whose adapter reported a successful connect (drain filter). */
 	connected: Set<string>;
+	/**
+	 * Re-wire the memoized production guard onto a FRESH adapter instance
+	 * (reconnect path). TRUE when wired; FALSE when stage 9 never
+	 * established wiring (no runner / no registry) or the surface exposes
+	 * no guard slot — the reconnect then proceeds exactly as today.
+	 */
+	rewireAdapter(platform: string, adapter: unknown): boolean;
 }
 
 function stderrLogger(): Logger {
@@ -360,9 +389,134 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 		return { ok: false, retryable: true, reason: message };
 	};
 
-	/** construct → connect({isReconnect:false}) → stoppable disconnect handle. */
+	/**
+	 * DEC-074 production guard wiring (one runner + one handler per process
+	 * — Hermes one-runner parity). The turnRunnerFactory runs ONCE against
+	 * the first stage-9 store; the composed handler + registry memoize for
+	 * reconnect re-wiring. Factory-bind was rejected: factories run before
+	 * the stage-8 frozen registry exists and take no arguments.
+	 */
+	let runnerPromise: Promise<ChatTurnRunner | null> | null = null;
+	let wiredBase: {
+		registry: GuardCommandRegistry;
+		messageHandler: ReturnType<typeof buildProductionMessageHandler>;
+	} | null = null;
+
+	const getRunner = (
+		store: StateStore | null,
+	): Promise<ChatTurnRunner | null> => {
+		if (runnerPromise !== null) return runnerPromise;
+		runnerPromise = (async () => {
+			if (input.turnRunnerFactory === undefined) return null;
+			try {
+				return await input.turnRunnerFactory({ store });
+			} catch (err) {
+				log.error(
+					"production turn runner factory failed — adapters stay unwired",
+					{
+						reason_code: "guard_unwired",
+						error: err instanceof Error ? err.message : String(err),
+					},
+				);
+				return null;
+			}
+		})();
+		return runnerPromise;
+	};
+
+	const wireProductionGuard = async (
+		platform: string,
+		adapter: unknown,
+		ctx: StageContext,
+	): Promise<void> => {
+		if (input.turnRunnerFactory === undefined) {
+			log.warn(
+				`platform adapter ${platform} connected without a turn runner — ingress stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+			return;
+		}
+		if (ctx.commands === null) {
+			log.warn(
+				`platform adapter ${platform} connected without a command registry — ingress stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+			return;
+		}
+		const runner = await getRunner(ctx.store);
+		if (runner === null) return; // factory failure already logged loudly
+		const sendReply = buildAdapterSendReply(adapter);
+		if (sendReply === null) {
+			log.warn(
+				`platform adapter ${platform} exposes no text egress — ingress stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+			return;
+		}
+		let base = wiredBase;
+		if (base === null) {
+			// The stage-8 registry is the frozen CLASS; the guard
+			// consumes row snapshots (guards/busy-policy.ts:
+			// CommandRegistry = readonly CommandDef[]) — toGuardRegistry
+			// projects THE registry without a hand-built list (07 §9).
+			base = {
+				registry: toGuardRegistry(ctx.commands.rows()),
+				messageHandler: buildProductionMessageHandler({
+					runner,
+					...(ctx.store !== null ? { store: ctx.store } : {}),
+					log,
+				}),
+			};
+			wiredBase = base;
+		}
+		if (
+			!tryAttachProductionGuard(adapter, {
+				registry: base.registry,
+				messageHandler: base.messageHandler,
+				sendReply,
+			})
+		) {
+			log.warn(
+				`platform adapter ${platform} exposes no guard slot — ingress stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+			return;
+		}
+		log.info(`platform adapter ${platform} guard wired`, {
+			platform,
+		});
+	};
+
+	/** Re-wire the memoized guard onto a fresh reconnect instance. */
+	const rewireAdapter = (platform: string, adapter: unknown): boolean => {
+		if (wiredBase === null) return false;
+		const sendReply = buildAdapterSendReply(adapter);
+		if (sendReply === null) {
+			log.warn(
+				`platform adapter ${platform} reconnect exposes no text egress — reconnect stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+			return false;
+		}
+		const ok = tryAttachProductionGuard(adapter, {
+			registry: wiredBase.registry,
+			messageHandler: wiredBase.messageHandler,
+			sendReply,
+		});
+		if (ok)
+			log.info(`platform adapter ${platform} guard re-wired`, { platform });
+		else
+			log.warn(
+				`platform adapter ${platform} reconnect exposes no guard slot — reconnect stays unwired`,
+				{ reason_code: "guard_unwired", platform },
+			);
+		return ok;
+	};
+
+	/** construct → wire handlers → connect({isReconnect:false}) → stoppable disconnect handle. */
 	const startOne = async (
 		hosting: PlatformHosting,
+		ctx: StageContext,
 	): Promise<AdapterStartOutcome> => {
 		let adapter: unknown;
 		try {
@@ -381,6 +535,23 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 				degraded: true,
 				reason: `adapter for ${hosting.platform} exposes no connect()`,
 			};
+		}
+		// DEC-074: wire the production guard BEFORE connect (Hermes
+		// _create_adapter parity: handler attached at creation, never
+		// after). Wiring NEVER fails the entry — a skip degrades to
+		// today's unwired behavior loudly (the `no guard attached` throw
+		// stays the explicit unwired signal).
+		try {
+			await wireProductionGuard(hosting.platform, adapter, ctx);
+		} catch (err) {
+			log.warn(
+				`platform adapter ${hosting.platform} guard wiring failed — connecting unwired`,
+				{
+					reason_code: "guard_unwired",
+					platform: hosting.platform,
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
 		}
 		try {
 			const okFlag = await surface.connect({ isReconnect: false });
@@ -407,7 +578,7 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 
 	const entries: AdapterEntry[] = platforms.map((hosting) => ({
 		platform: hosting.platform,
-		async start(): Promise<AdapterStartOutcome> {
+		async start(ctx: StageContext): Promise<AdapterStartOutcome> {
 			await ensureRegistered();
 			const missing = firstMissingSecret(hosting.manifest, secrets);
 			if (missing !== null) {
@@ -417,20 +588,26 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 					reason: `secret_missing:${missing}`,
 				};
 			}
-			return startOne(hosting);
+			return startOne(hosting, ctx);
 		},
 	}));
 
-	return { entries, connected };
+	return { entries, connected, rewireAdapter };
 }
 
 /**
- * Default reconnect backend: fresh factory + connect({isReconnect:true}) per
- * attempt (the base contract preserves server-side queues across reconnects).
- * Unknown platform or refused connect ⇒ false keeps the row queued under
- * backoff (reconnect-watcher.ts contract).
+ * Default reconnect backend: fresh factory + guard re-wire +
+ * connect({isReconnect:true}) per attempt (the base contract preserves
+ * server-side queues across reconnects). Unknown platform or refused
+ * connect ⇒ false keeps the row queued under backoff
+ * (reconnect-watcher.ts contract). The rewire keeps reconnects on the
+ * DEC-074 production guard — without it a fresh instance would silently
+ * drop back to the `no guard attached` throw after every reconnect.
  */
-function defaultReconnectBackend(input: GatewayRunInput): ReconnectHooks {
+export function defaultReconnectBackend(
+	input: GatewayRunInput,
+	rewire?: (platform: string, adapter: unknown) => boolean,
+): ReconnectHooks {
 	const byPlatform = new Map<string, PlatformHosting>();
 	for (const hosting of input.platforms ?? [])
 		byPlatform.set(hosting.platform, hosting);
@@ -447,6 +624,7 @@ function defaultReconnectBackend(input: GatewayRunInput): ReconnectHooks {
 			const surface = adapter as Partial<AdapterConnectSurface>;
 			if (typeof surface.connect !== "function") return false;
 			try {
+				rewire?.(platform, adapter);
 				return (await surface.connect({ isReconnect: true })) !== false;
 			} catch {
 				return false;
@@ -731,7 +909,9 @@ export function composeGatewayLifecycle(
 		...(input.timers !== undefined ? { timers: input.timers } : {}),
 		shutdownHooks: buildShutdownHookOverlays(input, storeOf, derived.connected),
 		bootRecovery: buildBootRecoveryOverlays(input, storeOf, derived.connected),
-		reconnectHooks: input.reconnectBackend ?? defaultReconnectBackend(input),
+		reconnectHooks:
+			input.reconnectBackend ??
+			defaultReconnectBackend(input, derived.rewireAdapter),
 		...(input.commandRegistry !== undefined
 			? { commandRegistry: input.commandRegistry }
 			: {}),
