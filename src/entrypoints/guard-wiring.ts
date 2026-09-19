@@ -167,9 +167,7 @@ export function toGuardRegistry(
 		(row): GuardCommandDef => ({
 			name: row.name,
 			...(row.aliases !== undefined ? { aliases: [...row.aliases] } : {}),
-			...(row.busyPolicy !== undefined
-				? { busyPolicy: row.busyPolicy }
-				: {}),
+			...(row.busyPolicy !== undefined ? { busyPolicy: row.busyPolicy } : {}),
 			...(row.busyHandler !== undefined && row.busyHandler !== null
 				? { busyHandler: row.busyHandler }
 				: {}),
