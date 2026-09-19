@@ -15,18 +15,41 @@
 // pi types resolve at runtime via the host pi installation (jiti); tsc gets
 // them through the peerDependency branch that npm ci installs (package-lock
 // was aligned with package.json's peerDependencies in 71999d4).
-import type { ExtensionAPI, ExtensionCommandContext, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
-import { composeGatewayLifecycle, type ComposedGateway } from "../src/entrypoints/gateway-run.js";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	SessionShutdownEvent,
+	SessionStartEvent,
+} from "@earendil-works/pi-coding-agent";
+import {
+	composeGatewayLifecycle,
+	type ComposedGateway,
+} from "../src/entrypoints/gateway-run.js";
+import {
+	PI_GATEWAY_PLATFORMS_ENV,
+	resolveConfiguredPlatforms,
+} from "../src/entrypoints/platform-hosting.js";
 
 export default function piGatewayExtension(pi: ExtensionAPI) {
 	let gateway: ComposedGateway | null = null;
 	let starting = false;
 
 	async function startGateway(home?: string): Promise<string> {
-		if (gateway || starting) return gateway ? "gateway already running" : "gateway starting...";
+		if (gateway || starting)
+			return gateway ? "gateway already running" : "gateway starting...";
 		starting = true;
 		try {
-			gateway = composeGatewayLifecycle(home ? { home } : {});
+			// DEC-072: explicit boot platform list — the allowlist resolves to
+			// hosted platforms with production factories, so stage 9 derives
+			// real adapter entries for listed platforms. Unset/empty ⇒ [] ⇒
+			// current no-platform behavior, unchanged.
+			const platforms = resolveConfiguredPlatforms(
+				process.env[PI_GATEWAY_PLATFORMS_ENV],
+			);
+			gateway = composeGatewayLifecycle({
+				...(home ? { home } : {}),
+				platforms,
+			});
 			const res = await gateway.lifecycle.startup();
 			if (!res.ok) {
 				const g = gateway;
@@ -60,7 +83,10 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
 		if (process.env.PI_GATEWAY_AUTO_START === "1") {
 			const msg = await startGateway();
-			ctx.ui.notify(msg, msg.startsWith("gateway running") ? "info" : "warning");
+			ctx.ui.notify(
+				msg,
+				msg.startsWith("gateway running") ? "info" : "warning",
+			);
 		}
 	});
 
@@ -69,7 +95,8 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("gateway", {
-		description: "pi-gateway — status / start / stop (Hermes parity, pi host loop)",
+		description:
+			"pi-gateway — status / start / stop (Hermes parity, pi host loop)",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const sub = args.trim().split(/\s+/)[0] ?? "";
 			if (sub === "start") {
@@ -83,7 +110,10 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			}
 			// status (default)
 			if (!gateway) {
-				ctx.ui.notify("gateway: not running — /gateway start [home] to start", "info");
+				ctx.ui.notify(
+					"gateway: not running — /gateway start [home] to start",
+					"info",
+				);
 				return;
 			}
 			ctx.ui.notify(
