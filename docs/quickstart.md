@@ -40,40 +40,77 @@ npm run build        # type check; must exit clean (dev only)
 Full requirements and the `PI_HOME` layout:
 [docs/installation.md](installation.md).
 
-## 2. Configure one platform
+## 2. Configure the platform list + secrets
 
-Every adapter declares its required secrets in a manifest (spec 04 §4). The
-Telegram adapter requires `TELEGRAM_BOT_TOKEN` (Bot API long-polling, the
-polling transport shape; DEC-024).
+The extension boots exactly the platforms named in `PI_GATEWAY_PLATFORMS`
+(comma-separated, case-insensitive, deduplicated; unknown names stay
+absent). Unset or empty resolves to zero platforms — the gateway starts
+with no adapters, unchanged (DEC-072):
 
-Provide the secret through your shell environment or the profile's `.env`
-store under `PI_HOME`:
+```sh
+export PI_GATEWAY_PLATFORMS="telegram,matrix"
+```
+
+Every adapter declares its required secrets in a manifest (spec 04 §4), and
+each listed platform still passes its `requiresEnv` gate at boot: listed but
+uncredentialed stays a loud disable naming the missing secret, never a
+silent skip.
+
+The Telegram adapter (Bot API long-polling, the polling transport shape;
+DEC-024) requires `TELEGRAM_BOT_TOKEN`:
 
 ```sh
 export TELEGRAM_BOT_TOKEN="123456:ABC..."
-```
-
-Then set a sender allowlist. Authorization is deny-by-default (spec 06 §2),
-so only listed users can drive the bot:
-
-```sh
 export TELEGRAM_ALLOWED_USERS="your-telegram-user-id"
 ```
 
-## 3. Run the gateway
+The Matrix adapter (long-poll sync; DEC-072/073) requires
+`MATRIX_HOMESERVER` plus `MATRIX_ACCESS_TOKEN` — or the `MATRIX_USER_ID` +
+`MATRIX_PASSWORD` login pair instead:
 
 ```sh
-pi gateway run
+export MATRIX_HOMESERVER="https://matrix.org"
+export MATRIX_ACCESS_TOKEN="syt_..."
+export MATRIX_ALLOWED_USERS="@you:matrix.org"
 ```
 
-This composition root (DEC-058) records a boot fingerprint, claims the PID
-file and runtime lock, opens or repairs `state.db`, starts the embedded
-services (cron, handoff), and connects your configured
-adapters. A missing secret disables an adapter loudly: check the log for the
-`adapter_disabled` reason rather than wondering why a platform never comes up.
+Provide the secrets through your shell environment or the profile's `.env`
+store under `PI_HOME`. Authorization is deny-by-default (spec 06 §2), so
+without the sender allowlist an adapter accepts no one.
 
-Stop with `Ctrl-C`: shutdown drains ingress, lets active turns finish, flushes
-delivery obligations, and exits (spec 08 §1.2).
+## 3. Run the gateway
+
+The gateway runs as a pi extension (`extensions/pi-gateway.ts`, loaded via
+the `pi.extensions` package manifest) inside a long-lived pi process — there
+is no separate gateway CLI. Boot pi in RPC mode with auto-start on
+(pi 0.84.4):
+
+```sh
+PI_GATEWAY_AUTO_START=1 PI_GATEWAY_PLATFORMS="telegram,matrix" pi --mode rpc
+```
+
+On `session_start` the extension resolves the platform list into hosted
+adapters (DEC-072; matrix binds the real CS-API HTTP transport, DEC-073),
+composes the lifecycle (DEC-058: boot fingerprint, PID file and runtime
+lock, `state.db` open/repair, embedded services), and starts it. The same
+lifecycle is available manually in chat via `/gateway start [home]` →
+`/gateway stop`, with `/gateway` reporting status.
+
+What "enabled" looks like:
+
+- The session notice reads
+  `gateway running — home=<PI_HOME> platforms=[telegram,matrix]`
+  (`platforms=[none]` means the list was empty or unset.)
+- The log records `platform adapter <name> connected` per adapter, then
+  `gateway READY`.
+- A listed-but-uncredentialed platform logs
+  `platform adapter <name> DISABLED: <MISSING_SECRET>` at ERROR with reason
+  code `adapter_disabled` — check that line rather than wondering why a
+  platform never comes up.
+
+Stop with `/gateway stop` (or by ending the session, which tears the
+gateway down on `session_shutdown`): shutdown drains ingress, lets active
+turns finish, flushes delivery obligations, and exits (spec 08 §1.2).
 
 ## 4. Say hello
 

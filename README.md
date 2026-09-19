@@ -38,22 +38,33 @@ run until pi can reach a provider — plus Node.js 26+ at runtime
    pi install . -l
    ```
 
-2. Set one platform secret. This example uses Telegram; every adapter declares
-   its required secrets in a manifest (spec 04 §4):
+2. Name the platforms to boot and set their secrets. This example uses
+   Telegram; every adapter declares its required secrets in a manifest
+   (spec 04 §4). Unset or empty `PI_GATEWAY_PLATFORMS` boots zero platforms
+   (DEC-072):
 
    ```sh
+   export PI_GATEWAY_PLATFORMS="telegram,matrix"
    export TELEGRAM_BOT_TOKEN="123456:ABC..."
    export TELEGRAM_ALLOWED_USERS="your-telegram-user-id"
    ```
 
    `TELEGRAM_ALLOWED_USERS` is the sender allowlist. Authorization is
    deny-by-default (spec 06 §2), so without it the bot accepts no one.
+   Matrix instead needs `MATRIX_HOMESERVER` plus `MATRIX_ACCESS_TOKEN` (or
+   the `MATRIX_USER_ID` + `MATRIX_PASSWORD` login pair) and
+   `MATRIX_ALLOWED_USERS`.
 
-3. Run the gateway:
+3. Run the gateway as a pi extension inside a long-lived pi process
+   (auto-start on `session_start`; pi 0.84.4):
 
    ```sh
-   pi gateway run          # see docs/quickstart.md for first-run setup
+   PI_GATEWAY_AUTO_START=1 PI_GATEWAY_PLATFORMS="telegram,matrix" pi --mode rpc
    ```
+
+   See docs/quickstart.md for first-run setup — including what "enabled"
+   looks like (`gateway running — platforms=[...]`, `gateway READY`, or a
+   loud `adapter_disabled` line naming the missing secret).
 
 4. Message your bot `hello` from an allowed user, then try `/help` (command
    list) and `/status` (adapters, worker pool, leases, delivery backlog) in
