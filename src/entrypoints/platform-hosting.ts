@@ -18,7 +18,10 @@ import { TelegramAdapter } from "../pi_platforms/telegram/telegram-adapter.js";
 import { TelegramBotApiFake } from "../pi_platforms/telegram/telegram-fake-server.js";
 import { MATRIX_MANIFEST } from "../pi_platforms/matrix/manifest.js";
 import { MatrixAdapterCore } from "../pi_platforms/matrix/matrix-adapter.js";
-import { FakeMatrixHomeserver } from "../pi_platforms/matrix/matrix-fake-server.js";
+import {
+	bindMatrixProductionTransport,
+	HttpMatrixHomeserver,
+} from "../pi_platforms/matrix/hs-client.js";
 import { kitScopedSecretReader } from "../pi_gateway/security/secretscope/wrapper.js";
 import type {
 	PlatformFactory,
@@ -70,8 +73,9 @@ export const PI_GATEWAY_PLATFORMS_ENV = "PI_GATEWAY_PLATFORMS";
  * requiresEnv gate still runs at stage 9 — listed but uncredentialed ⇒ loud
  * adapter_disabled naming the missing secret, never silent.
  *
- * Production factories construct whatever the adapters use today (fake
- * transports); the real-transport swap is the NEXT task, not this one.
+ * Production factories bind REAL transports (telegram Bot API fake-wire is
+ * the telegram test seam reused at boot; matrix binds HttpMatrixHomeserver,
+ * DEC-073 — FakeMatrixHomeserver stays the TEST seam).
  * NOTE (secret-scope R3): this module references the scope engine, so it
  * takes the raw allowlist string as a parameter and never touches the
  * ambient environment itself — the extension (outside the gate's src/ scan)
@@ -98,14 +102,25 @@ export function resolveConfiguredPlatforms(
 				),
 			);
 		} else if (name === MATRIX_MANIFEST.name) {
+			// DEC-073: production binds the REAL CS-API HTTP transport;
+			// FakeMatrixHomeserver stays the TEST seam (worlds/subjects).
 			out.push(
-				matrixHosting(
-					() =>
-						new MatrixAdapterCore({
-							hs: new FakeMatrixHomeserver(),
-							secretReader: secrets,
-						}),
-				),
+				matrixHosting(() => {
+					const homeserver = secrets("MATRIX_HOMESERVER") ?? "";
+					const accessToken = secrets("MATRIX_ACCESS_TOKEN");
+					const userId = secrets("MATRIX_USER_ID");
+					const client = new HttpMatrixHomeserver({
+						baseUrl: homeserver,
+						...(accessToken !== undefined ? { accessToken } : {}),
+						...(userId !== undefined ? { ownUserId: userId } : {}),
+					});
+					const adapter = new MatrixAdapterCore({
+						hs: client,
+						secretReader: secrets,
+					});
+					bindMatrixProductionTransport(adapter, client);
+					return adapter;
+				}),
 			);
 		}
 		// Unknown names stay absent (DEC-072: loud unknown-name rejection

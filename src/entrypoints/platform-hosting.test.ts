@@ -214,3 +214,70 @@ describe("explicit-list composition through stage 9", () => {
 		await composed.lifecycle.waitShutdown();
 	});
 });
+
+describe("matrix production factory — real HTTP transport (DEC-073)", () => {
+	it("factory adapter sends through the HTTP client with bearer auth (loopback stub)", async () => {
+		const puts: Array<{ path: string; auth: string | undefined; body: unknown }> =
+			[];
+		const { createServer } = await import("node:http");
+		const stub = createServer((req, res) => {
+			const url = new URL(req.url ?? "/", "http://127.0.0.1");
+			let text = "";
+			req.on("data", (c: Buffer) => {
+				text += c.toString("utf8");
+			});
+			req.on("end", () => {
+				if (req.method === "PUT") {
+					puts.push({
+						path: url.pathname,
+						auth:
+							typeof req.headers["authorization"] === "string"
+								? req.headers["authorization"]
+								: undefined,
+						body: text === "" ? null : (JSON.parse(text) as unknown),
+					});
+				}
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ event_id: "$factory1" }));
+			});
+		});
+		await new Promise<void>((resolve) => {
+			stub.listen(0, "127.0.0.1", () => resolve());
+		});
+		try {
+			const addr = stub.address();
+			const port =
+				typeof addr === "object" && addr !== null ? String(addr.port) : "1";
+			const entries = resolveConfiguredPlatforms("matrix", (name) =>
+				name === "MATRIX_HOMESERVER"
+					? `http://127.0.0.1:${port}`
+					: name === "MATRIX_ACCESS_TOKEN"
+						? "tok-factory"
+						: undefined,
+			);
+			expect(entries).toHaveLength(1);
+			const adapter = entries[0]?.factory();
+			expect(adapter).toBeInstanceOf(MatrixAdapterCore);
+			const wired = adapter as unknown as {
+				wireTransmitSend: (
+					chatId: string,
+					content: string,
+					metadata: unknown,
+				) => Promise<{ success: boolean; messageId?: string }>;
+			};
+			const result = await wired.wireTransmitSend("!r:x", "factory send", {
+				event_content: { msgtype: "m.text", body: "factory send" },
+			});
+			expect(result.success).toBe(true);
+			expect(result.messageId).toBe("$factory1");
+			expect(puts).toHaveLength(1);
+			expect(puts[0]?.path).toMatch(/\/send\/m\.room\.message\/.+/);
+			expect(puts[0]?.auth).toBe("Bearer tok-factory");
+			expect(puts[0]?.body).toEqual({ msgtype: "m.text", body: "factory send" });
+		} finally {
+			await new Promise<void>((resolve) => {
+				stub.close(() => resolve());
+			});
+		}
+	});
+});

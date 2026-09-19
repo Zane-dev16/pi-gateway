@@ -101,11 +101,11 @@ import {
 	normalizeBangCommand,
 } from "./manifest.js";
 import type {
-	FakeMatrixHomeserver,
 	MatrixSyncResponse,
 	MatrixSyncResult,
 	MatrixTimelineEvent,
 } from "./matrix-fake-server.js";
+import type { MatrixHomeserverSeam } from "./hs-client.js";
 
 /** adapter.py:HELD_INBOUND discipline shared across the polling family. */
 export const HELD_INBOUND_MAX = 64;
@@ -145,7 +145,7 @@ export interface MatrixRoomIdentity {
 }
 
 export interface MatrixAdapterDeps {
-	hs: FakeMatrixHomeserver;
+	hs: MatrixHomeserverSeam;
 	clock?: PollingClock | undefined;
 	timer?: TimerSeam | undefined;
 	spawner?: TaskSpawner | undefined;
@@ -234,7 +234,7 @@ export class MatrixAdapterCore
 	extends BasePlatformAdapter
 	implements StreamEgressAdapter
 {
-	readonly hs: FakeMatrixHomeserver;
+	readonly hs: MatrixHomeserverSeam;
 	readonly clock: PollingClock;
 
 	private readonly cp: EgressChokepoint;
