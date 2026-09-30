@@ -5,7 +5,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { AssistantMessage, Message, ToolResultMessage } from "./host.js";
+import type {
+	AssistantMessage,
+	JsonObject,
+	Message,
+	ToolResultMessage,
+} from "./host.js";
 import {
 	repairMessageSequence,
 	repairMessageSequenceWithCursor,
@@ -257,7 +262,7 @@ describe("tool-call argument repair ladder (_repair_tool_call_arguments)", () =>
 describe("sanitizeToolCallArguments (pre-request companion pass)", () => {
 	function assistantWithArgs(args: unknown): AssistantMessage {
 		return assistant([
-			fauxToolCall("echo", args as Record<string, unknown>, { id: "c1" }),
+			fauxToolCall("echo", args as JsonObject, { id: "c1" }),
 		]);
 	}
 
@@ -278,7 +283,7 @@ describe("sanitizeToolCallArguments (pre-request companion pass)", () => {
 			fauxToolCall("ok", { keep: true }, { id: "c0" }),
 		]);
 		const nulled = fauxAssistantMessage([
-			fauxToolCall("n", undefined as unknown as Record<string, unknown>, {
+			fauxToolCall("n", undefined as unknown as JsonObject, {
 				id: "c1",
 			}),
 		]);

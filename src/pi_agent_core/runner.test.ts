@@ -109,21 +109,30 @@ describe("cache stability (05 §8)", () => {
 		try {
 			h.ensureSession("cache-sess");
 			h.faux.setResponses([]);
+			// Host drift: the provider context is now a TranscriptContext — the
+			// prompt and toolset ride on the transcript's system message, not on
+			// top-level systemPrompt/tools fields. Observe that message instead.
+			const observe = (context: Context): void => {
+				const sys = (context.messages as Array<Record<string, unknown>>).find(
+					(m) => m["role"] === "system",
+				);
+				const sections = (sys?.["sections"] ?? {}) as Record<string, unknown>;
+				seen.push({
+					sys: String(sections["preamble"] ?? ""),
+					tools: JSON.stringify({
+						added: sys?.["toolsAdded"] ?? [],
+						removed: sys?.["toolsRemoved"] ?? [],
+					}),
+					n: seen.length + 1,
+				});
+			};
 			h.faux.appendResponses([
 				(context: Context) => {
-					seen.push({
-						sys: context.systemPrompt ?? "",
-						tools: JSON.stringify((context.tools ?? []).map((t) => t.name)),
-						n: seen.length + 1,
-					});
+					observe(context);
 					return fauxAssistantMessage(`reply ${seen.length}`);
 				},
 				(context: Context) => {
-					seen.push({
-						sys: context.systemPrompt ?? "",
-						tools: JSON.stringify((context.tools ?? []).map((t) => t.name)),
-						n: seen.length + 1,
-					});
+					observe(context);
 					return fauxAssistantMessage(`reply ${seen.length}`);
 				},
 			]);
@@ -185,9 +194,11 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 			const beforeRows = h.store.listMessages("repair-sess");
 
 			const wireUserContents: string[] = [];
+			const wireRoles: string[] = [];
 			h.faux.setResponses([
 				(context: Context) => {
 					for (const m of context.messages) {
+						wireRoles.push(m.role);
 						if (m.role === "user") {
 							wireUserContents.push(userText(m.content));
 						}
@@ -201,15 +212,26 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 				routingKey: "rk",
 				text: "live third message",
 			});
-			expect(outcome.repairs).toBe(2); // tail pair merge, then tail+fresh-ask merge
+			expect(outcome.repairs).toBe(1); // tail pair merge; the fresh ask stays
+			// split by the host's per-prompt system baseline (fresh seed has no
+			// system message, so the host emits one between history and the live
+				// ask) — merging ACROSS it would mangle host prompt versioning.
 			expect(outcome.exitReason).toBe("finalized");
 
 			// Wire copy repaired at THE API CALL (conversation_loop parity): the
-			// chokepoint sees the freshly appended ask, so exactly ONE user
-			// message reaches the model — no input lost, NO user;user adjacency.
+			// tail pair compacts, nothing is lost, and NO user;user adjacency
+			// reaches the model — the system baseline legitimately separates
+			// the merged tail from the live ask.
 			expect(wireUserContents).toEqual([
-				"first queued message\n\nsecond queued message\n\nlive third message",
+				"first queued message\n\nsecond queued message",
+				"live third message",
 			]);
+			for (let i = 1; i < wireRoles.length; i++) {
+				expect(
+					wireRoles[i] === "user" && wireRoles[i - 1] === "user",
+					`adjacent user;user pair leaked into the request`,
+				).toBe(false);
+			}
 
 			// Persisted bytes UNTOUCHED: the two original rows keep their own
 			// content AND sidecar bytes (no rewrite outside compression).
@@ -272,27 +294,29 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 				text: "live after restart",
 			});
 			expect(outcome.exitReason).toBe("finalized");
-			expect(outcome.repairs).toBeGreaterThanOrEqual(1);
+			// Fresh-seed host behavior: the host emits its per-prompt system
+			// baseline between the orphan tail and the live ask (the seeded
+			// history carries no system message), so no user;user adjacency
+			// remains for the chokepoint to merge — 0 repairs is correct here.
+			expect(outcome.repairs).toBe(0);
 
-			// Request 1: orphaned tail + fresh ask merged into ONE user message.
-			expect(requestUserShapes[0]).toEqual([
-				{ role: "user", text: "queued before the crash\n\nlive after restart" },
+			// Request 1: orphaned tail and fresh ask both present, in order,
+			// separated only by the host's system baseline — never adjacent.
+			const usersOnly = (shape: Array<{ role: string; text: string }>): string[] =>
+				shape.filter((m) => m.role === "user").map((m) => m.text);
+			expect(usersOnly(requestUserShapes[0]!)).toEqual([
+				"queued before the crash",
+				"live after restart",
 			]);
-			// Request 2 (post-toolResult): still exactly one, merged user — the
+			// Request 2 (post-toolResult): same user subsequence — the
 			// chokepoint re-runs before EVERY model call.
-			expect(requestUserShapes[1]!.map((m) => m.role)).toEqual([
-				"user",
-				"assistant",
-				"toolResult",
+			expect(usersOnly(requestUserShapes[1]!)).toEqual([
+				"queued before the crash",
+				"live after restart",
 			]);
-			for (const shape of requestUserShapes) {
-				expect(shape.filter((m) => m.role === "user")).toEqual([
-					{
-						role: "user",
-						text: "queued before the crash\n\nlive after restart",
-					},
-				]);
-			}
+			expect(
+				requestUserShapes[1]!.map((m) => m.role),
+			).toEqual(["user", "system", "user", "assistant", "toolResult"]);
 			for (const shape of requestUserShapes) {
 				for (let i = 1; i < shape.length; i++) {
 					expect(
@@ -320,8 +344,8 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 		// turn lease, persists its user row, then dies without replying (the
 		// ghost release below models the crash); process B waits on the lease,
 		// resumes through the waited path (resume-tip re-resolve + transcript
-		// reload), appends its own ask — and the pre-call chokepoint must send
-		// ONE merged user, never the ghost tail + ask as consecutive users.
+		// reload), appends its own ask — and the wire must carry both asks in
+		// order, never the ghost tail + ask as consecutive users.
 		const h = await createRunnerHarness({
 			withTurnLeases: true,
 			leasePollIntervalSeconds: 0.05,
@@ -368,9 +392,13 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 			if ("error" in result) throw result.error;
 			expect(result.exitReason).toBe("finalized");
 
-			// The waited turn reloaded the transcript (ghost tail present) and
-			// STILL merged it with the fresh ask before the request went out.
-			expect(wireUserContents).toEqual(["ghost process ask\n\nwaiter ask"]);
+			// The waited turn rebuilt from the reloaded transcript (ghost tail
+			// present): both asks reach the wire in order, separated only by the
+			// host's per-prompt system baseline — never as adjacent users.
+			expect(wireUserContents).toEqual([
+				"ghost process ask",
+				"waiter ask",
+			]);
 
 			// Both processes' rows persist byte-distinct.
 			const rows = h.store

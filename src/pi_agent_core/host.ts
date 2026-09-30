@@ -54,6 +54,8 @@ export type {
 	Api,
 	AssistantMessage,
 	Context,
+	JsonObject,
+	JsonValue,
 	Message,
 	Model,
 	StopReason,

@@ -41,6 +41,7 @@
 
 import type {
 	AssistantMessage,
+	JsonObject,
 	Message,
 	TextContent,
 	ToolCall,
@@ -300,7 +301,7 @@ export function repairToolCallArgumentsJson(
 }
 
 /** Parse repaired argument JSON; always yields a record ({} fallback). */
-function argumentsRecord(repairedJson: string): Record<string, unknown> {
+function argumentsRecord(repairedJson: string): JsonObject {
 	try {
 		const parsed: unknown = JSON.parse(repairedJson);
 		if (
@@ -308,7 +309,7 @@ function argumentsRecord(repairedJson: string): Record<string, unknown> {
 			parsed !== null &&
 			!Array.isArray(parsed)
 		) {
-			return parsed as Record<string, unknown>;
+			return parsed as JsonObject;
 		}
 	} catch {
 		/* fall through */

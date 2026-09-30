@@ -62,6 +62,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	type CreateAgentSessionOptions,
+	type JsonObject,
 	type Message,
 	type Model,
 	type StopReason,
@@ -632,8 +633,8 @@ export class GatewayAgentRunner {
 		waited: boolean,
 		dbHolder: string | null,
 	): Promise<TurnOutcome> {
-		const host = await this.acquireHostSession(sessionId);
-		const session = host.session;
+		let host = await this.acquireHostSession(sessionId);
+		let session = host.session;
 		// Turn-start flush-cursor reset (run.py:_init_cached_agent_for_turn
 		// parity: "Reset the SessionDB flush cursor so the new turn's messages
 		// are fully persisted"). From here until the assistant row lands
@@ -645,7 +646,13 @@ export class GatewayAgentRunner {
 		if (waited) {
 			// "Session is free; loading the latest transcript..." parity: the
 			// cached history may predate the wait — reload from durable rows.
-			await this.seedReplay(session, sessionId);
+			// Host drift (pi-coding-agent request projection reads the
+			// append-only sessionManager, which cannot rewind): drop the stale
+			// entry and rebuild so the ghost tail loads via the normal seed.
+			this.dropCachedSession(sessionId);
+			host = await this.acquireHostSession(sessionId);
+			session = host.session;
+			host.flushedDbIdx = null;
 		}
 
 		// Holder-scoped refresh daemon: long model/tool turns outlive a fixed
@@ -1099,12 +1106,20 @@ export class GatewayAgentRunner {
 			dedupeReplayedUserRows: true,
 		});
 		if (rows.length === 0) return;
-		const seeded: Message[] = [];
+		// Host drift (AgentSession projects every request from its append-only
+			// sessionManager, ignoring agent.state): seed the manager chain, then
+			// sync agent state from the projection. The manager is fresh at build
+			// so nothing duplicates; waited reloads rebuild instead of re-seeding.
 		for (const row of rows) {
-			seeded.push(rowToLoopMessage(row, this.model));
+			session.sessionManager.appendMessage(
+				rowToLoopMessage(row, this.model) as unknown as Parameters<
+					typeof session.sessionManager.appendMessage
+				>[0],
+			);
 		}
 		session.agent.state.messages =
-			seeded as unknown as typeof session.agent.state.messages;
+			session.sessionManager.buildSessionProjection()
+				.messages as unknown as typeof session.agent.state.messages;
 	}
 }
 
@@ -1212,7 +1227,7 @@ function tryParseJson(text: string): unknown {
 	}
 }
 
-function decodeToolArguments(args: unknown): Record<string, unknown> {
+function decodeToolArguments(args: unknown): JsonObject {
 	if (typeof args === "string") {
 		const parsed = tryParseJson(repairToolCallArgumentsJson(args));
 		if (
@@ -1220,13 +1235,13 @@ function decodeToolArguments(args: unknown): Record<string, unknown> {
 			parsed !== null &&
 			!Array.isArray(parsed)
 		) {
-			return parsed as Record<string, unknown>;
+			return parsed as JsonObject;
 		}
 		return {};
 	}
 	if (args === undefined || args === null || args === "") return {};
 	if (typeof args === "object" && !Array.isArray(args)) {
-		return args as Record<string, unknown>;
+		return args as JsonObject;
 	}
 	return {};
 }
