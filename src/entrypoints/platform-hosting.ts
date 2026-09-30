@@ -15,7 +15,10 @@
 import { TELEGRAM_MANIFEST } from "../pi_platforms/telegram/manifest.js";
 import { registerTelegramPlatform } from "../pi_platforms/telegram/telegram-adapter.js";
 import { TelegramAdapter } from "../pi_platforms/telegram/telegram-adapter.js";
-import { TelegramBotApiFake } from "../pi_platforms/telegram/telegram-fake-server.js";
+import {
+	bindTelegramProductionTransport,
+	HttpTelegramBotApi,
+} from "../pi_platforms/telegram/bot-api-client.js";
 import { MATRIX_MANIFEST } from "../pi_platforms/matrix/manifest.js";
 import { MatrixAdapterCore } from "../pi_platforms/matrix/matrix-adapter.js";
 import {
@@ -73,9 +76,9 @@ export const PI_GATEWAY_PLATFORMS_ENV = "PI_GATEWAY_PLATFORMS";
  * requiresEnv gate still runs at stage 9 — listed but uncredentialed ⇒ loud
  * adapter_disabled naming the missing secret, never silent.
  *
- * Production factories bind REAL transports (telegram Bot API fake-wire is
- * the telegram test seam reused at boot; matrix binds HttpMatrixHomeserver,
- * DEC-073 — FakeMatrixHomeserver stays the TEST seam).
+ * Production factories bind REAL transports (telegram binds HttpTelegramBotApi,
+ * DEC-077; matrix binds HttpMatrixHomeserver, DEC-073 — both fakes stay the
+ * TEST seams).
  * NOTE (secret-scope R3): this module references the scope engine, so it
  * takes the raw allowlist string as a parameter and never touches the
  * ambient environment itself — the extension (outside the gate's src/ scan)
@@ -92,14 +95,20 @@ export function resolveConfiguredPlatforms(
 		if (name === "" || seen.has(name)) continue;
 		seen.add(name);
 		if (name === TELEGRAM_MANIFEST.name) {
+			// DEC-077: production binds the REAL Bot API HTTP transport;
+			// TelegramBotApiFake stays the TEST seam (subjects/worlds).
 			out.push(
-				telegramHosting(
-					() =>
-						new TelegramAdapter({
-							wire: new TelegramBotApiFake(),
-							secretReader: secrets,
-						}),
-				),
+				telegramHosting(() => {
+					const client = new HttpTelegramBotApi({
+						token: secrets("TELEGRAM_BOT_TOKEN") ?? "",
+					});
+					const adapter = new TelegramAdapter({
+						wire: client,
+						secretReader: secrets,
+					});
+					bindTelegramProductionTransport(adapter, client);
+					return adapter;
+				}),
 			);
 		} else if (name === MATRIX_MANIFEST.name) {
 			// DEC-073: production binds the REAL CS-API HTTP transport;

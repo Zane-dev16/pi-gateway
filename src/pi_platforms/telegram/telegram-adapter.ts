@@ -118,6 +118,7 @@ import type {
 	TgWireUpdate,
 	TelegramBotApiFake,
 } from "./telegram-fake-server.js";
+import type { TelegramBotApiSeam } from "./bot-api-client.js";
 import { isUserAuthorized } from "../../pi_gateway/security/authz/index.js";
 import { needsRichRendering, richMessagePayload } from "./rich-messages.js";
 import type { DraftFrameArgs } from "../../pi_gateway/streaming/adapter-seam.js";
@@ -149,9 +150,11 @@ export interface TypingVariant {
 	threadId?: string | undefined;
 }
 
-export interface TelegramAdapterDeps extends Omit<PollingEngineDeps, "wire"> {
-	/** The REAL-shape fake Bot API server. */
-	wire: TelegramBotApiFake;
+export interface TelegramAdapterDeps<
+	Wire extends TelegramBotApiSeam = TelegramBotApiFake,
+> extends Omit<PollingEngineDeps, "wire"> {
+	/** Bot API transport (fake in tests, HTTP in production — DEC-077). */
+	wire: Wire;
 	/**
 	 * Scoped reader for OPTIONAL env (reactions/rich/link-preview/status
 	 * gates). Distinct from the required-secret reader so enablement stays
@@ -249,9 +252,11 @@ interface TelegramSendRouting {
 	dropThreadAnchor(): void;
 }
 
-export class TelegramAdapter extends PollingAdapterCore {
-	/** The real-shape Bot API fake (control plane + raw wire registry). */
-	readonly bot: TelegramBotApiFake;
+export class TelegramAdapter<
+	Wire extends TelegramBotApiSeam = TelegramBotApiFake,
+> extends PollingAdapterCore {
+	/** Bot API transport (control plane + raw wire registry). */
+	readonly bot: Wire;
 
 	/** A1 gate — adapter.py:_reactions_enabled (opt-in, default off). */
 	readonly reactionsEnabled: boolean;
@@ -332,12 +337,12 @@ export class TelegramAdapter extends PollingAdapterCore {
 		| (() => readonly TelegramMenuCommand[])
 		| undefined;
 
-	constructor(deps: TelegramAdapterDeps) {
+	constructor(deps: TelegramAdapterDeps<Wire>) {
 		super({
 			...deps,
 			// The inherited engine consumes a STRUCTURAL SUBSET of the wire
 			// (openSession/getUpdates/commitOffset/getMe/getWebhookInfo/
-			// sendChatAction) — all provided by TelegramBotApiFake.
+			// sendChatAction) — all provided by the seam.
 			wire: deps.wire as unknown as FakeTelegramServer,
 		});
 		this.bot = deps.wire;
