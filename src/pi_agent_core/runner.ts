@@ -1107,9 +1107,9 @@ export class GatewayAgentRunner {
 		});
 		if (rows.length === 0) return;
 		// Host drift (AgentSession projects every request from its append-only
-			// sessionManager, ignoring agent.state): seed the manager chain, then
-			// sync agent state from the projection. The manager is fresh at build
-			// so nothing duplicates; waited reloads rebuild instead of re-seeding.
+		// sessionManager, ignoring agent.state): seed the manager chain, then
+		// sync agent state from the projection. The manager is fresh at build
+		// so nothing duplicates; waited reloads rebuild instead of re-seeding.
 		for (const row of rows) {
 			session.sessionManager.appendMessage(
 				rowToLoopMessage(row, this.model) as unknown as Parameters<

@@ -215,7 +215,7 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 			expect(outcome.repairs).toBe(1); // tail pair merge; the fresh ask stays
 			// split by the host's per-prompt system baseline (fresh seed has no
 			// system message, so the host emits one between history and the live
-				// ask) — merging ACROSS it would mangle host prompt versioning.
+			// ask) — merging ACROSS it would mangle host prompt versioning.
 			expect(outcome.exitReason).toBe("finalized");
 
 			// Wire copy repaired at THE API CALL (conversation_loop parity): the
@@ -302,8 +302,9 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 
 			// Request 1: orphaned tail and fresh ask both present, in order,
 			// separated only by the host's system baseline — never adjacent.
-			const usersOnly = (shape: Array<{ role: string; text: string }>): string[] =>
-				shape.filter((m) => m.role === "user").map((m) => m.text);
+			const usersOnly = (
+				shape: Array<{ role: string; text: string }>,
+			): string[] => shape.filter((m) => m.role === "user").map((m) => m.text);
 			expect(usersOnly(requestUserShapes[0]!)).toEqual([
 				"queued before the crash",
 				"live after restart",
@@ -314,9 +315,13 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 				"queued before the crash",
 				"live after restart",
 			]);
-			expect(
-				requestUserShapes[1]!.map((m) => m.role),
-			).toEqual(["user", "system", "user", "assistant", "toolResult"]);
+			expect(requestUserShapes[1]!.map((m) => m.role)).toEqual([
+				"user",
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+			]);
 			for (const shape of requestUserShapes) {
 				for (let i = 1; i < shape.length; i++) {
 					expect(
@@ -395,10 +400,7 @@ describe("alternation repair PRE-CALL CHOKEPOINT (DEC-015)", () => {
 			// The waited turn rebuilt from the reloaded transcript (ghost tail
 			// present): both asks reach the wire in order, separated only by the
 			// host's per-prompt system baseline — never as adjacent users.
-			expect(wireUserContents).toEqual([
-				"ghost process ask",
-				"waiter ask",
-			]);
+			expect(wireUserContents).toEqual(["ghost process ask", "waiter ask"]);
 
 			// Both processes' rows persist byte-distinct.
 			const rows = h.store

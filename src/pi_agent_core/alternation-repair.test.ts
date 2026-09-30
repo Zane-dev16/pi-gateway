@@ -261,9 +261,7 @@ describe("tool-call argument repair ladder (_repair_tool_call_arguments)", () =>
 
 describe("sanitizeToolCallArguments (pre-request companion pass)", () => {
 	function assistantWithArgs(args: unknown): AssistantMessage {
-		return assistant([
-			fauxToolCall("echo", args as JsonObject, { id: "c1" }),
-		]);
+		return assistant([fauxToolCall("echo", args as JsonObject, { id: "c1" })]);
 	}
 
 	it("string arguments parse into objects; corrupt ones go through the ladder", () => {
