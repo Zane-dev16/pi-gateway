@@ -16,15 +16,26 @@
 // Strip posture: this module is importable from gateway-run.ts, which stays
 // strip-safe for bare-node runners — so kit types arrive as TYPE-ONLY
 // imports (erased) and adapters are touched STRUCTURALLY (attachGuard /
-// deliverText detected, never imported). The only runtime project import is
-// the authz decision chain (pi_gateway/security/authz — no parameter
-// properties, no enums anywhere in its import closure).
+// deliverText detected, never imported). Runtime project imports are the
+// authz decision chain (pi_gateway/security/authz — no parameter properties,
+// no enums anywhere in its import closure) plus the pure slash idle path
+// (commands/* + guards/slash-access — no node builtins, no platform code).
 
+import { createBuiltinCommandRegistry } from "../pi_gateway/commands/builtins.js";
+import {
+	buildIdleExecutors,
+	type IdleExecutor,
+} from "../pi_gateway/commands/idle-executors.js";
+import { classifySlashIntake } from "../pi_gateway/commands/slash-intake.js";
 import { isUserAuthorized } from "../pi_gateway/security/authz/decision.js";
 import type {
 	AuthzDecisionRecord,
 	AuthzSource,
 } from "../pi_gateway/security/authz/decision.js";
+import {
+	checkSlashAccess,
+	type SlashAccessPolicy,
+} from "../pi_gateway/guards/slash-access.js";
 import type {
 	CommandDef as GuardCommandDef,
 	CommandRegistry,
@@ -73,6 +84,19 @@ export interface EnsureSessionStore {
 	withWrite<T>(fn: (db: unknown) => T): Promise<T>;
 }
 
+/**
+ * Idle-path slash dispatch (DEC-078): resolve → slash-access gate → executor
+ * table → turn fallthrough. Absent (the production default) resolves against
+ * the frozen builtin registry with no access gating (backward-compat: no
+ * admin list ⇒ every allowed user keeps every command); tests inject a stub.
+ */
+export interface SlashIdleDispatch {
+	resolve: (rawName: string | null | undefined) => RegistryCommandDef | null;
+	executors: ReadonlyMap<string, IdleExecutor>;
+	rows: readonly RegistryCommandDef[];
+	policyOf?: ((event: IncomingEvent) => SlashAccessPolicy) | undefined;
+}
+
 export interface ProductionMessageHandlerDeps {
 	runner: ChatTurnRunner;
 	/** Stage-6 store for the durable session row (absent ⇒ ensure skipped). */
@@ -80,6 +104,19 @@ export interface ProductionMessageHandlerDeps {
 	/** Authz override (tests); default is the ported decision chain. */
 	isAuthorized?: ((source: AuthzSource) => AuthzDecisionRecord) | undefined;
 	log?: GuardWiringLogger | undefined;
+	/** Idle slash dispatch override (tests); default derives from builtins. */
+	slashIdle?: SlashIdleDispatch | null | undefined;
+}
+
+/** Production default: frozen builtin registry rows + the idle table. */
+function defaultSlashIdle(): SlashIdleDispatch {
+	const registry = createBuiltinCommandRegistry();
+	const rows = registry.rows();
+	return {
+		resolve: (raw) => registry.resolve(raw),
+		executors: buildIdleExecutors(rows),
+		rows,
+	};
 }
 
 /**
@@ -136,15 +173,50 @@ export function buildProductionMessageHandler(
 			});
 			return null;
 		}
-		const outcome = await runner.handleTurn({
-			sessionId: sessionKey,
-			routingKey: sessionKey,
-			text: event.text ?? "",
-		});
-		if (outcome.exitReason === "error") {
-			throw new Error(outcome.errorMessage ?? "turn error");
+		const runTurn = async (text: string): Promise<string | null | undefined> => {
+			const outcome = await runner.handleTurn({
+				sessionId: sessionKey,
+				routingKey: sessionKey,
+				text,
+			});
+			if (outcome.exitReason === "error") {
+				throw new Error(outcome.errorMessage ?? "turn error");
+			}
+			return outcome.finalText;
+		};
+		// DEC-078 idle path: recognized commands dispatch (or deny) locally;
+		// plain text AND unknown "/foo" take the turn on ORIGINAL bytes.
+		const idle = deps.slashIdle ?? defaultSlashIdle();
+		const text = event.text ?? "";
+		const intake = classifySlashIntake(
+			idle.resolve,
+			text,
+			event.allowGatewayControl === undefined
+				? {}
+				: { allowGatewayControl: event.allowGatewayControl },
+		);
+		if (intake.kind === "text") return runTurn(text);
+		if (idle.policyOf !== undefined) {
+			const denied = checkSlashAccess(
+				idle.policyOf(event),
+				event.source?.userId ?? null,
+				intake.cmd.name,
+			);
+			if (denied !== null) return denied;
 		}
-		return outcome.finalText;
+		const executor = idle.executors.get(intake.cmd.name);
+		if (executor !== undefined) {
+			const result = await executor({
+				sessionKey,
+				args: intake.args,
+				rows: idle.rows,
+				runner,
+				eventText: text,
+			});
+			if (result.kind === "reply") return result.text;
+			return runTurn(result.text);
+		}
+		return runTurn(text);
 	};
 }
 

@@ -22,7 +22,7 @@ import {
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count equals host builtins plus gateway-only survivors", () => {
 		// DEC-078 derivation: the census is the host BUILTIN_SLASH_COMMANDS
-		// (26 rows) plus the gateway-only survivors — never a Hermes number.
+		// (24 rows) plus the gateway-only survivors — never a Hermes number.
 		// Adding/removing a row is still a conscious census change, never an
 		// accident.
 		expect(BUILTIN_COMMAND_ROWS.length).toBe(
