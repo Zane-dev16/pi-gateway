@@ -21,11 +21,25 @@
 // no enums anywhere in its import closure) plus the pure slash idle path
 // (commands/* + guards/slash-access — no node builtins, no platform code).
 
+import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { createBuiltinCommandRegistry } from "../pi_gateway/commands/builtins.js";
 import {
 	buildIdleExecutors,
 	type IdleExecutor,
+	type IdleExecutorResult,
 } from "../pi_gateway/commands/idle-executors.js";
+import {
+	adoptSessionFile,
+	type AdoptionStore,
+} from "../pi_embedded/handoff/adoption.js";
+import type { RoutingBinder } from "../pi_embedded/handoff/binder.js";
+import type { SessionDriverLock } from "../pi_embedded/handoff/session-lock.js";
+import {
+	buildDiscoveryIndex,
+	listDiscoveryPaths,
+	mostRecentSessionAtPath,
+} from "../pi_gateway/discovery.js";
 import { classifySlashIntake } from "../pi_gateway/commands/slash-intake.js";
 import { isUserAuthorized } from "../pi_gateway/security/authz/decision.js";
 import type {
@@ -59,6 +73,30 @@ export interface ChatTurnRunner {
 		routingKey: string;
 		text: string;
 	}): Promise<TurnOutcome>;
+	/**
+	 * Drop the cached host session so the next turn rebuilds and reseeds
+	 * (DEC-079 switch executors: the binding moved, the cache must follow).
+	 * Optional — runners without a cache simply omit it. The production
+	 * GatewayAgentRunner already carries this exact method; no runner
+	 * change was needed.
+	 */
+	dropCachedSession?: ((sessionId: string) => void) | undefined;
+}
+
+/**
+ * Session-hopping deps (DEC-079): the chat-key → host-session-id binder,
+ * the host agent dir scanned for <agentDir>/sessions, the dir holding
+ * gateway.lock.db (drive sidecars live beside it), the adoption store, and
+ * an id minter (tests pin it deterministic; production mints randomUUIDs).
+ * Absent ⇒ today's behavior byte-identical: sessionId = chat key and the
+ * switch names stay passthrough on original bytes.
+ */
+export interface SessionHopDeps {
+	binder: RoutingBinder;
+	agentDir: string;
+	lockDir: string;
+	adoptStore: AdoptionStore;
+	newSessionId?: (() => string) | undefined;
 }
 
 /**
@@ -97,10 +135,169 @@ export interface SlashIdleDispatch {
 	policyOf?: ((event: IncomingEvent) => SlashAccessPolicy) | undefined;
 }
 
+/** One switch executor: chat key + dash-repaired args ⇒ reply or turn. */
+type SwitchExecutor = (
+	sessionKey: string,
+	args: string,
+) => Promise<IdleExecutorResult>;
+
+/**
+ * The DEC-079 switch table over the binder: /new repoints the chat at a
+ * fresh host session; /resume lands on history via binder switchSession +
+ * replay through the normal pipeline; /switch-path lists every path
+ * holding pi sessions and re-roots the chat there (adopting the newest
+ * file under the drive lock); /new-path starts a fresh session under a
+ * given path. /sessions stays absent by design — pure host passthrough.
+ * Held drive locks ride a per-handler chat map: the next switch for that
+ * chat releases before rebinding, and process death frees via the fd.
+ */
+function buildSwitchExecutors(
+	hop: SessionHopDeps,
+	locks: Map<string, SessionDriverLock>,
+	runner: ChatTurnRunner,
+): ReadonlyMap<string, SwitchExecutor> {
+	const mintId = hop.newSessionId ?? randomUUID;
+	const releaseChatLock = (sessionKey: string): void => {
+		const held = locks.get(sessionKey);
+		if (held === undefined) return;
+		locks.delete(sessionKey);
+		held.release();
+	};
+	const rebind = async (sessionKey: string, id: string): Promise<void> => {
+		await hop.binder.ensureEntry(sessionKey, { origin: "gateway" });
+		await hop.binder.switchSession(sessionKey, id);
+	};
+	return new Map<string, SwitchExecutor>([
+		[
+			"new",
+			async (sessionKey): Promise<IdleExecutorResult> => {
+				const id = mintId();
+				await rebind(sessionKey, id);
+				releaseChatLock(sessionKey);
+				runner.dropCachedSession?.(id);
+				return { kind: "reply", text: `Started a new session (${id}).` };
+			},
+		],
+		[
+			"resume",
+			async (sessionKey, args): Promise<IdleExecutorResult> => {
+				const id = args.trim().split(/\s+/, 1)[0] ?? "";
+				if (id === "") {
+					return {
+						kind: "reply",
+						text: "Usage: /resume <session-id> — rebinds this chat onto that session's history.",
+					};
+				}
+				await rebind(sessionKey, id);
+				releaseChatLock(sessionKey);
+				runner.dropCachedSession?.(id);
+				return {
+					kind: "reply",
+					text: `Resumed session (${id}). The next turn replays its history.`,
+				};
+			},
+		],
+		[
+			"switch-path",
+			async (sessionKey, args): Promise<IdleExecutorResult> => {
+				const index = buildDiscoveryIndex(hop.agentDir);
+				const target = args.trim();
+				if (target === "") {
+					const paths = listDiscoveryPaths(index);
+					if (paths.length === 0) {
+						return {
+							kind: "reply",
+							text: `No pi sessions found under ${hop.agentDir}.`,
+						};
+					}
+					return {
+						kind: "reply",
+						text:
+							`Paths holding pi sessions:\n${paths.map((p) => `- ${p}`).join("\n")}` +
+							"\n/switch-path <path> re-roots this chat there.",
+					};
+				}
+				const found = mostRecentSessionAtPath(index, target);
+				if (found === null) {
+					const paths = listDiscoveryPaths(index);
+					const known =
+						paths.length === 0
+							? "none — run /switch-path to confirm"
+							: paths.map((p) => `- ${p}`).join("\n");
+					return {
+						kind: "reply",
+						text: `No pi sessions under ${target}. Known paths:\n${known}`,
+					};
+				}
+				await hop.binder.ensureEntry(sessionKey, { origin: "gateway" });
+				const disposition = await adoptSessionFile({
+					sessionFile: found.file,
+					sessionId: found.id,
+					lockDir: hop.lockDir,
+					store: hop.adoptStore,
+				});
+				if (disposition.kind === "readonly-plus-takeover") {
+					return {
+						kind: "reply",
+						text:
+							`Session ${found.id} is live in another process, so this chat stays ` +
+							`read-only: ask its owner to exit, then run /switch-path ${target} ` +
+							`again to take over.`,
+					};
+				}
+				releaseChatLock(sessionKey);
+				locks.set(sessionKey, disposition.lock);
+				await hop.binder.switchSession(sessionKey, found.id);
+				runner.dropCachedSession?.(found.id);
+				return {
+					kind: "reply",
+					text:
+						`Chat re-rooted onto ${target}: adopted ${disposition.entryCount} ` +
+						`entries from session ${found.id}.`,
+				};
+			},
+		],
+		[
+			"new-path",
+			async (sessionKey, args): Promise<IdleExecutorResult> => {
+				const target = args.trim();
+				if (target === "") {
+					return {
+						kind: "reply",
+						text: "Usage: /new-path <path> — starts a fresh session under that path.",
+					};
+				}
+				let isDir = false;
+				try {
+					isDir = statSync(target).isDirectory();
+				} catch {
+					isDir = false;
+				}
+				if (!isDir) {
+					return { kind: "reply", text: `No such directory: ${target}.` };
+				}
+				const id = mintId();
+				await rebind(sessionKey, id);
+				releaseChatLock(sessionKey);
+				runner.dropCachedSession?.(id);
+				return {
+					kind: "reply",
+					text: `Fresh session (${id}) under ${target}.`,
+				};
+			},
+		],
+	]);
+}
+
 export interface ProductionMessageHandlerDeps {
 	runner: ChatTurnRunner;
 	/** Stage-6 store for the durable session row (absent ⇒ ensure skipped). */
 	store?: EnsureSessionStore | null | undefined;
+	/**
+	 * Session-hopping seam (DEC-079). Absent ⇒ the pre-079 path exactly:
+	 * the chat key drives the turn and switch names stay passthrough.
+	 */
+	sessionHop?: SessionHopDeps | null | undefined;
 	/** Authz override (tests); default is the ported decision chain. */
 	isAuthorized?: ((source: AuthzSource) => AuthzDecisionRecord) | undefined;
 	log?: GuardWiringLogger | undefined;
@@ -123,10 +320,11 @@ function defaultSlashIdle(): SlashIdleDispatch {
  * THE production messageHandler (run.py:_handle_message parity): durable
  * session-ensure → allowlist authz → runner turn → final text.
  *
- * - sessionId = routingKey = the adapter-derived ingress sessionKey (cron
- *   executor precedent: routingKey === sessionId). Ensuring the durable row
- *   engages the runner's DB turn-lease layer; a fresh id would skip it
- *   (runner.ts:runTurn — "process-unique, nothing to race over").
+ * - sessionId is the binder-resolved host session for the adapter-derived
+ *   ingress sessionKey (DEC-079; pre-hop: sessionId = routingKey = the key,
+ *   the cron-executor precedent routingKey === sessionId). Ensuring the
+ *   durable row engages the runner's DB turn-lease layer; a fresh id would
+ *   skip it (runner.ts:runTurn — "process-unique, nothing to race over").
  * - Denied senders drop SILENTLY in-chat (Hermes _handle_message returns
  *   None; 06 §2.4 groups stay silent) with the denial LOGGED carrying
  *   reason_code + gate (06 §2.3 — reason codes make silent drops
@@ -140,6 +338,8 @@ export function buildProductionMessageHandler(
 	const { runner, log } = deps;
 	const decide =
 		deps.isAuthorized ?? ((source: AuthzSource) => isUserAuthorized(source));
+	// Held foreign-drive locks by chat key (DEC-079): one handler, one map.
+	const chatLocks = new Map<string, SessionDriverLock>();
 	return async (
 		event: IncomingEvent,
 		_ctx: TurnContext,
@@ -147,13 +347,30 @@ export function buildProductionMessageHandler(
 		const sessionKey = String(
 			(event.metadata ?? {})["gateway_session_key"] ?? "",
 		);
-		if (deps.store !== undefined && deps.store !== null && sessionKey !== "") {
+		// DEC-079: the chat key resolves onto its bound HOST session id
+		// (binder entry, minted on first contact). Without the hop seam the
+		// driving id IS the chat key — the pre-079 path, byte-identical.
+		const hop = deps.sessionHop ?? null;
+		const switchExecutors =
+			hop !== null ? buildSwitchExecutors(hop, chatLocks, runner) : null;
+		let driveSessionId = sessionKey;
+		if (hop !== null && sessionKey !== "") {
+			const bound =
+				hop.binder.entryOf(sessionKey) ??
+				(await hop.binder.ensureEntry(sessionKey, { origin: "gateway" }));
+			driveSessionId = bound.session_id;
+		}
+		if (
+			deps.store !== undefined &&
+			deps.store !== null &&
+			driveSessionId !== ""
+		) {
 			await deps.store.withWrite((db) => {
 				(db as { prepare(sql: string): { run(...args: unknown[]): void } })
 					.prepare(
 						"INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, 'gateway', ?)",
 					)
-					.run(sessionKey, Math.floor(Date.now() / 1000));
+					.run(driveSessionId, Math.floor(Date.now() / 1000));
 			});
 		}
 		const source = event.source;
@@ -173,9 +390,11 @@ export function buildProductionMessageHandler(
 			});
 			return null;
 		}
-		const runTurn = async (text: string): Promise<string | null | undefined> => {
+		const runTurn = async (
+			text: string,
+		): Promise<string | null | undefined> => {
 			const outcome = await runner.handleTurn({
-				sessionId: sessionKey,
+				sessionId: driveSessionId,
 				routingKey: sessionKey,
 				text,
 			});
@@ -203,6 +422,16 @@ export function buildProductionMessageHandler(
 				intake.cmd.name,
 			);
 			if (denied !== null) return denied;
+		}
+		// DEC-079 switch table owns the session-hopping names; the idle
+		// table owns the rest. Absent hop ⇒ switchExecutors is null and the
+		// recognized-but-executorless names (/new, /resume, /sessions …)
+		// fall through to the turn on ORIGINAL bytes, as before.
+		const switchExecutor = switchExecutors?.get(intake.cmd.name);
+		if (switchExecutor !== undefined) {
+			const result = await switchExecutor(sessionKey, intake.args);
+			if (result.kind === "reply") return result.text;
+			return runTurn(result.text);
 		}
 		const executor = idle.executors.get(intake.cmd.name);
 		if (executor !== undefined) {

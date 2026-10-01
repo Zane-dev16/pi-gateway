@@ -26,7 +26,7 @@ describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 		// Adding/removing a row is still a conscious census change, never an
 		// accident.
 		expect(BUILTIN_COMMAND_ROWS.length).toBe(
-			BUILTIN_SLASH_COMMANDS.length + 18,
+			BUILTIN_SLASH_COMMANDS.length + 20,
 		);
 		expect(BUILTIN_SLASH_COMMANDS.length).toBe(24);
 	});

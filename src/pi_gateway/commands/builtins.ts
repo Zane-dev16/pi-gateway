@@ -201,6 +201,21 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		category: "Session",
 	},
 	{
+		name: "switch-path",
+		description:
+			"List paths holding pi sessions, or re-root this chat onto one",
+		category: "Session",
+		gatewayOnly: true,
+		argsHint: "[path]",
+	},
+	{
+		name: "new-path",
+		description: "Start a fresh session under a given path",
+		category: "Session",
+		gatewayOnly: true,
+		argsHint: "<path>",
+	},
+	{
 		name: "platform",
 		description: "Pause, resume, or list a failing gateway platform",
 		category: "Info",
@@ -245,7 +260,7 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 
 /**
  * The shipped census: host-derived rows in host order, then gateway-only
- * rows. Count = host builtins + survivors (24 + 18 = 42 today); the count
+ * rows. Count = host builtins + survivors (24 + 20 = 44 today); the count
  * test pins the sum shape, not a Hermes number.
  */
 export const BUILTIN_COMMAND_ROWS: readonly CommandDef[] = [

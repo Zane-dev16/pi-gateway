@@ -8,10 +8,12 @@
 //
 // Real today: /help renders gateway help lines derived from the live
 // registry rows (pi names, no Hermes-only rows). Host session commands with
-// no gateway-reachable seam (/compact's AgentSession.compact,
-// /new's session repoint, model/export TUI handlers) stay passthrough until
-// their seams land — the runner owns those sessions and this layer may not
-// reach past its handleTurn edge. A passthrough is never an error reply.
+// no gateway-reachable seam (/compact's AgentSession.compact, model/export
+// TUI handlers) stay passthrough until their seams land — the runner owns
+// those sessions and this layer may not reach past its handleTurn edge.
+// The /new + /resume + /switch-path + /new-path repoints live one layer up
+// (guard-wiring switch executors over the binder); this table stays the
+// passthrough default for everything else. A passthrough is never an error.
 
 import type { TurnOutcome } from "../../pi_agent_core/runner-types.js";
 import type { CommandDef } from "./command-def.js";
@@ -46,9 +48,7 @@ export type IdleExecutor = (
 ) => Promise<IdleExecutorResult> | IdleExecutorResult;
 
 /** /help: the registry rendered as reply text. Zero model calls. */
-export function helpIdleExecutor(
-	ctx: IdleExecutorContext,
-): IdleExecutorResult {
+export function helpIdleExecutor(ctx: IdleExecutorContext): IdleExecutorResult {
 	return {
 		kind: "reply",
 		text: gatewayHelpLines(ctx.rows).join("\n"),
