@@ -1,6 +1,6 @@
 // pi_gateway/commands/builtins — the SHIPPED command rows (07 §1).
 //
-// DEC-027 derivation: rows derive from the HOST census
+// DEC-078 derivation: rows derive from the HOST census
 // (`BUILTIN_SLASH_COMMANDS` via pi_agent_core/host.js), not the Hermes
 // COMMAND_REGISTRY. Names, descriptions, and args hints come from the host
 // verbatim; this module adds only presentational category metadata,
@@ -72,7 +72,7 @@ function hostRows(): CommandDef[] {
 		const overlay = HOST_OVERLAYS[cmd.name];
 		if (overlay === undefined) {
 			throw new Error(
-				`host builtin /${cmd.name} has no DEC-027 overlay entry — add its category`,
+				`host builtin /${cmd.name} has no DEC-078 overlay entry — add its category`,
 			);
 		}
 		return {
@@ -82,7 +82,9 @@ function hostRows(): CommandDef[] {
 			...(cmd.argumentHint !== undefined && cmd.argumentHint !== ""
 				? { argsHint: cmd.argumentHint }
 				: {}),
-			...(overlay.aliases !== undefined ? { aliases: [...overlay.aliases] } : {}),
+			...(overlay.aliases !== undefined
+				? { aliases: [...overlay.aliases] }
+				: {}),
 			...(overlay.cliOnly === true ? { cliOnly: true as const } : {}),
 			...(overlay.busyPolicy !== undefined
 				? { busyPolicy: overlay.busyPolicy }
@@ -97,7 +99,7 @@ function hostRows(): CommandDef[] {
 /**
  * Gateway-only survivors: real gateway machinery with no host meaning.
  * Every row here must name its executor owner in the comment, or it does
- * not ship (DEC-027: no inert rows).
+ * not ship (DEC-078: no inert rows).
  */
 const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 	{

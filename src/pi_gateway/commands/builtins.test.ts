@@ -1,4 +1,4 @@
-// Builtin registry row census CONTRACTS (07 §1; DEC-027 derivation). The
+// Builtin registry row census CONTRACTS (07 §1; DEC-078 derivation). The
 // shipped set must be POPULATED and FAITHFUL: every derived consumer
 // derives from these rows, so an empty/wrong census poisons help, menus,
 // completions, known-command classification AND Guard-2 busy dispatch
@@ -21,7 +21,7 @@ import {
 
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count equals host builtins plus gateway-only survivors", () => {
-		// DEC-027 derivation: the census is the host BUILTIN_SLASH_COMMANDS
+		// DEC-078 derivation: the census is the host BUILTIN_SLASH_COMMANDS
 		// (26 rows) plus the gateway-only survivors — never a Hermes number.
 		// Adding/removing a row is still a conscious census change, never an
 		// accident.
@@ -119,7 +119,7 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 		}
 		// Gateway-only subcommands surface on the gateway catalog only.
 		const gw = completionCatalog(rows, { surface: "gateway" });
-			expect(gw.subcommands.get("/platform")).toEqual([
+		expect(gw.subcommands.get("/platform")).toEqual([
 			"pause",
 			"resume",
 			"list",
@@ -128,7 +128,7 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 
 	it("the telegram menu model carries sanitized gateway-available entries", () => {
 		const menu = telegramMenuModel(rows);
-			expect(menu.length).toBeGreaterThan(30);
+		expect(menu.length).toBeGreaterThan(30);
 		const names = menu.map((m) => m.command);
 		expect(names).toContain("new");
 		expect(names).toContain("compact");
