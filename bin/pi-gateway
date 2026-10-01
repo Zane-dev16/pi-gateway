@@ -1,0 +1,16 @@
+#!/bin/sh
+# pi-gateway standalone entrypoint (DEC-080). Runs the TS CLI through the
+# repo's resolve hook — the same path the two-process drivers use — with
+# exec so signals reach node directly (service-manager drain semantics).
+target="$0"
+while [ -L "$target" ]; do
+	dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)
+	link=$(ls -l "$target" | sed 's/.* -> //')
+	case "$link" in
+		/*) target="$link" ;;
+		*) target="$dir/$link" ;;
+	esac
+done
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)
+ROOT_DIR=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+exec node --import "$ROOT_DIR/src/pi_state/testing/node-ts-resolve.mjs" "$ROOT_DIR/src/entrypoints/pi-gateway.ts" "$@"

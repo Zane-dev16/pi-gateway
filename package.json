@@ -7,6 +7,9 @@
   "pi": {
     "extensions": ["./extensions"]
   },
+  "bin": {
+    "pi-gateway": "bin/pi-gateway"
+  },
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vitest run",

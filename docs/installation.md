@@ -80,6 +80,25 @@ never trips the first one's duplicate-instance guard, and under multiplex each
 profile's secrets and allowlists are isolated by the fail-closed secret scope
 (spec 06 §3, DEC-003).
 
+## Standalone process (DEC-080)
+
+For a daemon that outlives any chat process, run the standalone
+entrypoint instead of the in-pi `/gateway` shim (same composition root,
+own lifecycle: PID file, runtime lock, `state.db` open/repair, log files
+under `<PI_HOME>/logs/gateway.log`). Link the checkout so the command
+resolves:
+
+```sh
+ln -s /path/to/pi-gateway/bin/pi-gateway ~/.local/bin/pi-gateway
+pi-gateway run --home "$PI_HOME"     # foreground; parks until stopped
+pi-gateway status --home "$PI_HOME"   # PID file + lock liveness, starts nothing
+pi-gateway stop --home "$PI_HOME"     # planned-stop marker, then SIGTERM
+```
+
+A second `run` against the same home exits 0 with a lock-held message
+instead of double-polling. Platforms come from `PI_GATEWAY_PLATFORMS`
+(the same allowlist the extension reads).
+
 ## Running as a service
 
 `pi gateway run` is a long-lived foreground process designed to sit under any
