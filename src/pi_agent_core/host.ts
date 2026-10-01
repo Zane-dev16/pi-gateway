@@ -38,6 +38,20 @@ import { Type as _Type } from "/usr/local/lib/node_modules/@earendil-works/pi-co
 export const Type = _Type;
 export type { Static } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js";
 
+// Host slash-command census (DEC-027 derivation seam): the SDK index does
+// not export it, so this single deep import is the sanctioned exception to
+// the index-only rule — same justification as the Type value above. The
+// module is side-effect-free (one APP_NAME import). Every other module
+// reads the census through THIS re-export, never its own deep import.
+import {
+	BUILTIN_SLASH_COMMANDS as _BUILTIN_SLASH_COMMANDS,
+} from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/slash-commands.js";
+export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<{
+	readonly name: string;
+	readonly description: string;
+	readonly argumentHint?: string;
+}> = _BUILTIN_SLASH_COMMANDS;
+
 export type {
 	AgentSession,
 	AgentSessionEvent,

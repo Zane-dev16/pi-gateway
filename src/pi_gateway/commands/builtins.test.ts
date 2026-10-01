@@ -1,10 +1,11 @@
-// Builtin registry row census CONTRACTS (07 §1; hermes_cli/commands.py:
-// COMMAND_REGISTRY). The shipped set must be POPULATED and FAITHFUL: every
-// derived consumer derives from these rows, so an empty/wrong census poisons
-// help, menus, completions, known-command classification AND Guard-2 busy
-// dispatch simultaneously. Row count is pinned to the reference census.
+// Builtin registry row census CONTRACTS (07 §1; DEC-027 derivation). The
+// shipped set must be POPULATED and FAITHFUL: every derived consumer
+// derives from these rows, so an empty/wrong census poisons help, menus,
+// completions, known-command classification AND Guard-2 busy dispatch
+// simultaneously. Row count is pinned to host builtins + gateway survivors.
 
 import { describe, expect, it } from "vitest";
+import { BUILTIN_SLASH_COMMANDS } from "../../pi_agent_core/host.js";
 import {
 	BUILTIN_COMMAND_ROWS,
 	createBuiltinCommandRegistry,
@@ -19,16 +20,15 @@ import {
 } from "./derived.js";
 
 describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
-	it("row count matches the hermes COMMAND_REGISTRY census exactly", () => {
-		// Pinned against /tmp/hermes-upstream hermes_cli/commands.py
-		// COMMAND_REGISTRY (99 CommandDef rows), reduced by THREE under the
-		// DEC-070 scope amendment: the recurring in-session /loop wakeup
-		// surface (row + persistence + wake watcher, item 6), the kanban
-		// multi-agent task board (row + subcommands, item 1), and the /update
-		// self-update row (item 3) were removed with owner validation.
+	it("row count equals host builtins plus gateway-only survivors", () => {
+		// DEC-027 derivation: the census is the host BUILTIN_SLASH_COMMANDS
+		// (26 rows) plus the gateway-only survivors — never a Hermes number.
 		// Adding/removing a row is still a conscious census change, never an
 		// accident.
-		expect(BUILTIN_COMMAND_ROWS).toHaveLength(96);
+		expect(BUILTIN_COMMAND_ROWS.length).toBe(
+			BUILTIN_SLASH_COMMANDS.length + 18,
+		);
+		expect(BUILTIN_SLASH_COMMANDS.length).toBe(24);
 	});
 
 	it("every row validates against the CommandDef schema (registry accepts all)", () => {
@@ -41,9 +41,28 @@ describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 		);
 	});
 
-	it("canonical names are unique across the whole census", () => {
+	it("host canonical names win (compact, not compress) and Hermes-only rows are gone", () => {
 		const names = BUILTIN_COMMAND_ROWS.map((r) => r.name);
-		expect(new Set(names).size).toBe(names.length);
+		expect(names).toContain("compact");
+		expect(names).not.toContain("compress");
+		for (const dropped of [
+			"subscription",
+			"topup",
+			"pet",
+			"hatch",
+			"wake",
+			"moa",
+			"yolo",
+			"egress",
+			"blueprint",
+			"curator",
+		]) {
+			expect(names, dropped).not.toContain(dropped);
+		}
+		// Every host builtin ships exactly once.
+		for (const cmd of BUILTIN_SLASH_COMMANDS) {
+			expect(names, cmd.name).toContain(cmd.name);
+		}
 	});
 });
 
@@ -82,48 +101,51 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 
 	it("gateway help lines cover every gateway-available row", () => {
 		const lines = gatewayHelpLines(rows);
-		expect(lines.length).toBeGreaterThan(50);
-		expect(lines.some((l) => l.startsWith("`/new [name]`"))).toBe(true);
+		expect(lines.length).toBeGreaterThan(30);
+		expect(lines.some((l) => l.startsWith("`/new"))).toBe(true);
 		expect(lines.some((l) => l.startsWith("`/help"))).toBe(true);
 	});
 
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {
 		for (const surface of ["cli", "gateway"] as const) {
 			const catalog = completionCatalog(rows, { surface });
-			// 80 completions before DEC-070 removed the /loop (item 6), /kanban
-			// (item 1), and /update (item 3) rows; the catalog still derives
-			// purely from the surviving census (96 rows ⇒ 76 completion keys).
-			expect(catalog.commands.length).toBeGreaterThanOrEqual(76);
+			// The catalog derives purely from the surviving census (host
+			// builtins + gateway survivors + their aliases).
+			expect(catalog.commands.length).toBeGreaterThanOrEqual(35);
 			expect(catalog.commands).toContain("/new");
 			expect(catalog.commands).toContain("/reset");
-			expect(catalog.subcommands.get("/voice")).toEqual([
-				"on",
-				"off",
-				"tts",
-				"status",
-			]);
+			expect(catalog.commands).toContain("/compact");
+			expect(catalog.commands).not.toContain("/subscription");
 		}
+		// Gateway-only subcommands surface on the gateway catalog only.
+		const gw = completionCatalog(rows, { surface: "gateway" });
+			expect(gw.subcommands.get("/platform")).toEqual([
+			"pause",
+			"resume",
+			"list",
+		]);
 	});
 
 	it("the telegram menu model carries sanitized gateway-available entries", () => {
 		const menu = telegramMenuModel(rows);
-		expect(menu.length).toBeGreaterThan(30);
+			expect(menu.length).toBeGreaterThan(30);
 		const names = menu.map((m) => m.command);
 		expect(names).toContain("new");
+		expect(names).toContain("compact");
 		expect(names).toContain("sethome"); // set-home sanitized to underscores
+		expect(names).not.toContain("subscription");
 		expect(names.every((n) => /^[a-z0-9_]+$/.test(n))).toBe(true);
 	});
 
 	it("the known-command set classifies real commands vs unknown text", () => {
 		const known = gatewayKnownCommands(rows);
-		expect(known.size).toBeGreaterThan(60);
-		for (const token of ["new", "reset", "stop", "help", "background"]) {
+		expect(known.size).toBeGreaterThan(40);
+		for (const token of ["new", "reset", "stop", "help", "compact"]) {
 			expect(known.has(token), token).toBe(true);
 		}
-		// cli_only rows without gates stay OUT of the gateway known-set.
-		expect(known.has("clear")).toBe(false);
-		// …but a config-gated cli_only row is ALWAYS routable.
-		expect(known.has("verbose")).toBe(true);
+		// Dropped Hermes-only rows classify as unknown text now.
+		expect(known.has("subscription")).toBe(false);
+		expect(known.has("compress")).toBe(false);
 	});
 });
 
@@ -131,7 +153,7 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 	const registry = createBuiltinCommandRegistry();
 	const resolver = BusyResolver.fromLookup(registry.lookup());
 
-	it("all 96 surviving canonical rows project into the guard feed with valid policies", () => {
+	it("all surviving canonical rows project into the guard feed with valid policies", () => {
 		const guardRows = toGuardRows(BUILTIN_COMMAND_ROWS);
 		expect(guardRows).toHaveLength(BUILTIN_COMMAND_ROWS.length);
 		const lookup = buildBusyLookup(guardRows);
@@ -154,7 +176,7 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 			expect(VALID_BUSY_POLICIES.has(policy as string)).toBe(true);
 			checked += 1;
 		}
-		expect(checked).toBeGreaterThan(110); // 96 names + aliases
+		expect(checked).toBeGreaterThan(45); // names + aliases
 	});
 
 	it("interrupt-class routing covers the /stop, /new cancel-handoff class", () => {
@@ -174,9 +196,9 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 				expect(row.busyPolicy, `/${row.name}`).toBeDefined();
 			}
 		}
-		// Spot-check the documented classes (CommandDef field docs): /moa's
-		// custom busy-reject text vs the /queue FIFO enqueue handler.
-		expect(registry.resolve("moa")?.busyHandler).toBe("moa");
+		// Spot-check the surviving handler classes: /model's custom
+		// busy-reject vs the /queue FIFO enqueue handler.
+		expect(registry.resolve("model")?.busyHandler).toBe("model");
 		expect(registry.resolve("queue")?.busyHandler).toBe("queue");
 	});
 });
