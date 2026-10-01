@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"fixture-adopt-1","timestamp":"2026-09-30T12:00:00.000Z","cwd":"/proj/adopted"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-09-30T12:01:00.000Z","message":{"role":"user","content":[{"type":"text","text":"summarize the deploy checklist"}],"timestamp":1759233660000}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-09-30T12:02:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Three steps: freeze, migrate, verify."}],"timestamp":1759233720000}}
+{"type":"thinking_level_change","id":"e3","parentId":"e2","timestamp":"2026-09-30T12:03:00.000Z","thinkingLevel":"high"}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2026-09-30T12:04:00.000Z","message":{"role":"user","content":"plain string content still adopts","timestamp":1759233840000}}
+{"type":"custom","id":"e5","parentId":"e4","timestamp":"2026-09-30T12:05:00.000Z","customType":"note","data":{}}
+{"type":"message","id":"e6","parentId":"e5","timestamp":"2026-09-30T12:06:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Noted."}],"timestamp":1759233960000}}
