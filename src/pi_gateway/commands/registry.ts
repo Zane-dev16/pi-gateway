@@ -22,18 +22,17 @@ import {
 
 /** Thrown when a registration would shadow an existing name or alias. */
 export class RegistryCollisionError extends Error {
-	constructor(
-		/** The conflicting token (name or alias). */
-		readonly token: string,
-		/** Canonical name of the row already owning the token. */
-		readonly owner: string,
-		/** Canonical name of the incoming row. */
-		readonly incoming: string,
-	) {
+	readonly token: string;
+	readonly owner: string;
+	readonly incoming: string;
+	constructor(token: string, owner: string, incoming: string) {
 		super(
 			`registry collision: "${token}" is already owned by /${owner}; refusing to overwrite it with /${incoming}`,
 		);
 		this.name = "RegistryCollisionError";
+		this.token = token;
+		this.owner = owner;
+		this.incoming = incoming;
 	}
 }
 

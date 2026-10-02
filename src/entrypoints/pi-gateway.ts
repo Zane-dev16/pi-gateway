@@ -158,10 +158,13 @@ export async function runCommand(
 			input.turnRunnerFactory = overrides.turnRunnerFactory;
 	} else {
 		// Lazy census load (see module header): no allowlist ⇒ no adapter
-		// chains enter the process at all.
-		const hosting = await import("./platform-hosting.js");
-		const raw = (process.env[hosting.PI_GATEWAY_PLATFORMS_ENV] ?? "").trim();
+		// chains enter the process at all. Read the env var BEFORE importing
+		// platform-hosting: that module statically pulls adapter chains with
+		// parameter properties bare-node strip-only runners cannot parse.
+		// Canonical var name lives in platform-hosting.ts:PI_GATEWAY_PLATFORMS_ENV.
+		const raw = (process.env["PI_GATEWAY_PLATFORMS"] ?? "").trim();
 		if (raw !== "") {
+			const hosting = await import("./platform-hosting.js");
 			const platforms = hosting.resolveConfiguredPlatforms(raw);
 			if (platforms.length > 0) {
 				const runner = await import("./production-runner.js");
