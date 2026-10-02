@@ -232,6 +232,13 @@ interface CachedHostSession {
 	 * entry until the next successful turn re-stamps it (fail-closed).
 	 */
 	flushedDbIdx: number | null;
+	/**
+	 * Filesystem root the host session was built under (DEC-079 path
+	 * linkage: the persisted binder path when the chat carries one, else
+	 * process.cwd()). A cache hit is reusable only under the SAME root — a
+	 * re-rooted chat rebuilds instead of driving the old root's session.
+	 */
+	cwd: string;
 }
 
 interface InflightTurn {
@@ -368,6 +375,14 @@ export class GatewayAgentRunner {
 	}
 
 	/**
+	 * Diagnostics: the root the cached host session runs under (null when
+	 * uncached). Tests assert bound-path turns build under that root.
+	 */
+	cachedSessionCwd(sessionId: string): string | null {
+		return this.cache.peek(sessionId)?.cwd ?? null;
+	}
+
+	/**
 	 * Effective DEC-021 pressure bound the cache enforces — the operator byte
 	 * override when provided, else the startup-derived memory budget.
 	 */
@@ -393,6 +408,13 @@ export class GatewayAgentRunner {
 		sessionId: string;
 		routingKey: string;
 		text: string;
+		/**
+		 * Bound working path for this chat (DEC-079: the persisted binder
+		 * entry cwd). Optional — absent falls back to the session's stored
+		 * sessions.cwd, then process.cwd(). Threaded into the host session
+		 * build; never a filesystem write beyond the host's own scoping.
+		 */
+		cwd?: string | undefined;
 	}): Promise<TurnOutcome> {
 		if (this.closed) throw new Error("runner is closed");
 		const generation = (this.generations.get(request.sessionId) ?? 0) + 1;
@@ -469,7 +491,8 @@ export class GatewayAgentRunner {
 		modelRef: string,
 	): Promise<Model<Api>> {
 		if (this.closed) throw new Error("runner is closed");
-		if (modelRef.trim() === "") throw new Error("Usage: /model <provider/model>");
+		if (modelRef.trim() === "")
+			throw new Error("Usage: /model <provider/model>");
 		const resolved = resolveCliModel({
 			cliModel: modelRef.trim(),
 			modelRuntime: this.modelRuntime,
@@ -520,7 +543,12 @@ export class GatewayAgentRunner {
 	// ------------------------------------------------------------------
 
 	private async runTurn(
-		request: { sessionId: string; routingKey: string; text: string },
+		request: {
+			sessionId: string;
+			routingKey: string;
+			text: string;
+			cwd?: string | undefined;
+		},
 		state: ConversationState,
 	): Promise<TurnOutcome> {
 		state.turnStartedAt = this.now();
@@ -705,13 +733,18 @@ export class GatewayAgentRunner {
 	 * released by runTurn's finally or here).
 	 */
 	private async driveTurn(
-		request: { sessionId: string; routingKey: string; text: string },
+		request: {
+			sessionId: string;
+			routingKey: string;
+			text: string;
+			cwd?: string | undefined;
+		},
 		state: ConversationState,
 		sessionId: string,
 		waited: boolean,
 		dbHolder: string | null,
 	): Promise<TurnOutcome> {
-		let host = await this.acquireHostSession(sessionId);
+		let host = await this.acquireHostSession(sessionId, request.cwd);
 		let session = host.session;
 		// Turn-start flush-cursor reset (run.py:_init_cached_agent_for_turn
 		// parity: "Reset the SessionDB flush cursor so the new turn's messages
@@ -728,7 +761,7 @@ export class GatewayAgentRunner {
 			// append-only sessionManager, which cannot rewind): drop the stale
 			// entry and rebuild so the ghost tail loads via the normal seed.
 			this.dropCachedSession(sessionId);
-			host = await this.acquireHostSession(sessionId);
+			host = await this.acquireHostSession(sessionId, request.cwd);
 			session = host.session;
 			host.flushedDbIdx = null;
 		}
@@ -1117,24 +1150,70 @@ export class GatewayAgentRunner {
 		}
 	}
 
-	/** Cache get-or-build so consecutive turns reuse byte-identical prompt+tools. */
+	/**
+	 * Cache get-or-build so consecutive turns reuse byte-identical
+	 * prompt+tools. The entry is reusable only under the SAME root: an
+	 * explicit cwd wins, else the session's stored sessions.cwd, else
+	 * process.cwd(). A root mismatch drops and rebuilds so a re-rooted chat
+	 * never drives the old root's host session.
+	 */
 	private async acquireHostSession(
 		sessionId: string,
+		cwd?: string | undefined,
 	): Promise<CachedHostSession> {
+		const wanted = cwd !== undefined && cwd !== "" ? cwd : undefined;
+		if (wanted !== undefined) this.stampSessionCwd(sessionId, wanted);
+		const root = wanted ?? this.readSessionCwd(sessionId) ?? process.cwd();
 		const hit = this.cache.get(sessionId);
-		if (hit) return hit;
-		const built = await this.buildHostSession(sessionId);
+		if (hit !== undefined) {
+			if (hit.cwd === root) return hit;
+			this.dropCachedSession(sessionId);
+		}
+		const built = await this.buildHostSession(sessionId, root);
 		this.cache.set(sessionId, built, estimateSessionBytes(built.session));
 		return built;
 	}
 
+	/**
+	 * Durable root fallback (sessions.cwd): the last bound path stamped by
+	 * an explicit-cwd turn. Read-only probe — null when unset or unreadable
+	 * (caller falls back to process.cwd()). Never throws.
+	 */
+	private readSessionCwd(sessionId: string): string | null {
+		try {
+			const row = this.store.db
+				.prepare("SELECT cwd FROM sessions WHERE id = ? LIMIT 1")
+				.get(sessionId) as { cwd: string | null } | undefined;
+			const cwd = row?.cwd;
+			return typeof cwd === "string" && cwd !== "" ? cwd : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Stamp the bound path onto the session row (DEC-079 path linkage:
+	 * /switch-path and /new-path roots persist here via handleTurn's cwd).
+	 * Best-effort — a missing row or a locked store never breaks a turn.
+	 */
+	private stampSessionCwd(sessionId: string, cwd: string): void {
+		try {
+			this.store.db
+				.prepare("UPDATE sessions SET cwd = ? WHERE id = ?")
+				.run(cwd, sessionId);
+		} catch {
+			/* observation-only — never breaks a turn */
+		}
+	}
+
 	private async buildHostSession(
 		sessionId: string,
+		root: string,
 	): Promise<CachedHostSession> {
 		const settingsManager = SettingsManager.inMemory({});
 		const resourceLoader = new DefaultResourceLoader({
-			cwd: process.cwd(),
-			agentDir: process.cwd(),
+			cwd: root,
+			agentDir: root,
 			systemPromptOverride: () => this.systemPrompt,
 			// Deterministic prompt bytes: the gateway owns prompt composition;
 			// ambient project context files (AGENTS.md discovery) must never leak
@@ -1145,9 +1224,9 @@ export class GatewayAgentRunner {
 		await resourceLoader.reload();
 
 		const createOptions: CreateAgentSessionOptions = {
-			cwd: process.cwd(),
-			agentDir: process.cwd(),
-			sessionManager: SessionManager.inMemory(process.cwd()),
+			cwd: root,
+			agentDir: root,
+			sessionManager: SessionManager.inMemory(root),
 			settingsManager,
 			resourceLoader,
 			modelRuntime: this.modelRuntime,
@@ -1169,6 +1248,7 @@ export class GatewayAgentRunner {
 		return {
 			session,
 			flushedDbIdx: session.agent.state.messages.length,
+			cwd: root,
 		};
 	}
 
