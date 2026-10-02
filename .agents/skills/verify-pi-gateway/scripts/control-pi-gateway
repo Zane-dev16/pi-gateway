@@ -1,0 +1,147 @@
+#!/bin/bash
+# control-pi-gateway — verification harness for pi-gateway.
+# Usage is shown in SKILL.md; every subcommand below is literal.
+# Never touches ~/.pi unless --home points there (don't).
+REPO=/root/pi-gateway/pi-gateway
+BIN=$REPO/bin/pi-gateway
+PIBIN=$REPO/node_modules/.bin/pi
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 irellzane@loki"
+
+cmd=${1:-}; shift 2>/dev/null || true
+HOME_DIR=""
+SCENARIO="send-receive"
+CLI_ARGS=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --home) HOME_DIR="$2"; shift 2;;
+    --scenario) SCENARIO="$2"; shift 2;;
+    --) shift; CLI_ARGS="$*"; break;;
+    *) shift;;
+  esac
+done
+
+need_home() {
+  if [ -z "$HOME_DIR" ]; then echo "missing --home <dir>" >&2; exit 2; fi
+}
+
+case "$cmd" in
+  launch)
+    need_home
+    mkdir -p "$HOME_DIR"
+    LOG="$HOME_DIR.launch.log"
+    # Extension path (README step 3): pi --mode rpc with auto-start composes
+    # the SAME gateway-run composition root. stdin must stay OPEN
+    # (tail -f /dev/null) or pi exits on EOF. cwd=$REPO so pi loads the
+    # local ./extensions entry. Platform/bot env (PI_GATEWAY_PLATFORMS,
+    # TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS) passes through from ours.
+    cd "$REPO" || exit 1
+    touch "$LOG"
+    MARK=$(wc -l <"$LOG")
+    PI_HOME="$HOME_DIR" PI_GATEWAY_AUTO_START=1 nohup bash -c 'tail -f /dev/null | exec '"$PIBIN"' --mode rpc' >>"$LOG" 2>&1 &
+    NEWLPID=$!
+    echo "=== launch $(date -u +%FT%TZ) launcher=$NEWLPID ===" >>"$LOG"
+    # Only lines written AFTER this launch count (append-mode log keeps
+    # older runs' READY lines, which must not satisfy this wait).
+    fresh() { tail -n +$((MARK + 1)) "$LOG" 2>/dev/null | grep -q "$1"; }
+    i=0
+    while [ $i -lt 60 ]; do
+      if fresh "gateway READY"; then break; fi
+      if fresh "startup ABORTED"; then break; fi
+      sleep 1; i=$((i+1))
+    done
+    if fresh "startup ABORTED"; then
+      echo "launch refused (duplicate guard?) — tail of $LOG:" >&2
+      grep -E "duplicate|already running|ABORTED" "$LOG" | head -n 5 >&2
+      # Reap only the launcher tree THIS call started; keep the recorded
+      # pid file and the live instance's log lines untouched.
+      pkill -TERM -P "$NEWLPID" 2>/dev/null || true
+      kill -TERM "$NEWLPID" 2>/dev/null || true
+      exit 1
+    fi
+    if ! fresh "gateway READY"; then
+      echo "launch failed — tail of $LOG:" >&2; tail -n 20 "$LOG" >&2
+      pkill -TERM -P "$NEWLPID" 2>/dev/null || true
+      kill -TERM "$NEWLPID" 2>/dev/null || true
+      exit 1
+    fi
+    echo "$NEWLPID" >"$HOME_DIR/.verify-launcher-pid"
+    echo "HOME_DIR=$HOME_DIR"
+    echo "GATEWAY_PID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$HOME_DIR/gateway_state.json','utf8')).pid)" 2>/dev/null)"
+    echo "LOG=$LOG"
+    ;;
+  doctor)
+    need_home
+    FAIL=0
+    if [ -f "$HOME_DIR/gateway_state.json" ]; then
+      read S_P S_PID < <(node -e "const s=JSON.parse(require('fs').readFileSync('$HOME_DIR/gateway_state.json','utf8')); console.log(s.gateway_state+' '+s.pid)" 2>/dev/null) || FAIL=1
+      echo "doctor: state=$S_P pid=$S_PID"
+      [ "$S_P" = "running" ] || { echo "doctor: gateway_state is $S_P, want running" >&2; FAIL=1; }
+      if kill -0 "$S_PID" 2>/dev/null; then echo "doctor: pid $S_PID alive"; else echo "doctor: pid $S_PID DEAD" >&2; FAIL=1; fi
+    else
+      echo "doctor: no gateway_state.json in $HOME_DIR" >&2; FAIL=1
+    fi
+    grep -q "gateway READY" "$HOME_DIR.launch.log" 2>/dev/null && echo "doctor: READY logged" || { echo "doctor: no READY in launch log" >&2; FAIL=1; }
+    node -e "
+      const db = require('$REPO/node_modules/better-sqlite3')('$HOME_DIR/state.db', { readonly: true });
+      const tables = db.prepare(\"SELECT name FROM sqlite_master WHERE type='table'\").all().map(r=>r.name);
+      for (const t of ['sessions','messages','delivery_obligations','session_turn_leases'])
+        if (!tables.includes(t)) { console.error('doctor: table missing: '+t); process.exitCode=1; }
+      console.log('doctor: state.db tables ok ('+tables.length+' tables)');
+    " || FAIL=1
+    [ $FAIL -eq 0 ] && echo "doctor: HEALTHY $HOME_DIR" || { echo "doctor: UNHEALTHY" >&2; exit 1; }
+    ;;
+  cli)
+    need_home
+    # Standalone bin passthrough (status/stop for gateway.pid homes).
+    # shellcheck disable=SC2086
+    "$BIN" $CLI_ARGS --home "$HOME_DIR"
+    ;;
+  db)
+    need_home
+    if [ -z "$CLI_ARGS" ]; then echo "usage: control-pi-gateway db --home <dir> -- \"<sql>\"" >&2; exit 2; fi
+    node -e "
+      const db = require('$REPO/node_modules/better-sqlite3')('$HOME_DIR/state.db', { readonly: true });
+      const rows = db.prepare(process.argv[1]).all();
+      console.log(JSON.stringify(rows, null, 1).slice(0, 4000));
+    " "$CLI_ARGS"
+    ;;
+  headless)
+    # Offline Telegram turn: real adapter engine vs Bot-API fake (no network).
+    cd "$REPO" || exit 1
+    case "$SCENARIO" in
+      send-receive)
+        ./node_modules/.bin/vitest run src/pi_platforms/telegram/telegram.test.ts 2>&1 | tail -n 15;;
+      *)
+        echo "unknown scenario: $SCENARIO (only send-receive)" >&2; exit 2;;
+    esac
+    ;;
+  cdp-targets)
+    $SSH "curl -s --max-time 5 http://localhost:9222/json/list | head -c 2000; echo; echo CDP_OK" 2>&1 | head -n 30
+    echo "test chat: https://web.telegram.org/a/#8979458891"
+    ;;
+  cleanup)
+    need_home
+    LPID="$(cat "$HOME_DIR/.verify-launcher-pid" 2>/dev/null)"
+    GPID=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('$HOME_DIR/gateway_state.json','utf8')).pid)}catch(e){}" 2>/dev/null)
+    # Graceful drain first: SIGTERM the gateway pid so it exits planned_stop.
+    [ -n "$GPID" ] && kill -TERM "$GPID" 2>/dev/null || true
+    i=0
+    while [ $i -lt 15 ]; do
+      DEAD=$(node -e "try{const s=JSON.parse(require('fs').readFileSync('$HOME_DIR/gateway_state.json','utf8')); if(s.gateway_state!=='running'){console.log('drained');process.exit(0)}}catch(e){console.log('gone');process.exit(0)} process.exit(1)" 2>/dev/null) && break
+      sleep 1; i=$((i+1))
+    done
+    # Then reap OUR launcher children only (the tail feeding stdin, pi
+    # remnant): pkill -P hits children of our recorded launcher pid, never
+    # anything else on the box.
+    [ -n "$LPID" ] && pkill -TERM -P "$LPID" 2>/dev/null || true
+    [ -n "$LPID" ] && kill -TERM "$LPID" 2>/dev/null || true
+    sleep 2
+    rm -rf "$HOME_DIR"
+    rm -f "$HOME_DIR.launch.log"
+    echo "cleanup: removed $HOME_DIR (artifacts kept)"
+    ;;
+  *)
+    echo "usage: control-pi-gateway <launch|doctor|cli|db|headless|cdp-targets|cleanup> [--home <dir>] [-- <args>]" >&2
+    exit 2;;
+esac
