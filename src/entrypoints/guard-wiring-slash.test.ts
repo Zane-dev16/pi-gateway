@@ -130,6 +130,30 @@ describe("idle slash path (DEC-078)", () => {
 		expect(stub.texts).toEqual(["/compact focus the tail"]);
 	});
 
+	it("/compact with the runner seam compacts locally and consumes no turn", async () => {
+		const stub = stubRunner();
+		const compacted: string[] = [];
+		const handler = buildProductionMessageHandler({
+			runner: {
+				...stub.runner,
+				compactSession: async (sessionId: string) => {
+					compacted.push(sessionId);
+					return {
+						summary: "condensed talk",
+						tokensBefore: 42424,
+					};
+				},
+			},
+			isAuthorized: ALLOW_ALL,
+		});
+		const reply = await handler(event("/compact focus the tail"), CTX);
+		if (typeof reply !== "string") throw new Error("/compact must reply");
+		expect(reply).toContain("Compacted 42424 tokens");
+		expect(reply).toContain("condensed talk");
+		expect(compacted).toEqual(["sess"]);
+		expect(stub.texts).toEqual([]);
+	});
+
 	it("allowGatewayControl:false treats slash as plain text", async () => {
 		const stub = stubRunner();
 		const handler = buildProductionMessageHandler({

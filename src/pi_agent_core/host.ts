@@ -53,6 +53,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<{
 export type {
 	AgentSession,
 	AgentSessionEvent,
+	CompactionResult,
 	CreateAgentSessionOptions,
 	CreateAgentSessionResult,
 	InputSource,

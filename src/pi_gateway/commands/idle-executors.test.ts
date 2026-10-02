@@ -10,7 +10,12 @@ import {
 	BUILTIN_COMMAND_ROWS,
 	createBuiltinCommandRegistry,
 } from "./builtins.js";
-import { buildIdleExecutors } from "./idle-executors.js";
+import {
+	buildIdleExecutors,
+	compactIdleExecutor,
+	type IdleExecutorContext,
+	type IdleTurnRunner,
+} from "./idle-executors.js";
 
 const rows = createBuiltinCommandRegistry().rows();
 
@@ -69,5 +74,92 @@ describe("idle /help executor (DEC-078)", () => {
 		}
 		expect(result.text).toContain("`/compact");
 		expect(result.text).not.toContain("`/new");
+	});
+});
+
+describe("idle /compact executor (blocker 1)", () => {
+	function ctxWith(
+		runner: IdleTurnRunner,
+		extra?: Partial<IdleExecutorContext>,
+	): IdleExecutorContext {
+		return {
+			sessionKey: "chat-7",
+			args: "",
+			rows,
+			runner,
+			eventText: "/compact",
+			...extra,
+		};
+	}
+
+	function recordingRunner(): {
+		turns: string[];
+		sessions: string[];
+		runner: IdleTurnRunner;
+	} {
+		const turns: string[] = [];
+		const sessions: string[] = [];
+		return {
+			turns,
+			sessions,
+			runner: {
+				handleTurn: async (request: {
+					sessionId: string;
+				routingKey: string;
+				text: string;
+			}) => {
+					turns.push(request.text);
+					throw new Error("compact must not consume a turn");
+				},
+				compactSession: async (sessionId: string) => {
+					sessions.push(sessionId);
+					return { summary: "condensed talk", tokensBefore: 42424 };
+				},
+			},
+		};
+	}
+
+	it("runs the runner seam and replies with tokens plus summary", async () => {
+		const stub = recordingRunner();
+		const result = await compactIdleExecutor(
+			ctxWith(stub.runner, { hostSessionId: "drive-9" }),
+		);
+		if (result.kind !== "reply") throw new Error("/compact must reply");
+		expect(stub.sessions).toEqual(["drive-9"]);
+		expect(result.text).toContain("Compacted 42424 tokens");
+		expect(result.text).toContain("condensed talk");
+		expect(stub.turns).toEqual([]);
+	});
+
+	it("falls back to the chat key without a resolved host session", async () => {
+		const stub = recordingRunner();
+		const result = await compactIdleExecutor(ctxWith(stub.runner));
+		if (result.kind !== "reply") throw new Error("/compact must reply");
+		expect(stub.sessions).toEqual(["chat-7"]);
+	});
+
+	it("without the runner seam stays passthrough on original bytes", async () => {
+		const table = buildIdleExecutors(rows);
+		const compact = table.get("compact");
+		if (compact === undefined) throw new Error("/compact has no idle executor");
+		const result = await compact(
+			ctxWith(throwingRunner(), { eventText: "/compact focus" }),
+		);
+		expect(result).toEqual({ kind: "passthrough", text: "/compact focus" });
+	});
+
+	it("a host refusal renders as reply text, never a throw", async () => {
+		const runner: IdleTurnRunner = {
+			handleTurn: async () => {
+				throw new Error("must not turn");
+			},
+			compactSession: async () => {
+				throw new Error("Nothing to compact (session too small)");
+			},
+		};
+		const result = await compactIdleExecutor(ctxWith(runner));
+		if (result.kind !== "reply") throw new Error("refusal must reply");
+		expect(result.text).toContain("Compaction failed");
+		expect(result.text).toContain("Nothing to compact");
 	});
 });

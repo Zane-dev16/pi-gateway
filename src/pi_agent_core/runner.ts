@@ -61,6 +61,7 @@ import {
 	SettingsManager,
 	type Api,
 	type AssistantMessage,
+	type CompactionResult,
 	type CreateAgentSessionOptions,
 	type JsonObject,
 	type Message,
@@ -430,6 +431,23 @@ export class GatewayAgentRunner {
 		const entry = this.cache.peek(sessionId);
 		entry?.session.dispose();
 		this.cache.delete(sessionId);
+	}
+
+	/**
+	 * Manual compaction for /compact: run the REAL host AgentSession.compact()
+	 * against the cached host session (built + replay-seeded first when
+	 * absent). The host aborts any in-flight op, summarizes the head, and
+	 * mutates the cached session in place — no rekey needed. Throws the
+	 * host's own error when there is nothing to compact; the caller renders it.
+	 */
+	async compactSession(
+		sessionId: string,
+		customInstructions?: string,
+	): Promise<CompactionResult> {
+		if (this.closed) throw new Error("runner is closed");
+		const host = await this.acquireHostSession(sessionId);
+		if (customInstructions === undefined) return host.session.compact();
+		return host.session.compact(customInstructions);
 	}
 
 	async close(): Promise<void> {

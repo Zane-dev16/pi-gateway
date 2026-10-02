@@ -81,6 +81,17 @@ export interface ChatTurnRunner {
 	 * change was needed.
 	 */
 	dropCachedSession?: ((sessionId: string) => void) | undefined;
+	/**
+	 * Manual compaction over the runner's cached host session
+	 * (runner.ts:GatewayAgentRunner.compactSession). Optional — without it
+	 * /compact stays passthrough on original bytes.
+	 */
+	compactSession?:
+		| ((
+				sessionId: string,
+				customInstructions?: string,
+			) => Promise<{ summary: string; tokensBefore: number }>)
+		| undefined;
 }
 
 /**
@@ -441,6 +452,7 @@ export function buildProductionMessageHandler(
 				rows: idle.rows,
 				runner,
 				eventText: text,
+				hostSessionId: driveSessionId,
 			});
 			if (result.kind === "reply") return result.text;
 			return runTurn(result.text);
