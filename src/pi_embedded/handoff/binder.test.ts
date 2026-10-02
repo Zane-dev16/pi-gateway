@@ -43,6 +43,17 @@ function sessionRow(id: string): SessionRow | undefined {
 		.get(id) as SessionRow | undefined;
 }
 
+function parseConfig(raw: string | null): { _reset_from?: string } {
+	if (raw === null) return {};
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return {};
+		return parsed as { _reset_from?: string };
+	} catch {
+		return {};
+	}
+}
+
 async function seedSession(
 	id: string,
 	opts: Partial<SessionRow> = {},
@@ -207,13 +218,11 @@ describe("RoutingBinder — switchSession", () => {
 		await binder.ensureEntry("k", {});
 		await binder.switchSession("k", "cli-1");
 
-		const stamped = JSON.parse(
-			sessionRow("reset-child")?.model_config ?? "{}",
-		) as { _reset_from?: string };
+		const stamped = parseConfig(sessionRow("reset-child")?.model_config ?? null);
 		expect(stamped._reset_from).toBe("cli-1");
-		const marked = JSON.parse(
-			sessionRow("marked-child")?.model_config ?? "{}",
-		) as { _reset_from?: string };
+		const marked = parseConfig(
+			sessionRow("marked-child")?.model_config ?? null,
+		);
 		expect(marked._reset_from).toBe("cli-1"); // unchanged value
 
 		// A NON-same-key child is not a reset continuation — never stamped.
@@ -225,9 +234,45 @@ describe("RoutingBinder — switchSession", () => {
 				)
 				.run(),
 		);
-		const unrelatedConfig = sessionRow("unrelated")?.model_config ?? null;
-		expect(unrelatedConfig === null ? {} : JSON.parse(unrelatedConfig)).toEqual(
+		expect(parseConfig(sessionRow("unrelated")?.model_config ?? null)).toEqual(
 			{},
 		);
+	});
+});
+
+describe("RoutingBinder — path linkage (blocker 2)", () => {
+	it("seeds cwd on ensureEntry and reads it back", async () => {
+		await binder.ensureEntry("path-key", { cwd: "/proj/a" });
+		expect(binder.entryOf("path-key")?.cwd).toBe("/proj/a");
+	});
+
+	it("defaults cwd to null when unseeded", async () => {
+		await binder.ensureEntry("bare-key", {});
+		expect(binder.entryOf("bare-key")?.cwd).toBeNull();
+	});
+
+	it("switchSession preserves cwd across the rebind", async () => {
+		await binder.ensureEntry("move-key", { cwd: "/proj/a" });
+		await binder.switchSession("move-key", "cli-9");
+		const entry = binder.entryOf("move-key");
+		expect(entry?.session_id).toBe("cli-9");
+		expect(entry?.cwd).toBe("/proj/a");
+	});
+
+	it("setEntryCwd moves the root and survives a later switch", async () => {
+		await binder.ensureEntry("root-key", {});
+		await binder.switchSession("root-key", "cli-1");
+		await binder.setEntryCwd("root-key", "/proj/a");
+		expect(binder.entryOf("root-key")?.cwd).toBe("/proj/a");
+		await binder.switchSession("root-key", "cli-2");
+		expect(binder.entryOf("root-key")?.cwd).toBe("/proj/a");
+		await binder.setEntryCwd("root-key", "/proj/b");
+		expect(binder.entryOf("root-key")?.cwd).toBe("/proj/b");
+		await binder.setEntryCwd("root-key", null);
+		expect(binder.entryOf("root-key")?.cwd).toBeNull();
+	});
+
+	it("setEntryCwd on a missing entry returns null", async () => {
+		expect(await binder.setEntryCwd("ghost-key", "/proj/a")).toBeNull();
 	});
 });

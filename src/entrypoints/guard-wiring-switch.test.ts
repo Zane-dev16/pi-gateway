@@ -8,7 +8,7 @@
 
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { TurnOutcome } from "../pi_agent_core/runner-types.js";
@@ -387,6 +387,91 @@ describe("path switching over real discovery + adoption", () => {
 		expect(binder.entryOf(CHAT)?.session_id).toBe("fresh-1");
 		await handler(event("hello"), CTX);
 		expect(stub.texts.at(-1)?.sessionId).toBe("fresh-1");
+	});
+
+	describe("path linkage (blocker 2 slice)", () => {
+		it("/switch-path persists the adopted session's path", async () => {
+			const stub = stubRunner();
+			const handler = buildProductionMessageHandler({
+				runner: stub.runner,
+				store: state,
+				isAuthorized: ALLOW_ALL,
+				sessionHop: hop(),
+			});
+			expect(binder.entryOf(CHAT)).toBeNull();
+			const reply = String(await handler(event("/switch-path /proj/a"), CTX));
+			expect(reply).toContain("re-rooted onto /proj/a");
+			expect(binder.entryOf(CHAT)?.session_id).toBe("hist-1");
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/a");
+		});
+
+		it("/new-path persists the fresh target", async () => {
+			const stub = stubRunner();
+			const handler = buildProductionMessageHandler({
+				runner: stub.runner,
+				store: state,
+				isAuthorized: ALLOW_ALL,
+				sessionHop: hop(),
+			});
+			const target = join(agentDir, "sessions", "--a--");
+			const reply = String(await handler(event(`/new-path ${target}`), CTX));
+			expect(reply).toContain(`Fresh session (fresh-1) under ${target}.`);
+			expect(binder.entryOf(CHAT)?.session_id).toBe("fresh-1");
+			expect(binder.entryOf(CHAT)?.cwd).toBe(resolve(target));
+		});
+
+		it("/new keeps the current root on its fresh binding", async () => {
+			const stub = stubRunner();
+			const handler = buildProductionMessageHandler({
+				runner: stub.runner,
+				store: state,
+				isAuthorized: ALLOW_ALL,
+				sessionHop: hop(),
+			});
+			await handler(event("/switch-path /proj/a"), CTX);
+			const reply = String(await handler(event("/new"), CTX));
+			expect(reply).toContain("Started a new session (fresh-1).");
+			expect(binder.entryOf(CHAT)?.session_id).toBe("fresh-1");
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/a");
+		});
+
+		it("re-root restores the earlier path", async () => {
+			const stub = stubRunner();
+			const handler = buildProductionMessageHandler({
+				runner: stub.runner,
+				store: state,
+				isAuthorized: ALLOW_ALL,
+				sessionHop: hop(),
+			});
+			await handler(event("/switch-path /proj/a"), CTX);
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/a");
+			await handler(event("/switch-path /proj/b"), CTX);
+			expect(binder.entryOf(CHAT)?.session_id).toBe("hist-2");
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/b");
+			const back = String(await handler(event("/switch-path /proj/a"), CTX));
+			expect(back).toContain("re-rooted onto /proj/a");
+			expect(binder.entryOf(CHAT)?.session_id).toBe("hist-1");
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/a");
+			await handler(event("next"), CTX);
+			expect(stub.texts.at(-1)?.sessionId).toBe("hist-1");
+		});
+
+		it("an unknown path holds the binding and the path", async () => {
+			const stub = stubRunner();
+			const handler = buildProductionMessageHandler({
+				runner: stub.runner,
+				store: state,
+				isAuthorized: ALLOW_ALL,
+				sessionHop: hop(),
+			});
+			await handler(event("/switch-path /proj/a"), CTX);
+			const reply = String(
+				await handler(event("/switch-path /proj/nowhere"), CTX),
+			);
+			expect(reply).toContain("No pi sessions under /proj/nowhere");
+			expect(binder.entryOf(CHAT)?.session_id).toBe("hist-1");
+			expect(binder.entryOf(CHAT)?.cwd).toBe("/proj/a");
+		});
 	});
 
 	it("/new-path refuses missing args and missing directories", async () => {

@@ -23,6 +23,7 @@
 
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import { resolve } from "node:path";
 import { createBuiltinCommandRegistry } from "../pi_gateway/commands/builtins.js";
 import {
 	buildIdleExecutors,
@@ -259,6 +260,7 @@ function buildSwitchExecutors(
 				releaseChatLock(sessionKey);
 				locks.set(sessionKey, disposition.lock);
 				await hop.binder.switchSession(sessionKey, found.id);
+				await hop.binder.setEntryCwd(sessionKey, found.cwd);
 				runner.dropCachedSession?.(found.id);
 				return {
 					kind: "reply",
@@ -289,6 +291,7 @@ function buildSwitchExecutors(
 				}
 				const id = mintId();
 				await rebind(sessionKey, id);
+				await hop.binder.setEntryCwd(sessionKey, resolve(target));
 				releaseChatLock(sessionKey);
 				runner.dropCachedSession?.(id);
 				return {

@@ -51,6 +51,8 @@ export interface RoutingEntry {
 	display_name?: string | null;
 	platform?: string | null;
 	chat_type?: string | null;
+	/** Working path the chat is rooted at (DEC-079 path linkage). Null means unset. */
+	cwd?: string | null;
 }
 
 /** Seed facts used when a routing entry must be created fresh. */
@@ -59,6 +61,7 @@ export interface RoutingEntrySeed {
 	display_name?: string | null;
 	platform?: string | null;
 	chat_type?: string | null;
+	cwd?: string | null;
 }
 
 /**
@@ -66,7 +69,7 @@ export interface RoutingEntrySeed {
  * promote_to_session_reset promotes live rows and ACCIDENTAL ends only.
  * Parity: hermes_state.py:promote_to_session_reset's WHERE clause.
  */
-const PROMOTABLE_ACCIDENTAL_ENDS = ["agent_close", "ws_orphan_reap"];
+const PROMOTABLE_ACCIDENTAL_ENDS_SQL = "'agent_close', 'ws_orphan_reap'";
 
 /**
  * Reset-boundary reasons for reopen-time child stabilization.
@@ -95,16 +98,20 @@ function parseEntry(
 		if (typeof parsed.session_id !== "string" || parsed.session_id === "") {
 			return null;
 		}
-		return {
-			session_key: key,
-			session_id: parsed.session_id,
-			created_at: typeof parsed.created_at === "number" ? parsed.created_at : 0,
-			updated_at: typeof parsed.updated_at === "number" ? parsed.updated_at : 0,
-			origin: parsed.origin ?? null,
-			display_name: parsed.display_name ?? null,
-			platform: parsed.platform ?? null,
-			chat_type: parsed.chat_type ?? null,
-		};
+			return {
+				session_key: key,
+				session_id: parsed.session_id,
+				created_at: typeof parsed.created_at === "number" ? parsed.created_at : 0,
+				updated_at: typeof parsed.updated_at === "number" ? parsed.updated_at : 0,
+				origin: parsed.origin ?? null,
+				display_name: parsed.display_name ?? null,
+				platform: parsed.platform ?? null,
+				chat_type: parsed.chat_type ?? null,
+				cwd:
+					typeof parsed.cwd === "string" && parsed.cwd !== ""
+						? parsed.cwd
+						: null,
+			};
 	} catch {
 		// Corrupt entry_json behaves like a missing entry: loud at the caller
 		// (switchSession returns null ⇒ handoff fails with its error payload),
@@ -177,6 +184,7 @@ export class RoutingBinder {
 				display_name: seed.display_name ?? null,
 				platform: seed.platform ?? null,
 				chat_type: seed.chat_type ?? null,
+				cwd: seed.cwd ?? null,
 			};
 			conn
 				.prepare(
@@ -230,6 +238,7 @@ export class RoutingBinder {
 				display_name: oldEntry.display_name ?? null,
 				platform: oldEntry.platform ?? null,
 				chat_type: oldEntry.chat_type ?? null,
+				cwd: oldEntry.cwd ?? null,
 			};
 
 			// Entry swap (fresh created_at/updated_at, identity carried over).
@@ -243,6 +252,42 @@ export class RoutingBinder {
 			this.promoteEndedPredecessor(conn, oldEntry.session_id, now);
 			this.reopenTarget(conn, targetSessionId);
 			return newEntry;
+		});
+	}
+
+	/**
+	 * Persist the chat's working path (DEC-079 path linkage): /switch-path
+	 * records the adopted session's path, /new-path the fresh target. Null
+	 * clears it. Missing entry behaves like switchSession (null, loud at
+	 * the caller). switchSession itself preserves cwd, so /new and /resume
+	 * keep the current root until a path command moves it.
+	 */
+	async setEntryCwd(
+		sessionKey: string,
+		cwd: string | null,
+		scope = "",
+	): Promise<RoutingEntry | null> {
+		return executeWrite(this.db, (conn) => {
+			const now = this.clock.nowSeconds();
+			const row = conn
+				.prepare(
+					"SELECT entry_json FROM gateway_routing WHERE scope = ? AND session_key = ?",
+				)
+				.get(scope, sessionKey) as { entry_json: string } | undefined;
+			const oldEntry = parseEntry(row?.entry_json, sessionKey);
+			if (oldEntry === null) return null;
+			const next: RoutingEntry = {
+				...oldEntry,
+				cwd: cwd === "" ? null : cwd,
+				updated_at: now,
+			};
+			conn
+				.prepare(
+					"UPDATE gateway_routing SET entry_json = ?, updated_at = ? " +
+						"WHERE scope = ? AND session_key = ?",
+				)
+				.run(JSON.stringify(next), now, scope, sessionKey);
+			return next;
 		});
 	}
 
@@ -265,7 +310,7 @@ export class RoutingBinder {
 		conn
 			.prepare(
 				`UPDATE sessions SET ended_at = ?, end_reason = 'session_switch'
-			 WHERE id = ? AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))`,
+			 WHERE id = ? AND (ended_at IS NULL OR end_reason IN (${PROMOTABLE_ACCIDENTAL_ENDS_SQL}))`,
 			)
 			.run(now, predecessorId);
 	}
