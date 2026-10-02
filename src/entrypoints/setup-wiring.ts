@@ -110,29 +110,40 @@ export async function validateTelegramToken(
 	}
 }
 
-/**
- * Live dispatch: telegram gets getMe; platforms without an equivalent yet
- * accept any non-empty values so the same machine stays data-driven while
- * their validators land (documented permissive arm, not a silent skip).
- */
+/** Live check per platform. Telegram runs getMe over HTTP. */
+export type LiveValidator = (
+	values: ReadonlyMap<string, string>,
+	opts?: { baseUrl?: string | undefined },
+) => Promise<SetupValidation>;
+
+/** Platform to live check. Unlisted platforms fail closed. */
+const LIVE_VALIDATORS: Record<string, LiveValidator> = {
+	telegram: (values, opts) =>
+		validateTelegramToken(values.get("TELEGRAM_BOT_TOKEN") ?? "", opts),
+};
+
+// Live dispatch runs the platform table. Unlisted platforms fail closed
+// so setup never writes unvalidated secrets.
 export async function validateSetupLive(
 	platform: string,
 	values: ReadonlyMap<string, string>,
+	opts: { baseUrl?: string | undefined } = {},
 ): Promise<SetupValidation> {
-	if (platform === "telegram") {
-		const token = values.get("TELEGRAM_BOT_TOKEN") ?? "";
-		return validateTelegramToken(token);
+	const validator = LIVE_VALIDATORS[platform];
+	if (validator === undefined) {
+		return { ok: false, error: `no live validator for ${platform}` };
 	}
-	for (const [name, value] of values) {
-		if (value.trim() === "") return { ok: false, error: `${name} is required` };
-	}
-	return { ok: true };
+	return validator(values, opts);
 }
 
 /** Minimal TUI surface the setup IO needs (subset of ExtensionUIContext). */
 export interface TuiDialogs {
 	select(title: string, options: string[]): Promise<string | undefined>;
-	input(title: string, placeholder?: string): Promise<string | undefined>;
+	input(
+		title: string,
+		placeholder?: string,
+		opts?: { password?: boolean; signal?: AbortSignal; timeout?: number },
+	): Promise<string | undefined>;
 	confirm(title: string, message: string): Promise<boolean>;
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 }
@@ -141,13 +152,21 @@ export function buildTuiSetupIO(ui: TuiDialogs): SetupIO {
 	return {
 		selectPlatform: (platforms) =>
 			ui.select("setup — choose platform", [...platforms]),
-		// NOTE: TUI input has no password mode; secrets travel only through
-		// the returned value into the writer, never into notify/log lines.
+		// NOTE: The host honors signal and timeout on dialogs today. The
+		// password flag is forwarded so masking dialogs hide secrets.
+		// Secrets travel only through the returned value into the writer,
+		// never into notify or log lines.
 		inputVar: (platform, spec) =>
-			ui.input(
-				`setup ${platform} — ${spec.name}`,
-				spec.description ?? spec.name,
-			),
+			spec.password === true
+				? ui.input(
+						`setup ${platform} — ${spec.name}`,
+						spec.description ?? spec.name,
+						{ password: true },
+					)
+				: ui.input(
+						`setup ${platform} — ${spec.name}`,
+						spec.description ?? spec.name,
+					),
 		confirmSave: (platform, varNames) =>
 			ui.confirm(
 				`setup ${platform} — save`,
