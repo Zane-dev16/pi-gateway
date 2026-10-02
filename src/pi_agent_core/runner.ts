@@ -57,6 +57,8 @@ import {
 import {
 	createAgentSession,
 	DefaultResourceLoader,
+	resolveCliModel,
+	serializeSessionBranch,
 	SessionManager,
 	SettingsManager,
 	type Api,
@@ -281,6 +283,8 @@ export class GatewayAgentRunner {
 	private readonly cache: AgentInstanceCache<CachedHostSession>;
 	private readonly pool: TurnWorkerPool;
 	private readonly inflight = new Map<string, InflightTurn>();
+	/** Per-session /model overrides (setSessionModel); consulted at build. */
+	private readonly modelOverrides = new Map<string, Model<Api>>();
 	private readonly generations = new Map<string, number>();
 	/** Per-session monotonic ms of the last durable activity stamp (60s gate). */
 	private readonly activityStamps = new Map<string, number>();
@@ -448,6 +452,62 @@ export class GatewayAgentRunner {
 		const host = await this.acquireHostSession(sessionId);
 		if (customInstructions === undefined) return host.session.compact();
 		return host.session.compact(customInstructions);
+	}
+
+	/**
+	 * /model: resolve `ref` through the REAL host CLI resolution
+	 * (resolveCliModel over the runtime catalog — provider/model or bare
+	 * id, ambiguity rejected, never a silent catalog-order pick) and switch
+	 * the cached host session via AgentSession.setModel (persist:false —
+	 * per-session only, gateway never rewrites global defaults). The choice
+	 * is recorded as a per-session override so a later cache rebuild keeps
+	 * it. Throws the host's own error for unknown/ambiguous/unauthenticated
+	 * refs; the caller renders it.
+	 */
+	async setSessionModel(
+		sessionId: string,
+		modelRef: string,
+	): Promise<Model<Api>> {
+		if (this.closed) throw new Error("runner is closed");
+		if (modelRef.trim() === "") throw new Error("Usage: /model <provider/model>");
+		const resolved = resolveCliModel({
+			cliModel: modelRef.trim(),
+			modelRuntime: this.modelRuntime,
+		});
+		if (resolved.error !== undefined) throw new Error(resolved.error);
+		if (resolved.model === undefined)
+			throw new Error(`Unknown model "${modelRef.trim()}".`);
+		const host = await this.acquireHostSession(sessionId);
+		await host.session.setModel(resolved.model, { persist: false });
+		this.modelOverrides.set(sessionId, resolved.model);
+		return resolved.model;
+	}
+
+	/** Current model of the cached host session (built first when absent). */
+	async getSessionModel(sessionId: string): Promise<Model<Api>> {
+		if (this.closed) throw new Error("runner is closed");
+		const host = await this.acquireHostSession(sessionId);
+		const current = host.session.model as Model<Api> | undefined;
+		if (current === undefined) throw new Error("host session has no model");
+		return current;
+	}
+
+	/** Catalog the runner can resolve /model refs against (catalog order). */
+	listAvailableModels(): Model<Api>[] {
+		return [...this.modelRuntime.getModels()];
+	}
+
+	/**
+	 * /export: serialize the cached host session's current branch as JSONL
+	 * through the REAL host serializer — INLINE bytes, never a file write
+	 * (chat-supplied paths never reach the filesystem; there is no gateway
+	 * path policy for host file exports). Throws the host's own error when
+	 * closed; the caller renders it.
+	 */
+	async exportSessionJsonl(sessionId: string): Promise<string> {
+		if (this.closed) throw new Error("runner is closed");
+		const host = await this.acquireHostSession(sessionId);
+		return serializeSessionBranch(host.session.sessionManager);
 	}
 
 	async close(): Promise<void> {
@@ -1098,9 +1158,11 @@ export class GatewayAgentRunner {
 		if (this.customTools) {
 			createOptions.customTools = [...this.customTools];
 		}
+		const effectiveModel = this.modelOverrides.get(sessionId) ?? this.model;
+		createOptions.model = effectiveModel;
 		const { session } = await createAgentSession(createOptions);
 
-		await this.seedReplay(session, sessionId);
+		await this.seedReplay(session, sessionId, effectiveModel);
 		// Freshly built from durable rows: the live transcript IS the persisted
 		// one, so the entry starts fully caught up (agent_init.py:1762 parity —
 		// a rebuilt agent never carries an unflushed tail).
@@ -1118,6 +1180,7 @@ export class GatewayAgentRunner {
 	private async seedReplay(
 		session: AgentSession,
 		sessionId: string,
+		model: Model<Api> = this.model,
 	): Promise<void> {
 		const rows: MessageRow[] = readReplayMessages(this.store.db, sessionId, {
 			includeAncestors: true,
@@ -1130,7 +1193,7 @@ export class GatewayAgentRunner {
 		// so nothing duplicates; waited reloads rebuild instead of re-seeding.
 		for (const row of rows) {
 			session.sessionManager.appendMessage(
-				rowToLoopMessage(row, this.model) as unknown as Parameters<
+				rowToLoopMessage(row, model) as unknown as Parameters<
 					typeof session.sessionManager.appendMessage
 				>[0],
 			);

@@ -93,6 +93,31 @@ export interface ChatTurnRunner {
 				customInstructions?: string,
 			) => Promise<{ summary: string; tokensBefore: number }>)
 		| undefined;
+	/**
+	 * /model over the runner's cached host session
+	 * (runner.ts:GatewayAgentRunner.setSessionModel). Optional — without it
+	 * /model stays passthrough on original bytes.
+	 */
+	setSessionModel?:
+		| ((sessionId: string, modelRef: string) => Promise<{
+					provider: string;
+					id: string;
+			  }>)
+		| undefined;
+	/** Current model of the cached host session (bare-/model listing). */
+	getSessionModel?:
+		| ((sessionId: string) => Promise<{ provider: string; id: string }>)
+		| undefined;
+	/** Catalog /model refs resolve against (catalog order). */
+	listAvailableModels?:
+		| (() => ReadonlyArray<{ provider: string; id: string }>)
+		| undefined;
+	/**
+	 * /export over the runner's cached host session
+	 * (runner.ts:GatewayAgentRunner.exportSessionJsonl — INLINE bytes,
+	 * never a file write). Optional — without it /export stays passthrough.
+	 */
+	exportSessionJsonl?: ((sessionId: string) => Promise<string>) | undefined;
 }
 
 /**

@@ -13,6 +13,8 @@ import {
 import {
 	buildIdleExecutors,
 	compactIdleExecutor,
+	exportIdleExecutor,
+	modelIdleExecutor,
 	type IdleExecutorContext,
 	type IdleTurnRunner,
 } from "./idle-executors.js";
@@ -161,5 +163,162 @@ describe("idle /compact executor (blocker 1)", () => {
 		if (result.kind !== "reply") throw new Error("refusal must reply");
 		expect(result.text).toContain("Compaction failed");
 		expect(result.text).toContain("Nothing to compact");
+	});
+});
+
+describe("idle /model executor", () => {
+	function ctxWithModel(
+		runner: IdleTurnRunner,
+		args: string,
+		extra?: Partial<IdleExecutorContext>,
+	): IdleExecutorContext {
+		return {
+			sessionKey: "chat-7",
+			args,
+			rows,
+			runner,
+			eventText: args === "" ? "/model" : `/model ${args}`,
+			...extra,
+		};
+	}
+
+	function modelRunner(): {
+		turns: string[];
+		sessions: Array<{ sessionId: string; ref: string }>;
+		runner: IdleTurnRunner;
+	} {
+		const turns: string[] = [];
+		const sessions: Array<{ sessionId: string; ref: string }> = [];
+		return {
+			turns,
+			sessions,
+			runner: {
+				handleTurn: async (request: {
+					sessionId: string;
+					routingKey: string;
+					text: string;
+				}) => {
+					turns.push(request.text);
+					throw new Error("model must not consume a turn");
+				},
+				setSessionModel: async (sessionId: string, ref: string) => {
+					sessions.push({ sessionId, ref });
+					if (ref === "fauxb/faux-2") return { provider: "fauxb", id: "faux-2" };
+					throw new Error(`Unknown model "${ref}".`);
+				},
+				getSessionModel: async () => ({ provider: "faux", id: "faux-1" }),
+				listAvailableModels: () => [
+					{ provider: "faux", id: "faux-1" },
+					{ provider: "fauxb", id: "faux-2" },
+				],
+			},
+		};
+	}
+
+	it("switches through the runner seam and replies with the new identity", async () => {
+		const stub = modelRunner();
+		const result = await modelIdleExecutor(
+			ctxWithModel(stub.runner, "fauxb/faux-2", { hostSessionId: "drive-9" }),
+		);
+		if (result.kind !== "reply") throw new Error("/model must reply");
+		expect(stub.sessions).toEqual([
+			{ sessionId: "drive-9", ref: "fauxb/faux-2" },
+		]);
+		expect(result.text).toBe("Model: fauxb/faux-2");
+		expect(stub.turns).toEqual([]);
+	});
+
+	it("bare /model lists the current plus the catalog", async () => {
+		const stub = modelRunner();
+		const result = await modelIdleExecutor(ctxWithModel(stub.runner, ""));
+		if (result.kind !== "reply") throw new Error("bare /model must reply");
+		expect(result.text).toContain("Current model: faux/faux-1");
+		expect(result.text).toContain("fauxb/faux-2");
+		expect(stub.turns).toEqual([]);
+	});
+
+	it("an unknown ref renders as reply text, never a throw", async () => {
+		const stub = modelRunner();
+		const result = await modelIdleExecutor(
+			ctxWithModel(stub.runner, "nope/nothing"),
+		);
+		if (result.kind !== "reply") throw new Error("refusal must reply");
+		expect(result.text).toContain("Model switch failed");
+		expect(result.text).toContain("nope/nothing");
+		expect(stub.turns).toEqual([]);
+	});
+
+	it("without the runner seam stays passthrough on original bytes", async () => {
+		const table = buildIdleExecutors(rows);
+		const model = table.get("model");
+		if (model === undefined) throw new Error("/model has no idle executor");
+		const result = await model(
+			ctxWithModel(throwingRunner(), "fauxb/faux-2", {
+				eventText: "/model fauxb/faux-2",
+			}),
+		);
+		expect(result).toEqual({ kind: "passthrough", text: "/model fauxb/faux-2" });
+	});
+});
+
+describe("idle /export executor", () => {
+	function ctxWithExport(
+		runner: IdleTurnRunner,
+		extra?: Partial<IdleExecutorContext>,
+	): IdleExecutorContext {
+		return {
+			sessionKey: "chat-7",
+			args: "",
+			rows,
+			runner,
+			eventText: "/export",
+			...extra,
+		};
+	}
+
+	it("renders the runner bytes inline and consumes no turn", async () => {
+		const turns: string[] = [];
+		const sessions: string[] = [];
+		const runner: IdleTurnRunner = {
+			handleTurn: async (request: { sessionId: string; text: string }) => {
+				turns.push(request.text);
+				throw new Error("export must not consume a turn");
+			},
+			exportSessionJsonl: async (sessionId: string) => {
+				sessions.push(sessionId);
+				return '{"type":"session"}\n{"role":"user"}';
+			},
+		};
+		const result = await exportIdleExecutor(
+			ctxWithExport(runner, { hostSessionId: "drive-9" }),
+		);
+		if (result.kind !== "reply") throw new Error("/export must reply");
+		expect(sessions).toEqual(["drive-9"]);
+		expect(result.text).toContain('"type":"session"');
+		expect(turns).toEqual([]);
+	});
+
+	it("without the runner seam stays passthrough on original bytes", async () => {
+		const table = buildIdleExecutors(rows);
+		const exporter = table.get("export");
+		if (exporter === undefined) throw new Error("/export has no idle executor");
+		const result = await exporter(
+			ctxWithExport(throwingRunner(), { eventText: "/export out.jsonl" }),
+		);
+		expect(result).toEqual({ kind: "passthrough", text: "/export out.jsonl" });
+	});
+
+	it("a host refusal renders as reply text, never a throw", async () => {
+		const runner: IdleTurnRunner = {
+			handleTurn: async () => {
+				throw new Error("must not turn");
+			},
+			exportSessionJsonl: async () => {
+				throw new Error("runner is closed");
+			},
+		};
+		const result = await exportIdleExecutor(ctxWithExport(runner));
+		if (result.kind !== "reply") throw new Error("refusal must reply");
+		expect(result.text).toContain("Export failed");
 	});
 });

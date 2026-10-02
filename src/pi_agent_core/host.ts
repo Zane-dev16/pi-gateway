@@ -50,6 +50,17 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<{
 	readonly argumentHint?: string;
 }> = _BUILTIN_SLASH_COMMANDS;
 
+// Session-export census (model/export seam): the SDK index does not export
+// it, so this single deep import is the sanctioned exception to the
+// index-only rule — same justification as the census above. The module is
+// side-effect-free on import (pure serialize + file-writing entry points
+// that only run when called). The gateway renders exports INLINE and never
+// calls the file-writing entry point — chat-supplied paths never reach the
+// filesystem. Every other module reads the serializer through THIS
+// re-export, never its own deep import.
+import { serializeSessionBranch as _serializeSessionBranch } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/session-export.js";
+export const serializeSessionBranch = _serializeSessionBranch;
+
 export type {
 	AgentSession,
 	AgentSessionEvent,

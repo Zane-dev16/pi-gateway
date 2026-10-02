@@ -130,6 +130,46 @@ describe("idle slash path (DEC-078)", () => {
 		expect(stub.texts).toEqual(["/compact focus the tail"]);
 	});
 
+	it("/model with the runner seam switches locally and consumes no turn", async () => {
+		const stub = stubRunner();
+		const switched: Array<{ sessionId: string; ref: string }> = [];
+		const handler = buildProductionMessageHandler({
+			runner: {
+				...stub.runner,
+				setSessionModel: async (sessionId: string, ref: string) => {
+					switched.push({ sessionId, ref });
+					return { provider: "fauxb", id: "faux-2" };
+				},
+			},
+			isAuthorized: ALLOW_ALL,
+		});
+		const reply = await handler(event("/model fauxb/faux-2"), CTX);
+		if (typeof reply !== "string") throw new Error("/model must reply");
+		expect(reply).toBe("Model: fauxb/faux-2");
+		expect(switched).toEqual([{ sessionId: "sess", ref: "fauxb/faux-2" }]);
+		expect(stub.texts).toEqual([]);
+	});
+
+	it("/export with the runner seam renders inline and consumes no turn", async () => {
+		const stub = stubRunner();
+		const exported: string[] = [];
+		const handler = buildProductionMessageHandler({
+			runner: {
+				...stub.runner,
+				exportSessionJsonl: async (sessionId: string) => {
+					exported.push(sessionId);
+					return '{"type":"session"}';
+				},
+			},
+			isAuthorized: ALLOW_ALL,
+		});
+		const reply = await handler(event("/export"), CTX);
+		if (typeof reply !== "string") throw new Error("/export must reply");
+		expect(reply).toContain('"type":"session"');
+		expect(exported).toEqual(["sess"]);
+		expect(stub.texts).toEqual([]);
+	});
+
 	it("/compact with the runner seam compacts locally and consumes no turn", async () => {
 		const stub = stubRunner();
 		const compacted: string[] = [];
