@@ -29,6 +29,7 @@ import {
 import {
 	escapeMarkdownV2,
 	isPlainLaneContent,
+	PLAIN_LANE_PREFIX,
 	toTelegramMarkdownV2Full,
 } from "./markdown-v2.js";
 import {
@@ -64,6 +65,8 @@ import { TelegramAdapter } from "./telegram-adapter.js";
 import { registerTelegramPlatform } from "./telegram-adapter.js";
 import { TelegramBotApiFake } from "./telegram-fake-server.js";
 import { ManualPollingClock } from "../polling/clock.js";
+import { gatewayHelpLines } from "../../pi_gateway/commands/derived.js";
+import { BUILTIN_COMMAND_ROWS } from "../../pi_gateway/commands/builtins.js";
 
 describe("telegram manifest data (Q17/DEC-017 — vendor ground truth as data)", () => {
 	it("rate tiers resolve per method class, first-listed tier wins", () => {
@@ -125,6 +128,7 @@ describe("telegram manifest data (Q17/DEC-017 — vendor ground truth as data)",
 	});
 
 	it("notification kwargs silence by default and honor notify metadata", () => {
+		// SAFETY: test builds a minimal Metadata stand-in; notificationKwargs only reads known keys.
 		const meta = { notify: true } as unknown as Record<string, unknown>;
 		expect(notificationKwargs("important", meta)).toEqual({});
 		expect(notificationKwargs("important", undefined)).toEqual({
@@ -157,6 +161,24 @@ describe("telegram markdown dialects (format_message/_escape_mdv2 ports)", () =>
 
 	it("escapeMarkdownV2 covers every reserved character", () => {
 		expect(escapeMarkdownV2("a.b!c|d#e")).toBe("a\\.b\\!c\\|d\\#e");
+		expect(escapeMarkdownV2("a -- b")).toBe("a \\-\\- b");
+	});
+
+	it("live /help bytes convert with no unescaped reserved char (no fallback)", () => {
+		const help = gatewayHelpLines(BUILTIN_COMMAND_ROWS).join("\n");
+		const out = toTelegramMarkdownV2Full(help);
+		expect(out.startsWith(PLAIN_LANE_PREFIX)).toBe(false);
+		expect(out).toContain("\\-\\-");
+		const RESERVED = new Set("_*[]()~`>#+-=|{}.!".split(""));
+		let unescaped = 0;
+		for (let i = 0; i < out.length; i++) {
+			if (out[i] === "\\") {
+				i++;
+				continue;
+			}
+			if (RESERVED.has(out[i]!)) unescaped++;
+		}
+		expect(unescaped).toBe(0);
 	});
 
 	it("plain-lane detection keys off prefix or explicit parse_mode none", () => {
@@ -226,6 +248,7 @@ describe("telegram reactions (A1/A2)", () => {
 		expect(normalizeMessageReactionUpdate({ message_id: 1 })).toBeNull();
 		// Malformed wire data (boolean id) coerces to null — hostile shapes
 		// never throw.
+		// SAFETY: test forges a hostile wire shape the normalizer must reject without throwing.
 		const hostile = { message_id: true as unknown as string, chat: {} };
 		expect(normalizeMessageReactionUpdate(hostile)).toBeNull();
 	});
@@ -310,6 +333,7 @@ describe("telegram adapter construction (production defaults + registration)", (
 
 	it("registration path registers the telegram platform under its manifest name", () => {
 		const registered: string[] = [];
+		// SAFETY: test doubles only the registerPlatform seam the registration path touches.
 		const ctx = {
 			registerPlatform: (manifest: { name: string }) => {
 				registered.push(manifest.name);
@@ -446,6 +470,7 @@ describe("telegram-wire-r2 pure helpers (tg2-x)", () => {
 		expect(normalizeMessageEditedEvent({ chat: {} })).toBeNull();
 		expect(
 			normalizeMessageEditedEvent({
+				// SAFETY: test forges a hostile wire shape the normalizer must reject without throwing.
 				message_id: true as unknown as number,
 				chat: { id: 1 },
 			}),

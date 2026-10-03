@@ -168,12 +168,22 @@ export function writeRuntimeStatus(
 		existing !== null
 			? (existing as Partial<RuntimeStatusRecord>)
 			: baseRecord(identity);
+	// Process identity belongs to the LIVE process, not the file: a bounce
+	// leaves a dead pid behind, so a changed pid reconverges pid/argv/
+	// start_time onto the live identity instead of preserving the stale row.
+	const livePid = identity.pid ?? base.pid ?? process.pid;
+	const sameProcess = base.pid !== undefined && base.pid === livePid;
 	const next: RuntimeStatusRecord = {
-		pid: base.pid ?? identity.pid ?? process.pid,
+		pid: livePid,
 		kind: base.kind ?? "pi-gateway",
-		argv: base.argv ?? identity.argv ?? [...process.argv],
-		start_time:
-			base.start_time ?? defaultStartTimeSec(identity.pid ?? process.pid),
+		argv: sameProcess
+			? (base.argv ?? identity.argv ?? [...process.argv])
+			: (identity.argv ?? [...process.argv]),
+		start_time: sameProcess
+			? (base.start_time ??
+					identity.startTimeSec ??
+					defaultStartTimeSec(livePid))
+			: (identity.startTimeSec ?? defaultStartTimeSec(livePid)),
 		pi_home: base.pi_home ?? identity.home,
 		gateway_state:
 			patch.gateway_state ??
@@ -204,5 +214,7 @@ export function writeRuntimeStatus(
 export function readRuntimeStatus(home: string): RuntimeStatusRecord | null {
 	const raw = readJson(runtimeStatusPath(home));
 	if (raw === null) return null;
+	// SAFETY: readJson guarantees a parsed non-array object; the full record
+	// shape is trusted because writeRuntimeStatus is the sole atomic writer.
 	return raw as unknown as RuntimeStatusRecord;
 }

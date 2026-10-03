@@ -15,7 +15,7 @@
 // parse_mode=MarkdownV2 stamp. Plain lanes (§6.1 fallback body / explicit
 // parse_mode "none") ship RAW with no parse_mode.
 
-const MDV2_ESCAPE_RE = /([_*[\]()~`>#+=|{}.!\\])/g;
+const MDV2_ESCAPE_RE = /([_*[\]()~`>#+\-=|{}.!\\])/g;
 
 /** adapter.py:_escape_mdv2 — escape every MarkdownV2 special character. */
 export function escapeMarkdownV2(text: string): string {
