@@ -225,4 +225,35 @@ describe("TUI run end to end with scripted dialogs", () => {
 		expect(allowCall?.opts).toBeUndefined();
 		expect(seen.join("\n")).not.toContain(secret);
 	});
+
+	it("dialog requests carry names, never values (masking starts here)", async () => {
+		home = mkdtempSync(join(tmpdir(), "setup-wiring-titles-"));
+		const secret = "title-scope-token-51de";
+		const titles: string[] = [];
+		const ui = {
+			select: async (_t: string, o: string[]) => o[0],
+			input: async (t: string, p?: string) => {
+				titles.push(`${t} ${p ?? ""}`);
+				return t.includes("TELEGRAM_BOT_TOKEN") ? secret : "222";
+			},
+			confirm: async () => true,
+			notify: (_m: string) => {},
+		};
+		const res = await runTuiSetup(home, ui, {
+			specs: [
+				{
+					name: "telegram",
+					required: [{ name: "TELEGRAM_BOT_TOKEN", password: true as const }],
+					optional: [
+						{ name: "TELEGRAM_ALLOWED_USERS", optional: true as const },
+					],
+				},
+			],
+			validate: async () => ({ ok: true as const }),
+		});
+		expect(res.ok).toBe(true);
+		// The host dialog echoes keystrokes (see the setup-wiring NOTE);
+		// the adapter side holds the line: no value in any dialog arg.
+		expect(titles.join("\n")).not.toContain(secret);
+	});
 });

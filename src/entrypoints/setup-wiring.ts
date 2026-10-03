@@ -152,10 +152,14 @@ export function buildTuiSetupIO(ui: TuiDialogs): SetupIO {
 	return {
 		selectPlatform: (platforms) =>
 			ui.select("setup — choose platform", [...platforms]),
-		// NOTE: The host honors signal and timeout on dialogs today. The
-		// password flag is forwarded so masking dialogs hide secrets.
-		// Secrets travel only through the returned value into the writer,
-		// never into notify or log lines.
+		// NOTE (host gap, not a gateway defect): ExtensionUIDialogOptions
+		// (host dist/core/extensions/types.d.ts) carries signal + timeout
+		// only — no password/masking flag — and ExtensionUIContext.input
+		// renders plain echo. The password flag below is forwarded so a
+		// future masking dialog hides secrets; today the host ignores it
+		// and the token echoes while typing. Secrets still travel only
+		// through the returned value into the writer, never into notify
+		// or log lines.
 		inputVar: (platform, spec) =>
 			spec.password === true
 				? ui.input(
