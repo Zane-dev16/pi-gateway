@@ -621,3 +621,43 @@ describe("e2e through the real host loop", () => {
 		}
 	});
 });
+
+describe("bound chat root threads into handleTurn", () => {
+	it("a chat rooted at /proj/a builds its turn under /proj/a", async () => {
+		const stub = stubRunner();
+		const handler = buildProductionMessageHandler({
+			runner: stub.runner,
+			store: state,
+			isAuthorized: ALLOW_ALL,
+			sessionHop: hop(),
+		});
+		await handler(event("before"), CTX);
+		await binder.setEntryCwd(CHAT, "/proj/a");
+		await handler(event("after root"), CTX);
+		expect(stub.texts.at(-1)).toEqual({
+			sessionId: binder.entryOf(CHAT)?.session_id ?? "",
+			routingKey: CHAT,
+			text: "after root",
+			cwd: "/proj/a",
+		});
+	});
+
+	it("an unrooted chat sends no cwd key (runner falls back)", async () => {
+		const stub = stubRunner();
+		const handler = buildProductionMessageHandler({
+			runner: stub.runner,
+			store: state,
+			isAuthorized: ALLOW_ALL,
+			sessionHop: hop(),
+		});
+		await handler(event("plain"), CTX);
+		expect(binder.entryOf(CHAT)?.cwd ?? null).toBeNull();
+		expect(stub.texts).toEqual([
+			{
+				sessionId: binder.entryOf(CHAT)?.session_id ?? "",
+				routingKey: CHAT,
+				text: "plain",
+			},
+		]);
+	});
+});

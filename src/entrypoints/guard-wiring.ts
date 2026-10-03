@@ -73,6 +73,13 @@ export interface ChatTurnRunner {
 		sessionId: string;
 		routingKey: string;
 		text: string;
+		/**
+		 * Bound working path for this chat (the persisted binder entry
+		 * cwd). Optional — absent falls back to the session's stored
+		 * sessions.cwd, then process.cwd(). Guard-wiring threads the
+		 * entry through; runners without a cache simply ignore it.
+		 */
+		cwd?: string | undefined;
 	}): Promise<TurnOutcome>;
 	/**
 	 * Drop the cached host session so the next turn rebuilds and reseeds
@@ -393,11 +400,14 @@ export function buildProductionMessageHandler(
 		const switchExecutors =
 			hop !== null ? buildSwitchExecutors(hop, chatLocks, runner) : null;
 		let driveSessionId = sessionKey;
+		let driveCwd: string | null = null;
 		if (hop !== null && sessionKey !== "") {
 			const bound =
 				hop.binder.entryOf(sessionKey) ??
 				(await hop.binder.ensureEntry(sessionKey, { origin: "gateway" }));
 			driveSessionId = bound.session_id;
+			driveCwd =
+				typeof bound.cwd === "string" && bound.cwd !== "" ? bound.cwd : null;
 		}
 		if (
 			deps.store !== undefined &&
@@ -436,6 +446,7 @@ export function buildProductionMessageHandler(
 				sessionId: driveSessionId,
 				routingKey: sessionKey,
 				text,
+				...(driveCwd !== null ? { cwd: driveCwd } : {}),
 			});
 			if (outcome.exitReason === "error") {
 				throw new Error(outcome.errorMessage ?? "turn error");
