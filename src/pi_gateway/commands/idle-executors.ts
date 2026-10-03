@@ -13,7 +13,8 @@
 // (resolveCliModel) and switches the cached host session via
 // AgentSession.setModel (persist:false — per-session only); /export renders
 // the REAL host branch serialization (serializeSessionBranch) INLINE as reply
-// text. Path policy: chat-supplied /export paths never reach the filesystem
+// text, JSONL by default with an `html` disposition for a minimal HTML
+// transcript. Path policy: chat-supplied /export paths never reach the filesystem
 // (the host file-writing entry point is never called) — there is no gateway
 // path policy for host file exports, so inline bytes are the only form.
 // The /new + /resume + /switch-path + /new-path repoints live one layer up
@@ -185,9 +186,17 @@ export async function modelIdleExecutor(
 
 /**
  * /export: the REAL host branch serialization over the runner's cached host
- * session, rendered INLINE as reply text. Chat-supplied path args never
- * reach the filesystem — the host file-writing entry point is never called.
- * A runner without the seam stays passthrough on original bytes.
+ * session, rendered INLINE as reply text. Format is a disposition on the
+ * args tail (host TUI /export parity: `.jsonl` ⇒ JSONL, otherwise HTML) —
+ * bare `/export` (or an explicit `.jsonl`) returns the JSONL branch bytes;
+ * `/export html` (or `*.html`) returns a minimal self-contained HTML
+ * transcript rendered from those same bytes. Chat-supplied path args never
+ * reach the filesystem — the host file-writing entry points (and its rich
+ * exportSessionToHtml, which needs a session FILE the gateway's in-memory
+ * host sessions do not have) are never called. A runner without the seam
+ * stays passthrough on original bytes. Delivery rides the existing reply-text
+ * send path; a real `.html` file attachment needs a document disposition on
+ * IdleExecutorResult plus platform senders — that seam does not exist yet.
  */
 export async function exportIdleExecutor(
 	ctx: IdleExecutorContext,
@@ -199,11 +208,58 @@ export async function exportIdleExecutor(
 	const sessionId = ctx.hostSessionId ?? ctx.sessionKey;
 	try {
 		const jsonl = await runner.exportSessionJsonl(sessionId);
+		const arg = ctx.args.trim().toLowerCase();
+		if (arg === "html" || arg.endsWith(".html")) {
+			return { kind: "reply", text: renderExportHtml(jsonl) };
+		}
 		return { kind: "reply", text: jsonl };
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
 		return { kind: "reply", text: `Export failed: ${reason}` };
 	}
+}
+
+/** Escape once for HTML text content (order matters: & first). */
+function escapeHtml(s: string): string {
+	return s
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+/**
+ * Minimal self-contained HTML transcript from JSONL branch bytes. One card
+ * per entry (role or type as the heading, string content or the raw entry
+ * JSON as the body); unparsable lines ride as preformatted raw text so a
+ * half-written branch still exports. Kept minimal on purpose — the host's
+ * rich template needs a session FILE plus file delivery, neither of which
+ * exists on this path.
+ */
+export function renderExportHtml(jsonl: string): string {
+	const cards = jsonl
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.map((line) => {
+			let entry: Record<string, unknown>;
+			try {
+				entry = JSON.parse(line) as Record<string, unknown>;
+			} catch {
+				return `<article class="entry"><pre>${escapeHtml(line)}</pre></article>`;
+			}
+			const role =
+				typeof entry["role"] === "string"
+					? (entry["role"] as string)
+					: typeof entry["type"] === "string"
+						? (entry["type"] as string)
+						: "entry";
+			const content = entry["content"];
+			const body =
+				typeof content === "string" ? content : JSON.stringify(entry);
+			return `<article class="entry"><h2>${escapeHtml(role)}</h2><pre>${escapeHtml(body)}</pre></article>`;
+		})
+		.join("\n");
+	return `<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>Session export</title></head><body>\n${cards}\n</body></html>\n`;
 }
 
 /**

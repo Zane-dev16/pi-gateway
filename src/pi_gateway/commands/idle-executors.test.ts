@@ -321,4 +321,47 @@ describe("idle /export executor", () => {
 		if (result.kind !== "reply") throw new Error("refusal must reply");
 		expect(result.text).toContain("Export failed");
 	});
+
+	it("/export html renders the branch as an HTML document", async () => {
+		const turns: string[] = [];
+		const runner: IdleTurnRunner = {
+			handleTurn: async (request: { sessionId: string; text: string }) => {
+				turns.push(request.text);
+				throw new Error("export must not consume a turn");
+			},
+			exportSessionJsonl: async () =>
+				'{"type":"session","id":"s1"}\n{"role":"user","content":"hello <b>world</b>"}',
+		};
+		const result = await exportIdleExecutor(
+			ctxWithExport(runner, { args: "html", eventText: "/export html" }),
+		);
+		if (result.kind !== "reply") throw new Error("/export html must reply");
+		if (result.text === null) throw new Error("/export html must send text");
+		expect(result.text.startsWith("<!DOCTYPE html>")).toBe(true);
+		expect(result.text).toContain("hello &lt;b&gt;world&lt;/b&gt;");
+		expect(result.text).not.toContain("<b>world</b>");
+		expect(result.text.trimEnd().endsWith("</html>")).toBe(true);
+		expect(turns).toEqual([]);
+	});
+
+	it("/export transcript.html renders HTML while bare stays JSONL", async () => {
+		const runner: IdleTurnRunner = {
+			handleTurn: async () => {
+				throw new Error("export must not consume a turn");
+			},
+			exportSessionJsonl: async () => '{"type":"session"}\n{"role":"user"}',
+		};
+		const html = await exportIdleExecutor(
+			ctxWithExport(runner, {
+				args: "transcript.html",
+				eventText: "/export transcript.html",
+			}),
+		);
+		if (html.kind !== "reply") throw new Error("*.html must reply");
+		expect(html.text).toContain("<!DOCTYPE html>");
+		const jsonl = await exportIdleExecutor(ctxWithExport(runner));
+		if (jsonl.kind !== "reply") throw new Error("bare /export must reply");
+		expect(jsonl.text).toContain('{"type":"session"}');
+		expect(jsonl.text).not.toContain("<!DOCTYPE html>");
+	});
 });

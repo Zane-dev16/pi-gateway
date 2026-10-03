@@ -7,7 +7,9 @@
 // faux models, sanctioned injection) and assert the observed model identity
 // and export bytes — never the seam's shape.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import { GatewayAgentRunner } from "./runner.js";
 
 import {
 	createRunnerHarness,
@@ -108,7 +110,71 @@ describe("runner setSessionModel", () => {
 			h.ensureSession("model-unknown");
 			await expect(
 				h.runner.setSessionModel("model-unknown", "nope/nothing-here"),
-			).rejects.toThrow();
+			).rejects.toThrow('Model "nope/nothing-here" not found');
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("a first-pass miss refreshes the catalog and then resolves", async () => {
+		const h = await createRunnerHarness();
+		try {
+			h.ensureSession("model-refresh");
+			let refreshes = 0;
+			const runtime = h.env.modelRuntime;
+			const through = runtime.refresh.bind(runtime);
+			const spy = vi.spyOn(runtime, "refresh").mockImplementation(async (opts) => {
+				refreshes += 1;
+				if (refreshes === 1) registerSecondProvider(h);
+				return through(opts);
+			});
+			try {
+				const switched = await h.runner.setSessionModel(
+					"model-refresh",
+					"fauxb/faux-2",
+				);
+				expect(`${switched.provider}/${switched.id}`).toBe("fauxb/faux-2");
+				// The provider registration fires its own background refresh,
+				// so the count is timing-dependent; the identity above proves
+				// the miss refreshed first and the retry resolved.
+				expect(refreshes).toBeGreaterThanOrEqual(1);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await h.close();
+		}
+	});
+
+	it("the switch survives a restart through the session row", async () => {
+		const h = await createRunnerHarness();
+		try {
+			registerSecondProvider(h);
+			h.ensureSession("model-restart");
+			await oneTurn(h, "model-restart", "hello");
+			await h.runner.setSessionModel("model-restart", "fauxb/faux-2");
+			const row = h.store.db
+				.prepare("SELECT model, billing_provider FROM sessions WHERE id = ?")
+				.get("model-restart") as { model: string; billing_provider: string };
+			expect(`${row.billing_provider}/${row.model}`).toBe("fauxb/faux-2");
+			const model = h.env.faux.getModel();
+			if (!model) throw new Error("faux provider exposed no model");
+			const restarted = new GatewayAgentRunner({
+				store: {
+					db: h.store.db,
+					appendMessage: (m) => h.store.appendMessage(m),
+					queueTokenCounts: h.store.queueTokenCounts.bind(h.store),
+				},
+				systemPrompt: h.env.systemPrompt,
+				model,
+				modelRuntime: h.env.modelRuntime,
+			});
+			try {
+				const current = await restarted.getSessionModel("model-restart");
+				expect(`${current.provider}/${current.id}`).toBe("fauxb/faux-2");
+			} finally {
+				await restarted.close();
+			}
 		} finally {
 			await h.close();
 		}

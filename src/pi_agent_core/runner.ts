@@ -481,10 +481,14 @@ export class GatewayAgentRunner {
 	 * (resolveCliModel over the runtime catalog — provider/model or bare
 	 * id, ambiguity rejected, never a silent catalog-order pick) and switch
 	 * the cached host session via AgentSession.setModel (persist:false —
-	 * per-session only, gateway never rewrites global defaults). The choice
-	 * is recorded as a per-session override so a later cache rebuild keeps
-	 * it. Throws the host's own error for unknown/ambiguous/unauthenticated
-	 * refs; the caller renders it.
+	 * per-session only, gateway never rewrites global defaults). A first-pass
+	 * miss refreshes the catalogs once and retries (host interactive
+	 * findExactModelMatch parity — a stale snapshot never refuses a name the
+	 * refresh would bring in). The choice is recorded in the in-memory
+	 * override map AND stamped onto the session row (sessions.model +
+	 * billing_provider, the columns usage attribution already owns), so a
+	 * cache rebuild AND a process restart keep it. Throws the host's own
+	 * error for unknown/ambiguous/unauthenticated refs; the caller renders it.
 	 */
 	async setSessionModel(
 		sessionId: string,
@@ -493,16 +497,30 @@ export class GatewayAgentRunner {
 		if (this.closed) throw new Error("runner is closed");
 		if (modelRef.trim() === "")
 			throw new Error("Usage: /model <provider/model>");
-		const resolved = resolveCliModel({
+		let resolved = resolveCliModel({
 			cliModel: modelRef.trim(),
 			modelRuntime: this.modelRuntime,
 		});
+		if (resolved.model === undefined) {
+			try {
+				await this.modelRuntime.refresh({
+				signal: AbortSignal.timeout(15_000),
+			});
+		} catch {
+			/* a failed refresh still retries against the cached catalog */
+		}
+			resolved = resolveCliModel({
+				cliModel: modelRef.trim(),
+				modelRuntime: this.modelRuntime,
+			});
+		}
 		if (resolved.error !== undefined) throw new Error(resolved.error);
 		if (resolved.model === undefined)
 			throw new Error(`Unknown model "${modelRef.trim()}".`);
 		const host = await this.acquireHostSession(sessionId);
 		await host.session.setModel(resolved.model, { persist: false });
 		this.modelOverrides.set(sessionId, resolved.model);
+		this.stampSessionModel(sessionId, resolved.model);
 		return resolved.model;
 	}
 
@@ -1192,6 +1210,43 @@ export class GatewayAgentRunner {
 	}
 
 	/**
+	 * Stamp the /model override onto the session row (sessions.model +
+	 * billing_provider — the route columns usage attribution already owns).
+	 * Best-effort — a missing row or a locked store never breaks a switch.
+	 */
+	private stampSessionModel(sessionId: string, model: Model<Api>): void {
+		try {
+			this.store.db
+				.prepare("UPDATE sessions SET model = ?, billing_provider = ? WHERE id = ?")
+				.run(model.id, model.provider, sessionId);
+		} catch {
+			/* observation-only — never breaks a switch */
+		}
+	}
+
+	/**
+	 * Durable /model override fallback (sessions.model + billing_provider):
+	 * the stamped route when it still resolves against the live catalog,
+	 * else null. Read-only probe — null when unset, unparsable, or retired.
+	 */
+	private readPersistedModel(sessionId: string): Model<Api> | null {
+		try {
+			const row = this.store.db
+				.prepare("SELECT model, billing_provider FROM sessions WHERE id = ? LIMIT 1")
+				.get(sessionId) as
+				| { model: string | null; billing_provider: string | null }
+				| undefined;
+			const id = row?.model;
+			const provider = row?.billing_provider;
+			if (typeof id !== "string" || id === "" || typeof provider !== "string" || provider === "")
+				return null;
+			return this.modelRuntime.getModel(provider, id) ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
 	 * Stamp the bound path onto the session row (DEC-079 path linkage:
 	 * /switch-path and /new-path roots persist here via handleTurn's cwd).
 	 * Best-effort — a missing row or a locked store never breaks a turn.
@@ -1237,7 +1292,10 @@ export class GatewayAgentRunner {
 		if (this.customTools) {
 			createOptions.customTools = [...this.customTools];
 		}
-		const effectiveModel = this.modelOverrides.get(sessionId) ?? this.model;
+		const effectiveModel =
+			this.modelOverrides.get(sessionId) ??
+			this.readPersistedModel(sessionId) ??
+			this.model;
 		createOptions.model = effectiveModel;
 		const { session } = await createAgentSession(createOptions);
 
