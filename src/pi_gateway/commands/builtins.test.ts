@@ -23,10 +23,12 @@ describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 	it("row count equals host builtins plus gateway-only survivors", () => {
 		// DEC-078 derivation: the census is the host BUILTIN_SLASH_COMMANDS
 		// (24 rows) plus the gateway-only survivors — never a Hermes number.
-		// Adding/removing a row is still a conscious census change, never an
-		// accident.
+		// /status duplicates host /session; /commands duplicates /help
+		// filtering plus skill modes. Adding/removing a row is still a
+		// conscious census change, never an accident.
+		expect(BUILTIN_COMMAND_ROWS.length).toBe(42);
 		expect(BUILTIN_COMMAND_ROWS.length).toBe(
-			BUILTIN_SLASH_COMMANDS.length + 20,
+			BUILTIN_SLASH_COMMANDS.length + 18,
 		);
 		expect(BUILTIN_SLASH_COMMANDS.length).toBe(24);
 	});
@@ -104,6 +106,10 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 		expect(lines.length).toBeGreaterThan(30);
 		expect(lines.some((l) => l.startsWith("`/new"))).toBe(true);
 		expect(lines.some((l) => l.startsWith("`/help"))).toBe(true);
+		// Cut rows stay cut: /status duplicates host /session, /commands
+		// duplicates /help filtering plus skill modes.
+		expect(lines.some((l) => l.startsWith("`/status"))).toBe(false);
+		expect(lines.some((l) => l.startsWith("`/commands"))).toBe(false);
 	});
 
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {

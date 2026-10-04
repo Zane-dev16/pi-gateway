@@ -122,7 +122,7 @@ response.
 Useful first commands in chat:
 
 - `/help`: commands, derived from the single central registry (spec 07 §1)
-- `/status`: adapters, worker-pool depth, lease table, delivery backlog
+- `/session`: session info and stats (host command, same registry)
 
 ## 5. Verify state on disk
 

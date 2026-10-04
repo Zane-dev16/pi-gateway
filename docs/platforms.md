@@ -88,7 +88,7 @@ token-lock protection for unique credentials (spec 06 §5).
    `{P}_GROUP_ALLOWED_CHATS`, policies). See
    [docs/configuration.md](configuration.md).
 3. Restart (`pi gateway run --replace` takes over a running instance) and
-   check `/status` for the adapter's connection state.
+   check `gateway_state.json` for the adapter's connection state.
 
 Per-surface specifics (token endpoints, signature setup, media caching) are
 documented in the adapter module and its manifest description.

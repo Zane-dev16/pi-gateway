@@ -70,7 +70,7 @@ see [docs/operations.md](operations.md).
 ```
 
 Diagnostics live outside the gateway process: `gateway_state.json`, the
-heartbeat file, and `/status` are all read-only snapshots. A monitoring check
+heartbeat file are all read-only snapshots. A monitoring check
 must never poke adapters directly (spec 08 §4).
 
 If none of this helps, gather the files above (redact secrets) and open an

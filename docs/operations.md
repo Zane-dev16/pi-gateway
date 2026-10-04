@@ -56,9 +56,8 @@ marker can't be used, startup fails without griefing an unrelated process.
 - `state/gateway.heartbeat` is rewritten every 30s. A stale mtime means the
   process is alive but the loop is frozen, which is the external monitor's
   signal.
-- `/status` (chat command) reports adapters up or disabled with reason,
-  worker-pool depth, pending slots, lease-table size, and the delivery
-  backlog.
+- `/session` (chat command) reports session info and stats; adapter and
+  backlog state lives in `gateway_state.json` above.
 - Health endpoints are read-only over the same snapshot; monitoring must
   never poke adapters (no side effects).
 

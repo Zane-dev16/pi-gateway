@@ -183,12 +183,6 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		busyHandler: "steer",
 	},
 	{
-		name: "status",
-		description: "Show session, model, token, and context info",
-		category: "Session",
-		busyPolicy: "dispatch",
-	},
-	{
 		name: "sethome",
 		description: "Set this chat as the home channel",
 		category: "Session",
@@ -224,15 +218,6 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		subcommands: ["pause", "resume", "list"],
 	},
 	{
-		name: "commands",
-		description: "Browse all commands and skills (paginated)",
-		category: "Info",
-		gatewayOnly: true,
-		argsHint: "[page]",
-		busyPolicy: "dispatch",
-		execute: "gateway_commands",
-	},
-	{
 		name: "help",
 		description:
 			"Show available commands (/help skills lists skill commands, /help <text> filters)",
@@ -260,7 +245,7 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 
 /**
  * The shipped census: host-derived rows in host order, then gateway-only
- * rows. Count = host builtins + survivors (24 + 20 = 44 today); the count
+ * rows. Count = host builtins + survivors (24 + 18 = 42 today); the count
  * test pins the sum shape, not a Hermes number.
  */
 export const BUILTIN_COMMAND_ROWS: readonly CommandDef[] = [

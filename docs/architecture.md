@@ -60,7 +60,7 @@ MessageEvent → [L1 adapter guard] → [L2 runner guard] → [turn lease ×2]
 6. Delivery obligations: outbound sends obligate first, then attempt, with
    CAS-guarded transitions `pending → attempting → delivered | failed |
    abandoned` and caps of 3 attempts / 24h stale / 7d retention / 500 rows
-   (DEC-053/054). `/status` surfaces the backlog (spec 08 §4).
+   (DEC-053/054). The backlog itself lives in `gateway_state.json` (spec 08 §4).
 
 ## Core invariants
 
