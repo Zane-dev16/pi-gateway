@@ -1,6 +1,6 @@
 // pi_platforms/kit/lifecycle-state — adapter fatal-error state machine and the
 // LOUD disable path (04 §7 error-handling table; §4.2 "Missing secrets disable
-// the adapter LOUDLY (visible in /status), never silently").
+// the adapter LOUDLY (visible in gateway_state.json), never silently").
 //
 // Ported from the READ-ONLY Hermes reference, semantics only:
 //   gateway/platforms/base.py:_set_fatal_error (fatal state stamps status;
@@ -11,7 +11,7 @@ import type { StreamLogger } from "../../pi_gateway/streaming/adapter-seam.js";
 
 export type AdapterRunState = "active" | "degraded" | "disabled" | "fatal";
 
-/** Structured disable reason — surfaced verbatim in /status. */
+/** Structured disable reason — surfaced verbatim in gateway_state.json. */
 export type DisableReason =
 	| { kind: "secret_missing"; secretKey: string; manifestName: string }
 	| {
@@ -53,7 +53,7 @@ export function describeReason(reason: DisableReason): string {
 	}
 }
 
-/** One /status-shaped snapshot line per adapter. */
+/** One snapshot line per adapter (surfaced via gateway_state.json). */
 export interface AdapterStatusSnapshot {
 	state: AdapterRunState;
 	reason?: DisableReason | undefined;
@@ -91,7 +91,7 @@ export class AdapterLifecycleState {
 		this.listeners.push(listener);
 	}
 
-	/** Loud disable — ALWAYS logs; visible in /status; throws nothing. */
+	/** Loud disable — ALWAYS logs; visible in gateway_state.json; throws nothing. */
 	disable(reason: DisableReason): void {
 		if (this._state === "disabled" || this._state === "fatal") return;
 		this._state = "disabled";

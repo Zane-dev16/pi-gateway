@@ -4,7 +4,7 @@
 // (backward-compat — existing installs keep every command); (2) with gating
 // on, non-admins reach ONLY user_allowed_commands plus the {help,whoami}
 // floor; (3) the denial text is BYTE-STABLE; (4) the gate sits BETWEEN the
-// status/context pre-gate and dispatch on BOTH the running-agent fast-path
+// context pre-gate and dispatch on BOTH the running-agent fast-path
 // (RunnerBusyGuard.dispatchBusySlashCommand) and the cold path
 // (checkColdPathSlashAccess) so an in-flight agent can't be used to bypass.
 
@@ -36,7 +36,7 @@ const REGISTRY: CommandDef[] = [
 		busyHandler: "model",
 		aliases: ["mdl"],
 	},
-	{ name: "status", busyPolicy: "dispatch" },
+	{ name: "context", busyPolicy: "dispatch" },
 	{ name: "help", busyPolicy: "dispatch" },
 	{ name: "whoami", busyPolicy: "dispatch" },
 ];
@@ -70,7 +70,6 @@ function gatedGuard(
 		plainHandlers: {
 			help: () => "helped",
 			whoami: () => "you are you",
-			status: () => "status",
 			context: () => "context",
 		},
 		slashAccessPolicyOf: policyFactory,
@@ -97,8 +96,8 @@ describe("policy coercion (slash_access.py _coerce_* helpers)", () => {
 
 	it("command lists strip leading slashes and lowercase (either YAML style)", () => {
 		expect(
-			[...coerceCommandSet(["/Help", "QUEUE", "//Status"])].sort(),
-		).toEqual(["help", "queue", "status"]);
+			[...coerceCommandSet(["/Help", "QUEUE", "//Context"])].sort(),
+		).toEqual(["context", "help", "queue"]);
 		expect([...coerceCommandSet("/whoami, /Model")].sort()).toEqual([
 			"model",
 			"whoami",
@@ -145,9 +144,9 @@ describe("policyFromExtra — enabled flag, floor, and the dm→group fallback",
 	});
 
 	it("dm commands fall back to group_user_allowed_commands when unset", () => {
-		const shared = { group_user_allowed_commands: ["status"] };
+		const shared = { group_user_allowed_commands: ["context"] };
 		expect([...policyFromExtra(shared, "dm").userAllowedCommands]).toEqual([
-			"status",
+			"context",
 		]);
 		// …but never RESTRICTIVELY: an explicit dm list wins outright.
 		const both = { ...shared, user_allowed_commands: ["queue"] };
@@ -191,7 +190,7 @@ describe("policyForSource over config/source shapes", () => {
 			telegram: {
 				extra: {
 					group_allow_admin_from: ["boss"],
-					group_user_allowed_commands: ["/status"],
+					group_user_allowed_commands: ["/context"],
 				},
 			},
 		};
@@ -201,7 +200,7 @@ describe("policyForSource over config/source shapes", () => {
 			userId: "boss",
 		});
 		expect(group.enabled).toBe(true);
-		expect(canRunSlashCommand(group, "boss", "status")).toBe(true);
+		expect(canRunSlashCommand(group, "boss", "context")).toBe(true);
 	});
 });
 
@@ -311,11 +310,11 @@ describe("RUNNING-AGENT FAST-PATH gate (run.py ~17282 between pregate and dispat
 		).resolves.toBe(checkSlashAccess(makeDmPolicy(), "bob", "model"));
 	});
 
-	it("/status pre-gates — answered even for gated non-admins", async () => {
+	it("/context pre-gates — answered even for gated non-admins", async () => {
 		const { guard } = gatedGuard(() => makeDmPolicy());
 		await expect(
-			guard.dispatchBusySlashCommand("status", dmEvent("bob"), "k"),
-		).resolves.toBe("status");
+			guard.dispatchBusySlashCommand("context", dmEvent("bob"), "k"),
+		).resolves.toBe("context");
 	});
 
 	it("the {help, whoami} floor passes mid-run for non-admins", async () => {
@@ -396,13 +395,13 @@ describe("COLD-PATH gate (run.py ~17507 before built-in dispatch)", () => {
 		);
 	});
 
-	it("cold path has NO pregate exemption: /status gates too (Hermes parity)", () => {
+	it("cold path has NO pregate exemption: /context gates too (Hermes parity)", () => {
 		const { guard } = gatedGuard(() => makeDmPolicy());
-		expect(guard.checkColdPathSlashAccess(dmEvent("bob"), "status")).toContain(
-			"/status is admin-only here.",
+		expect(guard.checkColdPathSlashAccess(dmEvent("bob"), "context")).toContain(
+			"/context is admin-only here.",
 		);
 		expect(
-			guard.checkColdPathSlashAccess(dmEvent("alice"), "status"),
+			guard.checkColdPathSlashAccess(dmEvent("alice"), "context"),
 		).toBeNull();
 	});
 

@@ -72,9 +72,9 @@ describe("mattermost adapter — intake filters", () => {
 		const w = makeMattermostWorld({ name: "mm-cmds" });
 		turnsSnapshot = () => w.subject.turns();
 		await w.connectAndAwaitLive();
-		w.pushPost("!free:fake.example", USER_ID, "  /status now");
+		w.pushPost("!free:fake.example", USER_ID, "  /approve now");
 		w.pushPost("!free:fake.example", USER_ID, `hey @${w.mm.botUsername} look`);
-		await vi_waitFor(() => w.subject.turns().includes("/status now"));
+		await vi_waitFor(() => w.subject.turns().includes("/approve now"));
 		await vi_waitFor(() => w.subject.turns().some((t) => t.includes("look")));
 		const mentionTurn = w.subject.turns().find((t) => t.includes("look"));
 		expect(mentionTurn).not.toContain("@");

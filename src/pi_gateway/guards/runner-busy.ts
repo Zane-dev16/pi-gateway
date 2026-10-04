@@ -573,7 +573,7 @@ export class RunnerBusyGuard {
 		const resolved = resolveBusyDispatch(this.lookup, rawName);
 		if (resolved === null) return null; // unknown "/foo" → queues as text
 
-		// run.py ~17282: the access gate sits BETWEEN the status/context
+		// run.py ~17282: the access gate sits BETWEEN the context
 		// pre-gate and busy dispatch. /help and /whoami pass under the
 		// always-allowed floor inside checkSlashAccess.
 		if (resolved.kind !== "pregate") {

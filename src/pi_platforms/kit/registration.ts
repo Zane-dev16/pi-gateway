@@ -17,7 +17,7 @@
 //                        hook; getStandaloneSender() hands it to the cron /
 //                        send-tool fallback lane)
 //
-// "Missing secrets disable the adapter LOUDLY (visible in /status), never
+// "Missing secrets disable the adapter LOUDLY (visible in gateway_state.json), never
 // silently" — enablement resolves through a SCOPED secret reader (fail-closed:
 // scoped miss returns the declared default, NEVER borrows process env after a
 // scoped miss — DEC-003/009).
@@ -92,7 +92,7 @@ export class PluginContext {
 
 	/**
 	 * §11 step 3/4 flow: resolve enablement from required env; missing secret
-	 * ⇒ LOUD disable (state visible in /status); token lock acquired here so
+	 * ⇒ LOUD disable (state visible in gateway_state.json); token lock acquired here so
 	 * a second instance refuses at REGISTRATION time, not first send.
 	 */
 	registerPlatform(

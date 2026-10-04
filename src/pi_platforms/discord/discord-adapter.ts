@@ -223,7 +223,7 @@ export interface AdapterClock {
 	sleepMs: SleepFn;
 }
 
-/** Command registry — the shared five-command conformance registry. */
+/** Command registry — the shared four-command conformance registry. */
 export const DISCORD_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -238,7 +238,6 @@ export const DISCORD_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export const DISCORD_REQUIRED_SECRET = "DISCORD_BOT_TOKEN";

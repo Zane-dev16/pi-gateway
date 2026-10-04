@@ -541,7 +541,7 @@ export class AdapterSessionGuard {
 					}
 					return;
 				}
-				// Lane B: direct dispatch (/approve, /deny, /status, …) — the
+				// Lane B: direct dispatch (/approve, /deny, …) — the
 				// running task keeps running.
 				await this.dispatchInline(event);
 				return;

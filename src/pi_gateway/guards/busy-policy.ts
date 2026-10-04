@@ -133,7 +133,6 @@ export const SPECIAL_BUSY_HANDLERS: ReadonlySet<string> = new Set([
 
 /** Pre-gate commands answer before access gating (users always see state). */
 export const PREGATE_COMMANDS: ReadonlySet<string> = new Set([
-	"status",
 	"context",
 ]);
 
@@ -157,7 +156,7 @@ export function catchAllBusyRejectText(name: string): string {
 }
 
 export type BusyDispatchKind =
-	| "pregate" // /status, /context — answer before access gating
+	| "pregate" // /context — answers before access gating
 	| "special" // busy_handler mid-run variant
 	| "plain" // busy_policy dispatch | interrupt_then_dispatch, no special
 	| "reject"; // catch-all (or handler-keyed reject text)
@@ -178,7 +177,7 @@ export interface BusyDispatch {
  *      CALLER between pregate and everything else; see guards/slash-access.ts
  *      and RunnerBusyGuard.dispatchBusySlashCommand — this pure resolver has
  *      no event/userId to gate with),
- *   1. pre-gate (/status, /context),
+ *   1. pre-gate (/context),
  *   2. busy_handler special (mid-run variant differs from normal handler);
  *      a non-special handler key carrying known reject text rejects with it,
  *   3. busy_policy dispatch|interrupt_then_dispatch plain handler,

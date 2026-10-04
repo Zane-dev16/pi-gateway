@@ -99,7 +99,6 @@ export const IRC_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" },
-	{ name: "status", busyPolicy: "dispatch" },
 ];
 
 /** Held-inbound window cap (polling-family discipline: drop-oldest at 64). */
@@ -282,7 +281,7 @@ export class IrcAdapter
 
 		// §11 step 3/4: missing required secret ⇒ LOUD disable at construction
 		// (Hermes refuses at connect(); the kit expresses the same posture at
-		// construction so /status shows the reason instead of a silent skip).
+		// construction so gateway_state.json shows the reason instead of a silent skip.
 		const enablement = resolveEnablement(
 			IRC_PLUGIN_MANIFEST,
 			this.secretReader,

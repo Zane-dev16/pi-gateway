@@ -228,7 +228,7 @@ export interface FeishuRestPlane {
 	getChat(chatId: string): Promise<{ name: string; chatType: string } | null>;
 }
 
-/** Command registry — the five-command conformance registry (family parity). */
+/** Command registry — the four-command conformance registry (family parity). */
 export const FEISHU_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -243,7 +243,6 @@ export const FEISHU_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 /** Required secrets (plugin.yaml requires_env; loud-disable row). */

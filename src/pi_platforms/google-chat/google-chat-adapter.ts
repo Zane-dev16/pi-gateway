@@ -99,7 +99,6 @@ export const GCHAT_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 // ── configuration (__init__ @647 parity, HTTP-mode subset) ───────────────────

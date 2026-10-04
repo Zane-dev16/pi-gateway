@@ -835,9 +835,9 @@ describe("arrival batching (pre-guard coalescing)", () => {
 
 	it("commands NEVER batch — they dispatch inline immediately", async () => {
 		const h = await makeEngine({ textBatchDelayMs: 5_000 });
-		h.push(textEnvelope("cmd-1", "on_cmd", "/status"));
+		h.push(textEnvelope("cmd-1", "on_cmd", "/approve"));
 		await eventually(() =>
-			h.engine.turnLog.some((t) => t.startsWith("/status")),
+			h.engine.turnLog.some((t) => t.startsWith("/approve")),
 		);
 	});
 });

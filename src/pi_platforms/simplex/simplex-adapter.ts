@@ -120,7 +120,6 @@ export const SIMPLEX_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 /**
@@ -400,7 +399,7 @@ export class SimplexAdapter extends BasePlatformAdapter {
 
 		// §11 step 3/4: missing required secret ⇒ LOUD disable (status-visible).
 		// Hermes gates via check_requirements() (SIMPLEX_WS_URL required);
-		// the kit expresses the same posture at construction so /status shows
+		// the kit expresses the same posture at construction so gateway_state.json shows
 		// the reason instead of a silent skip.
 		const enablement = resolveEnablement(
 			SIMPLEX_PLUGIN_MANIFEST,

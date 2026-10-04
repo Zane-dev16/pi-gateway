@@ -123,7 +123,7 @@ import {
 } from "./block-cards.js";
 import type { SlackInteractivePayload } from "./fake-socket-mode.js";
 
-/** Slack's five-command conformance registry (identical to the ws shape). */
+/** Slack's four-command conformance registry (identical to the ws shape). */
 export const SLACK_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -138,7 +138,6 @@ export const SLACK_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export interface SlackAdapterDeps extends PersistentWsAdapterDeps {

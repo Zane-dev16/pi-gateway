@@ -112,7 +112,7 @@ export const HELD_INBOUND_MAX = 64;
 
 const REQUIRED_SECRETS = ["MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN"] as const;
 
-/** Command registry — same five-command conformance registry as the kit base. */
+/** Command registry — same four-command conformance registry as the kit base. */
 export const MATRIX_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -127,7 +127,6 @@ export const MATRIX_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export interface MatrixRoomIdentity {

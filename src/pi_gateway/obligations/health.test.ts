@@ -1,4 +1,4 @@
-// Behavior contracts for the /status-bound obligations health snapshot
+// Behavior contracts for the gateway_state.json obligations health snapshot
 // (Q16: undelivered obligations surface in health). Pure query + shape —
 // every assertion runs against seeded rows at an explicit injected instant.
 

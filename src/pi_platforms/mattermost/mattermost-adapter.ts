@@ -95,7 +95,7 @@ import { MmRestError } from "./mm-fake-server.js";
 
 const REQUIRED_SECRETS = ["MATTERMOST_URL", "MATTERMOST_TOKEN"] as const;
 
-/** Command registry — same five-command conformance registry as the kit base. */
+/** Command registry — same four-command conformance registry as the kit base. */
 export const MM_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -110,7 +110,6 @@ export const MM_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export interface MattermostAdapterDeps {

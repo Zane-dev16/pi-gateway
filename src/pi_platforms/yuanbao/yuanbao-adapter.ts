@@ -1458,5 +1458,4 @@ const YB_REGISTRY: CommandRegistry = [
 		busyHandler: "new",
 	},
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];

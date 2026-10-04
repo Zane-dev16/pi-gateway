@@ -83,7 +83,7 @@ export const TYPING_REFRESH_MS = 2_000;
 
 const REQUIRED_SECRET = "TELEGRAM_BOT_TOKEN";
 
-/** Command registry — same five-command conformance registry as the kit base. */
+/** Command registry — same four-command conformance registry as the kit base. */
 export const POLLING_REGISTRY = [
 	{
 		name: "new",
@@ -98,7 +98,6 @@ export const POLLING_REGISTRY = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export interface PollingEngineDeps {

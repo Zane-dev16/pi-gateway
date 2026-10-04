@@ -282,12 +282,12 @@ describe("matrix adapter — mention gating", () => {
 		});
 		w.hs.pushRoomMessage("!chan:fake.example", ALICE, {
 			msgtype: "m.text",
-			body: "/status now",
+			body: "/approve now",
 		});
-		await vi_waitFor(() => w.subject.turns().includes("/status now"));
+		await vi_waitFor(() => w.subject.turns().includes("/approve now"));
 		await wall();
 		expect(w.subject.turns()).toContain("silent pill");
-		expect(w.subject.turns()).toContain("/status now");
+		expect(w.subject.turns()).toContain("/approve now");
 		expect(w.subject.turns()).not.toContain("no mention");
 	});
 

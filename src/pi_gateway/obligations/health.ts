@@ -1,8 +1,8 @@
-// health.ts — undelivered-obligation health snapshot for future /status
+// health.ts — undelivered-obligation health snapshot for gateway_state.json
 // consumption. Pure query + shape; no CLI, no I/O beyond the open DB handle.
 //
 // Spec anchor: 09-open-questions.md Q16 — "undelivered obligations surface
-// in /status health"; 08-operations.md carries the table but owns no CLI yet.
+// in gateway_state.json health"; 08-operations.md carries the table but owns no CLI yet.
 
 import type Database from "better-sqlite3";
 
@@ -55,6 +55,8 @@ export function obligationHealthSnapshot(
 	db: Database.Database,
 	nowSeconds: number,
 ): ObligationsHealth {
+	// SAFETY: better-sqlite3 returns unknown; the (state, n) shape is fixed by
+	// the SELECT directly above, and unknown states are filtered at runtime.
 	const counts = db
 		.prepare(
 			"SELECT state, COUNT(*) AS n FROM delivery_obligations GROUP BY state",
@@ -77,6 +79,8 @@ export function obligationHealthSnapshot(
 	}
 	const undelivered = byState.pending + byState.attempting + byState.failed;
 
+	// SAFETY: better-sqlite3 returns unknown; the aggregate shape is fixed by
+	// the SELECT directly above, and every field is null-checked at use.
 	const extremes = db
 		.prepare(
 			`SELECT MIN(created_at) AS oldest_created_at,
@@ -112,6 +116,8 @@ export function obligationHealthSnapshot(
 function soonestNextRetry(db: Database.Database, now: number): number | null {
 	// Per-row delay depends on attempts; evaluate the schedule over the
 	// (cap-bounded ≤500) candidate set in JS.
+	// SAFETY: better-sqlite3 returns unknown; the (updated_at, attempts)
+	// shape is fixed by the SELECT directly above.
 	const rows = db
 		.prepare(
 			`SELECT updated_at, attempts FROM delivery_obligations

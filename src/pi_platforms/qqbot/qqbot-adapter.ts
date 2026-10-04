@@ -616,7 +616,7 @@ export class QQBotAdapter extends BasePlatformAdapter {
 
 		if (this.appId === "" || this.clientSecret === "") {
 			// Loud-disable parity: connect() refuses without credentials; the
-			// lifecycle records the reason so /status shows it.
+			// lifecycle records the reason so gateway_state.json shows it.
 			this.lifecycle.disable({
 				kind: "secret_missing",
 				secretKey: this.clientSecret === "" ? "QQ_CLIENT_SECRET" : "QQ_APP_ID",
@@ -2645,5 +2645,4 @@ const QQ_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];

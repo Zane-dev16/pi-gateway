@@ -125,10 +125,10 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 			const scheduler = schedulerOf(s);
 			s.holdTurnsForBurst(true);
 			await s.deliverInbound(textEvent("busy-turn"), "sess-cmd");
-			await s.deliverInbound(textEvent("/status"), "sess-cmd");
+			await s.deliverInbound(textEvent("/approve"), "sess-cmd");
 			expectTrue(
-				s.replies().some((r) => r.includes("/status")),
-				"/status dispatches INLINE mid-turn",
+				s.replies().some((r) => r.includes("/approve")),
+				"/approve dispatches INLINE mid-turn",
 			);
 			await s.deliverInbound(textEvent("/foo bar"), "sess-cmd");
 			expectTrue(
@@ -905,6 +905,8 @@ export type { RowResult };
 
 /** Extract the deterministic scheduler a subject was built with. */
 function schedulerOf(s: ConformanceSubject): ManualScheduler {
+	// SAFETY: conformance subjects store their ManualScheduler under
+	// SCHEDULER_SYMBOL at construction; the undefined throw below enforces it.
 	const sched = (s as unknown as Record<symbol, ManualScheduler>)[
 		SCHEDULER_SYMBOL
 	];

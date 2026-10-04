@@ -126,7 +126,7 @@ describe("concurrent enqueue bursts — deterministic scheduling (§11)", () => 
 		);
 		// Lane B dispatch runs INLINE and its handler parks on the same gate —
 		// fire it without awaiting (the await happens after release).
-		const statusDispatch = f.guard.handleMessage(f.text("/status"), KEY);
+		const approveDispatch = f.guard.handleMessage(f.text("/approve"), KEY);
 		await f.guard.handleMessage(f.text("text-2"), KEY);
 		await f.guard.handleMessage(
 			{ messageType: "photo", mediaUrls: ["/p2.png"] },
@@ -134,11 +134,11 @@ describe("concurrent enqueue bursts — deterministic scheduling (§11)", () => 
 		);
 
 		f.holdTurns(false);
-		await statusDispatch;
+		await approveDispatch;
 		await f.scheduler.quiesce();
 
-		// /status dispatched INLINE (Lane B) even mid-burst:
-		expect(f.turns).toContain("/status");
+		// /approve dispatched INLINE (Lane B) even mid-burst:
+		expect(f.turns).toContain("/approve");
 		f.holdTurns(false);
 		await f.scheduler.quiesce();
 

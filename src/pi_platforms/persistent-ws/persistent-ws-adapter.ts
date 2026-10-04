@@ -126,7 +126,7 @@ export interface AdapterClock {
 	sleepMs: SleepFn;
 }
 
-/** Command registry — same five-command conformance registry as the kit base. */
+/** Command registry — same four-command conformance registry as the kit base. */
 export const WS_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -141,7 +141,6 @@ export const WS_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 export interface PersistentWsAdapterDeps {

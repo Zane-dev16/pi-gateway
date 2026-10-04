@@ -34,7 +34,7 @@ const REGISTRY: CommandDef[] = [
 	{ name: "stop", busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" },
 	{ name: "approve", busyPolicy: "dispatch" },
 	{ name: "deny", busyPolicy: "dispatch" },
-	{ name: "status", busyPolicy: "dispatch" },
+	{ name: "context", busyPolicy: "dispatch" },
 	{ name: "model", busyPolicy: "reject", busyHandler: "model" },
 	{ name: "queue", busyPolicy: "dispatch", busyHandler: "queue" },
 ];
@@ -94,7 +94,9 @@ describe("busy_policy enum and registry resolution (DEC-005)", () => {
 
 	it("resolution order: pre-gate → special handler → policy dispatch → catch-all reject", () => {
 		const lookup = buildCommandLookup(REGISTRY);
-		expect(resolveBusyDispatch(lookup, "status")?.kind).toBe("pregate");
+		expect(resolveBusyDispatch(lookup, "context")?.kind).toBe("pregate");
+		// /status is cut: unknown names resolve null and queue as text.
+		expect(resolveBusyDispatch(lookup, "status")).toBeNull();
 		expect(resolveBusyDispatch(lookup, "queue")?.kind).toBe("special");
 		expect(resolveBusyDispatch(lookup, "approve")?.kind).toBe("plain");
 		const model = resolveBusyDispatch(lookup, "model");
@@ -260,7 +262,7 @@ describe("runner-side FIFO overflow (§3.1, #28503)", () => {
 				},
 			},
 			plainHandlers: {
-				status: () => "all agents idle",
+				context: () => "all agents idle",
 				approve: () => "approved",
 			},
 		});
@@ -277,8 +279,8 @@ describe("runner-side FIFO overflow (§3.1, #28503)", () => {
 		).toBe("fresh session started"); // alias resolves to same special
 		expect(
 			await f.runner.dispatchBusySlashCommand(
-				"status",
-				textEvent("/status"),
+				"context",
+				textEvent("/context"),
 				KEY,
 			),
 		).toBe("all agents idle");

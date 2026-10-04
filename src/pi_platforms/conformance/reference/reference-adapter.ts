@@ -50,7 +50,6 @@ export const REFERENCE_REGISTRY = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 const REQUIRED_SECRET = "REFERENCE_BOT_TOKEN";
@@ -318,7 +317,7 @@ class ReferenceCore extends BasePlatformAdapter implements StreamEgressAdapter {
 		this.secretReader = opts.secretReader;
 
 		// §11 step 3/4 + §8 identity rows: missing required secret ⇒ LOUD
-		// disable at construction (visible in /status), never silent skip.
+		// disable at construction (visible in gateway_state.json), never silent skip.
 		const enablement = resolveEnablement(
 			{
 				name: opts.manifestName,

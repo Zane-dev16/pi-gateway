@@ -83,7 +83,6 @@ export const MSGRAPH_REGISTRY: CommandRegistry = [
 	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
 	{ name: "approve", busyPolicy: "dispatch" as const },
-	{ name: "status", busyPolicy: "dispatch" as const },
 ];
 
 /**
@@ -296,7 +295,7 @@ export class MSGraphWebhookAdapter extends BasePlatformAdapter {
 		// §11 step 3/4: missing required secret ⇒ LOUD disable (status-visible).
 		// Hermes refuses at connect() ("Refusing to start without
 		// extra.client_state configured"); the kit expresses the same posture at
-		// construction so /status shows the reason instead of a silent skip.
+		// construction so gateway_state.json shows the reason instead of a silent skip.
 		const enablement = resolveEnablement(
 			MSGRAPH_WEBHOOK_PLUGIN_MANIFEST,
 			this.secretReader,

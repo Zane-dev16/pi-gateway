@@ -258,7 +258,6 @@ export function makeFixture(options: FixtureOptions = {}): {
 			},
 			{ name: "model", busyPolicy: "reject", busyHandler: "model" },
 			{ name: "approve", busyPolicy: "dispatch" },
-			{ name: "status", busyPolicy: "dispatch" },
 			{ name: "queue", busyPolicy: "dispatch", busyHandler: "queue" },
 		],
 		spawner: options.spawner ?? scheduler.spawner,
