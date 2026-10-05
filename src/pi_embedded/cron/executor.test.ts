@@ -1,6 +1,7 @@
 // Behavior contracts for the cron turn executor: DEC-012 (memory ENABLED,
-// provable at the constructor seam) and normal-pipeline execution through the
-// REAL GatewayAgentRunner with a scripted model.
+// provable at the constructor seam). Embedded host-loop pipeline proofs
+// dissolved per DEC-084 (RPC children own turns). Stub runners prove the
+// executor seam instead.
 
 import { describe, expect, it } from "vitest";
 
@@ -19,11 +20,6 @@ import {
 	systemClock,
 } from "../approvals/index.js";
 import { ApprovalQueues } from "../approvals/queue.js";
-import {
-	createRunnerHarness,
-	type RunnerHarness,
-} from "../../pi_agent_core/testing/runner-harness.js";
-import { fauxAssistantMessage } from "../../pi_agent_core/testing/faux-model.js";
 
 describe("DEC-012 — cron agents run WITH memory (constructor seam)", () => {
 	it("the construction plan emits skip_memory=false EXPLICITLY", () => {
@@ -88,73 +84,6 @@ describe("DEC-012 — cron agents run WITH memory (constructor seam)", () => {
 		expect(executor.lastConstruction?.skipMemory).toBe(false);
 		const seen = seenRequests[0];
 		expect(seen?.sessionId).toBe(cronSessionId("jobX"));
-	});
-});
-
-describe("cron turns through the NORMAL runner pipeline (real host loop)", () => {
-	let harness: RunnerHarness;
-
-	async function freshHarness(memorySpies?: {
-		prefetched?: string[];
-		synced?: Array<{ userText: string; responseText: string }>;
-	}): Promise<RunnerHarness> {
-		return createRunnerHarness({
-			systemPrompt: "cron pipeline test prompt",
-			...(memorySpies
-				? {
-						memoryHooks: {
-							prefetchAll: (query) => {
-								memorySpies.prefetched?.push(query);
-								return "prefetched memory context";
-							},
-							syncAll: (input) => {
-								memorySpies.synced?.push(input);
-							},
-						},
-					}
-				: {}),
-		});
-	}
-
-	it("runs the job prompt through handleTurn into the job's OWN session; rows persist there", async () => {
-		harness = await freshHarness();
-		harness.faux.setResponses([fauxAssistantMessage("cron output")]);
-		const executor = new CronTurnExecutor(harness.runner);
-		const { outcome } = await executor.run({
-			jobId: "job42",
-			prompt: "run nightly brief",
-			ensureSession: (sessionId) => harness.ensureSession(sessionId),
-		});
-
-		expect(outcome.exitReason).toBe("finalized");
-		expect(outcome.finalText).toBe("cron output");
-		// Deliveries originate in the job's OWN session (isolation invariant).
-		expect(executor.lastConstruction?.sessionId).toBe("cron:job42");
-		const rows = harness.store.listMessages("cron:job42");
-		expect(rows.map((r) => r.role)).toEqual(["user", "assistant"]);
-		expect(rows[1]!.content).toBe("cron output");
-		await harness.close();
-	});
-
-	it("memory hooks FIRE for the cron turn — skip_memory=False is provable end-to-end", async () => {
-		const spies: {
-			prefetched: string[];
-			synced: Array<{ userText: string; responseText: string }>;
-		} = { prefetched: [], synced: [] };
-		harness = await freshHarness(spies);
-		harness.faux.setResponses([fauxAssistantMessage("with memory")]);
-		const executor = new CronTurnExecutor(harness.runner);
-		await executor.run({
-			jobId: "mem-job",
-			prompt: "remember this",
-			ensureSession: (sessionId) => harness.ensureSession(sessionId),
-		});
-
-		expect(spies.prefetched).toEqual(["remember this"]); // prefetch leg ran
-		expect(spies.synced).toEqual([
-			{ userText: "remember this", responseText: "with memory" }, // sync leg ran
-		]);
-		await harness.close();
 	});
 });
 

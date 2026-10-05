@@ -26,7 +26,7 @@ import {
 	type ScriptedModelEnv,
 } from "../pi_agent_core/testing/faux-model.js";
 import { matrixHosting } from "./platform-hosting.js";
-import { buildProductionTurnRunnerFactory } from "./production-runner.js";
+import type { ChatTurnRunner } from "./guard-wiring.js";
 import {
 	LOCK_HELD_MESSAGE,
 	piGatewayMain,
@@ -133,9 +133,21 @@ describe("pi-gateway run — standalone boot proof", () => {
 		});
 		env = await createScriptedModelEnv();
 		const e = env;
-		e.faux.setResponses([fauxAssistantMessage("STANDALONE-OK")]);
-		const model = e.faux.getModel();
-		if (!model) throw new Error("faux provider exposed no model");
+		// DEC-084 subtraction: embedded factory dissolved. Stub runner proves
+		// the composed boot plus turn path without the host loop.
+		const stubRunner: ChatTurnRunner = {
+			handleTurn: async () => ({
+				exitReason: "finalized" as const,
+				finalText: "STANDALONE-OK",
+				iterations: 1,
+				repairs: 0,
+				userRowId: 1,
+				assistantRowId: 2,
+				usage: null,
+			}),
+		};
+		void e;
+		void fauxAssistantMessage;
 
 		let adapter: MatrixAdapterCore | null = null;
 		const out: string[] = [];
@@ -147,11 +159,7 @@ describe("pi-gateway run — standalone boot proof", () => {
 				logger: spy.log,
 				installSignals: false,
 				secretReader: matrixSecrets(),
-				turnRunnerFactory: buildProductionTurnRunnerFactory({
-					home,
-					modelRuntime: e.modelRuntime,
-					model,
-				}),
+				turnRunnerFactory: () => stubRunner,
 				platforms: [
 					matrixHosting(() => {
 						const a = new MatrixAdapterCore({

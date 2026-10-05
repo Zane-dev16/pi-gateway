@@ -12,7 +12,6 @@ import {
 	assertStoreMatchesSchema,
 	connectAndInitWithPatience,
 	getMeta,
-	healGatewayRoutingPk,
 	initStore,
 	readProbeStatements,
 	reconcileColumns,
@@ -25,7 +24,6 @@ import {
 	boundActivityDescription,
 	SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS,
 } from "./store.js";
-import { SessionTurnLeaseLostError, structuredHolder } from "./leases.js";
 import { executeWrite } from "./wal.js";
 import { makeTempDir, removeTempDir } from "./testing/harness.js";
 
@@ -569,74 +567,7 @@ describe("DEC-070 item 5 — async-delegation rail retreat (drop-if-present, no-
 	});
 });
 
-describe("02 §3 step 7 — gateway_routing PK heal", () => {
-	function buildLegacyRouting(path: string): void {
-		const raw = new Database(path);
-		raw.pragma("journal_mode = WAL");
-		raw.exec(`
-			CREATE TABLE IF NOT EXISTS gateway_routing (
-			  session_key TEXT PRIMARY KEY,
-			  entry_json TEXT NOT NULL,
-			  updated_at REAL NOT NULL
-			);
-		`);
-		raw
-			.prepare(
-				"INSERT INTO gateway_routing (session_key, entry_json, updated_at) VALUES (?, ?, ?)",
-			)
-			.run("agent:main:telegram:dm:111", '{"v":1}', 100);
-		raw.close();
-	}
 
-	it("heals legacy session_key-only PK preserving rows; composite scope isolation enforced after", async () => {
-		const p = dbPath();
-		buildLegacyRouting(p);
-		const raw = new Database(p);
-		// The heal needs the scope column present (reconcile adds it first).
-		expect(healGatewayRoutingPk(raw)).toBe(true);
-		const cols = raw
-			.prepare('PRAGMA table_info("gateway_routing")')
-			.all() as Array<Record<string, unknown>>;
-		const pkCols = cols
-			.filter((c) => Number(c["pk"]) > 0)
-			.sort((a, b) => Number(a["pk"]) - Number(b["pk"]))
-			.map((c) => String(c["name"]));
-		expect(pkCols).toEqual(["scope", "session_key"]);
-		const preserved = raw
-			.prepare("SELECT session_key FROM gateway_routing")
-			.all() as Array<{ session_key: string }>;
-		expect(preserved.map((r) => r.session_key)).toContain(
-			"agent:main:telegram:dm:111",
-		);
-		// Composite PK allows same key under a DIFFERENT scope (the isolation the
-		// old shape made impossible).
-		raw
-			.prepare(
-				"INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) VALUES ('ws2', 'agent:main:telegram:dm:111', '{}', 200)",
-			)
-			.run();
-		// …and idempotent: correct shape reports nothing to heal.
-		expect(healGatewayRoutingPk(raw)).toBe(false);
-		raw.close();
-	});
-
-	it("full init heals end-to-end through StateStore.open", async () => {
-		const p = dbPath();
-		buildLegacyRouting(p);
-		// Pre-add scope column like reconcile would (legacy DB mid-upgrade).
-		const raw = new Database(p);
-		raw.exec(
-			"ALTER TABLE gateway_routing ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
-		);
-		raw.close();
-		const store = await StateStore.open(p);
-		try {
-			expect(store.initReport?.routingPkHealed).toBe(true);
-		} finally {
-			await store.close();
-		}
-	});
-});
 
 describe("write ladder integration through the facade", () => {
 	it("withWrite retries busy and lands both sides' commits", async () => {
@@ -715,165 +646,7 @@ describe("write ladder integration through the facade", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Transcript-write lease admission (hermes_state.py:
-// _check_transcript_write_guards turn-lease leg via insertMessageInTx).
-// ---------------------------------------------------------------------------
 
-describe("transcript-write lease admission inside the message write txn", () => {
-	async function openWithSession(sessionId: string) {
-		const store = await StateStore.open(dbPath());
-		store.db
-			.prepare(
-				"INSERT INTO sessions (id, source, started_at) VALUES (?, 'telegram', ?)",
-			)
-			.run(sessionId, Date.now() / 1000);
-		return store;
-	}
-
-	function leaseOf(store: StateStore, sessionId: string) {
-		return store.db
-			.prepare(
-				"SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
-			)
-			.get(sessionId) as { holder: string; expires_at: number } | undefined;
-	}
-
-	it("owner-matching append lands; the guard is silent while the lease is fresh", async () => {
-		const store = await openWithSession("adm-1");
-		try {
-			const holder = "gw:pid=1";
-			expect(store.leases.tryAcquire("adm-1", holder)).toBe(true);
-			const rowId = await store.appendMessage({
-				sessionId: "adm-1",
-				role: "user",
-				content: "held write",
-				turnLeaseHolder: holder,
-			});
-			expect(rowId).toBeGreaterThan(0);
-			expect(store.listMessages("adm-1")).toHaveLength(1);
-		} finally {
-			await store.close();
-		}
-	});
-
-	it("expired-but-matching lease RENEWS in the same txn — a starved refresher recovers", async () => {
-		const store = await openWithSession("adm-2");
-		try {
-			const holder = "gw:pid=2";
-			expect(store.leases.tryAcquire("adm-2", holder, 300)).toBe(true);
-			// Force expiry behind the writer's back (>TTL stall).
-			store.db
-				.prepare(
-					"UPDATE session_turn_leases SET expires_at = ? WHERE conversation_id = 'adm-2'",
-				)
-				.run(Date.now() / 1000 - 10);
-			await store.appendMessage({
-				sessionId: "adm-2",
-				role: "user",
-				content: "stalled but still ours",
-				turnLeaseHolder: holder,
-				turnLeaseTtlSeconds: 300,
-			});
-			const lease = leaseOf(store, "adm-2");
-			expect(lease?.holder).toBe(holder);
-			expect(lease!.expires_at).toBeGreaterThan(Date.now() / 1000 + 200); // renewed ~+300s
-		} finally {
-			await store.close();
-		}
-	});
-
-	it("FOREIGN holder ⇒ SessionTurnLeaseLostError; nothing lands, thief keeps the slot", async () => {
-		const store = await openWithSession("adm-3");
-		try {
-			const thief = structuredHolder("thief", process.pid);
-			expect(store.leases.tryAcquire("adm-3", thief)).toBe(true);
-			await expect(
-				store.appendMessage({
-					sessionId: "adm-3",
-					role: "assistant",
-					content: "stale flush after takeover",
-					turnLeaseHolder: "gw:pid=999999",
-				}),
-			).rejects.toBeInstanceOf(SessionTurnLeaseLostError);
-			// Fail-fast fencing: no partial row survived the refused txn.
-			expect(
-				store.listMessages("adm-3", { includeInactive: true }),
-			).toHaveLength(0);
-			expect(leaseOf(store, "adm-3")?.holder).toBe(thief);
-		} finally {
-			await store.close();
-		}
-	});
-
-	it("missing lease row ⇒ refusal (released mid-turn means someone else owns the lineage now)", async () => {
-		const store = await openWithSession("adm-4");
-		try {
-			await expect(
-				store.appendMessage({
-					sessionId: "adm-4",
-					role: "user",
-					content: "ghost write",
-					turnLeaseHolder: "gw:pid=1",
-				}),
-			).rejects.toBeInstanceOf(SessionTurnLeaseLostError);
-			expect(store.listMessages("adm-4")).toHaveLength(0);
-		} finally {
-			await store.close();
-		}
-	});
-
-	it("holder-less appends skip the guard entirely (recovery replays keep working)", async () => {
-		const store = await openWithSession("adm-5");
-		try {
-			// No lease row exists AT ALL — an unguarded write must still land.
-			const rowId = await store.appendMessage({
-				sessionId: "adm-5",
-				role: "user",
-				content: "unguarded recovery replay",
-			});
-			expect(rowId).toBeGreaterThan(0);
-		} finally {
-			await store.close();
-		}
-	});
-
-	it("admission keys on the LINEAGE ROOT: a child-segment append contends with the root holder", async () => {
-		const store = await StateStore.open(dbPath());
-		try {
-			const db = store.db;
-			db.prepare(
-				"INSERT INTO sessions (id, source, parent_session_id, started_at, end_reason) VALUES ('lin', 'telegram', NULL, ?, 'compression')",
-			).run(Date.now() / 1000);
-			db.prepare(
-				"INSERT INTO sessions (id, source, parent_session_id, started_at) VALUES ('lin_child', 'telegram', 'lin', ?)",
-			).run(Date.now() / 1000);
-			const owner = structuredHolder("root-owner", process.pid);
-			expect(store.leases.tryAcquire("lin", owner)).toBe(true);
-
-			// Writing through the CHILD segment hits the SAME root-keyed row.
-			await expect(
-				store.appendMessage({
-					sessionId: "lin_child",
-					role: "user",
-					content: "segment write without ownership",
-					turnLeaseHolder: "gw:pid=424242",
-				}),
-			).rejects.toBeInstanceOf(SessionTurnLeaseLostError);
-
-			// The rightful owner writing through the child segment lands.
-			await store.appendMessage({
-				sessionId: "lin_child",
-				role: "user",
-				content: "segment write as owner",
-				turnLeaseHolder: owner,
-			});
-			expect(store.listMessages("lin_child")).toHaveLength(1);
-		} finally {
-			await store.close();
-		}
-	});
-});
 
 // ---------------------------------------------------------------------------
 // Mid-turn activity heartbeat (hermes_state.py:touch_session_activity).

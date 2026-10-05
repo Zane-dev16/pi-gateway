@@ -87,16 +87,6 @@ export {
 	type SlashToken,
 } from "./slash-intake.js";
 
-// Idle-path executor table: canonical name → local handler (DEC-078).
-export {
-	buildIdleExecutors,
-	helpIdleExecutor,
-	type IdleExecutor,
-	type IdleExecutorContext,
-	type IdleExecutorResult,
-	type IdleTurnRunner,
-} from "./idle-executors.js";
-
 // §1.6 injection path: user-message injection + deferred cache invalidation.
 export {
 	DeferredInvalidationBuffer,

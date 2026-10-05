@@ -1,10 +1,8 @@
 // Behavior contracts: DEC-020 ConversationState boundary registry +
-// context-local identity; DEC-021 agent-cache LRU + memory-pressure bound;
-// per-turn checkpoint dedup ledger.
+// context-local identity; per-turn checkpoint dedup ledger.
+// DEC-021 agent-cache dissolved per DEC-084 (RPC children own sessions).
 
 import { describe, expect, it } from "vitest";
-
-import { AgentInstanceCache } from "./agent-cache.js";
 import { TurnCheckpointLedger } from "./checkpoints.js";
 import {
 	CONVERSATION_STATE_FIELDS,
@@ -74,66 +72,6 @@ describe("ConversationState — DEC-020", () => {
 			if (line.startsWith("A:")) expect(line).toBe("A:chat-A");
 			if (line.startsWith("B:")) expect(line).toBe("B:chat-B");
 		}
-	});
-});
-
-describe("AgentInstanceCache — DEC-021", () => {
-	it("LRU entry cap evicts least-recently-used first", () => {
-		let t = 1000;
-		const clock = () => ++t * 1000;
-		const cache = new AgentInstanceCache<string>({ maxEntries: 2, now: clock });
-		cache.set("a", "va", 10);
-		cache.set("b", "vb", 10);
-		cache.set("c", "vc", 10);
-		expect(cache.keys().sort()).toEqual(["b", "c"]);
-		expect(cache.get("a")).toBeUndefined();
-		// Touch b, insert d → b survives, c goes.
-		cache.get("b");
-		cache.set("d", "vd", 10);
-		expect(cache.keys().sort()).toEqual(["b", "d"]);
-	});
-
-	it("byte-pressure bound sheds LRU entries until under budget (synthetic RSS accounting)", () => {
-		let t = 0;
-		const cache = new AgentInstanceCache<string>({
-			maxEntries: 64,
-			maxTotalBytes: 100,
-			now: () => ++t,
-		});
-		cache.set("warm-1", "v1", 60);
-		cache.set("warm-2", "v2", 30); // total 90 ≤ 100
-		expect(cache.size).toBe(2);
-		cache.set("big-3", "v3", 80); // pushes over → shed oldest
-		expect(cache.keys()).toEqual(["big-3"]);
-		expect(cache.totalBytes).toBe(80);
-		// An entry larger than the whole budget is kept (no thrash on every op).
-		cache.set("huge", "vh", 500);
-		expect(cache.has("huge")).toBe(true);
-		expect(cache.has("big-3")).toBe(false);
-	});
-
-	it("idle sweep drops entries past TTL using the injected clock", () => {
-		let now = 10_000;
-		const cache = new AgentInstanceCache<string>({
-			idleTtlMs: 1000,
-			now: () => now,
-		});
-		cache.set("old", "v", 5);
-		now = 10_500;
-		cache.set("new", "w", 5);
-		now = 11_200;
-		const evicted = cache.sweepIdle();
-		expect(evicted).toEqual(["old"]);
-		expect(cache.keys()).toEqual(["new"]);
-	});
-
-	it("set() over an existing key refreshes bytes without double counting", () => {
-		const cache = new AgentInstanceCache<string>({ maxTotalBytes: 1000 });
-		cache.set("k", "v1", 50);
-		expect(cache.totalBytes).toBe(50);
-		cache.set("k", "v2", 90);
-		expect(cache.totalBytes).toBe(90);
-		expect(cache.size).toBe(1);
 	});
 });
 

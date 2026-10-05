@@ -167,11 +167,10 @@ export async function runCommand(
 			const hosting = await import("./platform-hosting.js");
 			const platforms = hosting.resolveConfiguredPlatforms(raw);
 			if (platforms.length > 0) {
-				const runner = await import("./production-runner.js");
+				// Embedded turn factory dissolved per DEC-084 (RPC children own
+				// turns). Platforms compose without a factory until Todo 3 lands;
+				// ingress stays unwired with a loud guard_unwired degrade.
 				input.platforms = platforms;
-				input.turnRunnerFactory = runner.buildProductionTurnRunnerFactory({
-					home: opts.home,
-				});
 			}
 		}
 	}

@@ -108,16 +108,7 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
   PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
-CREATE TABLE IF NOT EXISTS gateway_routing (
-  scope TEXT NOT NULL DEFAULT '', session_key TEXT NOT NULL,
-  entry_json TEXT NOT NULL, updated_at REAL NOT NULL,
-  PRIMARY KEY (scope, session_key)
-);
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (session_key TEXT PRIMARY KEY, failure_streak INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS compression_locks (session_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
-                                acquired_at REAL NOT NULL, expires_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
-                                  acquired_at REAL NOT NULL, expires_at REAL NOT NULL);
 
 CREATE TABLE IF NOT EXISTS delivery_obligations (
   obligation_id TEXT PRIMARY KEY,
@@ -146,8 +137,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
   ON messages(session_id) WHERE role='assistant' AND tool_calls IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
-CREATE INDEX IF NOT EXISTS idx_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 `;

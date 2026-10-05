@@ -97,14 +97,3 @@ export {
 	checkSlashAccess,
 	checkSourceSlashAccess,
 } from "./slash-access.js";
-
-// Layer 1 of the turn lease (DEC-004, 03 §7) — in-process registry.
-export {
-	DEFAULT_LEASE_WAIT_MS,
-	DEFAULT_MAX_LEASES,
-	SessionTurnLeaseRegistry,
-	TurnLeaseTimeoutError,
-	TurnLeaseToken,
-	type AcquireOptions,
-	type RegistryOptions,
-} from "./turn-lease.js";

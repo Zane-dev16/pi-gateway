@@ -33,8 +33,6 @@ import {
 	WS_REQUIRED_SECRET,
 	type RestPlane,
 } from "./persistent-ws-adapter.js";
-import { createRunnerHarness } from "../../pi_agent_core/testing/runner-harness.js";
-import { fauxAssistantMessage } from "../../pi_agent_core/testing/faux-model.js";
 import { GatewayStreamConsumer } from "../../pi_gateway/streaming/gateway-stream-consumer.js";
 import { FakePlatformWire } from "../conformance/wire.js";
 import { makeWsWorld, eventually } from "./ws-fixture.js";
@@ -508,116 +506,88 @@ describe("PersistentWsAdapter — transport lifecycle", () => {
 
 // ── e2e — fake ws inbound → guards → runner → streaming → RAW egress ────
 
-describe("e2e — pushed ws event becomes a REAL agent turn streamed natively", () => {
-	it("inbound event → guard turn (scripted model) → native RAW *Stream egress captured by the fake server", async () => {
-		const h = await createRunnerHarness();
-		try {
-			h.ensureSession("sess-ws-e2e");
-			h.faux.setResponses([fauxAssistantMessage("**RAW** final from model")]);
-
-			const world = makeWsWorld({
-				name: "ws-e2e",
-				streamIsMessageChatIds: ["chat-e2e"],
-			});
-			const { engine, ws, wire } = world;
-			engine.attachStandardGuard();
-			let sawTurnText = "";
-			engine.turnDriver = async (event, text) => {
-				sawTurnText = text;
-				expect(text).toBe("hello gateway");
-				const outcome = await h.runner.handleTurn({
-					sessionId: "sess-ws-e2e",
-					routingKey: `rk-${String(event.source?.chatId)}`,
-					text,
-				});
-				expect(outcome.exitReason).toBe("finalized");
-				// Stream the turn through the NATIVE *Stream plane: RAW
-				// cumulative frames + authoritative final adoption.
-				const consumer = new GatewayStreamConsumer(
-					world.subject.streamAdapter(),
-					String(event.source?.chatId),
-					{
-						transport: "draft",
-						chatType: "dm",
-						editIntervalMs: 0,
-						bufferThreshold: 1,
-					},
-					{ reply_to_message_id: event.messageId ?? "e1" },
-				);
-				const runP = consumer.run();
-				consumer.onDelta("**RAW** partial; ");
-				await new Promise<void>((r) => setTimeout(r, 3));
-				consumer.finish(outcome.finalText);
-				await runP;
-				return null; // delivery owned by the streaming lane
-			};
-
-			await world.connectAndAwaitLive();
-			ws.pushEvent({
-				type: "message",
-				chatId: "chat-e2e",
-				userId: "user-1",
-				text: "hello gateway",
-			});
-
-			await eventually(() => sawTurnText === "hello gateway", 10_000);
-			await eventually(
-				() =>
-					wire.ops.some(
-						(o) => o.op === "seal" && o.content.includes("final from model"),
-					),
-				10_000,
+describe("e2e — pushed ws event becomes a stub turn streamed natively", () => {
+	it("inbound event → guard turn (stub runner) → native RAW *Stream egress captured by the fake server", async () => {
+		// DEC-084 subtraction: embedded runner dissolved. Stub turn proves the
+		// transport plus streaming egress contract without the host loop.
+		const world = makeWsWorld({
+			name: "ws-e2e",
+			streamIsMessageChatIds: ["chat-e2e"],
+		});
+		const { engine, ws, wire } = world;
+		engine.attachStandardGuard();
+		let sawTurnText = "";
+		engine.turnDriver = async (event, text) => {
+			sawTurnText = text;
+			expect(text).toBe("hello gateway");
+			const finalText = "**RAW** final from model";
+			// Stream the turn through the NATIVE *Stream plane: RAW
+			// cumulative frames + authoritative final adoption.
+			const consumer = new GatewayStreamConsumer(
+				world.subject.streamAdapter(),
+				String(event.source?.chatId),
+				{
+					transport: "draft",
+					chatType: "dm",
+					editIntervalMs: 0,
+					bufferThreshold: 1,
+				},
+				{ reply_to_message_id: event.messageId ?? "e1" },
 			);
+			const runP = consumer.run();
+			consumer.onDelta("**RAW** partial; ");
+			await new Promise<void>((r) => setTimeout(r, 3));
+			consumer.finish(finalText);
+			await runP;
+			return null; // delivery owned by the streaming lane
+		};
 
-			// Guard saw exactly ONE turn.
-			expect(engine.turnLog.filter((t) => t === "hello gateway")).toHaveLength(
-				1,
-			);
+		await world.connectAndAwaitLive();
+		ws.pushEvent({
+			type: "message",
+			chatId: "chat-e2e",
+			userId: "user-1",
+			text: "hello gateway",
+		});
 
-			// Native frames are RAW markdown — byte-untouched by the mrkdwn
-			// converter (§10.2 invariant; converting centrally is banned).
-			const streamOps = wire.ops.filter(
-				(o) => o.op === "draft" || o.op === "seal",
-			);
-			expect(streamOps.length).toBeGreaterThanOrEqual(2);
-			const rawBytes = streamOps.map((o) => o.content).join("");
-			expect(rawBytes).toContain("**RAW**"); // double-star survived
-			const drafts = wire.draftsOf("chat-e2e").map((d) => d.content);
-			for (let i = 1; i < drafts.length; i++) {
-				expect(drafts[i]?.startsWith(drafts[i - 1] as string)).toBe(true);
-			}
-
-			// The sealed stream IS the message: exactly ONE seal, carrying
-			// the authoritative final suffix; NEVER a plain-send duplicate.
-			const seals = wire.ops.filter(
-				(o) => o.op === "seal" && o.chatId === "chat-e2e",
-			);
-			expect(seals).toHaveLength(1);
-			const dupes = wire
-				.sendsOf("chat-e2e")
-				.filter((o) => o.content.includes("final from model"));
-			expect(dupes).toHaveLength(0);
-
-			// Persist-what-you-send: user + assistant rows landed in pi_state.
-			const rows = h.store.db
-				.prepare(
-					"SELECT role, content FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
-				)
-				.all("sess-ws-e2e") as Array<{ role: string; content: string }>;
-			expect(
-				rows.some((r) => r.role === "user" && r.content === "hello gateway"),
-			).toBe(true);
-			expect(
-				rows.some(
-					(r) =>
-						r.role === "assistant" &&
-						(r.content ?? "").includes("final from model"),
+		await eventually(() => sawTurnText === "hello gateway", 10_000);
+		await eventually(
+			() =>
+				wire.ops.some(
+					(o) => o.op === "seal" && o.content.includes("final from model"),
 				),
-			).toBe(true);
+			10_000,
+		);
 
-			engine.disconnect();
-		} finally {
-			await h.close();
+		// Guard saw exactly ONE turn.
+		expect(engine.turnLog.filter((t) => t === "hello gateway")).toHaveLength(
+			1,
+		);
+
+		// Native frames are RAW markdown — byte-untouched by the mrkdwn
+		// converter (§10.2 invariant; converting centrally is banned).
+		const streamOps = wire.ops.filter(
+			(o) => o.op === "draft" || o.op === "seal",
+		);
+		expect(streamOps.length).toBeGreaterThanOrEqual(2);
+		const rawBytes = streamOps.map((o) => o.content).join("");
+		expect(rawBytes).toContain("**RAW**"); // double-star survived
+		const drafts = wire.draftsOf("chat-e2e").map((d) => d.content);
+		for (let i = 1; i < drafts.length; i++) {
+			expect(drafts[i]?.startsWith(drafts[i - 1] as string)).toBe(true);
 		}
+
+		// The sealed stream IS the message: exactly ONE seal, carrying
+		// the authoritative final suffix; NEVER a plain-send duplicate.
+		const seals = wire.ops.filter(
+			(o) => o.op === "seal" && o.chatId === "chat-e2e",
+		);
+		expect(seals).toHaveLength(1);
+		const dupes = wire
+			.sendsOf("chat-e2e")
+			.filter((o) => o.content.includes("final from model"));
+		expect(dupes).toHaveLength(0);
+
+		engine.disconnect();
 	}, 20_000);
 });

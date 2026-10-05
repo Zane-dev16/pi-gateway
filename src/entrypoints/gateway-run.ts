@@ -40,13 +40,11 @@
 // for bare test drivers; composition overlays them):
 //   - flush_delivery_obligations → DeliveryLedger.prune over the lifecycle-
 //     owned store BEFORE closeDatabase (retention GC: caps 3/24h/7d/500).
-//   - release_leases → sweep session_turn_leases rows held by THIS process
-//     (structured holder pid match, hermes_state.py holder grammar) so a
-//     graceful stop never leaves TTL-stalled leases for the next boot.
-//   - notify_active_sessions + active-session keys → live conversations read
-//     from non-expired turn-lease rows; an injected notice sender fires while
-//     adapters are still connected (run.py:_notify_active_sessions_of_shutdown
-//     ordering); keys also feed #7536 restart-failure counting at teardown.
+//   - release_leases → dissolved per DEC-084 (no cross-chat lease table).
+//     The overlay stays as a no-op so lifecycle supervision is untouched.
+//   - notify_active_sessions + active-session keys → dissolved per DEC-084.
+//     Per-chat child processes own their turns, so the gateway reads no
+//     live-turn truth at drain. Keys stay empty for #7536 counting input.
 //   - boot sends → pending-obligation redelivery through the injected
 //     DeliverySender, filtered to ACTUALLY-connected platforms so absent ones
 //     never spend an attempt (run.py:_redeliver_pending_obligations inside
@@ -63,7 +61,6 @@ import {
 	type DeliverySender,
 } from "../pi_gateway/obligations/index.js";
 import { kitScopedSecretReader } from "../pi_gateway/security/secretscope/wrapper.js";
-import { extractHolderPid } from "../pi_state/leases.js";
 import type { StateStore } from "../pi_state/index.js";
 import type { Database } from "better-sqlite3";
 
@@ -637,14 +634,9 @@ export function defaultReconnectBackend(
 // Production drain-hook + boot-recovery overlays.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Non-expired conversation keys — the live-turn truth this layer can read. */
-function liveLeaseSessionKeys(db: Database, nowSeconds: number): string[] {
-	const rows = db
-		.prepare(
-			"SELECT conversation_id FROM session_turn_leases WHERE expires_at > ?",
-		)
-		.all(nowSeconds) as Array<{ conversation_id: string }>;
-	return rows.map((r) => String(r.conversation_id));
+/** Live-turn truth at drain — dissolved per DEC-084 (per-chat children own turns). */
+function liveLeaseSessionKeys(): string[] {
+	return [];
 }
 
 /**
@@ -654,63 +646,18 @@ function liveLeaseSessionKeys(db: Database, nowSeconds: number): string[] {
  * Returns the drain-start active-key snapshot taken here.
  */
 async function deliverShutdownNotices(
-	db: Database,
-	send: ((sessionKey: string) => Promise<void>) | undefined,
-	log: Logger,
+	_send: ((sessionKey: string) => Promise<void>) | undefined,
+	_log: Logger,
 ): Promise<readonly string[]> {
-	const keys = liveLeaseSessionKeys(db, Date.now() / 1000);
-	if (keys.length === 0 || send === undefined) {
-		if (keys.length > 0) {
-			log.warn(
-				"active sessions at shutdown but no notice transport configured",
-				{ count: keys.length },
-			);
-		}
-		return keys;
-	}
-	for (const key of keys) {
-		try {
-			await send(key);
-		} catch (err) {
-			log.warn("shutdown notice delivery failed", {
-				session_key: key,
-				error: String(err),
-			});
-		}
-	}
-	return keys;
+	return liveLeaseSessionKeys();
 }
 
 /**
- * Self-held lease sweep: a graceful stop releases THIS process's turn leases
- * instead of leaving the next boot to wait out TTLs. Foreign-process rows are
- * untouched (their owners/TTLs own recovery). Guarded deletes under one
- * write transaction; returns the released row count.
+ * Self-held lease sweep — dissolved per DEC-084 (no session_turn_leases table).
+ * Kept as a no-op so the drain-hook shape stays stable for lifecycle supervision.
  */
-function sweepSelfHeldLeases(db: Database, selfPid: number): number {
-	const rows = db
-		.prepare("SELECT conversation_id, holder FROM session_turn_leases")
-		.all() as Array<{ conversation_id: string; holder: string }>;
-	let released = 0;
-	db.exec("BEGIN IMMEDIATE");
-	try {
-		for (const row of rows) {
-			if (extractHolderPid(String(row.holder)) !== selfPid) continue;
-			db.prepare(
-				"DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
-			).run(String(row.conversation_id), String(row.holder));
-			released++;
-		}
-		db.exec("COMMIT");
-	} catch (err) {
-		try {
-			db.exec("ROLLBACK");
-		} catch {
-			/* best-effort */
-		}
-		throw err;
-	}
-	return released;
+function sweepSelfHeldLeases(): number {
+	return 0;
 }
 
 /**
@@ -725,33 +672,28 @@ function buildShutdownHookOverlays(
 	_connected: Set<string>,
 ): Partial<DrainHooks> {
 	const log = input.logger ?? stderrLogger();
-	const selfPid = input.selfPid ?? process.pid;
 
 	// Drain-start snapshot of live conversations (_drain_active_agents
-	// snapshot semantics): captured in the FIRST drain phase while the db is
-	// still open, reused for restart-failure counting after close_database —
-	// the engine runs that step post-close by design (#7536 parity).
+	// snapshot semantics): dissolved per DEC-084, stays empty. Captured in
+	// the FIRST drain phase while the db is still open, reused for
+	// restart-failure counting after close_database.
 	const drainState: { activeKeys: readonly string[] } = { activeKeys: [] };
 
 	return {
-		// run.py:_stop_impl_body notify phase — adapters still connected here,
-		// so notices can actually reach chats. Per-key isolated like Hermes'
-		// notify loop.
+		// run.py:_stop_impl_body notify phase — dissolved per DEC-084.
+		// No live-turn truth to notify; the snapshot stays empty.
 		notifyActiveSessions: async () => {
 			const store = storeOf();
 			if (store === null) return;
 			drainState.activeKeys = await deliverShutdownNotices(
-				store.db,
 				input.shutdownNoticeSender,
 				log,
 			);
 		},
 
-		// Self-held lease sweep — see sweepSelfHeldLeases above.
+		// Self-held lease sweep — dissolved per DEC-084 (no-op).
 		releaseLeases: async () => {
-			const store = storeOf();
-			if (store === null) return;
-			const released = sweepSelfHeldLeases(store.db, selfPid);
+			const released = sweepSelfHeldLeases();
 			if (released > 0)
 				log.info("released this process's turn leases", { count: released });
 		},

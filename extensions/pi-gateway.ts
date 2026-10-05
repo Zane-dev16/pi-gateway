@@ -25,7 +25,6 @@ import {
 	composeGatewayLifecycle,
 	type ComposedGateway,
 } from "../src/entrypoints/gateway-run.js";
-import { buildProductionTurnRunnerFactory } from "../src/entrypoints/production-runner.js";
 import { resolvePiHome } from "../src/pi_home.js";
 import {
 	PI_GATEWAY_PLATFORMS_ENV,
@@ -52,16 +51,12 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			const platforms = resolveConfiguredPlatforms(
 				process.env[PI_GATEWAY_PLATFORMS_ENV],
 			);
-			// DEC-075: the production turn-runner closes over the host agent
-			// loop; the resolved home is shared so profile auth (agent dir)
-			// and composition agree on the same profile.
+			// DEC-084: embedded turn factory dissolved (RPC children own turns
+			// next). Platforms compose without a factory until Todo 3 lands.
 			const resolvedHome = home ?? resolvePiHome();
 			gateway = composeGatewayLifecycle({
 				home: resolvedHome,
 				platforms,
-				turnRunnerFactory: buildProductionTurnRunnerFactory({
-					home: resolvedHome,
-				}),
 			});
 			const res = await gateway.lifecycle.startup();
 			if (!res.ok) {

@@ -15,7 +15,7 @@
 //     gateway-approval contexts (see approvals/gate.ts).
 //
 // DEC-012 in this codebase: memory on/off is decided at agent construction
-// (GatewayAgentRunner's MemoryTurnHooks). The cron executor therefore
+// (host memory hooks). The cron executor therefore
 // declares its policy at construction — skipMemory MUST be false; anything
 // else throws CronMemoryPolicyError BEFORE any turn runs (a future
 // memory-off cron mode requires explicit DEC sign-off, never silent
@@ -63,7 +63,7 @@ export function isCronSessionContext(
 	return envFlagEnabled(env[CRON_SESSION_ENV]);
 }
 
-/** Structural runner surface consumed here (GatewayAgentRunner subset). */
+/** Structural runner surface consumed here (embedded turn subset). */
 export interface CronRunnerSurface {
 	handleTurn(request: {
 		sessionId: string;

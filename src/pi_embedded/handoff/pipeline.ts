@@ -34,7 +34,7 @@
 //   gateway/delivery.py:looks_like_telegram_private_chat_id
 //                                          → looksLikeTelegramPrivateChatId
 //   gateway/session.py:build_session_key   → shared buildSessionKey (imported)
-//   hermes_state.py:switch_session         → RoutingBinder.switchSession
+//   hermes_state.py:switch_session         → dissolved per DEC-084
 
 import type { IncomingEvent } from "../../pi_gateway/guards/events.js";
 import {
@@ -42,12 +42,33 @@ import {
 	type IsolationFlags,
 	type SessionSource,
 } from "../../pi_gateway/resolution/session-key.js";
-import type { RoutingEntry, RoutingEntrySeed } from "./binder.js";
 import type { HandoffRow } from "./queue.js";
 import { systemClock, type GatewayClock } from "./clock.js";
 
 export { systemClock };
 export type { GatewayClock };
+
+/** Routing entry snapshot the pipeline re-binds (binder dissolved per DEC-084). */
+export interface RoutingEntry {
+	session_key: string;
+	session_id: string;
+	created_at: number;
+	updated_at: number;
+	origin?: string | null;
+	display_name?: string | null;
+	platform?: string | null;
+	chat_type?: string | null;
+	cwd?: string | null;
+}
+
+/** Seed facts used when a routing entry must be created fresh. */
+export interface RoutingEntrySeed {
+	origin?: string | null;
+	display_name?: string | null;
+	platform?: string | null;
+	chat_type?: string | null;
+	cwd?: string | null;
+}
 
 /** Destination-platform liveness + optional capabilities (transport seam). */
 export interface HandoffTransport {
@@ -89,8 +110,7 @@ export interface HandoffLogger {
 }
 
 /**
- * Structural binder view the pipeline consumes (RoutingBinder satisfies it;
- * tests/driver compositions may stub it).
+ * Structural binder view the pipeline consumes (dissolved per DEC-084).
  */
 export interface HandoffBinderView {
 	ensureEntry(

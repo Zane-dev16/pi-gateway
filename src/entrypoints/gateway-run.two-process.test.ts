@@ -9,7 +9,7 @@
 // signal handlers. The parent SIGTERMs it and asserts the supervisor
 // contract end-to-end (08 §1.2): exit 0, gateway_state=stopped persisted,
 // PID file released, .clean_shutdown receipt written, adapter disconnected,
-// self-held turn leases swept while foreign rows survive.
+// drain overlays run while foreign state survives.
 
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,8 +21,7 @@ import { cleanShutdownMarkerPath } from "../pi_gateway/lifecycle/shutdown.js";
 import { writePlannedStopMarker } from "../pi_gateway/lifecycle/markers.js";
 import { pidFilePath } from "../pi_gateway/lifecycle/instance-guard.js";
 import { readRuntimeStatus } from "../pi_gateway/lifecycle/status-stamp.js";
-import { StateStore } from "../pi_state/index.js";
-import { structuredHolder } from "../pi_state/leases.js";
+
 
 const DRIVER_TS = fileURLToPath(
 	new URL("./testing/gateway-run-driver.ts", import.meta.url),
@@ -79,7 +78,7 @@ function parseResultJson(stdout: string): { exitCode: number; ran: boolean } {
 }
 
 describe("gateway-run — two-process composition contracts", () => {
-	it("SIGTERM against the fully-composed child drains gracefully: exit 0, stopped stamp, PID release, clean-shutdown receipt, adapter disconnect, self-lease sweep with foreign survival", async () => {
+	it("SIGTERM against the fully-composed child drains gracefully: exit 0, stopped stamp, PID release, clean-shutdown receipt, adapter disconnect", async () => {
 		const child = spawn(
 			process.execPath,
 			["--import", RESOLVE_MJS, DRIVER_TS, "--home", home, "--coord", coord],
@@ -102,32 +101,6 @@ describe("gateway-run — two-process composition contracts", () => {
 			const childPid = child.pid;
 			expect(typeof childPid).toBe("number");
 
-			// Seed leases AFTER READY so the child's stage 6 already opened its
-			// store: one row held by the CHILD process pid (swept at drain), one
-			// foreign row that must survive.
-			const seed = await StateStore.open(join(home, "state.db"));
-			const now = Date.now() / 1000;
-			seed.db
-				.prepare(
-					"INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
-				)
-				.run(
-					"conv-child",
-					structuredHolder("turn-lease", childPid as number),
-					now - 5,
-					now + 600,
-				);
-			seed.db
-				.prepare(
-					"INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
-				)
-				.run(
-					"conv-foreign",
-					structuredHolder("other-gateway", 999999999),
-					now - 5,
-					now + 600,
-				);
-			seed.close();
 
 			// Marker-before-SIGTERM ordering (08 §1.2): `gateway stop` marks the
 			// stop as planned BEFORE signalling, so the child classifies the
@@ -164,12 +137,5 @@ describe("gateway-run — two-process composition contracts", () => {
 		expect(adapterLog.connects).toBe(1);
 		expect(adapterLog.disconnects).toBe(1);
 
-		// Drain overlays: child-pid lease gone, foreign lease survives.
-		const verify = await StateStore.open(join(home, "state.db"));
-		const remaining = verify.db
-			.prepare("SELECT conversation_id FROM session_turn_leases")
-			.all() as Array<{ conversation_id: string }>;
-		verify.close();
-		expect(remaining.map((r) => r.conversation_id)).toEqual(["conv-foreign"]);
 	});
 });

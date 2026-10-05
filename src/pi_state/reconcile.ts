@@ -6,7 +6,7 @@
 // Spec: /root/pi-gateway/02-session-and-state.md
 //   §2.2 storage-version tracking (schema_version advances freely on
 //        writable open)
-//   §3   "Migration Style: Declarative Reconcile" — startup steps 1–7, the
+//   §3   "Migration Style: Declarative Reconcile" — startup steps 1–6, the
 //        error taxonomy for ALTER races, and "read-only opens never DDL"
 //   §9   title partial unique index ensured at every open with self-healing
 //        dedup; index creation must never abort an open
@@ -17,7 +17,6 @@
 //   hermes_state_schema.py:_init_schema (title dedup)    → ensureTitleUniqueIndex
 //   hermes_state_schema.py:_ensure_fts_schema            → REMOVED (DEC-070):
 //        retreatFtsObjects drops the FTS objects that parity created
-//   hermes_state_schema.py:_heal_gateway_routing_pk      → healGatewayRoutingPk
 //   SessionDB._connect_and_init_with_lock_patience       → connectAndInitWithPatience
 
 import type Database from "better-sqlite3";
@@ -360,81 +359,12 @@ export function retreatAsyncDelegationObjects(db: Database.Database): number {
 }
 
 // ---------------------------------------------------------------------------
-// Step 7 — one-time structural heals
-// ---------------------------------------------------------------------------
-
-/**
- * Rebuild gateway_routing when its PRIMARY KEY predates scoping
- * (02 §3 step 7; hermes_state_schema.py:_heal_gateway_routing_pk): early
- * tables had `session_key TEXT PRIMARY KEY` with no composite scope key, so
- * upserts targeting (scope, session_key) fail forever. Recreate with the
- * correct DDL preserving rows; newest wins cross-scope collisions.
- */
-export function healGatewayRoutingPk(db: Database.Database): boolean {
-	const rows = db
-		.prepare('PRAGMA table_info("gateway_routing")')
-		.all() as Array<Record<string, unknown>>;
-	if (rows.length === 0) return false; // not created yet — nothing to heal
-	const pkCols = rows
-		.filter((r) => Number(r["pk"]) > 0)
-		.sort((a, b) => Number(a["pk"]) - Number(b["pk"]))
-		.map((r) => String(r["name"]));
-	const correct =
-		pkCols.length === 2 && pkCols[0] === "scope" && pkCols[1] === "session_key";
-	if (correct) return false;
-
-	db.exec("BEGIN IMMEDIATE");
-	try {
-		db.exec(`
-			CREATE TABLE gateway_routing_rebuilt (
-			  scope TEXT NOT NULL DEFAULT '', session_key TEXT NOT NULL,
-			  entry_json TEXT NOT NULL, updated_at REAL NOT NULL,
-			  PRIMARY KEY (scope, session_key)
-			);
-		`);
-		// Newest wins collisions (ORDER BY updated_at ASC so later rows overwrite).
-		// Defensive against pre-reconcile shapes missing the scope column.
-		const hasScope = db
-			.prepare('PRAGMA table_info("gateway_routing")')
-			.all()
-			.some((c) => String((c as Record<string, unknown>)["name"]) === "scope");
-		if (hasScope) {
-			db.exec(`
-				INSERT OR REPLACE INTO gateway_routing_rebuilt
-				  (scope, session_key, entry_json, updated_at)
-				SELECT COALESCE(scope, ''), session_key, entry_json, updated_at
-				  FROM gateway_routing ORDER BY updated_at ASC;
-			`);
-		} else {
-			db.exec(`
-				INSERT OR REPLACE INTO gateway_routing_rebuilt
-				  (scope, session_key, entry_json, updated_at)
-				SELECT '', session_key, entry_json, updated_at
-				  FROM gateway_routing ORDER BY updated_at ASC;
-			`);
-		}
-		db.exec("DROP TABLE gateway_routing;");
-		db.exec("ALTER TABLE gateway_routing_rebuilt RENAME TO gateway_routing;");
-		db.exec("COMMIT");
-		return true;
-	} catch (err) {
-		try {
-			db.exec("ROLLBACK");
-		} catch {
-			/* best-effort */
-		}
-		throw err;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Whole-init sequence (02 §3 steps 1–7)
+// Whole-init sequence (02 §3 steps 1–6)
 // ---------------------------------------------------------------------------
 
 export interface InitReport {
 	reconciled: ReconcileResult;
 	titleIndexEnsured: boolean;
-	routingPkHealed: boolean;
 	/** Legacy FTS objects dropped by the DEC-070 retreat (0 when clean). */
 	ftsRetreated: number;
 	/** Legacy async-delegation rail objects dropped by the DEC-070 retreat (0
@@ -469,14 +399,15 @@ function bumpSchemaVersion(db: Database.Database): void {
 }
 
 /**
- * Startup reconcile sequence, exactly 02 §3 steps 1–7:
+ * Startup reconcile sequence, exactly 02 §3 steps 1–6:
  *   1. executescript(SCHEMA_SQL)          (CREATE … IF NOT EXISTS)
  *   2. column reconcile ('duplicate column' tolerated; locked/busy RE-RAISED)
  *   3. DEFERRED_INDEX_SQL                 (indexes on reconciled-in columns)
  *   4. unique title index w/ dedup repair
  *   5. FTS retreat — DEC-070 item 9: drop-if-present legacy FTS objects
  *   6. bump schema_version (unconditional — no FTS gate remains)
- *   7. one-time structural heals (gateway_routing PK predating scope)
+ *
+ * Step 7 (gateway_routing heal) dissolved per DEC-084 with the routing table.
  *
  * Additive change = add a line to SCHEMA; destructive change = explicit
  * versioned migration, never reconcile.
@@ -487,7 +418,6 @@ export function initStore(
 ): InitReport {
 	db.exec(SCHEMA_TABLES_SQL); // step 1 (tables; indexes follow reconcile)
 	const reconciled = reconcileColumns(db); // step 2 (locked/busy propagate)
-	const routingPkHealed = healGatewayRoutingPk(db); // step 7 before indexes (table shape final)
 	db.exec(SCHEMA_TIER1_INDEXES_SQL); // step 1 (tier-1 indexes, post-reconcile)
 	db.exec(DEFERRED_INDEX_SQL); // step 3
 	const titleIndexEnsured = ensureTitleUniqueIndex(db); // step 4
@@ -503,7 +433,6 @@ export function initStore(
 	return {
 		reconciled,
 		titleIndexEnsured,
-		routingPkHealed,
 		ftsRetreated,
 		delegationRetreated,
 		versionBumped: true,

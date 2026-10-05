@@ -4,7 +4,7 @@
 // run'), §3.1 stage order, 08-operations.md §1.1–§1.2. Whole-sequence parity
 // anchor: gateway/run.py:start_gateway — cron provider bound, watchers bound,
 // adapters derived from manifests with missing-secret loud disable, REAL
-// drain overlays (obligations flush / notify / lease release), boot
+// drain overlays (obligations flush), boot
 // redelivery, signal wiring. Two-process startup/shutdown contracts live in
 // gateway-run.two-process.test.ts.
 
@@ -19,17 +19,12 @@ import {
 	type DeliveryRequest,
 } from "../pi_gateway/obligations/index.js";
 import { RETENTION_SECONDS } from "../pi_gateway/obligations/ledger.js";
-import {
-	readRestartFailureCounts,
-	type Logger,
-} from "../pi_gateway/lifecycle/shutdown.js";
+import type { Logger } from "../pi_gateway/lifecycle/shutdown.js";
 import { StateStore } from "../pi_state/index.js";
-import { structuredHolder } from "../pi_state/leases.js";
 import {
 	composeGatewayLifecycle,
 	runGateway,
 	type AdapterConnectSurface,
-	type GatewayRunInput,
 	type PlatformHosting,
 } from "./gateway-run.js";
 
@@ -113,20 +108,6 @@ function driverHosting(
 
 async function openStore(): Promise<StateStore> {
 	return StateStore.open(join(home, "state.db"));
-}
-
-function insertLease(
-	store: StateStore,
-	conversationId: string,
-	holder: string,
-	expiresInSec: number,
-): void {
-	const now = Date.now() / 1000;
-	store.db
-		.prepare(
-			"INSERT INTO session_turn_leases (conversation_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
-		)
-		.run(conversationId, holder, now - 10, now + expiresInSec);
 }
 
 /** Ghost-owner ledger: rows owned by a provably-dead process stamp. */
@@ -226,35 +207,9 @@ describe("composeGatewayLifecycle — production stage entries", () => {
 });
 
 describe("production drain overlays", () => {
-	it("releases THIS process's turn leases at drain and leaves foreign rows alone", async () => {
-		const seed = await openStore();
-		insertLease(
-			seed,
-			"conv-self",
-			structuredHolder("turn-lease", process.pid),
-			300,
-		);
-		insertLease(seed, "conv-foreign", "foreign-gateway:pid=999999999", 300);
-		seed.close();
 
-		const composed = composeGatewayLifecycle({
-			home,
-			logger: spyLogger().log,
-			installSignals: false,
-		});
-		await composed.lifecycle.startup();
-		const outcome = await composed.lifecycle.requestShutdown("planned_stop");
-		expect(outcome.flushesFailed).toBe(false);
 
-		const verify = await openStore();
-		const remaining = verify.db
-			.prepare("SELECT conversation_id FROM session_turn_leases")
-			.all() as Array<{ conversation_id: string }>;
-		verify.close();
-		expect(remaining.map((r) => r.conversation_id)).toEqual(["conv-foreign"]);
-	});
-
-	it("flushes delivery obligations before closeDatabase (retention GC) and counts live sessions into restart-failure state", async () => {
+	it("flushes delivery obligations before closeDatabase (retention GC)", async () => {
 		const seed = await openStore();
 		const staleAt = Date.now() / 1000 - RETENTION_SECONDS - 86_400;
 		const deadLedger = ghostLedger(seed);
@@ -269,7 +224,6 @@ describe("production drain overlays", () => {
 		);
 		await deadLedger.beginAttempt(staleId, { nowSeconds: staleAt });
 		await deadLedger.markDelivered(staleId, { nowSeconds: staleAt });
-		insertLease(seed, "conv-live", "holder-live:pid=42", 600);
 		seed.close();
 
 		const composed = composeGatewayLifecycle({
@@ -287,56 +241,9 @@ describe("production drain overlays", () => {
 		verify.close();
 		expect(row.n).toBe(0); // retention-expired delivered row pruned pre-close
 
-		// Live lease at teardown ⇒ #7536 restart-failure counting input.
-		const counts = readRestartFailureCounts(home);
-		expect(Object.keys(counts)).toContain("conv-live");
 	});
 
-	it("notify phase fires the injected transport per live session while adapters are still connected; absent transport warns loudly", async () => {
-		const seed = await openStore();
-		insertLease(seed, "conv-a", "holder-x:pid=42", 300);
-		seed.close();
 
-		const sent: string[] = [];
-		const spy = spyLogger();
-		const input: GatewayRunInput = {
-			home,
-			logger: spy.log,
-			installSignals: false,
-			shutdownNoticeSender: async (key) => {
-				sent.push(key);
-			},
-		};
-		const composed = composeGatewayLifecycle(input);
-		await composed.lifecycle.startup();
-		await composed.lifecycle.requestShutdown("planned_stop");
-		expect(sent).toEqual(["conv-a"]);
-
-		// Same shape WITHOUT a transport: loud warning, no fake sends.
-		const home2 = mkdtempSync(join(tmpdir(), "pi-gateway-run-home2-"));
-		try {
-			const seed2 = await StateStore.open(join(home2, "state.db"));
-			insertLease(seed2, "conv-b", "holder-y:pid=43", 300);
-			seed2.close();
-			const spy2 = spyLogger();
-			const composed2 = composeGatewayLifecycle({
-				home: home2,
-				logger: spy2.log,
-				installSignals: false,
-			});
-			await composed2.lifecycle.startup();
-			await composed2.lifecycle.requestShutdown("planned_stop");
-			const warned = spy2.calls.find(
-				(c) =>
-					c.level === "warn" &&
-					c.message.includes("no notice transport configured"),
-			);
-			expect(warned).toBeDefined();
-			expect(warned?.meta?.count).toBe(1);
-		} finally {
-			rmSync(home2, { recursive: true, force: true });
-		}
-	});
 });
 
 describe("boot sends — pending-obligation redelivery", () => {

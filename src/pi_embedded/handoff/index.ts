@@ -8,7 +8,6 @@
 // Public surface:
 //   clock       — GatewayClock seam (injected time; contracts drive it)
 //   queue       — HandoffQueue (pending-row protocol over sessions columns)
-//   binder      — RoutingBinder (switch_session re-bind over gateway_routing)
 //   pipeline    — HandoffPipeline (claim→…→synthetic-turn step sequence)
 //   dispatcher  — GuardQuiesceDispatcher (L1-ingress composition reference)
 //   watcher     — HandoffWatcher (2s poll + 5s startup delay loop)
@@ -16,7 +15,6 @@
 
 export * from "./clock.js";
 export * from "./queue.js";
-export * from "./binder.js";
 export * from "./pipeline.js";
 export * from "./dispatcher.js";
 export * from "./watcher.js";

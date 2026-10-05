@@ -22,8 +22,6 @@ import {
 	eventually,
 } from "./fixture.js";
 import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
-import { createRunnerHarness } from "../../pi_agent_core/testing/runner-harness.js";
-import { fauxAssistantMessage } from "../../pi_agent_core/testing/faux-model.js";
 import { GatewayStreamConsumer } from "../../pi_gateway/streaming/gateway-stream-consumer.js";
 
 function makeEngine(
@@ -381,92 +379,64 @@ describe("egress doors ride the audited chokepoint (DEC-006)", () => {
 	});
 });
 
-describe("e2e — fake inbound → guards → runner (scripted model) → streaming → egress", () => {
-	it("a pushed update becomes a REAL agent turn whose final streams out the doors", async () => {
-		const h = await createRunnerHarness();
-		try {
-			h.ensureSession("sess-e2e");
-			h.faux.setResponses([fauxAssistantMessage("final hello from model")]);
-
-			const world = makePollingWorld({ name: "e2e-polling" });
-			const { engine, tg, wire } = world;
-			engine.turnDriver = async (event, text) => {
-				expect(text).toBe("hello gateway");
-				const outcome = await h.runner.handleTurn({
-					sessionId: "sess-e2e",
-					routingKey: `rk-${String(event.source?.chatId)}`,
-					text,
-				});
-				expect(outcome.exitReason).toBe("finalized");
-				// Stream the turn through the adapter's doors: Telegram-shaped
-				// drafts (DM) + authoritative final adoption (invariant 2).
-				const consumer = new GatewayStreamConsumer(
-					world.subject.streamAdapter(),
-					String(event.source?.chatId),
-					{
-						transport: "auto",
-						chatType: "dm",
-						editIntervalMs: 0,
-						bufferThreshold: 1,
-					},
-					{ reply_to_message_id: event.messageId ?? "m-1" },
-				);
-				const runP = consumer.run();
-				consumer.onDelta("streaming partial; ");
-				await new Promise<void>((r) => setTimeout(r, 3));
-				consumer.finish(outcome.finalText);
-				await runP;
-				return null; // delivery owned by the streaming lane
-			};
-
-			await engine.connect({ isReconnect: false });
-			tg.pushUpdate("chat-e2e", "hello gateway");
-
-			// The turn's egress lands on the fake platform wire.
-			await eventually(
-				() =>
-					wire.sendsOf("chat-e2e").length > 0 &&
-					engine.turnLog.includes("hello gateway"),
-				5_000,
+describe("e2e — fake inbound → guards → stub turn → streaming → egress", () => {
+	it("a pushed update becomes a stub turn whose final streams out the doors", async () => {
+		// DEC-084 subtraction: embedded runner dissolved. Stub turn proves the
+		// transport plus streaming egress contract without the host loop.
+		const world = makePollingWorld({ name: "e2e-polling" });
+		const { engine, tg, wire } = world;
+		engine.turnDriver = async (event, text) => {
+			expect(text).toBe("hello gateway");
+			const finalText = "final hello from model";
+			// Stream the turn through the adapter's doors: Telegram-shaped
+			// drafts (DM) + authoritative final adoption (invariant 2).
+			const consumer = new GatewayStreamConsumer(
+				world.subject.streamAdapter(),
+				String(event.source?.chatId),
+				{
+					transport: "auto",
+					chatType: "dm",
+					editIntervalMs: 0,
+					bufferThreshold: 1,
+				},
+				{ reply_to_message_id: event.messageId ?? "m-1" },
 			);
+			const runP = consumer.run();
+			consumer.onDelta("streaming partial; ");
+			await new Promise<void>((r) => setTimeout(r, 3));
+			consumer.finish(finalText);
+			await runP;
+			return null; // delivery owned by the streaming lane
+		};
 
-			// Guard saw exactly ONE turn; the model's authoritative final is
-			// byte-exact on the wire; draft frames were prefix-stable.
-			expect(engine.turnLog.filter((t) => t === "hello gateway")).toHaveLength(
-				1,
-			);
-			const finalSends = wire
-				.sendsOf("chat-e2e")
-				.filter((o) => o.content.includes("final hello from model"));
-			expect(finalSends).toHaveLength(1);
-			expect(finalSends[0]?.content).toBe("final hello from model");
+		await engine.connect({ isReconnect: false });
+		tg.pushUpdate("chat-e2e", "hello gateway");
 
-			const drafts = wire.draftsOf("chat-e2e").map((d) => d.content);
-			expect(drafts.length).toBeGreaterThanOrEqual(1);
-			for (let i = 1; i < drafts.length; i++) {
-				expect(drafts[i]?.startsWith(drafts[i - 1] as string)).toBe(true);
-			}
+		// The turn's egress lands on the fake platform wire.
+		await eventually(
+			() =>
+				wire.sendsOf("chat-e2e").length > 0 &&
+				engine.turnLog.includes("hello gateway"),
+			5_000,
+		);
 
-			// Persist-what-you-send: user + assistant rows landed in pi_state.
-			const rows = h.store.db
-				.prepare(
-					"SELECT role, content FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
-				)
-				.all("sess-e2e") as Array<{ role: string; content: string }>;
-			expect(
-				rows.some((r) => r.role === "user" && r.content === "hello gateway"),
-			).toBe(true);
-			expect(
-				rows.some(
-					(r) =>
-						r.role === "assistant" &&
-						(r.content ?? "").includes("final hello from model"),
-				),
-			).toBe(true);
+		// Guard saw exactly ONE turn; the stub final is
+		// byte-exact on the wire; draft frames were prefix-stable.
+		expect(engine.turnLog.filter((t) => t === "hello gateway")).toHaveLength(
+			1,
+		);
+		const finalSends = wire
+			.sendsOf("chat-e2e")
+			.filter((o) => o.content.includes("final hello from model"));
+		expect(finalSends).toHaveLength(1);
+		expect(finalSends[0]?.content).toBe("final hello from model");
 
-			engine.disconnect();
-		} finally {
-			await h.close();
+		const drafts = wire.draftsOf("chat-e2e").map((d) => d.content);
+		expect(drafts.length).toBeGreaterThanOrEqual(1);
+		for (let i = 1; i < drafts.length; i++) {
+			expect(drafts[i]?.startsWith(drafts[i - 1] as string)).toBe(true);
 		}
+
+		engine.disconnect();
 	}, 15_000);
 });
