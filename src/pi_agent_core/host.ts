@@ -73,6 +73,18 @@ export type {
 	ToolDefinition,
 } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
 
+// Per-chat RPC children (DEC-084): the sanctioned headless loop surface.
+// RpcClient spawns `node <cliPath> --mode rpc` (LF-only JSONL over
+// stdin/stdout) and each child owns exactly one session natively.
+export { RpcClient } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-client.js";
+export type { RpcClientOptions } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-client.js";
+export type { RpcSessionState } from "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/rpc/rpc-types.js";
+
+/** Absolute CLI entry the registry spawns per chat (the RpcClient default
+ * `dist/cli.js` is relative to the caller and unusable from the gateway). */
+export const PI_CLI_PATH =
+	"/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+
 // Type-level surface of the wire protocol the loop drives (pi-ai).
 export type {
 	Api,
