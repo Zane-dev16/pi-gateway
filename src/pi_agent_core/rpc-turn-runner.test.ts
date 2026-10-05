@@ -8,7 +8,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ChatProcRegistry } from "./chat-proc-registry.js";
-import { RpcTurnRunner } from "./rpc-turn-runner.js";
+import {
+	parseSlashCommand,
+	renderSessionExportHtml,
+	RpcTurnRunner,
+} from "./rpc-turn-runner.js";
 import type { TurnClient, TurnRpcEvent } from "./rpc-turn-runner.js";
 import { StateStore } from "../pi_state/index.js";
 
@@ -24,6 +28,31 @@ class FakeTurnClient implements TurnClient {
 	failProbe = false;
 	seen: TurnRpcEvent[] = [];
 	gate: (() => void) | null = null;
+	hostSessionId = "host-session-1";
+	currentModel = { provider: "acme", id: "model-a" };
+	catalog: Array<{ provider: string; id: string }> = [
+		{ provider: "acme", id: "model-a" },
+		{ provider: "acme", id: "model-b" },
+	];
+	compactSummary = "compacted summary";
+	compactTokens = 1234;
+	branchEntries: Array<unknown> = [
+		{ id: "e1", role: "user", content: "hi" },
+		{ id: "e2", role: "assistant", content: "hello" },
+	];
+	newSessionCalls = 0;
+	switchCalls: string[] = [];
+	setModelCalls: Array<{ provider: string; id: string }> = [];
+	compactCalls: Array<string | undefined> = [];
+	entriesCalls = 0;
+	failNew: string | null = null;
+	failSwitch: string | null = null;
+	failSetModel: string | null = null;
+	failCompact: string | null = null;
+	failEntries: string | null = null;
+	failAvailable: string | null = null;
+	probeCalls = 0;
+	failProbeAfterCalls: number | null = null;
 
 	async start(): Promise<void> {
 		this.started = true;
@@ -33,10 +62,25 @@ class FakeTurnClient implements TurnClient {
 		this.started = false;
 	}
 
-	async getState(): Promise<{ sessionId: string; isStreaming: boolean }> {
+	async getState(): Promise<{
+		sessionId: string;
+		isStreaming: boolean;
+		model?: { provider: string; id: string };
+	}> {
 		if (this.failProbe) throw new Error("boom-probe");
 		if (!this.started) throw new Error("not started");
-		return { sessionId: "host-session-1", isStreaming: false };
+		this.probeCalls += 1;
+		if (
+			this.failProbeAfterCalls !== null &&
+			this.probeCalls > this.failProbeAfterCalls
+		) {
+			throw new Error("boom-probe");
+		}
+		return {
+			sessionId: this.hostSessionId,
+			isStreaming: false,
+			model: { ...this.currentModel },
+		};
 	}
 
 	async prompt(message: string): Promise<string> {
@@ -64,6 +108,57 @@ class FakeTurnClient implements TurnClient {
 		this.seen.push({ type: "subscribed" });
 		void listener;
 		return () => {};
+	}
+
+	async newSession(): Promise<{ cancelled: false }> {
+		this.newSessionCalls += 1;
+		if (this.failNew !== null) throw new Error(this.failNew);
+		this.hostSessionId = "host-session-2";
+		return { cancelled: false as const };
+	}
+
+	async switchSession(sessionPath: string): Promise<{ cancelled: false }> {
+		this.switchCalls.push(sessionPath);
+		if (this.failSwitch !== null) throw new Error(this.failSwitch);
+		this.hostSessionId = `resumed-${sessionPath}`;
+		return { cancelled: false as const };
+	}
+
+	async setModel(
+		provider: string,
+		modelId: string,
+	): Promise<{ provider: string; id: string }> {
+		this.setModelCalls.push({ provider, id: modelId });
+		if (this.failSetModel !== null) throw new Error(this.failSetModel);
+		this.currentModel = { provider, id: modelId };
+		return { ...this.currentModel };
+	}
+
+	async getAvailableModels(): Promise<
+		Array<{ provider: string; id: string }>
+	> {
+		if (this.failAvailable !== null) throw new Error(this.failAvailable);
+		return this.catalog.map((m) => ({ ...m }));
+	}
+
+	async compact(
+		customInstructions?: string,
+	): Promise<{ summary: string; tokensBefore: number }> {
+		this.compactCalls.push(customInstructions);
+		if (this.failCompact !== null) throw new Error(this.failCompact);
+		return {
+			summary: this.compactSummary,
+			tokensBefore: this.compactTokens,
+		};
+	}
+
+	async getEntries(): Promise<{
+		entries: Array<unknown>;
+		leafId: string | null;
+	}> {
+		this.entriesCalls += 1;
+		if (this.failEntries !== null) throw new Error(this.failEntries);
+		return { entries: [...this.branchEntries], leafId: "leaf-1" };
 	}
 }
 
@@ -301,5 +396,322 @@ describe("RpcTurnRunner plain turn", () => {
 
 		expect(outcome.exitReason).toBe("error");
 		expect(outcome.errorMessage).toBe("chat child cannot drive a turn");
+	});
+});
+
+describe("parseSlashCommand", () => {
+	it("returns null for plain text", () => {
+		expect(parseSlashCommand("say hi")).toBeNull();
+	});
+
+	it("parses the command word plus the args tail", () => {
+		expect(parseSlashCommand("/resume abc123")).toEqual({
+			name: "resume",
+			args: "abc123",
+		});
+	});
+
+	it("lowercases the name and trims the args", () => {
+		expect(parseSlashCommand("  /MODEL  acme/model-b  ")).toEqual({
+			name: "model",
+			args: "acme/model-b",
+		});
+	});
+
+	it("returns null for a bare slash", () => {
+		expect(parseSlashCommand("/")).toBeNull();
+	});
+});
+
+describe("RpcTurnRunner native sessions", () => {
+	it("/new starts a fresh host session without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { registry, runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Started a new session (host-session-2).");
+		expect(outcome.iterations).toBe(0);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.newSessionCalls).toBe(1);
+		expect(registry.get("chat-1")?.state).toBe("ready");
+
+		const rows = s.listMessages("sess-1");
+		expect(rows.map((r) => [r.role, r.content])).toEqual([
+			["user", "/new"],
+			["assistant", "Started a new session (host-session-2)."],
+		]);
+	});
+
+	it("/resume with no id renders usage without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/resume",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Usage: /resume <session-id> — rebinds this chat onto that session's history.",
+		);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.switchCalls).toEqual([]);
+
+		const rows = s.listMessages("sess-1");
+		expect(rows.map((r) => r.role)).toEqual(["user", "assistant"]);
+	});
+
+	it("/resume rebinds through switchSession without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/resume sess-file-9",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Resumed session (resumed-sess-file-9). The next turn replays its history.",
+		);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.switchCalls).toEqual(["sess-file-9"]);
+	});
+
+	it("bare /model lists current plus catalog without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/model",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Current model: acme/model-a\nAvailable: acme/model-a, acme/model-b",
+		);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.setModelCalls).toEqual([]);
+	});
+
+	it("/model with a qualified ref switches without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/model acme/model-b",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Model: acme/model-b");
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.setModelCalls).toEqual([
+			{ provider: "acme", id: "model-b" },
+		]);
+
+		const rows = s.listMessages("sess-1");
+		expect(rows.map((r) => [r.role, r.content])).toEqual([
+			["user", "/model acme/model-b"],
+			["assistant", "Model: acme/model-b"],
+		]);
+	});
+
+	it("/model with a bare id resolves against the catalog", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/model model-b",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Model: acme/model-b");
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("/model with an unknown ref replies failed without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/model nope/nope",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toContain("Model switch failed");
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("/compact renders the host summary without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/compact",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Compacted 1234 tokens of context.\n\ncompacted summary",
+		);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.compactCalls).toEqual([undefined]);
+	});
+
+	it("/compact refusals render as reply text", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		fake.failCompact = "Nothing to compact (session too small)";
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/compact focus on the API",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Compaction failed: Nothing to compact (session too small)",
+		);
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("/export renders branch entries as inline JSONL", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/export",
+		});
+
+		const expected =
+			`${JSON.stringify({ id: "e1", role: "user", content: "hi" })}\n` +
+			`${JSON.stringify({ id: "e2", role: "assistant", content: "hello" })}\n`;
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(expected);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.entriesCalls).toBe(1);
+	});
+
+	it("/export html renders the minimal transcript", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/export html",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toContain("<title>Session export</title>");
+		expect(outcome.finalText).toContain("hello");
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("a session command while busy fails fast with no native call", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		fake.gate = () => {};
+		const { runner } = makeRunner([fake], s);
+
+		const first = runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "one",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const second = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new",
+		});
+		fake.gate?.();
+		await first;
+
+		expect(second.exitReason).toBe("error");
+		expect(second.errorMessage).toBe("turn already in progress for this chat");
+		expect(fake.newSessionCalls).toBe(0);
+		expect(fake.promptCalls).toEqual(["one"]);
+	});
+
+	it("a session transport failure marks dead then heals", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const dead = new FakeTurnClient();
+		dead.failNew = "boom-new";
+		dead.failProbeAfterCalls = 1;
+		const healed = new FakeTurnClient();
+		healed.hostSessionId = "host-session-9";
+		const { registry, runner } = makeRunner([dead, healed], s);
+
+		const failed = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new",
+		});
+		expect(failed.exitReason).toBe("error");
+		expect(failed.errorMessage).toBe("new failed: boom-new");
+		expect(registry.get("chat-1")?.state).toBe("dead");
+
+		const next = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new",
+		});
+		expect(next.exitReason).toBe("finalized");
+		expect(next.finalText).toContain("host-session-2");
+		expect(registry.get("chat-1")?.generation).toBe(1);
+	});
+
+	it("renderSessionExportHtml escapes entry text", () => {
+		const jsonl = `${JSON.stringify({ role: "user", content: "<b>hi</b>" })}\n`;
+		const html = renderSessionExportHtml(jsonl);
+		expect(html).toContain("&lt;b&gt;hi&lt;/b&gt;");
+		expect(html).not.toContain("<b>hi</b>");
 	});
 });
