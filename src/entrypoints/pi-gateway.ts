@@ -167,10 +167,25 @@ export async function runCommand(
 			const hosting = await import("./platform-hosting.js");
 			const platforms = hosting.resolveConfiguredPlatforms(raw);
 			if (platforms.length > 0) {
-				// Embedded turn factory dissolved per DEC-084 (RPC children own
-				// turns). Platforms compose without a factory until Todo 3 lands;
-				// ingress stays unwired with a loud guard_unwired degrade.
 				input.platforms = platforms;
+				// DEC-084 turns: one shared registry per process plus one
+				// runner closing over the lifecycle-owned stage-6 store.
+				// Children share the gateway home, so file auth plus the
+				// PI_PROVIDER and PI_MODEL env inherit with zero secret
+				// copies. Per-chat homes stay deferred until shared-home
+				// contention is measured, not assumed.
+				const [{ ChatProcRegistry }, { RpcTurnRunner }] = [
+					await import("../pi_agent_core/chat-proc-registry.js"),
+					await import("../pi_agent_core/rpc-turn-runner.js"),
+				];
+				const registry = new ChatProcRegistry();
+				const home = opts.home;
+				input.turnRunnerFactory = ({ store }) =>
+					new RpcTurnRunner({
+						registry,
+						resolveHome: () => home,
+						...(store !== null ? { store } : {}),
+					});
 			}
 		}
 	}
