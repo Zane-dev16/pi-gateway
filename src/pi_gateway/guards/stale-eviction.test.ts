@@ -34,16 +34,17 @@ function makeGuard(extra: Partial<RunnerBusyOptions> = {}): {
 	const guard = new RunnerBusyGuard({
 		registry: [
 			{
-				name: "stop",
+				name: "new",
+				aliases: ["reset"],
 				busyPolicy: "interrupt_then_dispatch",
-				busyHandler: "stop",
+				busyHandler: "new",
 			},
 		],
 		slots,
 		onWarning: (m) => warnings.push(m),
 		invalidateRunGeneration: (key, reason) => generations.push({ key, reason }),
 		releaseRunningAgentState: (key) => released.push(key),
-		specialHandlers: { stop: () => "stopped" },
+		specialHandlers: { new: () => "restarted" },
 		...extra,
 	});
 	return { guard, generations, released, warnings, slots };
@@ -264,42 +265,42 @@ describe("busy-entry integration (eviction precedes the ladder, run.py order)", 
 
 	it("dispatchBusySlashCommand returns null on eviction — no mid-run dispatch into a dead entry", async () => {
 		const now = 1_000_000_000;
-		let stopRan = false;
+		let runRan = false;
 		const f = makeGuard({
 			now: () => now,
 			specialHandlers: {
-				stop: () => {
-					stopRan = true;
-					return "stopped";
+				new: () => {
+					runRan = true;
+					return "restarted";
 				},
 			},
 		});
 		f.guard.markTurnStarted(KEY, now - 2_000_000);
 
 		await expect(
-			f.guard.dispatchBusySlashCommand("stop", textEvent(), KEY),
+			f.guard.dispatchBusySlashCommand("new", textEvent(), KEY),
 		).resolves.toBeNull();
-		expect(stopRan).toBe(false);
+		expect(runRan).toBe(false);
 		expect(f.generations.length).toBe(1);
 	});
 
-	it("a LIVE entry still dispatches /stop normally (regression guard)", async () => {
+	it("a LIVE entry still dispatches /new normally (regression guard)", async () => {
 		const now = 1_000_000_000;
-		let stopRan = false;
+		let runRan = false;
 		const f = makeGuard({
 			now: () => now,
 			specialHandlers: {
-				stop: () => {
-					stopRan = true;
-					return "stopped";
+				new: () => {
+					runRan = true;
+					return "restarted";
 				},
 			},
 		});
 		f.guard.markTurnStarted(KEY, now - 100);
 		await expect(
-			f.guard.dispatchBusySlashCommand("stop", textEvent(), KEY),
-		).resolves.toBe("stopped");
-		expect(stopRan).toBe(true);
+			f.guard.dispatchBusySlashCommand("new", textEvent(), KEY),
+		).resolves.toBe("restarted");
+		expect(runRan).toBe(true);
 		expect(f.generations).toEqual([]);
 	});
 });

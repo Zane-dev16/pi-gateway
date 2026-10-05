@@ -206,7 +206,7 @@ function rowContents(sessionId: string): string[] {
 }
 
 describe("switch contracts over real seams", () => {
-	it("/sessions lists via passthrough bytes (no new code)", async () => {
+	it("/session lists via passthrough bytes (no new code)", async () => {
 		const stub = stubRunner();
 		const handler = buildProductionMessageHandler({
 			runner: stub.runner,
@@ -214,12 +214,12 @@ describe("switch contracts over real seams", () => {
 			isAuthorized: ALLOW_ALL,
 			sessionHop: hop(),
 		});
-		const reply = await handler(event("/sessions"), CTX);
-		expect(reply).toBe("TURN:/sessions");
+		const reply = await handler(event("/session"), CTX);
+		expect(reply).toBe("TURN:/session");
 		const bound = binder.entryOf(CHAT)?.session_id ?? "";
 		expect(bound).not.toBe("");
 		expect(stub.texts).toEqual([
-			{ sessionId: bound, routingKey: CHAT, text: "/sessions" },
+			{ sessionId: bound, routingKey: CHAT, text: "/session" },
 		]);
 	});
 

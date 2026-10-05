@@ -15,7 +15,7 @@ import {
 } from "./runner-busy.js";
 
 const REGISTRY: CommandDef[] = [
-	{ name: "stop", busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" },
+	{ name: "new", aliases: ["reset"], busyPolicy: "interrupt_then_dispatch", busyHandler: "new" },
 ];
 
 const TELEGRAM_KEY = "agent:main:telegram:dm:100";

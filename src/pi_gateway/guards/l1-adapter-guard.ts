@@ -532,7 +532,7 @@ export class AdapterSessionGuard {
 			// Bypass lanes (§5): commands NEVER queue (#4926/#5057).
 			if (shouldBypassActiveSession(this.lookup, cmd)) {
 				if (cmd !== null && isInterruptThenDispatch(this.lookup, cmd)) {
-					// Lane A: cancel-handoff (/stop, /new, /reset).
+					// Lane A: cancel-handoff (/new, /reset; DEC-083 cut /stop).
 					this.discardTextDebounce(sessionKey);
 					try {
 						await this.dispatchActiveSessionCommand(event, sessionKey, cmd);
@@ -541,14 +541,14 @@ export class AdapterSessionGuard {
 					}
 					return;
 				}
-				// Lane B: direct dispatch (/approve, /deny, …) — the
+				// Lane B: direct dispatch (/restart, /help, …) — the
 				// running task keeps running.
 				await this.dispatchInline(event);
 				return;
 			}
 
 			// Lane C: clarify intercept — agent blocked on the resolver must see
-			// the next non-command message first (same shape as /approve).
+			// the next non-command message first.
 			if (
 				cmd === null &&
 				allowsControl(event) &&
@@ -639,7 +639,7 @@ export class AdapterSessionGuard {
 	// -- Lane A: cancel-handoff -------------------------------------------------
 
 	/**
-	 * base.py:_dispatch_active_session_command — serialize /stop,/new,/reset:
+	 * base.py:_dispatch_active_session_command — serialize /new,/reset (DEC-083 cut /stop):
 	 * (1) swap a command-scoped guard so racing follow-ups stay queued;
 	 * (2) run the runner handler INLINE;
 	 * (3) send the response BEFORE cancelling the old task (#18912 — the

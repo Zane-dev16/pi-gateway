@@ -29,10 +29,11 @@ const ROWS: CommandDef[] = [
 		aliases: ["reset"],
 		argsHint: "[name]",
 		busyPolicy: "interrupt_then_dispatch",
+		busyHandler: "new",
 	}),
-	row("stop", { busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" }),
-	row("background", {
-		aliases: ["bg", "btw"],
+	row("restart", { busyPolicy: "dispatch" }),
+	row("export", {
+		aliases: ["ex", "ex2"],
 		argsHint: "<prompt>",
 		busyPolicy: "dispatch",
 	}),
@@ -55,10 +56,10 @@ describe("gatewayKnownCommands (GATEWAY_KNOWN_COMMANDS parity)", () => {
 		for (const token of [
 			"new",
 			"reset",
-			"stop",
-			"background",
-			"bg",
-			"btw",
+			"restart",
+			"export",
+			"ex",
+			"ex2",
 			"skills",
 			"start",
 		]) {
@@ -75,7 +76,7 @@ describe("gatewayKnownCommands (GATEWAY_KNOWN_COMMANDS parity)", () => {
 	it("isGatewayKnownCommand is slash/case-insensitive and null-safe", () => {
 		const known = gatewayKnownCommands(ROWS);
 		expect(isGatewayKnownCommand(known, "/RESET")).toBe(true);
-		expect(isGatewayKnownCommand(known, "bg")).toBe(true);
+		expect(isGatewayKnownCommand(known, "ex")).toBe(true);
 		expect(isGatewayKnownCommand(known, "/foo")).toBe(false);
 		expect(isGatewayKnownCommand(known, null)).toBe(false);
 		expect(isGatewayKnownCommand(known, "")).toBe(false);
@@ -90,7 +91,7 @@ describe("gatewayHelpLines byte format (gateway_help_lines parity)", () => {
 		expect(lines).toContain(
 			"`/new [name]` -- new description (alias: `/reset`)",
 		);
-		expect(lines).toContain("`/stop` -- stop description");
+		expect(lines).toContain("`/restart` -- restart description");
 		expect(lines).toContain("`/skills` -- skills description");
 		expect(
 			lines.some((l) => l.startsWith("/redraw") || l.includes("redraw")),
@@ -113,11 +114,11 @@ describe("gatewayHelpLines byte format (gateway_help_lines parity)", () => {
 describe("CLI catalog (COMMANDS / _build_description parity)", () => {
 	it("usage hint folds into canonical entries only; aliases get the plain form", () => {
 		const catalog = cliCommandDescriptions(ROWS);
-		expect(catalog.get("/background")).toBe(
-			"background description (usage: /background <prompt>)",
+		expect(catalog.get("/export")).toBe(
+			"export description (usage: /export <prompt>)",
 		);
-		expect(catalog.get("/bg")).toBe(
-			"background description (alias for /background)",
+		expect(catalog.get("/ex")).toBe(
+			"export description (alias for /export)",
 		);
 		expect(catalog.get("/new")).toBe("new description (usage: /new [name])");
 		expect(catalog.get("/reset")).toBe("new description (alias for /new)");
@@ -130,7 +131,7 @@ describe("CLI catalog (COMMANDS / _build_description parity)", () => {
 
 	it("by-category grouping mirrors the flat entries", () => {
 		const byCategory = cliCommandsByCategory(ROWS);
-		expect(byCategory.get("Session")?.get("/stop")).toBe("stop description");
+		expect(byCategory.get("Session")?.get("/restart")).toBe("restart description");
 		expect(byCategory.get("Tools & Skills")?.get("/skills")).toBe(
 			"skills description",
 		);
@@ -151,7 +152,7 @@ describe("completions (COMMANDS + SUBCOMMANDS parity)", () => {
 			subcommandsFor(row("worktree", { subcommands: ["new", "list"] })),
 		).toEqual(["new", "list"]);
 		expect(
-			subcommandsFor(row("topic", { argsHint: "[off|help|session-id]" })),
+			subcommandsFor(row("deploy", { argsHint: "[off|help|session-id]" })),
 		).toEqual([
 			"off",
 			"help",
@@ -190,19 +191,19 @@ describe("telegramMenuModel (telegram_bot_commands parity, no Telegram import)",
 		const menu = telegramMenuModel(ROWS);
 		const names = menu.map((m) => m.command);
 		expect(names).toContain("new");
-		expect(names).toContain("background");
+		expect(names).toContain("export");
 		// Gated cli_only rows stay hidden while the gate is closed (default here).
 		expect(names).not.toContain("skills");
 		expect(names).not.toContain("reset");
-		expect(names).not.toContain("bg");
+		expect(names).not.toContain("ex");
 	});
 
 	it("hyphens → underscores; invalid chars stripped; arg-taking built-ins INCLUDED", () => {
 		const menu = telegramMenuModel([row("reload-mcp", {})]);
 		expect(menu[0]?.command).toBe("reload_mcp");
-		// /background requires <prompt> but stays in the menu (#24312).
+		// /export requires <prompt> but stays in the menu (#24312).
 		expect(telegramMenuModel(ROWS).map((m) => m.command)).toContain(
-			"background",
+			"export",
 		);
 	});
 

@@ -17,12 +17,14 @@ const ROWS: CommandDef[] = [
 		busyPolicy: "interrupt_then_dispatch",
 		busyHandler: "new",
 	}),
-	row("stop", { busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" }),
-	row("queue", {
-		aliases: ["q"],
+	row("start", {
+		busyPolicy: "dispatch",
+		busyHandler: "start",
+	}),
+	row("restart", {
+		aliases: ["rs"],
 		argsHint: "<prompt>",
 		busyPolicy: "dispatch",
-		busyHandler: "queue",
 	}),
 	row("model", { busyPolicy: "reject", busyHandler: "model" }),
 	row("title", {}), // default reject, no handler
@@ -31,16 +33,16 @@ const ROWS: CommandDef[] = [
 describe("toGuardRows — minimal L2 feed projection", () => {
 	it("projects exactly the guard-consumed fields; schema extras never leak", () => {
 		const [projected] = toGuardRows([
-			row("background", {
-				aliases: ["bg"],
+			row("export", {
+				aliases: ["ex"],
 				busyPolicy: "dispatch",
 				argsHint: "<prompt>",
 				gatewayConfigGate: "x.y",
 			}),
 		]);
 		expect(projected).toEqual({
-			name: "background",
-			aliases: ["bg"],
+			name: "export",
+			aliases: ["ex"],
 			busyPolicy: "dispatch",
 		});
 		expect(Object.keys(projected ?? {}).sort()).toEqual([
@@ -61,7 +63,7 @@ describe("BusyResolver predicates (commands.py parity)", () => {
 
 	it("resolves names AND aliases case/slash-insensitively; unknown → null", () => {
 		expect(resolver.resolve("/RESET")?.name).toBe("new");
-		expect(resolver.resolve("Q")?.name).toBe("queue");
+		expect(resolver.resolve("RS")?.name).toBe("restart");
 		expect(resolver.resolve("foo")).toBeNull();
 	});
 
@@ -69,9 +71,9 @@ describe("BusyResolver predicates (commands.py parity)", () => {
 		for (const name of [
 			"new",
 			"reset",
-			"stop",
-			"queue",
-			"q",
+			"start",
+			"restart",
+			"rs",
 			"model",
 			"title",
 		]) {
@@ -83,22 +85,23 @@ describe("BusyResolver predicates (commands.py parity)", () => {
 
 	it("interrupt-class routing resolves THROUGH aliases ('reset' → /new)", () => {
 		expect(resolver.isInterruptThenDispatch("reset")).toBe(true);
-		expect(resolver.isInterruptThenDispatch("stop")).toBe(true);
-		expect(resolver.isInterruptThenDispatch("queue")).toBe(false);
+		expect(resolver.isInterruptThenDispatch("new")).toBe(true);
+		expect(resolver.isInterruptThenDispatch("restart")).toBe(false);
+		expect(resolver.isInterruptThenDispatch("start")).toBe(false);
 		expect(resolver.isInterruptThenDispatch("model")).toBe(false);
 	});
 
 	it("bypassCommandNames derives policy≠reject canonicals from rows only", () => {
 		expect([...resolver.bypassCommandNames()].sort()).toEqual([
 			"new",
-			"queue",
-			"stop",
+			"restart",
+			"start",
 		]);
 	});
 
 	it("policyOf applies the DEC-005 default and returns null for unknowns", () => {
 		expect(resolver.policyOf("title")).toBe("reject");
-		expect(resolver.policyOf("q")).toBe("dispatch");
+		expect(resolver.policyOf("rs")).toBe("dispatch");
 		expect(resolver.policyOf("foo")).toBeNull();
 	});
 });

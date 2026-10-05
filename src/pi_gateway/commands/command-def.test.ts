@@ -16,10 +16,10 @@ import {
 describe("CommandDef schema (07 §1.1)", () => {
 	it("carries every spec field; name/description/category required, rest defaulted", () => {
 		const row: CommandDef = {
-			name: "background",
-			description: "Run a prompt in the background",
+			name: "export",
+			description: "Render the branch inline",
 			category: "Session",
-			aliases: ["bg", "btw"],
+			aliases: ["ex", "ex2"],
 			argsHint: "<prompt>",
 			subcommands: ["new", "list"],
 			cliOnly: false,

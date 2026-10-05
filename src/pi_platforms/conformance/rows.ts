@@ -125,10 +125,10 @@ export function buildSharedRows(deps: SharedRowDeps): ConformanceRow[] {
 			const scheduler = schedulerOf(s);
 			s.holdTurnsForBurst(true);
 			await s.deliverInbound(textEvent("busy-turn"), "sess-cmd");
-			await s.deliverInbound(textEvent("/approve"), "sess-cmd");
+			await s.deliverInbound(textEvent("/restart"), "sess-cmd");
 			expectTrue(
-				s.replies().some((r) => r.includes("/approve")),
-				"/approve dispatches INLINE mid-turn",
+				s.replies().some((r) => r.includes("/restart")),
+				"/restart dispatches INLINE mid-turn",
 			);
 			await s.deliverInbound(textEvent("/foo bar"), "sess-cmd");
 			expectTrue(

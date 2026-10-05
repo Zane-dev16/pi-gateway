@@ -1457,5 +1457,5 @@ const YB_REGISTRY: CommandRegistry = [
 		busyPolicy: "interrupt_then_dispatch" as const,
 		busyHandler: "new",
 	},
-	{ name: "approve", busyPolicy: "dispatch" as const },
+	{ name: "restart", busyPolicy: "dispatch" as const },
 ];

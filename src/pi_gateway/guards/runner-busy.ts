@@ -294,7 +294,7 @@ export class RunnerBusyGuard {
 		);
 	}
 
-	// -- /queue FIFO helpers --------------------------------------------------
+	// -- FIFO helpers (plain-text queueing; DEC-083 cut the /queue command row) ---
 
 	/** run.py:_enqueue_fifo — first item takes the slot; further items append to the overflow. */
 	enqueueFifo(
@@ -554,7 +554,7 @@ export class RunnerBusyGuard {
 	 * run.py:_dispatch_busy_slash_command — resolve and EXECUTE a recognized
 	 * slash command while the agent runs. Resolution order: staleness sweep →
 	 * pre-gate → SLASH-ACCESS GATE (run.py ~17282 — every non-pregate
-	 * recognized command, including /stop and /approve, so an in-flight agent
+	 * recognized command, including /new and /restart, so an in-flight agent
 	 * can't be used to bypass admin/user gating) → special busy_handler →
 	 * policy-dispatch plain handler → catch-all reject. Unknown commands
 	 * return null (caller queues them as text).

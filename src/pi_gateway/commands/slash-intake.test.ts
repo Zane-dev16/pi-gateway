@@ -19,7 +19,7 @@ const row = (name: string, extra: Partial<CommandDef>): CommandDef => ({
 
 const REGISTRY = new CommandRegistry([
 	row("new", { aliases: ["reset"] }),
-	row("background", { aliases: ["bg", "btw"], argsHint: "<prompt>" }),
+	row("export", { aliases: ["ex", "ex2"], argsHint: "<prompt>" }),
 ]);
 
 describe("extractSlashToken (base.py:get_command parity)", () => {
@@ -28,8 +28,8 @@ describe("extractSlashToken (base.py:get_command parity)", () => {
 			command: "new",
 			args: "hello world",
 		});
-		expect(extractSlashToken("/bg@mybot do stuff")).toEqual({
-			command: "bg",
+		expect(extractSlashToken("/ex@mybot do stuff")).toEqual({
+			command: "ex",
 			args: "do stuff",
 		});
 	});
@@ -48,8 +48,8 @@ describe("extractSlashToken (base.py:get_command parity)", () => {
 	});
 
 	it("bare '/cmd' has empty args", () => {
-		const { command, args } = extractSlashToken("/stop");
-		expect(command).toBe("stop");
+		const { command, args } = extractSlashToken("/new");
+		expect(command).toBe("new");
 		expect(args).toBe("");
 	});
 
@@ -102,8 +102,8 @@ describe("unknown commands queue as TEXT — byte-stable (07 §1.4/§2)", () => 
 	});
 
 	it("whitespace-prefixed commands still parse (lstrip semantics)", () => {
-		const intake = classifySlashIntake(resolve, "   /bg ship it");
+		const intake = classifySlashIntake(resolve, "   /ex ship it");
 		expect(intake.kind).toBe("command");
-		if (intake.kind === "command") expect(intake.token).toBe("bg");
+		if (intake.kind === "command") expect(intake.token).toBe("ex");
 	});
 });

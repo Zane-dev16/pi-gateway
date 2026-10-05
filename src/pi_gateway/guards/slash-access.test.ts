@@ -29,7 +29,12 @@ import {
 } from "./slash-access.js";
 
 const REGISTRY: CommandDef[] = [
-	{ name: "stop", busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" },
+	{
+		name: "new",
+		aliases: ["reset"],
+		busyPolicy: "interrupt_then_dispatch",
+		busyHandler: "new",
+	},
 	{
 		name: "model",
 		busyPolicy: "reject",
@@ -66,7 +71,7 @@ function gatedGuard(
 		registry: REGISTRY,
 		slots,
 		onWarning: (m) => warnings.push(m),
-		specialHandlers: { stop: () => "stopped" },
+		specialHandlers: { new: () => "restarted" },
 		plainHandlers: {
 			help: () => "helped",
 			whoami: () => "you are you",
@@ -78,10 +83,10 @@ function gatedGuard(
 	return { guard, warnings };
 }
 
-/** Enabled policy: alice admins; bob may run /queue only. */
+/** Enabled policy: alice admins; bob may run /restart only. */
 const makeDmPolicy = () =>
 	policyFromExtra(
-		{ allow_admin_from: "alice", user_allowed_commands: ["queue"] },
+		{ allow_admin_from: "alice", user_allowed_commands: ["restart"] },
 		"dm",
 	);
 
@@ -96,8 +101,8 @@ describe("policy coercion (slash_access.py _coerce_* helpers)", () => {
 
 	it("command lists strip leading slashes and lowercase (either YAML style)", () => {
 		expect(
-			[...coerceCommandSet(["/Help", "QUEUE", "//Context"])].sort(),
-		).toEqual(["context", "help", "queue"]);
+			[...coerceCommandSet(["/Help", "RESTART", "//Context"])].sort(),
+		).toEqual(["context", "help", "restart"]);
 		expect([...coerceCommandSet("/whoami, /Model")].sort()).toEqual([
 			"model",
 			"whoami",
@@ -149,9 +154,9 @@ describe("policyFromExtra — enabled flag, floor, and the dm→group fallback",
 			"context",
 		]);
 		// …but never RESTRICTIVELY: an explicit dm list wins outright.
-		const both = { ...shared, user_allowed_commands: ["queue"] };
+		const both = { ...shared, user_allowed_commands: ["restart"] };
 		expect([...policyFromExtra(both, "dm").userAllowedCommands]).toEqual([
-			"queue",
+			"restart",
 		]);
 	});
 });
@@ -228,7 +233,7 @@ describe("isAdmin / canRun — floor and membership semantics", () => {
 	});
 
 	it("listed user_allowed_commands pass; everything else denies", () => {
-		expect(canRunSlashCommand(policy, "bob", "queue")).toBe(true);
+		expect(canRunSlashCommand(policy, "bob", "restart")).toBe(true);
 		expect(canRunSlashCommand(policy, "bob", "model")).toBe(false);
 		expect(canRunSlashCommand(policy, "bob", "")).toBe(false);
 	});
@@ -346,19 +351,19 @@ describe("RUNNING-AGENT FAST-PATH gate (run.py ~17282 between pregate and dispat
 		await expect(
 			guard.dispatchBusySlashCommand("model", dmEvent("alice"), "k"),
 		).resolves.toBe(
-			"Agent is running — wait or /stop first, then switch models.",
+			"Agent is running — wait for the current response, then switch models.",
 		);
 	});
 
-	it("control-plane /stop is gated too — an in-flight agent can't be leveraged", async () => {
+	it("control-plane /new is gated too — an in-flight agent can't be leveraged", async () => {
 		const { guard } = gatedGuard(() => makeDmPolicy());
 		await expect(
-			guard.dispatchBusySlashCommand("stop", dmEvent("bob"), "k"),
-		).resolves.toContain("/stop is admin-only here.");
+			guard.dispatchBusySlashCommand("new", dmEvent("bob"), "k"),
+		).resolves.toContain("/new is admin-only here.");
 		const admin = gatedGuard(() => makeDmPolicy());
 		await expect(
-			admin.guard.dispatchBusySlashCommand("stop", dmEvent("alice"), "k"),
-		).resolves.toBe("stopped");
+			admin.guard.dispatchBusySlashCommand("new", dmEvent("alice"), "k"),
+		).resolves.toBe("restarted");
 	});
 
 	it("no policy resolver configured ⇒ gating fully off (backward-compat)", async () => {
@@ -371,7 +376,7 @@ describe("RUNNING-AGENT FAST-PATH gate (run.py ~17282 between pregate and dispat
 		await expect(
 			guard.dispatchBusySlashCommand("model", dmEvent("bob"), "k"),
 		).resolves.toBe(
-			"Agent is running — wait or /stop first, then switch models.",
+			"Agent is running — wait for the current response, then switch models.",
 		);
 	});
 
@@ -412,7 +417,7 @@ describe("COLD-PATH gate (run.py ~17507 before built-in dispatch)", () => {
 
 	it("the floor and listed commands pass on the cold path as well", () => {
 		const queueOnly = policyFromExtra(
-			{ allow_admin_from: ["alice"], user_allowed_commands: ["queue"] },
+			{ allow_admin_from: ["alice"], user_allowed_commands: ["restart"] },
 			"dm",
 		);
 		const { guard } = gatedGuard(() => queueOnly);

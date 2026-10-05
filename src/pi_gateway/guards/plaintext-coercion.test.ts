@@ -137,9 +137,10 @@ describe("intake wiring: L1 handleMessage coerces BEFORE classification", () => 
 				// /restart registered like the real row: dispatches mid-run.
 				{ name: "restart", busyPolicy: "dispatch" },
 				{
-					name: "stop",
+					name: "new",
+					aliases: ["reset"],
 					busyPolicy: "interrupt_then_dispatch",
-					busyHandler: "stop",
+					busyHandler: "new",
 				},
 			],
 		};

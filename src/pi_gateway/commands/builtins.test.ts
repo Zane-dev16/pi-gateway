@@ -24,11 +24,14 @@ describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 		// DEC-078 derivation: the census is the host BUILTIN_SLASH_COMMANDS
 		// (24 rows) plus the gateway-only survivors — never a Hermes number.
 		// /status duplicates host /session; /commands duplicates /help
-		// filtering plus skill modes. Adding/removing a row is still a
+		// filtering plus skill modes. DEC-083 cut thirteen rows (queue,
+		// steer, background, agents, stop, pause, approve, deny, sethome,
+		// sessions, topic, platform, version); survivors are help, start,
+		// restart, switch-path, new-path. Adding/removing a row is still a
 		// conscious census change, never an accident.
-		expect(BUILTIN_COMMAND_ROWS.length).toBe(42);
+		expect(BUILTIN_COMMAND_ROWS.length).toBe(29);
 		expect(BUILTIN_COMMAND_ROWS.length).toBe(
-			BUILTIN_SLASH_COMMANDS.length + 18,
+			BUILTIN_SLASH_COMMANDS.length + 5,
 		);
 		expect(BUILTIN_SLASH_COMMANDS.length).toBe(24);
 	});
@@ -58,6 +61,19 @@ describe("BUILTIN_COMMAND_ROWS — the shipped census", () => {
 			"egress",
 			"blueprint",
 			"curator",
+			"queue",
+			"steer",
+			"background",
+			"agents",
+			"stop",
+			"pause",
+			"approve",
+			"deny",
+			"sethome",
+			"sessions",
+			"topic",
+			"platform",
+			"version",
 		]) {
 			expect(names, dropped).not.toContain(dropped);
 		}
@@ -79,17 +95,42 @@ describe("resolve_command parity over the builtin registry", () => {
 		expect(registry.busyPolicyOf("/new")).toBe("interrupt_then_dispatch");
 	});
 
-	it("'//stop' resolves non-null (lstrip('/') strips ALL slashes)", () => {
-		const cmd = registry.resolve("//stop");
+	it("'//new' resolves non-null (lstrip('/') strips ALL slashes)", () => {
+		const cmd = registry.resolve("//new");
 		expect(cmd).not.toBeNull();
-		expect(cmd?.name).toBe("stop");
+		expect(cmd?.name).toBe("new");
 		expect(cmd?.busyPolicy).toBe("interrupt_then_dispatch");
 	});
 
-	it("aliases resolve to their owning row ('reset' → new, 'bg' → background)", () => {
+	it("aliases resolve to their owning row ('reset' → new)", () => {
 		expect(registry.resolve("reset")?.name).toBe("new");
-		expect(registry.resolve("bg")?.name).toBe("background");
-		expect(registry.resolve("/q")?.name).toBe("queue");
+	});
+
+	it("cut rows resolve null (queueable-text classification intact)", () => {
+		for (const cut of [
+			"queue",
+			"q",
+			"steer",
+			"background",
+			"bg",
+			"btw",
+			"agents",
+			"tasks",
+			"stop",
+			"pause",
+			"approve",
+			"deny",
+			"sethome",
+			"set-home",
+			"sessions",
+			"topic",
+			"platform",
+			"version",
+			"v",
+		]) {
+			expect(registry.resolve(cut), cut).toBeNull();
+			expect(registry.resolve(`/${cut}`), cut).toBeNull();
+		}
 	});
 
 	it("unknown commands still resolve null (queueable-text classification intact)", () => {
@@ -103,13 +144,31 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 
 	it("gateway help lines cover every gateway-available row", () => {
 		const lines = gatewayHelpLines(rows);
-		expect(lines.length).toBeGreaterThan(30);
+		expect(lines.length).toBeGreaterThan(15);
 		expect(lines.some((l) => l.startsWith("`/new"))).toBe(true);
 		expect(lines.some((l) => l.startsWith("`/help"))).toBe(true);
 		// Cut rows stay cut: /status duplicates host /session, /commands
-		// duplicates /help filtering plus skill modes.
+		// duplicates /help filtering plus skill modes, and DEC-083 cut
+		// thirteen rows with no gateway executor.
 		expect(lines.some((l) => l.startsWith("`/status"))).toBe(false);
 		expect(lines.some((l) => l.startsWith("`/commands"))).toBe(false);
+		for (const cut of [
+			"queue",
+			"steer",
+			"background",
+			"agents",
+			"stop",
+			"pause",
+			"approve",
+			"deny",
+			"sethome",
+			"sessions",
+			"topic",
+			"platform",
+			"version",
+		]) {
+			expect(lines.some((l) => l.startsWith(`/${cut} `) || l.startsWith(`/${cut}\``)), cut).toBe(false);
+		}
 	});
 
 	it("completion catalogs (cli + gateway) carry names AND aliases", () => {
@@ -117,41 +176,56 @@ describe("derived consumers are NON-EMPTY over the builtin rows", () => {
 			const catalog = completionCatalog(rows, { surface });
 			// The catalog derives purely from the surviving census (host
 			// builtins + gateway survivors + their aliases).
-			expect(catalog.commands.length).toBeGreaterThanOrEqual(35);
+			expect(catalog.commands.length).toBeGreaterThanOrEqual(20);
 			expect(catalog.commands).toContain("/new");
 			expect(catalog.commands).toContain("/reset");
 			expect(catalog.commands).toContain("/compact");
 			expect(catalog.commands).not.toContain("/subscription");
 		}
-		// Gateway-only subcommands surface on the gateway catalog only.
+		// No surviving gateway row carries explicit subcommands (/platform cut).
 		const gw = completionCatalog(rows, { surface: "gateway" });
-		expect(gw.subcommands.get("/platform")).toEqual([
-			"pause",
-			"resume",
-			"list",
-		]);
+		expect(gw.subcommands.size).toBe(0);
 	});
 
 	it("the telegram menu model carries sanitized gateway-available entries", () => {
 		const menu = telegramMenuModel(rows);
-		expect(menu.length).toBeGreaterThan(30);
+		expect(menu.length).toBeGreaterThan(15);
 		const names = menu.map((m) => m.command);
 		expect(names).toContain("new");
 		expect(names).toContain("compact");
-		expect(names).toContain("sethome"); // set-home sanitized to underscores
+		expect(names).toContain("switch_path");
+		expect(names).toContain("new_path");
+		expect(names).toContain("restart");
 		expect(names).not.toContain("subscription");
 		expect(names.every((n) => /^[a-z0-9_]+$/.test(n))).toBe(true);
 	});
 
 	it("the known-command set classifies real commands vs unknown text", () => {
 		const known = gatewayKnownCommands(rows);
-		expect(known.size).toBeGreaterThan(40);
-		for (const token of ["new", "reset", "stop", "help", "compact"]) {
+		expect(known.size).toBeGreaterThan(20);
+		for (const token of ["new", "reset", "help", "compact", "restart", "start"]) {
 			expect(known.has(token), token).toBe(true);
 		}
 		// Dropped Hermes-only rows classify as unknown text now.
 		expect(known.has("subscription")).toBe(false);
 		expect(known.has("compress")).toBe(false);
+		for (const cut of [
+			"queue",
+			"steer",
+			"background",
+			"agents",
+			"stop",
+			"pause",
+			"approve",
+			"deny",
+			"sethome",
+			"sessions",
+			"topic",
+			"platform",
+			"version",
+		]) {
+			expect(known.has(cut), cut).toBe(false);
+		}
 	});
 });
 
@@ -182,16 +256,16 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 			expect(VALID_BUSY_POLICIES.has(policy as string)).toBe(true);
 			checked += 1;
 		}
-		expect(checked).toBeGreaterThan(45); // names + aliases
+		expect(checked).toBeGreaterThan(25); // names + aliases
 	});
 
-	it("interrupt-class routing covers the /stop, /new cancel-handoff class", () => {
-		expect(resolver.isInterruptThenDispatch("/stop")).toBe(true);
+	it("interrupt-class routing covers the /new cancel-handoff class", () => {
 		expect(resolver.isInterruptThenDispatch("/new")).toBe(true);
+		expect(resolver.isInterruptThenDispatch("/stop")).toBe(false); // cut: unknown ⇒ never interrupt
 		// Dispatch-class commands bypass queueing; reject-class do not exist
 		// as unresolvable tokens — DEC-005 default only applies to rows that
 		// deliberately omit busy_policy.
-		expect(resolver.shouldBypassActiveSession("/background")).toBe(true);
+		expect(resolver.shouldBypassActiveSession("/restart")).toBe(true);
 		expect(resolver.policyOf("/model")).toBe("reject");
 		expect(resolver.shouldBypassActiveSession("/nope")).toBe(false); // unknown ⇒ queueable text
 	});
@@ -203,8 +277,9 @@ describe("Guard-2 busy coverage — EVERY resolvable token has a policy", () => 
 			}
 		}
 		// Spot-check the surviving handler classes: /model's custom
-		// busy-reject vs the /queue FIFO enqueue handler.
+		// busy-reject vs the /new interrupt and /start special handlers.
 		expect(registry.resolve("model")?.busyHandler).toBe("model");
-		expect(registry.resolve("queue")?.busyHandler).toBe("queue");
+		expect(registry.resolve("new")?.busyHandler).toBe("new");
+		expect(registry.resolve("start")?.busyHandler).toBe("start");
 	});
 });

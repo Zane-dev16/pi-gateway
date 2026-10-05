@@ -129,7 +129,6 @@ function makeTrackedSpawner(state: TrackedState): TaskSpawner {
 
 const TEST_REGISTRY: CommandRegistry = [
 	{ name: "new", aliases: ["reset"], busyPolicy: "interrupt_then_dispatch" },
-	{ name: "stop", busyPolicy: "interrupt_then_dispatch" },
 ];
 
 export interface HandoffHarnessOptions {

@@ -470,7 +470,7 @@ export function makeMattermostShapeFixture(): MattermostShapeFixture {
 				`UPPER @${mm.botUsername.toUpperCase()} case`,
 			); // case-insensitive
 			world.pushPost("!free:fake.example", USER_ID, "free-room chatter");
-			world.pushPost(chan, USER_ID, "/approve now");
+			world.pushPost(chan, USER_ID, "/restart now");
 			mm.addChannel("!dm-alice:fake.example", "D", "");
 			world.pushPost("!dm-alice:fake.example", USER_ID, "dm plain text");
 
@@ -497,14 +497,14 @@ export function makeMattermostShapeFixture(): MattermostShapeFixture {
 			return {
 				unmentionedChannelDropped:
 					!turns.includes("plain chatter") &&
-					!turns.includes("/approve now"),
+					!turns.includes("/restart now"),
 				usernameMentionStripped:
 					turns.some((t) => t.includes("look")) &&
 					turns.every((t) => !t.includes(`@${mm.botUsername}`)),
 				userIdMentionAccepted: turns.some((t) => t.includes("help")),
 				caseInsensitiveMatch: turns.some((t) => t.includes("case")),
 				freeChannelBypass: turns.includes("free-room chatter"),
-				unmentionedCommandDroppedAtGate: !turns.includes("/approve now"),
+				unmentionedCommandDroppedAtGate: !turns.includes("/restart now"),
 				dmExempt: turns.some((t) => t.includes("dm plain text")),
 				whitelistSilentlyDrops: !wl.subject
 					.turns()

@@ -46,16 +46,16 @@ describe("CommandRegistry registration enforcement", () => {
 	});
 
 	it("rejects an alias colliding with another row's alias", () => {
-		const registry = new CommandRegistry([row("background", ["bg"])]);
-		expect(() => registry.register(row("bground", ["bg"]))).toThrowError(
+		const registry = new CommandRegistry([row("export", ["ex"])]);
+		expect(() => registry.register(row("exrow", ["ex"]))).toThrowError(
 			RegistryCollisionError,
 		);
 	});
 
 	it("valid collisions-free registration succeeds and maps every alias", () => {
-		const registry = new CommandRegistry([row("new", ["reset"]), row("stop")]);
+		const registry = new CommandRegistry([row("new", ["reset"]), row("restart")]);
 		expect(registry.lookup().get("reset")).toBe(registry.resolve("new"));
-		expect(registry.lookup().get("stop")).toBe(registry.resolve("stop"));
+		expect(registry.lookup().get("restart")).toBe(registry.resolve("restart"));
 	});
 
 	it("idempotent re-registration of the identical row is allowed only when opted in", () => {
@@ -71,13 +71,13 @@ describe("CommandRegistry registration enforcement", () => {
 describe("resolve_command semantics (commands.py parity)", () => {
 	const registry = CommandRegistry.frozen([
 		row("new", ["reset"]),
-		row("background", ["bg", "btw"]),
+		row("export", ["ex", "ex2"]),
 	]);
 
 	it("resolves names and aliases case-insensitively", () => {
 		expect(registry.resolve("NEW")?.name).toBe("new");
 		expect(registry.resolve("Reset")?.name).toBe("new");
-		expect(registry.resolve("bg")?.name).toBe("background");
+		expect(registry.resolve("ex")?.name).toBe("export");
 	});
 
 	it("strips ALL leading slashes (lstrip('/') parity)", () => {
@@ -95,12 +95,12 @@ describe("resolve_command semantics (commands.py parity)", () => {
 
 	it("busyPolicyOf applies the DEC-005 default to unannotated rows", () => {
 		expect(registry.busyPolicyOf("new")).toBe("reject");
-		expect(registry.busyPolicyOf("background")).toBe("reject");
+		expect(registry.busyPolicyOf("export")).toBe("reject");
 		expect(registry.busyPolicyOf("nope")).toBeNull();
 		const withPolicy = CommandRegistry.frozen([
-			row("queue", ["q"], { busyPolicy: "dispatch", busyHandler: "queue" }),
+			row("restart", ["rs"], { busyPolicy: "dispatch" }),
 		]);
-		expect(withPolicy.busyPolicyOf("q")).toBe("dispatch");
+		expect(withPolicy.busyPolicyOf("rs")).toBe("dispatch");
 	});
 });
 

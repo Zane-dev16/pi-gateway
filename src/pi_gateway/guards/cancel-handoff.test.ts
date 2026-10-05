@@ -158,7 +158,7 @@ describe("cancel-handoff (Lane A, §5.1)", () => {
 		wedged.start(); // parks on the gate…
 
 		const startedAt = Date.now();
-		const dispatch = f.guard.handleMessage(f.text("/stop"), KEY);
+		const dispatch = f.guard.handleMessage(f.text("/new"), KEY);
 		f.holdTurns(false);
 		wedged.cancel(); // …and will IGNORE the flag entirely (wedged parity)
 

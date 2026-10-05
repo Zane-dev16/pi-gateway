@@ -274,7 +274,7 @@ export function parseJsonList(stdout: string): Array<Record<string, unknown>> {
 	);
 }
 
-/** Conformance command registry — same four-command shape as sibling adapters. */
+/** Conformance command registry — same three-command shape as sibling adapters. */
 const BUZZ_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -282,9 +282,8 @@ const BUZZ_REGISTRY: CommandRegistry = [
 		busyPolicy: "interrupt_then_dispatch",
 		busyHandler: "new",
 	},
-	{ name: "stop", busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" },
 	{ name: "model", busyPolicy: "reject", busyHandler: "model" },
-	{ name: "approve", busyPolicy: "dispatch" },
+	{ name: "restart", busyPolicy: "dispatch" },
 ];
 
 function sessionKeyOf(event: IncomingEvent): string {

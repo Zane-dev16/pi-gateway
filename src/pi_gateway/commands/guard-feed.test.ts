@@ -30,12 +30,14 @@ const REGISTRY = new CommandRegistry([
 		busyPolicy: "interrupt_then_dispatch",
 		busyHandler: "new",
 	}),
-	row("stop", { busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" }),
-	row("queue", {
-		aliases: ["q"],
+	row("start", {
+		busyPolicy: "dispatch",
+		busyHandler: "start",
+	}),
+	row("restart", {
+		aliases: ["rs"],
 		argsHint: "<prompt>",
 		busyPolicy: "dispatch",
-		busyHandler: "queue",
 	}),
 	row("model", { busyPolicy: "reject", busyHandler: "model" }),
 	row("title", {}),
@@ -71,7 +73,7 @@ describe("guard L2 machinery fed from THE registry (DEC-005)", () => {
 		await expect(
 			guard.dispatchBusySlashCommand("title", textEvent("/title x"), "k"),
 		).resolves.toBe(
-			"⏳ Agent is running — `/title` can't run mid-turn. Wait for the current response or `/stop` first.",
+			"⏳ Agent is running — `/title` can't run mid-turn. Wait for the current response.",
 		);
 	});
 
@@ -82,7 +84,7 @@ describe("guard L2 machinery fed from THE registry (DEC-005)", () => {
 		);
 		expect(dispatch?.kind).toBe("reject");
 		expect(dispatch?.rejectText).toBe(
-			"Agent is running — wait or /stop first, then switch models.",
+			"Agent is running — wait for the current response, then switch models.",
 		);
 		expect(dispatch?.handlerKey).toBe("model");
 	});
@@ -90,6 +92,6 @@ describe("guard L2 machinery fed from THE registry (DEC-005)", () => {
 	it("alias routing matches ('reset' → /new interrupt class) on registry rows alone", () => {
 		const guard = guardFromRegistry();
 		expect(guard.isInterruptThenDispatch("reset")).toBe(true);
-		expect(guard.resolve("q")?.name).toBe("queue");
+		expect(guard.resolve("rs")?.name).toBe("restart");
 	});
 });

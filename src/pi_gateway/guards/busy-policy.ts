@@ -36,7 +36,8 @@ export interface CommandDef {
 	busyPolicy?: BusyPolicy;
 	/**
 	 * Mid-run variant key (gateway/run.py:_dispatch_busy_slash_command step 1):
-	 * stop/new/queue/steer/goal/start/egress have special busy handlers;
+	 * new/goal/start/egress have special busy handlers (DEC-083 cut the
+	 * stop/queue/steer keys with their rows);
 	 * model/codex-runtime/moa carry command-specific reject texts.
 	 */
 	busyHandler?: string;
@@ -94,7 +95,7 @@ export function shouldBypassActiveSession(
 	return resolveCommand(lookup, rawName) !== null;
 }
 
-/** commands.py:is_interrupt_then_dispatch — Lane A cancel-handoff set (/stop, /new, /reset). */
+/** commands.py:is_interrupt_then_dispatch — Lane A cancel-handoff set (/new, /reset). */
 export function isInterruptThenDispatch(
 	lookup: ReadonlyMap<string, CommandDef>,
 	rawName: string | null | undefined,
@@ -117,16 +118,13 @@ export function bypassCommandNames(registry: CommandRegistry): Set<string> {
 
 /**
  * run.py:_dispatch_busy_slash_command special busy_handler keys (§5.4 table):
- * stop=new-style hard-kill family, queue=FIFO own-turns, steer=between-tool-
- * calls injection, goal=control-verb whitelists, start=platform ping,
- * egress=status formatter.
+ * new=new-style hard-kill family, goal=control-verb whitelists,
+ * start=platform ping, egress=status formatter (DEC-083 cut the
+ * stop/queue/steer keys with their rows).
  */
 export const SPECIAL_BUSY_HANDLERS: ReadonlySet<string> = new Set([
 	"start",
-	"stop",
 	"new",
-	"queue",
-	"steer",
 	"egress",
 	"goal",
 ]);
@@ -141,10 +139,11 @@ export const PREGATE_COMMANDS: ReadonlySet<string> = new Set([
  * (busy_policy="reject" with a busy_handler naming an entry here).
  */
 export const BUSY_REJECT_TEXT: Readonly<Record<string, string>> = {
-	model: "Agent is running — wait or /stop first, then switch models.",
+	model:
+		"Agent is running — wait for the current response, then switch models.",
 	"codex-runtime":
-		"Agent is running — wait or /stop first, then change runtime.",
-	moa: "Agent is running — wait or /stop first, then run /moa.",
+		"Agent is running — wait for the current response, then change runtime.",
+	moa: "Agent is running — wait for the current response, then run /moa.",
 };
 
 /**
@@ -152,7 +151,7 @@ export const BUSY_REJECT_TEXT: Readonly<Record<string, string>> = {
  * is required rather than interrupt+discard (#5057/#6252/#10370).
  */
 export function catchAllBusyRejectText(name: string): string {
-	return `⏳ Agent is running — \`/${name}\` can't run mid-turn. Wait for the current response or \`/stop\` first.`;
+	return `⏳ Agent is running — \`/${name}\` can't run mid-turn. Wait for the current response.`;
 }
 
 export type BusyDispatchKind =

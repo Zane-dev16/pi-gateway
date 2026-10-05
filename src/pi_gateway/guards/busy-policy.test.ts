@@ -31,12 +31,14 @@ const REGISTRY: CommandDef[] = [
 		busyPolicy: "interrupt_then_dispatch",
 		busyHandler: "new",
 	},
-	{ name: "stop", busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" },
-	{ name: "approve", busyPolicy: "dispatch" },
-	{ name: "deny", busyPolicy: "dispatch" },
+	{ name: "restart", busyPolicy: "dispatch" },
 	{ name: "context", busyPolicy: "dispatch" },
 	{ name: "model", busyPolicy: "reject", busyHandler: "model" },
-	{ name: "queue", busyPolicy: "dispatch", busyHandler: "queue" },
+	{
+		name: "start",
+		busyPolicy: "dispatch",
+		busyHandler: "start",
+	},
 ];
 
 const textEvent = (text: string): IncomingEvent => ({
@@ -64,14 +66,14 @@ describe("busy_policy enum and registry resolution (DEC-005)", () => {
 		// @mention stripping lives in the EVENT layer (getCommand), exactly as in
 		// Hermes where MessageEvent.get_command() normalizes before resolution:
 		expect(
-			getCommand({ messageType: "text", text: "/stop@botname args" }),
-		).toBe("stop");
+			getCommand({ messageType: "text", text: "/new@botname args" }),
+		).toBe("new");
 		expect(resolveCommand(lookup, "nosuchcmd")).toBeNull();
 	});
 
 	it("should_bypass covers ANY resolvable command — including reject-policy /model (#5057); unknown /foo does NOT bypass", () => {
 		const lookup = buildCommandLookup(REGISTRY);
-		expect(shouldBypassActiveSession(lookup, "approve")).toBe(true);
+		expect(shouldBypassActiveSession(lookup, "restart")).toBe(true);
 		expect(shouldBypassActiveSession(lookup, "model")).toBe(true);
 		expect(shouldBypassActiveSession(lookup, "reset")).toBe(true);
 		expect(shouldBypassActiveSession(lookup, "foo")).toBe(false);
@@ -82,13 +84,14 @@ describe("busy_policy enum and registry resolution (DEC-005)", () => {
 		const lookup = buildCommandLookup(REGISTRY);
 		expect(isInterruptThenDispatch(lookup, "new")).toBe(true);
 		expect(isInterruptThenDispatch(lookup, "reset")).toBe(true);
-		expect(isInterruptThenDispatch(lookup, "stop")).toBe(true);
-		expect(isInterruptThenDispatch(lookup, "approve")).toBe(false);
+		expect(isInterruptThenDispatch(lookup, "restart")).toBe(false);
+		expect(isInterruptThenDispatch(lookup, "stop")).toBe(false); // cut: unknown ⇒ never interrupt
 		expect(isInterruptThenDispatch(lookup, "model")).toBe(false);
 
 		const names = bypassCommandNames(REGISTRY);
 		expect(names.has("new")).toBe(true);
-		expect(names.has("approve")).toBe(true);
+		expect(names.has("restart")).toBe(true);
+		expect(names.has("start")).toBe(true);
 		expect(names.has("model")).toBe(false); // reject rows never in bypass set
 	});
 
@@ -97,12 +100,16 @@ describe("busy_policy enum and registry resolution (DEC-005)", () => {
 		expect(resolveBusyDispatch(lookup, "context")?.kind).toBe("pregate");
 		// /status is cut: unknown names resolve null and queue as text.
 		expect(resolveBusyDispatch(lookup, "status")).toBeNull();
-		expect(resolveBusyDispatch(lookup, "queue")?.kind).toBe("special");
-		expect(resolveBusyDispatch(lookup, "approve")?.kind).toBe("plain");
+		expect(resolveBusyDispatch(lookup, "start")?.kind).toBe("special");
+		expect(resolveBusyDispatch(lookup, "restart")?.kind).toBe("plain");
+		// Cut rows resolve null and queue as text.
+		expect(resolveBusyDispatch(lookup, "queue")).toBeNull();
+		expect(resolveBusyDispatch(lookup, "stop")).toBeNull();
+		expect(resolveBusyDispatch(lookup, "approve")).toBeNull();
 		const model = resolveBusyDispatch(lookup, "model");
 		expect(model?.kind).toBe("reject");
 		expect(model?.rejectText).toBe(
-			"Agent is running — wait or /stop first, then switch models.",
+			"Agent is running — wait for the current response, then switch models.",
 		);
 
 		// Catch-all text is BYTE-STABLE:
@@ -113,7 +120,7 @@ describe("busy_policy enum and registry resolution (DEC-005)", () => {
 		);
 		expect(resolved?.rejectText).toBe(catchAllBusyRejectText("frobnicate"));
 		expect(resolved?.rejectText).toBe(
-			"⏳ Agent is running — `/frobnicate` can't run mid-turn. Wait for the current response or `/stop` first.",
+			"⏳ Agent is running — `/frobnicate` can't run mid-turn. Wait for the current response.",
 		);
 	});
 });
@@ -255,15 +262,11 @@ describe("runner-side FIFO overflow (§3.1, #28503)", () => {
 		const f = makeRunner({
 			specialHandlers: {
 				new: () => "fresh session started",
-				queue: (ev) => {
-					calls.push(`fifo:${ev.text}`);
-					f.runner.enqueueFifo(KEY, ev);
-					return `queued ${String(ev.text)}`;
-				},
+				start: () => "start ping acked",
 			},
 			plainHandlers: {
 				context: () => "all agents idle",
-				approve: () => "approved",
+				restart: () => "restarting",
 			},
 		});
 
@@ -299,15 +302,22 @@ describe("runner-side FIFO overflow (§3.1, #28503)", () => {
 			),
 		).toBeNull();
 
-		// /queue special enqueues its OWN turn — messages are NOT merged:
+		// /start special dispatches inline mid-run (surviving special key):
 		expect(
 			await f.runner.dispatchBusySlashCommand(
-				"queue",
-				textEvent("/queue hello"),
+				"start",
+				textEvent("/start"),
 				KEY,
 			),
-		).toBe("queued /queue hello");
-		expect(f.runner.queueDepth(KEY)).toBe(1);
+		).toBe("start ping acked");
+		// /restart plain dispatches inline mid-run (surviving dispatch row):
+		expect(
+			await f.runner.dispatchBusySlashCommand(
+				"restart",
+				textEvent("/restart"),
+				KEY,
+			),
+		).toBe("restarting");
 	});
 });
 

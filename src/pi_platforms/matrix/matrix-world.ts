@@ -571,8 +571,8 @@ export function makeMatrixShapeFixture(): MatrixShapeFixture {
 			world.pushMessage(room, ALICE, "this pi-botx thing is odd");
 			// Free-response channel needs no mention.
 			world.pushMessage("!free:fake.example", ALICE, "free-room chatter");
-			// Commands bypass gating ("/approve").
-			world.pushMessage(room, ALICE, "/approve");
+			// Commands bypass gating ("/restart").
+			world.pushMessage(room, ALICE, "/restart");
 			// DM rooms exempt entirely (member_count ≤ 2 classification).
 			hs.addRoom("!dm-alice:fake.example", { memberCount: 2 });
 			world.pushMessage("!dm-alice:fake.example", ALICE, "dm plain text");
@@ -592,7 +592,7 @@ export function makeMatrixShapeFixture(): MatrixShapeFixture {
 
 			await eventually(
 				() =>
-					subject.turns().includes("/approve") &&
+					subject.turns().includes("/restart") &&
 					subject.turns().includes("dm plain text") &&
 					subject.turns().includes("yo pi-bot help me out"),
 				4_000,
@@ -611,7 +611,7 @@ export function makeMatrixShapeFixture(): MatrixShapeFixture {
 					t.includes("pi-botx"),
 				),
 				freeRoomBypass: turns.includes("free-room chatter"),
-				commandBypass: turns.includes("/approve"),
+				commandBypass: turns.includes("/restart"),
 				dmExempt: turns.includes("dm plain text"),
 				whitelistSilentlyDrops: !wl.subject
 					.turns()

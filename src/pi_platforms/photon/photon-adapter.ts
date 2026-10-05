@@ -382,13 +382,8 @@ const PHOTON_REGISTRY: CommandRegistry = [
 		busyPolicy: "interrupt_then_dispatch" as const,
 		busyHandler: "new",
 	},
-	{
-		name: "stop",
-		busyPolicy: "interrupt_then_dispatch" as const,
-		busyHandler: "stop",
-	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
-	{ name: "approve", busyPolicy: "dispatch" as const },
+	{ name: "restart", busyPolicy: "dispatch" as const },
 ];
 
 export class PhotonAdapter extends BasePlatformAdapter {

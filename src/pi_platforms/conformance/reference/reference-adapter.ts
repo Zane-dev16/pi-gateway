@@ -43,13 +43,8 @@ export const REFERENCE_REGISTRY = [
 		busyPolicy: "interrupt_then_dispatch" as const,
 		busyHandler: "new",
 	},
-	{
-		name: "stop",
-		busyPolicy: "interrupt_then_dispatch" as const,
-		busyHandler: "stop",
-	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
-	{ name: "approve", busyPolicy: "dispatch" as const },
+	{ name: "restart", busyPolicy: "dispatch" as const },
 ];
 
 const REQUIRED_SECRET = "REFERENCE_BOT_TOKEN";

@@ -123,7 +123,7 @@ import {
 } from "./block-cards.js";
 import type { SlackInteractivePayload } from "./fake-socket-mode.js";
 
-/** Slack's four-command conformance registry (identical to the ws shape). */
+/** Slack's three-command conformance registry (identical to the ws shape). */
 export const SLACK_REGISTRY: CommandRegistry = [
 	{
 		name: "new",
@@ -131,13 +131,8 @@ export const SLACK_REGISTRY: CommandRegistry = [
 		busyPolicy: "interrupt_then_dispatch" as const,
 		busyHandler: "new",
 	},
-	{
-		name: "stop",
-		busyPolicy: "interrupt_then_dispatch" as const,
-		busyHandler: "stop",
-	},
 	{ name: "model", busyPolicy: "reject" as const, busyHandler: "model" },
-	{ name: "approve", busyPolicy: "dispatch" as const },
+	{ name: "restart", busyPolicy: "dispatch" as const },
 ];
 
 export interface SlackAdapterDeps extends PersistentWsAdapterDeps {

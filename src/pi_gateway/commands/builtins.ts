@@ -99,7 +99,9 @@ function hostRows(): CommandDef[] {
 /**
  * Gateway-only survivors: real gateway machinery with no host meaning.
  * Every row here must name its executor owner in the comment, or it does
- * not ship (DEC-078: no inert rows).
+ * not ship (DEC-078: no inert rows). DEC-083 cut thirteen rows
+ * (queue, steer, background, agents, stop, pause, approve, deny, sethome,
+ * sessions, topic, platform, version); the five below are the survivors.
  */
 const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 	{
@@ -109,90 +111,6 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		gatewayOnly: true,
 		busyPolicy: "dispatch",
 		busyHandler: "start",
-	},
-	{
-		name: "topic",
-		description: "Enable or inspect Telegram DM topic sessions",
-		category: "Session",
-		gatewayOnly: true,
-		argsHint: "[off|help|session-id]",
-	},
-	{
-		name: "stop",
-		description: "Interrupt the running turn",
-		category: "Session",
-		busyPolicy: "interrupt_then_dispatch",
-		busyHandler: "stop",
-	},
-	{
-		name: "pause",
-		description:
-			"Pause new work globally (emergency stop); '/pause off' resumes",
-		category: "Session",
-		gatewayOnly: true,
-		argsHint: "[reason | off]",
-		busyPolicy: "dispatch",
-	},
-	{
-		name: "approve",
-		description: "Approve a pending dangerous command",
-		category: "Session",
-		gatewayOnly: true,
-		argsHint: "[session|always]",
-		busyPolicy: "dispatch",
-	},
-	{
-		name: "deny",
-		description: "Deny a pending dangerous command (optionally with a reason)",
-		category: "Session",
-		gatewayOnly: true,
-		argsHint: "[all] [reason]",
-		busyPolicy: "dispatch",
-	},
-	{
-		name: "background",
-		description: "Run a prompt in the background",
-		category: "Session",
-		aliases: ["bg", "btw"],
-		argsHint: "<prompt>",
-		busyPolicy: "dispatch",
-	},
-	{
-		name: "agents",
-		description: "Show active agents and running tasks",
-		category: "Session",
-		aliases: ["tasks"],
-		busyPolicy: "dispatch",
-	},
-	{
-		name: "queue",
-		description: "Queue a prompt for the next turn (doesn't interrupt)",
-		category: "Session",
-		aliases: ["q"],
-		argsHint: "<prompt>",
-		busyPolicy: "dispatch",
-		busyHandler: "queue",
-	},
-	{
-		name: "steer",
-		description:
-			"Inject a message after the next tool call without interrupting",
-		category: "Session",
-		argsHint: "<prompt>",
-		busyPolicy: "dispatch",
-		busyHandler: "steer",
-	},
-	{
-		name: "sethome",
-		description: "Set this chat as the home channel",
-		category: "Session",
-		gatewayOnly: true,
-		aliases: ["set-home"],
-	},
-	{
-		name: "sessions",
-		description: "Browse and resume previous sessions",
-		category: "Session",
 	},
 	{
 		name: "switch-path",
@@ -210,14 +128,6 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		argsHint: "<path>",
 	},
 	{
-		name: "platform",
-		description: "Pause, resume, or list a failing gateway platform",
-		category: "Info",
-		gatewayOnly: true,
-		argsHint: "<pause|resume|list> [name]",
-		subcommands: ["pause", "resume", "list"],
-	},
-	{
 		name: "help",
 		description:
 			"Show available commands (/help skills lists skill commands, /help <text> filters)",
@@ -233,19 +143,11 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		gatewayOnly: true,
 		busyPolicy: "dispatch",
 	},
-	{
-		name: "version",
-		description: "Show gateway version",
-		category: "Info",
-		aliases: ["v"],
-		busyPolicy: "dispatch",
-		execute: "version",
-	},
 ];
 
 /**
  * The shipped census: host-derived rows in host order, then gateway-only
- * rows. Count = host builtins + survivors (24 + 18 = 42 today); the count
+ * rows. Count = host builtins + survivors (24 + 5 = 29 today); the count
  * test pins the sum shape, not a Hermes number.
  */
 export const BUILTIN_COMMAND_ROWS: readonly CommandDef[] = [

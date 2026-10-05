@@ -31,10 +31,10 @@ const BUILTIN: CommandDef[] = [
 		aliases: ["reset"],
 		argsHint: "[name]",
 		busyPolicy: "interrupt_then_dispatch",
+		busyHandler: "new",
 	}),
-	row("stop", { busyPolicy: "interrupt_then_dispatch", busyHandler: "stop" }),
-	row("background", {
-		aliases: ["bg", "btw"],
+	row("export", {
+		aliases: ["ex", "ex2"],
 		argsHint: "<prompt>",
 		busyPolicy: "dispatch",
 	}),
