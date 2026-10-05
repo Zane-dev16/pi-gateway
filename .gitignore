@@ -4,4 +4,4 @@ node_modules/
 reports/
 *.tsbuildinfo
 .vite/
-.agents/skills/verify-pi-gateway/artifacts/
+.agents/
