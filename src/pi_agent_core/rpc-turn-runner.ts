@@ -51,6 +51,12 @@ export interface TurnClient extends ProcClient {
  * tests inject fakes. Checked per session command at the boundary:
  * a missing method is a composition bug, reported as an error outcome.
  */
+/** One host command row as returned by get_commands (no model call). */
+export interface HostCommandRow {
+	readonly name: string;
+	readonly description: string;
+}
+
 export interface SessionRpcClient extends TurnClient {
 	newSession(parentSession?: string): Promise<unknown>;
 	switchSession(sessionPath: string): Promise<unknown>;
@@ -65,6 +71,7 @@ export interface SessionRpcClient extends TurnClient {
 	getEntries(
 		since?: string,
 	): Promise<{ entries: Array<unknown>; leafId: unknown }>;
+	getCommands(): Promise<HostCommandRow[]>;
 }
 
 /** Parse the turn client for session capability. Null when any native
@@ -78,7 +85,8 @@ function asSessionClient(client: TurnClient): SessionRpcClient | null {
 		typeof candidate.setModel !== "function" ||
 		typeof candidate.getAvailableModels !== "function" ||
 		typeof candidate.compact !== "function" ||
-		typeof candidate.getEntries !== "function"
+		typeof candidate.getEntries !== "function" ||
+		typeof candidate.getCommands !== "function"
 	) {
 		return null;
 	}
@@ -104,13 +112,15 @@ export function parseSlashCommand(
 
 /** Native session commands: exactly these ride RPC, never prompt text.
  * Every other slash word falls through to the host prompt path, where the
- * child loop owns it natively. One deterministic reply path per name. */
+ * child loop owns it natively. One deterministic reply path per name.
+ * Help rides get_commands so it answers with zero model calls. */
 const NATIVE_SESSION_COMMANDS = new Set([
 	"new",
 	"resume",
 	"model",
 	"compact",
 	"export",
+	"help",
 ]);
 
 /** Escape once for HTML text content (order matters: & first). */
@@ -397,6 +407,9 @@ export class RpcTurnRunner {
 				case "export":
 					reply = await this.runExport(session, args);
 					break;
+				case "help":
+					reply = await this.runHelp(session, args);
+					break;
 				default:
 					return await this.fail(
 						request.routingKey,
@@ -544,6 +557,27 @@ export class RpcTurnRunner {
 		} catch (error) {
 			return `Compaction failed: ${RpcTurnRunner.errorText(error)}`;
 		}
+	}
+
+	/** Host command census as `/name` lines. Zero model calls.
+	 * Bare lists all. `skills` lists skill rows only. Any other filter
+	 * matches the substring against name plus description. */
+	private async runHelp(
+		client: SessionRpcClient,
+		args: string,
+	): Promise<string> {
+		const commands = await client.getCommands();
+		const filter = args.trim().toLowerCase();
+		const rows = commands.filter((c) => {
+			if (filter === "") return true;
+			if (filter === "skills") return c.name.startsWith("skill:");
+			return (
+				c.name.toLowerCase().includes(filter) ||
+				c.description.toLowerCase().includes(filter)
+			);
+		});
+		if (rows.length === 0) return "No commands match.";
+		return rows.map((c) => `\`/${c.name}\` -- ${c.description}`).join("\n");
 	}
 
 	/** Branch entries as inline JSONL, or minimal HTML on html disposition. */

@@ -45,6 +45,13 @@ class FakeTurnClient implements TurnClient {
 	setModelCalls: Array<{ provider: string; id: string }> = [];
 	compactCalls: Array<string | undefined> = [];
 	entriesCalls = 0;
+	commandsCalls = 0;
+	hostCommands: Array<{ name: string; description: string }> = [
+		{ name: "model", description: "Select model" },
+		{ name: "compact", description: "Compact context" },
+		{ name: "skill:notes", description: "Skill notes" },
+	];
+	failCommands: string | null = null;
 	failNew: string | null = null;
 	failSwitch: string | null = null;
 	failSetModel: string | null = null;
@@ -159,6 +166,14 @@ class FakeTurnClient implements TurnClient {
 		this.entriesCalls += 1;
 		if (this.failEntries !== null) throw new Error(this.failEntries);
 		return { entries: [...this.branchEntries], leafId: "leaf-1" };
+	}
+
+	async getCommands(): Promise<
+		Array<{ name: string; description: string }>
+	> {
+		this.commandsCalls += 1;
+		if (this.failCommands !== null) throw new Error(this.failCommands);
+		return this.hostCommands.map((c) => ({ ...c }));
 	}
 }
 
@@ -344,7 +359,7 @@ describe("RpcTurnRunner plain turn", () => {
 		const outcome = await runner.handleTurn({
 			sessionId: "sess-1",
 			routingKey: "chat-1",
-			text: "/help",
+			text: "/session",
 		});
 
 		expect(outcome.exitReason).toBe("finalized");
@@ -649,6 +664,60 @@ describe("RpcTurnRunner native sessions", () => {
 		expect(outcome.exitReason).toBe("finalized");
 		expect(outcome.finalText).toContain("<title>Session export</title>");
 		expect(outcome.finalText).toContain("hello");
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("/help lists host commands without a prompt", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/help",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"`/model` -- Select model\n`/compact` -- Compact context\n`/skill:notes` -- Skill notes",
+		);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.commandsCalls).toBe(1);
+	});
+
+	it("/help skills lists skill rows only", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/help skills",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("`/skill:notes` -- Skill notes");
+		expect(fake.promptCalls).toEqual([]);
+	});
+
+	it("/help with no match renders the empty notice", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fake = new FakeTurnClient();
+		const { runner } = makeRunner([fake], s);
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/help zzz-no-such",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("No commands match.");
 		expect(fake.promptCalls).toEqual([]);
 	});
 
