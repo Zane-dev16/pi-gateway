@@ -25,6 +25,8 @@ import {
 	composeGatewayLifecycle,
 	type ComposedGateway,
 } from "../src/entrypoints/gateway-run.js";
+import type { TurnRunnerFactory } from "../src/entrypoints/guard-wiring.js";
+import type { ChatProcRegistry } from "../src/pi_agent_core/chat-proc-registry.js";
 import { resolvePiHome } from "../src/pi_home.js";
 import {
 	PI_GATEWAY_PLATFORMS_ENV,
@@ -38,6 +40,11 @@ import {
 export default function piGatewayExtension(pi: ExtensionAPI) {
 	let gateway: ComposedGateway | null = null;
 	let starting = false;
+	// DEC-084: one shared per-chat process registry per extension process.
+	// Mirrors the standalone runCommand composition (pi-gateway.ts): the
+	// runner closes over the lifecycle-owned stage-6 store and children
+	// share the gateway home. Lazy so platform-less boots load nothing.
+	let chatRegistry: ChatProcRegistry | null = null;
 
 	async function startGateway(home?: string): Promise<string> {
 		if (gateway || starting)
@@ -51,12 +58,29 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			const platforms = resolveConfiguredPlatforms(
 				process.env[PI_GATEWAY_PLATFORMS_ENV],
 			);
-			// DEC-084: embedded turn factory dissolved (RPC children own turns
-			// next). Platforms compose without a factory until Todo 3 lands.
+			// DEC-084: embedded turn factory dissolved; per-chat RPC children
+			// own turns through the production factory below.
 			const resolvedHome = home ?? resolvePiHome();
+			let turnRunnerFactory: TurnRunnerFactory | undefined;
+			if (platforms.length > 0) {
+				const [{ ChatProcRegistry: Registry }, { RpcTurnRunner }] =
+					await Promise.all([
+						import("../src/pi_agent_core/chat-proc-registry.js"),
+						import("../src/pi_agent_core/rpc-turn-runner.js"),
+					]);
+				if (chatRegistry === null) chatRegistry = new Registry();
+				const registry = chatRegistry;
+				turnRunnerFactory = ({ store }) =>
+					new RpcTurnRunner({
+						registry,
+						resolveHome: () => resolvedHome,
+						...(store !== null ? { store } : {}),
+					});
+			}
 			gateway = composeGatewayLifecycle({
 				home: resolvedHome,
 				platforms,
+				...(turnRunnerFactory !== undefined ? { turnRunnerFactory } : {}),
 			});
 			const res = await gateway.lifecycle.startup();
 			if (!res.ok) {
