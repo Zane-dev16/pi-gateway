@@ -1,4 +1,40 @@
-# PROGRESS — live swap to RPC-rewrite build (2026-10-07)
+# PROGRESS — live gateway answers on RPC build (2026-10-07)
+
+## Fix `1131270`: extension boot composes the production turnRunnerFactory
+
+- Root cause: `extensions/pi-gateway.ts` composed
+  `composeGatewayLifecycle({home, platforms})` with no `turnRunnerFactory`
+  while the standalone CLI composed one. Stage 9 connected telegram
+  `guard_unwired` and ingress kept the `no guard attached` throw, so the
+  bot answered nothing on build `5640884`.
+- Fix: one shared `ChatProcRegistry` per extension process plus one
+  `RpcTurnRunner` closing over the lifecycle-owned stage-6 store, mirroring
+  `runCommand`. Children share the gateway home. Lazy import keeps
+  platform-less boots adapter-free. No new data shape: `TurnRequest`
+  (sessionId, routingKey, text) in, `TurnOutcome` out.
+- Checks: `tsc` clean, layering plus secret-scope clean, targeted suites
+  (rpc-turn-runner plus entrypoints, 69 tests) green, full suite green
+  (191 files, 2543 tests). Committed as `1131270`, pushed to origin.
+
+## Swap `5640884` → `1131270` plus live proof (2026-10-07)
+
+- Installed checkout fast-forward only, `5640884` → `1131270`. Old pid
+  `877020` SIGTERM'd, exited cleanly, state `planned_stop`. Relaunched on
+  the identical production boot path with the snapshotted live env (held in
+  memory, never printed). New pid `893992`, `gateway READY`, code_sha
+  `113127069a`, `platforms=[telegram]`. Log line: `platform adapter
+  telegram guard wired` (was `guard_unwired`). Zero `409`/conflict lines.
+- Live Telegram proof (user Irell @irellzane id=8469032365 → ZanishPiBot):
+  `/help` answered natively via `get_commands` (msgs 3379–3386, opens clean
+  with `` `/copyfile` `` head line, MarkdownV2 intact); plain turn `proof
+  ping reply with the word banana` answered `banana` (msg 3388, model turn
+  NOT policy-blocked); `state.db` messages 30 → 34 with user plus assistant
+  rows under session `tg:8469032365`; `/new` answered `Started a new
+  session (01a115d6-dcb5-7672-afdf-592c5805ecdb).` (msg 3390, native
+  reset). No blockers. MarkdownV2 comment: help opens clean, no escape
+  garbage.
+
+## Archive: live swap to RPC-rewrite build (2026-10-07)
 
 ## Swap
 
