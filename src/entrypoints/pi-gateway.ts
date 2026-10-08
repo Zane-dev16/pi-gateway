@@ -173,7 +173,8 @@ export async function runCommand(
 				// Children share the gateway home, so file auth plus the
 				// PI_PROVIDER and PI_MODEL env inherit with zero secret
 				// copies. Per-chat working dirs ride the runner-owned
-				// cwd map (DEC-085); discovery reads <home>/sessions.
+				// cwd map (DEC-085); discovery reads the pi agent dir
+				// where pi itself writes sessions, never the gateway home.
 				const [
 					{ ChatProcRegistry },
 					{ RpcTurnRunner },
@@ -181,6 +182,7 @@ export async function runCommand(
 						buildDiscoveryIndex,
 						listDiscoveryPaths,
 						mostRecentSessionAtPath,
+						resolveAgentDir,
 					},
 				] = [
 					await import("../pi_agent_core/chat-proc-registry.js"),
@@ -189,15 +191,16 @@ export async function runCommand(
 				];
 				const registry = new ChatProcRegistry();
 				const home = opts.home;
+				const agentDir = resolveAgentDir();
 				input.turnRunnerFactory = ({ store }) =>
 					new RpcTurnRunner({
 						registry,
 						resolveHome: () => home,
-						listDiscoveryPaths: (homeDir) =>
-							listDiscoveryPaths(buildDiscoveryIndex(homeDir)),
-						findSessionFileAtPath: (homeDir, rawPath) =>
+						listDiscoveryPaths: () =>
+							listDiscoveryPaths(buildDiscoveryIndex(agentDir)),
+						findSessionFileAtPath: (_homeDir, rawPath) =>
 							mostRecentSessionAtPath(
-								buildDiscoveryIndex(homeDir),
+								buildDiscoveryIndex(agentDir),
 								rawPath,
 							)?.file ?? null,
 						...(store !== null ? { store } : {}),

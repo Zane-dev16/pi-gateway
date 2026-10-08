@@ -12,6 +12,7 @@
 // only the lock-winning adoption path may load entries).
 
 import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 /**
@@ -140,6 +141,25 @@ function mtimeMsOf(filePath: string): number {
 	} catch {
 		return 0;
 	}
+}
+
+/**
+ * pi agent dir, mirroring the host rule exactly
+ * (`config.js:getAgentDir` in the installed pi): `PI_CODING_AGENT_DIR`
+ * when set, else `<os home>/.pi/agent`. Discovery scans for sessions
+ * where pi itself writes them; that root never follows PI_HOME.
+ */
+export function resolveAgentDir(): string {
+	const override = process.env["PI_CODING_AGENT_DIR"];
+	if (override) return expandAgentDir(override);
+	return join(homedir(), ".pi", "agent");
+}
+
+/** Tilde expansion mirroring the host normalizePath rule. */
+function expandAgentDir(raw: string): string {
+	if (raw === "~") return homedir();
+	if (raw.startsWith("~/")) return join(homedir(), raw.slice(2));
+	return raw;
 }
 
 /**

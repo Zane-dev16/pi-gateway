@@ -1,5 +1,28 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Verify tip plus fix DEC-087 discovery root (2026-10-08)
+
+- Root cause: the production turn factory rooted session discovery at the
+  gateway home (`<home>/sessions`), but pi writes sessions under its agent
+  dir (`<os home>/.pi/agent/sessions`, `PI_CODING_AGENT_DIR` override),
+  measured this session via the installed pi `config.js:getAgentDir` plus
+  real child session files. Bare `/switch-path` always reported none and
+  `/switch-path <path>` never rebound, always starting fresh.
+- Fix: `discovery.ts:resolveAgentDir` mirrors the host rule exactly
+  (env override else os-home agent dir with tilde expansion); the factory
+  in `entrypoints/pi-gateway.ts` resolves it once for both discovery
+  closures. Three tests pin override plus tilde plus fallback.
+- Verify (disposable homes only, live read-only, live pid undisturbed):
+  boot READY plus HEALTHY, CLI status running plus stop `planned_stop`,
+  headless Telegram 44 green, real-registry probe under an isolated
+  `PI_CODING_AGENT_DIR`: `/help` finalized, plain-turn echo with 12 db
+  rows, native `/new`, bare list with real paths, `/new-path` re-root
+  plus `/switch-path` rebind to the resumed session with child cwd moved
+  both ways. Gates plus full suite green (193 files, 2571 tests).
+  Artifacts under `verify-tip/`. Note: the doctor helper still expects
+  the DEC-084-dissolved `session_turn_leases` table and reports
+  UNHEALTHY on healthy tip homes; health was proven direct.
+
 ## Fix `1131270`: extension boot composes the production turnRunnerFactory
 
 - Root cause: `extensions/pi-gateway.ts` composed

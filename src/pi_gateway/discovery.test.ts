@@ -11,6 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -20,6 +21,7 @@ import {
 	listDiscoveryPaths,
 	mostRecentSessionAtPath,
 	readDiscoveryHeader,
+	resolveAgentDir,
 } from "./discovery.js";
 
 let agentDir: string;
@@ -169,5 +171,34 @@ describe("bindingFromRoutingEntry", () => {
 			chatKey: "agent:main:telegram:dm:42",
 			hostSessionId: "host-session-1",
 		});
+	});
+});
+
+describe("resolveAgentDir", () => {
+	const ENV = "PI_CODING_AGENT_DIR";
+	let saved: string | undefined;
+
+	beforeEach(() => {
+		saved = process.env[ENV];
+	});
+
+	afterEach(() => {
+		if (saved === undefined) delete process.env[ENV];
+		else process.env[ENV] = saved;
+	});
+
+	it("honors the override env dir", () => {
+		process.env[ENV] = "/tmp/pi-verify-agentdir";
+		expect(resolveAgentDir()).toBe("/tmp/pi-verify-agentdir");
+	});
+
+	it("expands a leading tilde against the os home", () => {
+		process.env[ENV] = "~/pi-agent";
+		expect(resolveAgentDir()).toBe(join(homedir(), "pi-agent"));
+	});
+
+	it("falls back to the os home agent dir when unset", () => {
+		delete process.env[ENV];
+		expect(resolveAgentDir()).toBe(join(homedir(), ".pi", "agent"));
 	});
 });
