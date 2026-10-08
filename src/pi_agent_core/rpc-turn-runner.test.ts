@@ -784,3 +784,220 @@ describe("RpcTurnRunner native sessions", () => {
 		expect(html).not.toContain("<b>hi</b>");
 	});
 });
+
+describe("RpcTurnRunner path commands (DEC-085)", () => {
+	function makePathRunner(
+		fakes: FakeTurnClient[],
+		s: StateStore | null,
+		seams: { paths?: string[]; sessionFile?: string | null } = {},
+	) {
+		const spawnedCwd: Array<string | undefined> = [];
+		let calls = 0;
+		const registry = new ChatProcRegistry({
+			makeClient: (opts) => {
+				spawnedCwd.push(opts.cwd);
+				const fake = fakes[calls];
+				calls += 1;
+				if (fake === undefined) throw new Error("no fake left");
+				return fake;
+			},
+		});
+		const runner = new RpcTurnRunner({
+			registry,
+			resolveHome: () => "/tmp/fake-home",
+			listDiscoveryPaths: () => seams.paths ?? [],
+			findSessionFileAtPath: () => seams.sessionFile ?? null,
+			store: s,
+		});
+		return { registry, runner, spawnedCwd };
+	}
+
+	it("/switch-path stops the old child, spawns at the target, and rebinds", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const first = new FakeTurnClient();
+		const second = new FakeTurnClient();
+		const { registry, runner, spawnedCwd } = makePathRunner(
+			[first, second],
+			s,
+			{
+				paths: ["/proj/a"],
+				sessionFile: "/home/sessions/x/s1.jsonl",
+			},
+		);
+
+		const plain = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "hi",
+		});
+		expect(plain.exitReason).toBe("finalized");
+		expect(spawnedCwd).toEqual(["/tmp/fake-home"]);
+		expect(first.started).toBe(true);
+
+		const moved = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path /proj/a",
+		});
+		expect(moved.exitReason).toBe("finalized");
+		expect(moved.finalText).toBe(
+			"Switched to /proj/a. Resumed session (resumed-/home/sessions/x/s1.jsonl).",
+		);
+		expect(first.started).toBe(false);
+		expect(spawnedCwd).toEqual(["/tmp/fake-home", "/proj/a"]);
+		expect(registry.get("chat-1")?.spawnOpts.cwd).toBe("/proj/a");
+		expect(second.switchCalls).toEqual(["/home/sessions/x/s1.jsonl"]);
+		expect(second.promptCalls).toEqual([]);
+		expect(registry.get("chat-1")?.state).toBe("ready");
+
+		const again = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "hi again",
+		});
+		expect(again.finalText).toBe("hello back");
+		expect(spawnedCwd).toEqual(["/tmp/fake-home", "/proj/a"]);
+		expect(second.promptCalls).toEqual(["hi again"]);
+	});
+
+	it("/new_path spawns at the target with a fresh session and no rebind", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const fresh = new FakeTurnClient();
+		const { runner, spawnedCwd } = makePathRunner([fresh], s, {
+			sessionFile: "/home/sessions/x/s9.jsonl",
+		});
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new_path /proj/b",
+		});
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Started a fresh session (host-session-2) under /proj/b.",
+		);
+		expect(spawnedCwd).toEqual(["/proj/b"]);
+		expect(fresh.newSessionCalls).toBe(1);
+		expect(fresh.switchCalls).toEqual([]);
+		expect(fresh.promptCalls).toEqual([]);
+	});
+
+	it("bare /switch-path lists paths without spawning a child", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const { registry, runner, spawnedCwd } = makePathRunner([], s, {
+			paths: ["/proj/a", "/proj/b"],
+		});
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path",
+		});
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Paths holding pi sessions:\n/proj/a\n/proj/b",
+		);
+		expect(spawnedCwd).toEqual([]);
+		expect(registry.size).toBe(0);
+
+		const rows = s.listMessages("sess-1");
+		expect(rows.map((r) => [r.role, r.content])).toEqual([
+			["user", "/switch-path"],
+			["assistant", "Paths holding pi sessions:\n/proj/a\n/proj/b"],
+		]);
+	});
+
+	it("bare /switch-path with no paths reports none", async () => {
+		const { runner, spawnedCwd } = makePathRunner([], null, { paths: [] });
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path",
+		});
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("No paths holding pi sessions.");
+		expect(spawnedCwd).toEqual([]);
+	});
+
+	it("bare /new-path renders usage without spawning", async () => {
+		const { runner, spawnedCwd } = makePathRunner([], null);
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new-path",
+		});
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Usage: /new-path <path> — starts a fresh session under that path.",
+		);
+		expect(spawnedCwd).toEqual([]);
+	});
+
+	it("/switch-path with no session at the target still moves and starts fresh", async () => {
+		const second = new FakeTurnClient();
+		const { runner, spawnedCwd } = makePathRunner([second], null, {
+			sessionFile: null,
+		});
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path /proj/empty",
+		});
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe(
+			"Switched to /proj/empty. No sessions there yet — starting fresh.",
+		);
+		expect(spawnedCwd).toEqual(["/proj/empty"]);
+		expect(second.switchCalls).toEqual([]);
+		expect(second.newSessionCalls).toBe(0);
+	});
+
+	it("relative targets resolve against the current chat cwd", async () => {
+		const a = new FakeTurnClient();
+		const b = new FakeTurnClient();
+		const { runner, spawnedCwd } = makePathRunner([a, b], null, {
+			sessionFile: null,
+		});
+		await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path /proj/a",
+		});
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/switch-path sub",
+		});
+		expect(outcome.finalText).toBe(
+			"Switched to /proj/a/sub. No sessions there yet — starting fresh.",
+		);
+		expect(spawnedCwd).toEqual(["/proj/a", "/proj/a/sub"]);
+	});
+
+	it("a path switch while busy fails fast without stopping the child", async () => {
+		const fake = new FakeTurnClient();
+		fake.gate = () => {};
+		const { runner } = makePathRunner([fake], null);
+
+		const first = runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "one",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const second = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/new-path /proj/b",
+		});
+		fake.gate?.();
+		await first;
+
+		expect(second.exitReason).toBe("error");
+		expect(second.errorMessage).toBe("turn already in progress for this chat");
+		expect(fake.started).toBe(true);
+	});
+});

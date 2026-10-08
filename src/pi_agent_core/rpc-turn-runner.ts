@@ -12,6 +12,7 @@
 // to the optional sink. Interim streaming edits to chat surfaces are future
 // work: the obligation path stays final-text, same as the dissolved runner.
 
+import { resolve } from "node:path";
 import type {
 	ChatProcRegistry,
 	ChatProcSpawnOpts,
@@ -113,7 +114,9 @@ export function parseSlashCommand(
 /** Native session commands: exactly these ride RPC, never prompt text.
  * Every other slash word falls through to the host prompt path, where the
  * child loop owns it natively. One deterministic reply path per name.
- * Help rides get_commands so it answers with zero model calls. */
+ * Help rides get_commands so it answers with zero model calls. Path
+ * commands live in PATH_COMMANDS below: they stop plus respawn the child
+ * at the target cwd before any rebind, so they never reach this set. */
 const NATIVE_SESSION_COMMANDS = new Set([
 	"new",
 	"resume",
@@ -122,6 +125,18 @@ const NATIVE_SESSION_COMMANDS = new Set([
 	"export",
 	"help",
 ]);
+
+/** Path commands: stop the chat child plus respawn it at the target cwd.
+ * Matched on the hyphen canonical form; the Telegram menu sends the
+ * underscore spelling, so callers canonicalize before lookup. */
+const PATH_COMMANDS = new Set(["switch-path", "new-path"]);
+
+/** Hyphen canonical form of a slash name (`switch_path` to `switch-path`).
+ * Existing native names carry neither mark, so canonicalizing is a no-op
+ * for them. */
+function canonicalCommandName(name: string): string {
+	return name.replace(/_/g, "-");
+}
 
 /** Escape once for HTML text content (order matters: & first). */
 function escapeHtml(s: string): string {
@@ -186,6 +201,17 @@ export interface RpcTurnRunnerOpts {
 	/** Child PI_HOME for a chat key. Production shares the gateway home. */
 	resolveHome: (routingKey: string) => string;
 	/**
+	 * Session discovery at a home dir. Production scans <home>/sessions
+	 * through pi_gateway/discovery (injected here so this module never
+	 * imports upward). Absent means no paths and no rebind targets:
+	 * switch-path reports none while the cwd move still lands.
+	 */
+	listDiscoveryPaths?: ((homeDir: string) => string[]) | undefined;
+	/** Newest session file at a path, or null when the path holds none. */
+	findSessionFileAtPath?:
+		| ((homeDir: string, rawPath: string) => string | null)
+		| undefined;
+	/**
 	 * Gateway message store. Absent means turns run with null row ids.
 	 * Present means the session row already exists: the production
 	 * handler ensures it before the turn, and the schema enforces it.
@@ -202,6 +228,14 @@ export interface RpcTurnRunnerOpts {
 export class RpcTurnRunner {
 	private readonly registry: ChatProcRegistry;
 	private readonly resolveHome: (routingKey: string) => string;
+	private readonly listDiscoveryPaths:
+		| ((homeDir: string) => string[])
+		| undefined;
+	private readonly findSessionFileAtPath:
+		| ((homeDir: string, rawPath: string) => string | null)
+		| undefined;
+	/** Per-chat cwd keyed by routing key. Absent means the gateway home. */
+	private readonly chatCwd = new Map<string, string>();
 	private readonly store: TurnMessageStore | null;
 	private readonly provider: string | undefined;
 	private readonly model: string | undefined;
@@ -213,11 +247,18 @@ export class RpcTurnRunner {
 	constructor(opts: RpcTurnRunnerOpts) {
 		this.registry = opts.registry;
 		this.resolveHome = opts.resolveHome;
+		this.listDiscoveryPaths = opts.listDiscoveryPaths;
+		this.findSessionFileAtPath = opts.findSessionFileAtPath;
 		this.store = opts.store ?? null;
 		this.provider = opts.provider;
 		this.model = opts.model;
 		this.turnTimeoutMs = opts.turnTimeoutMs;
 		this.onTurnEvent = opts.onTurnEvent;
+	}
+
+	/** Chat cwd for one routing key. Absent means the gateway home. */
+	cwdFor(routingKey: string, homeDir: string): string {
+		return this.chatCwd.get(routingKey) ?? homeDir;
 	}
 
 	/**
@@ -227,12 +268,28 @@ export class RpcTurnRunner {
 	 *
 	 * Session commands (/new, /resume, /model, /compact, /export) ride
 	 * native RPC calls, never prompt text: one deterministic reply path
-	 * per name. Every other slash word falls through to the host prompt
-	 * path, where the child loop owns it natively.
+	 * per name. Path commands (/switch-path, /new-path) stop plus respawn
+	 * the child at the target cwd first, then rebind. Every other slash
+	 * word falls through to the host prompt path, where the child loop
+	 * owns it natively.
 	 */
 	async handleTurn(request: TurnRequest): Promise<TurnOutcome> {
+		const homeDir = this.resolveHome(request.routingKey);
+		const earlySlash = parseSlashCommand(request.text);
+		if (
+			earlySlash !== null &&
+			PATH_COMMANDS.has(canonicalCommandName(earlySlash.name))
+		) {
+			return await this.runPathCommand(
+				request,
+				canonicalCommandName(earlySlash.name),
+				earlySlash.args,
+				homeDir,
+			);
+		}
 		const spawnOpts: ChatProcSpawnOpts = {
-			homeDir: this.resolveHome(request.routingKey),
+			homeDir,
+			cwd: this.cwdFor(request.routingKey, homeDir),
 		};
 		if (this.provider !== undefined) spawnOpts.provider = this.provider;
 		if (this.model !== undefined) spawnOpts.model = this.model;
@@ -363,6 +420,205 @@ export class RpcTurnRunner {
 		} finally {
 			unsubscribe();
 		}
+	}
+
+	/**
+	 * One path command (DEC-085). Bare /switch-path lists paths without
+	 * touching the registry. Bare /new-path renders usage. Otherwise the
+	 * live entry stops even when dead, the chat cwd moves to the resolved
+	 * target, a fresh child spawns with cwd set, and the rebind lands:
+	 * switch-path onto the newest session file at the target, new-path
+	 * onto a fresh session. A mid-flight child refuses instead of dying.
+	 */
+	private async runPathCommand(
+		request: TurnRequest,
+		name: string,
+		args: string,
+		homeDir: string,
+	): Promise<TurnOutcome> {
+		if (name === "switch-path" && args === "") {
+			const paths = this.listDiscoveryPaths?.(homeDir) ?? [];
+			const reply =
+				paths.length === 0
+					? "No paths holding pi sessions."
+					: `Paths holding pi sessions:\n${paths.join("\n")}`;
+			return await this.persistedReply(request, reply);
+		}
+		const rawTarget = args.split(/\s+/, 1)[0] ?? "";
+		if (rawTarget === "") {
+			return await this.persistedReply(
+				request,
+				"Usage: /new-path <path> — starts a fresh session under that path.",
+			);
+		}
+		const target = resolve(this.cwdFor(request.routingKey, homeDir), rawTarget);
+		const current = this.registry.get(request.routingKey);
+		if (
+			current !== undefined &&
+			(current.state === "busy" || current.state === "starting")
+		) {
+			return RpcTurnRunner.errorOutcome(
+				"turn already in progress for this chat",
+				null,
+				null,
+			);
+		}
+		try {
+			await this.registry.stop(request.routingKey);
+		} catch {
+			/* the entry already left the map; respawn anyway */
+		}
+		this.chatCwd.set(request.routingKey, target);
+		const spawnOpts: ChatProcSpawnOpts = { homeDir, cwd: target };
+		if (this.provider !== undefined) spawnOpts.provider = this.provider;
+		if (this.model !== undefined) spawnOpts.model = this.model;
+		let entry;
+		try {
+			entry = await this.registry.spawn(request.routingKey, spawnOpts);
+		} catch (error) {
+			return RpcTurnRunner.errorOutcome(
+				`spawn failed: ${RpcTurnRunner.errorText(error)}`,
+				null,
+				null,
+			);
+		}
+		if (entry.state !== "ready") {
+			return RpcTurnRunner.errorOutcome(
+				"turn already in progress for this chat",
+				null,
+				null,
+			);
+		}
+		const turnClient = asTurnClient(entry.client);
+		if (turnClient === null) {
+			return RpcTurnRunner.errorOutcome(
+				"chat child cannot drive a turn",
+				null,
+				null,
+			);
+		}
+		const session = asSessionClient(turnClient);
+		if (session === null) {
+			return RpcTurnRunner.errorOutcome(
+				"chat child cannot drive a session command",
+				null,
+				null,
+			);
+		}
+		entry.state = "busy";
+		let userRowId: number | null = null;
+		if (this.store !== null) {
+			try {
+				userRowId = await this.store.appendMessage({
+					sessionId: request.sessionId,
+				role: "user",
+				content: request.text,
+				});
+			} catch (error) {
+				entry.state = "ready";
+				return RpcTurnRunner.errorOutcome(
+					`user row persist failed: ${RpcTurnRunner.errorText(error)}`,
+					null,
+					null,
+				);
+			}
+		}
+		let reply: string;
+		try {
+			if (name === "switch-path") {
+				const file = this.findSessionFileAtPath?.(homeDir, target) ?? null;
+				if (file === null) {
+					reply = `Switched to ${target}. No sessions there yet — starting fresh.`;
+				} else {
+					await session.switchSession(file);
+					const state = (await session.getState()) as {
+						sessionId: string;
+					};
+					reply = `Switched to ${target}. Resumed session (${state.sessionId}).`;
+				}
+			} else {
+				await session.newSession();
+				const state = (await session.getState()) as {
+					sessionId: string;
+				};
+				reply = `Started a fresh session (${state.sessionId}) under ${target}.`;
+			}
+		} catch (error) {
+			return await this.fail(
+				request.routingKey,
+				`${name} failed: ${RpcTurnRunner.errorText(error)}`,
+				userRowId,
+				null,
+			);
+		}
+		let assistantRowId: number | null = null;
+		if (this.store !== null) {
+			try {
+				assistantRowId = await this.store.appendMessage({
+					sessionId: request.sessionId,
+				role: "assistant",
+				content: reply,
+				});
+			} catch (error) {
+				return await this.fail(
+					request.routingKey,
+					`assistant row persist failed: ${RpcTurnRunner.errorText(error)}`,
+					userRowId,
+					null,
+				);
+			}
+		}
+		const live = this.registry.get(request.routingKey);
+		if (live !== undefined && live.state === "busy") {
+			live.state = "ready";
+		}
+		return {
+			exitReason: "finalized",
+			finalText: reply,
+			iterations: 0,
+			repairs: 0,
+			userRowId,
+			assistantRowId,
+			usage: null,
+		};
+	}
+
+	/** Finalized reply with both message rows, no child involved. */
+	private async persistedReply(
+		request: TurnRequest,
+		reply: string,
+	): Promise<TurnOutcome> {
+		let userRowId: number | null = null;
+		let assistantRowId: number | null = null;
+		if (this.store !== null) {
+			try {
+				userRowId = await this.store.appendMessage({
+					sessionId: request.sessionId,
+				role: "user",
+				content: request.text,
+				});
+				assistantRowId = await this.store.appendMessage({
+					sessionId: request.sessionId,
+				role: "assistant",
+				content: reply,
+				});
+			} catch (error) {
+				return RpcTurnRunner.errorOutcome(
+					`assistant row persist failed: ${RpcTurnRunner.errorText(error)}`,
+					userRowId,
+					null,
+				);
+			}
+		}
+		return {
+			exitReason: "finalized",
+			finalText: reply,
+			iterations: 0,
+			repairs: 0,
+			userRowId,
+			assistantRowId,
+			usage: null,
+		};
 	}
 
 	/**

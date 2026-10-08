@@ -98,10 +98,11 @@ function hostRows(): CommandDef[] {
 
 /**
  * Gateway-only survivors: real gateway machinery with no host meaning.
- * Every row here must name its executor owner in the comment, or it does
+ * Every row here names its executor owner via `execute`, or it does
  * not ship (DEC-078: no inert rows). DEC-083 cut thirteen rows
  * (queue, steer, background, agents, stop, pause, approve, deny, sethome,
  * sessions, topic, platform, version); the five below are the survivors.
+ * Path rows execute in RpcTurnRunner native path commands (DEC-085).
  */
 const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 	{
@@ -118,6 +119,7 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 			"List paths holding pi sessions, or re-root this chat onto one",
 		category: "Session",
 		gatewayOnly: true,
+		execute: "switch_path",
 		argsHint: "[path]",
 	},
 	{
@@ -125,6 +127,7 @@ const GATEWAY_ONLY_ROWS: readonly CommandDef[] = [
 		description: "Start a fresh session under a given path",
 		category: "Session",
 		gatewayOnly: true,
+		execute: "new_path",
 		argsHint: "<path>",
 	},
 	{

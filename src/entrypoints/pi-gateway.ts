@@ -172,11 +172,20 @@ export async function runCommand(
 				// runner closing over the lifecycle-owned stage-6 store.
 				// Children share the gateway home, so file auth plus the
 				// PI_PROVIDER and PI_MODEL env inherit with zero secret
-				// copies. Per-chat homes stay deferred until shared-home
-				// contention is measured, not assumed.
-				const [{ ChatProcRegistry }, { RpcTurnRunner }] = [
+				// copies. Per-chat working dirs ride the runner-owned
+				// cwd map (DEC-085); discovery reads <home>/sessions.
+				const [
+					{ ChatProcRegistry },
+					{ RpcTurnRunner },
+					{
+						buildDiscoveryIndex,
+						listDiscoveryPaths,
+						mostRecentSessionAtPath,
+					},
+				] = [
 					await import("../pi_agent_core/chat-proc-registry.js"),
 					await import("../pi_agent_core/rpc-turn-runner.js"),
+					await import("../pi_gateway/discovery.js"),
 				];
 				const registry = new ChatProcRegistry();
 				const home = opts.home;
@@ -184,6 +193,13 @@ export async function runCommand(
 					new RpcTurnRunner({
 						registry,
 						resolveHome: () => home,
+						listDiscoveryPaths: (homeDir) =>
+							listDiscoveryPaths(buildDiscoveryIndex(homeDir)),
+						findSessionFileAtPath: (homeDir, rawPath) =>
+							mostRecentSessionAtPath(
+								buildDiscoveryIndex(homeDir),
+								rawPath,
+							)?.file ?? null,
 						...(store !== null ? { store } : {}),
 					});
 			}

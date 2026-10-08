@@ -59,7 +59,8 @@ export interface ChatProcEntry {
 
 /** Where a child lives plus which model surface it boots with. */
 export interface ChatProcSpawnOpts {
-	/** Disposable PI_HOME for this chat. One home per child, never shared. */
+	/** PI_HOME for the child. Production shares the gateway home across
+	 * chats; per-chat working dirs ride cwd, not separate homes. */
 	homeDir: string;
 	/** Agent working directory. Defaults to homeDir. */
 	cwd?: string | undefined;
