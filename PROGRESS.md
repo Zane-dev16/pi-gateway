@@ -1,5 +1,39 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Live swap `1131270` → `fd7b9b5` plus Telegram proof (2026-10-08)
+
+- Installed checkout fast-forward only, `aca2c85` → `fd7b9b5` (3 commits:
+  `cb17c5f` path-switch, `f060301` status-file, `fd7b9b5` discovery-root).
+  Repo checkout already at tip. Identity `Irell Zane` verified in both.
+- Live gateway: old pid `893992` stopped via `bin/pi-gateway stop`
+  (`gateway: stop signalled`), exited at once, state `stopped`/`planned_stop`.
+  Relaunched on the identical production boot path (`PI_HOME=/root/.pi`,
+  `PI_GATEWAY_AUTO_START=1`, `PI_GATEWAY_PLATFORMS=telegram`, cwd installed
+  checkout, `tail -f /dev/null | exec pi --mode rpc`, log appended to
+  `/root/.pi/gateway-live.log`). Bot token re-supplied from a local session
+  artifact without printing. New pid `1113424`, `gateway READY`, code_sha
+  `fd7b9b5ed3`, `platform adapter telegram guard wired`. Zero `409`/conflict
+  lines in the fresh log (one uuid false positive only).
+- Live Telegram proof (user Irell @irellzane id=8469032365 → ZanishPiBot,
+  `whoami` first): `/help` answered natively via host catalog (msgs
+  3395–3402, skill list, no model call); plain `reply with the word
+  pineapple-live-8` answered `pineapple-live-8` (msg 3404, model turn NOT
+  policy-blocked); `state.db` messages 38 → 40 with user plus assistant rows
+  under session `tg:8469032365`; `/new` answered `Started a new session
+  (01a11b36-d026-7346-9324-95a8efc476ce).` (msg 3406, native reset);
+  `/new-path /tmp/live-path-probe-dirb` answered `Started a fresh session
+  (01a11b37-f048-74ca-8557-015d10f69f83) under /tmp/live-path-probe-dirb.`
+  (msg 3410, child cwd moved); `/switch-path /root/.pi` answered `Switched
+  to /root/.pi. No sessions there yet — starting fresh.` (msg 3412, cwd
+  moved back). No blockers.
+- Open gap (not a blocker): bare `/switch-path` on live answers `No paths
+  holding pi sessions.` Root cause read from tree: the standalone factory
+  in `entrypoints/pi-gateway.ts` closes over both discovery closures, but
+  the live extension factory in `extensions/pi-gateway.ts` passes none, so
+  the runner falls back to an empty list and the rebind lookup stays null.
+  Dir moves still land both ways. Follow-up wires the same two closures
+  into the extension factory.
+
 ## Verify tip plus fix DEC-087 discovery root (2026-10-08)
 
 - Root cause: the production turn factory rooted session discovery at the
