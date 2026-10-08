@@ -10,10 +10,25 @@
 //   _get_code_identity_fields       → code_sha / code_version stamps that
 //                                     "degrade to absent fields rather than
 //                                     failing the write"
+//   _RUNTIME_STATUS_STALE_TTL_S     → RUNTIME_STATUS_STALE_TTL_S (120s)
+//   runtime_status_is_stale         → runtimeStatusIsStale
+//   runtime_status_pid_is_live      → runtimeStatusPidIsLive
+//
+// DEC-086 single-writer discipline: only the true gateway boss writes
+// `gateway_state.json` (lifecycle stage 10, drain flips, exit stamps — all
+// boss-owned). Workers never write it and never stamp the shared file.
+// Workers needing to publish facts use their own owned files via
+// workerStatusPath plus writeWorkerStatus, merged only at the read or
+// reporting boundary. Readers never trust the file alone: interpret with
+// interpretRuntimeStatus (pid alive plus heartbeat freshness) and report
+// stale file plus dead pulse as crashed, never live. Missing or
+// unreadable reads as absent, never as stopped.
 //
 // The gateway_state vocabulary used by this skeleton: starting | running |
 // draining | stopped (#42675: an UNEXPECTED signal must never persist
-// "stopped" — enforced by the shutdown controller, not here).
+// "stopped" — enforced by the shutdown controller, not here). The
+// interpreted liveness vocabulary is live | crashed | absent (DEC-086) —
+// synthesized by readers, never persisted.
 
 import {
 	existsSync,
@@ -25,6 +40,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { uptime as osUptime } from "node:os";
+import { probeProcess } from "./process-info.js";
 
 export const RUNTIME_STATUS_FILENAME = "gateway_state.json";
 
@@ -156,6 +172,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Read-modify-write patch (parity of write_runtime_status): missing file ⇒
  * fresh base record first. Never throws for identity-degradation reasons —
  * code stamps arrive pre-degraded (null) from the caller.
+ *
+ * DEC-086 ownership: only the true gateway boss calls this (lifecycle
+ * stage 10, drain flips, exit stamps). Workers never call it — they own
+ * separate files via workerStatusPath plus writeWorkerStatus, or nothing.
  */
 export function writeRuntimeStatus(
 	home: string,
@@ -217,4 +237,179 @@ export function readRuntimeStatus(home: string): RuntimeStatusRecord | null {
 	// SAFETY: readJson guarantees a parsed non-array object; the full record
 	// shape is trusted because writeRuntimeStatus is the sole atomic writer.
 	return raw as unknown as RuntimeStatusRecord;
+}
+
+/** Max age of a snapshot before its liveness claim is suspect (Hermes
+ * `_RUNTIME_STATUS_STALE_TTL_S`: 2x the 60s housekeeping interval). */
+export const RUNTIME_STATUS_STALE_TTL_S = 120;
+
+/** Tolerance for wall-clock start_time equality (boot-second rounding). */
+export const RUNTIME_STATUS_START_TIME_TOLERANCE_S = 2;
+
+/** Whole seconds since the snapshot updated_at. Null when missing. */
+export function runtimeStatusHeartbeatAgeS(
+	record: Pick<RuntimeStatusRecord, "updated_at"> | null | undefined,
+	nowMs: () => number = Date.now,
+): number | null {
+	if (record === null || record === undefined) return null;
+	const parsed = Date.parse(record.updated_at);
+	if (!Number.isFinite(parsed)) return null;
+	return Math.max(0, Math.floor((nowMs() - parsed) / 1000));
+}
+
+/** True when the snapshot updated_at is older than ttl (or missing). */
+export function runtimeStatusIsStale(
+	record: Pick<RuntimeStatusRecord, "updated_at"> | null | undefined,
+	ttlS: number = RUNTIME_STATUS_STALE_TTL_S,
+	nowMs: () => number = Date.now,
+): boolean {
+	const age = runtimeStatusHeartbeatAgeS(record, nowMs);
+	if (age === null) return true;
+	return age > ttlS;
+}
+
+/**
+ * Live wall-clock start_time for a pid in the status-stamp domain
+ * (boot wall clock plus ticks over USER_HZ — the same construction as
+ * defaultStartTimeSec). Null when unknown: off Linux or unreadable proc.
+ * Callers fall back to pid equality alone when null (08 §1.2 rule).
+ */
+export function liveStatusStartTimeSec(pid: number): number | null {
+	if (process.platform !== "linux") return null;
+	try {
+		const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = raw.lastIndexOf(")");
+		const rest =
+			close >= 0
+				? raw
+						.slice(close + 1)
+						.trim()
+						.split(/\s+/)
+				: [];
+		const parsed = Number.parseInt(rest[19] ?? "", 10);
+		if (!Number.isFinite(parsed)) return null;
+		const hz = 100;
+		const bootSec = Math.floor(Date.now() / 1000) - Math.floor(osUptime());
+		return Math.floor(bootSec + parsed / hz);
+	} catch {
+		return null;
+	}
+}
+
+export interface RuntimePidProbes {
+	pidAlive?: ((pid: number) => boolean) | undefined;
+	liveStartTimeSec?: ((pid: number) => number | null) | undefined;
+}
+
+/**
+ * True when the snapshot pid is alive and passes the start_time reuse
+ * guard. Both known but apart beyond tolerance means the holder exited
+ * and the OS recycled the pid — never signal it. Either unknown falls
+ * back to pid aliveness alone (08 §1.2 rule).
+ */
+export function runtimeStatusPidIsLive(
+	record: Pick<RuntimeStatusRecord, "pid" | "start_time"> | null | undefined,
+	probes: RuntimePidProbes = {},
+): boolean {
+	if (record === null || record === undefined) return false;
+	const pid = record.pid;
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	const alive = (probes.pidAlive ?? ((p: number) => probeProcess(p).alive))(pid);
+	if (!alive) return false;
+	const live =
+		probes.liveStartTimeSec !== undefined
+			? probes.liveStartTimeSec(pid)
+			: liveStatusStartTimeSec(pid);
+	const recorded = record.start_time;
+	if (live === null || live === undefined) return true;
+	if (typeof recorded !== "number" || !Number.isFinite(recorded)) return true;
+	return Math.abs(live - recorded) <= RUNTIME_STATUS_START_TIME_TOLERANCE_S;
+}
+
+/** Interpreted liveness for one home (DEC-086). Synthesized, never stored. */
+export type RuntimeLiveness = "live" | "crashed" | "absent";
+
+export interface RuntimeStatusView {
+	outcome: RuntimeLiveness;
+	record: RuntimeStatusRecord | null;
+	pidAlive: boolean;
+	stale: boolean;
+	startTimeMatches: boolean;
+}
+
+export interface InterpretRuntimeStatusOptions extends RuntimePidProbes {
+	ttlS?: number | undefined;
+	nowMs?: (() => number) | undefined;
+}
+
+/**
+ * Interpret the shared file with liveness alongside it. Missing or
+ * unreadable reads as absent, never as stopped. A live pid with a
+ * matching start_time reads live (stale heartbeat rides alongside as a
+ * health warning, never as death — Hermes parity). A dead pulse reads
+ * crashed, never live — including stale file plus dead pulse.
+ */
+export function interpretRuntimeStatus(
+	home: string,
+	opts: InterpretRuntimeStatusOptions = {},
+): RuntimeStatusView {
+	const record = readRuntimeStatus(home);
+	if (record === null) {
+		return {
+			outcome: "absent",
+			record: null,
+			pidAlive: false,
+			stale: false,
+			startTimeMatches: false,
+		};
+	}
+	const nowMs = opts.nowMs ?? Date.now;
+	const ttlS = opts.ttlS ?? RUNTIME_STATUS_STALE_TTL_S;
+	const stale = runtimeStatusIsStale(record, ttlS, nowMs);
+	const probes: RuntimePidProbes = {};
+	if (opts.pidAlive !== undefined) probes.pidAlive = opts.pidAlive;
+	if (opts.liveStartTimeSec !== undefined) {
+		probes.liveStartTimeSec = opts.liveStartTimeSec;
+	}
+	const pidAlive = runtimeStatusPidIsLive(record, probes);
+	const live =
+		probes.liveStartTimeSec !== undefined
+			? probes.liveStartTimeSec(record.pid)
+			: liveStatusStartTimeSec(record.pid);
+	const startTimeMatches =
+		live === null ||
+		live === undefined ||
+		typeof record.start_time !== "number" ||
+		!Number.isFinite(record.start_time)
+			? pidAlive
+			: Math.abs(live - record.start_time) <=
+					RUNTIME_STATUS_START_TIME_TOLERANCE_S;
+	return {
+		outcome: pidAlive ? "live" : "crashed",
+		record,
+		pidAlive,
+		stale,
+		startTimeMatches,
+	};
+}
+
+/** Owned worker state path: <home>/workers/<id>.json (DEC-086). */
+export function workerStatusPath(home: string, workerId: string): string {
+	const safe = workerId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "worker";
+	return join(home, "workers", `${safe}.json`);
+}
+
+/**
+ * Worker-owned scratch write. Never touches `gateway_state.json` — the
+ * boss stays the sole writer of the shared file. Merged only at the read
+ * or reporting boundary by whoever consumes the worker files.
+ */
+export function writeWorkerStatus(
+	home: string,
+	workerId: string,
+	payload: unknown,
+): string {
+	const path = workerStatusPath(home, workerId);
+	writeAtomic(path, payload);
+	return path;
 }

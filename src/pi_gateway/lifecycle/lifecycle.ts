@@ -50,9 +50,11 @@ import {
 import { processStartTime } from "./process-info.js";
 import { persistExitStatusPatch } from "./status-persist.js";
 import {
+	interpretRuntimeStatus,
 	readRuntimeStatus,
 	writeRuntimeStatus,
 	type GatewayRuntimeState,
+	type RuntimeStatusView,
 } from "./status-stamp.js";
 import {
 	SHUTDOWN_EXIT_CODES,
@@ -904,7 +906,9 @@ export class GatewayLifecycle {
 	private async stageRuntimeIdentity(ctx: StageContext): Promise<void> {
 		// 08 §1.1 step 8 second half / 01 §3.1 stage 10: stamp runtime identity
 		// + code fingerprint, then READY. Code stamps degrade to absent fields
-		// rather than failing the write (08 §4).
+		// rather than failing the write (08 §4). DEC-086: this is THE boss
+		// writer of gateway_state.json — workers never reach this stage and
+		// never stamp the shared file.
 		const fingerprint = ctx.fingerprint ?? bootFingerprintValue();
 		writeRuntimeStatus(
 			ctx.home,
@@ -1605,6 +1609,15 @@ export class GatewayLifecycle {
 
 	statusSnapshot(): ReturnType<typeof readRuntimeStatus> {
 		return readRuntimeStatus(this.homeValue);
+	}
+
+	/**
+	 * Interpreted liveness for this home (DEC-086). Raw file plus pid
+	 * alive plus heartbeat freshness: stale file plus dead pulse reads
+	 * crashed, never live; missing reads as absent, never as stopped.
+	 */
+	runtimeLiveness(): RuntimeStatusView {
+		return interpretRuntimeStatus(this.homeValue);
 	}
 
 	/** Test/driver hook: dispose resources without a full drain. */
