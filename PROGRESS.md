@@ -1,5 +1,42 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## VerifyLive `afe462e` on tip plus live swap and Telegram proof (2026-10-09)
+
+- Disposable homes first, live read-only until swap. Boot READY plus
+  HEALTHY on a disposable home, CLI status running plus stop
+  `planned_stop`. Throwaway in-repo probe (mirrored the production
+  factory exactly, deleted before commit) under an isolated
+  `PI_CODING_AGENT_DIR` with seeded auth plus model config: `/help`
+  finalized, plain echo `pineapple-verifylive-1` finalized on the live
+  model path, native `/new`, bare `/switch-path` populated, `/new-path`
+  moved child cwd, `/switch-path` rebound to the resumed session, 12 db
+  rows with user plus assistant pairs. Headless Telegram 44 green. `tsc`
+  clean. Targeted suites (status-stamp plus discovery plus
+  rpc-turn-runner, 51 tests) green. Artifacts under `verifylive/`.
+  Fallout fixed in the probe: the isolated agent dir needed the live
+  model config (settings plus models) beside auth, else children default
+  to a dead endpoint; one cold-start `/help` timeout passed on retry.
+- Installed checkout fast-forward only, `81e5966` → `afe462e`
+  (`ca85df8` extension discovery wiring plus `afe462e` status guard).
+  Old pid `1113424` stopped via `bin/pi-gateway stop`, exited at once,
+  state `stopped`/`planned_stop`. Relaunched on the identical production
+  boot path with the profile env file sourced in memory (never printed).
+  New pid `1421693`, `gateway READY`, code_sha `afe462ee46`,
+  `platform adapter telegram guard wired`. Zero `409` lines.
+- Live Telegram proof (user Irell @irellzane id=8469032365 → ZanishPiBot,
+  `whoami` first): `/help` answered natively (msgs 3414–3421, opens with
+  `` `/copyfile` ``); plain `reply with the word pineapple-live-10`
+  answered `pineapple-live-10` (msg 3423, model turn live); `state.db`
+  messages 48 → 56 with user plus assistant rows for all four turns;
+  `/new` answered `Started a new session
+  (01a12274-76fb-7493-8493-e59b6d740d1f).` (msg 3425, native reset);
+  bare `/switch-path` answered a populated listing (`/root`, `/root/.pi`,
+  `/root/pi-gateway`, and more, msg 3427), closing the prior open gap.
+- Guard proven live: 3 competing starters aborted at `duplicate_guard`
+  during the phase while `gateway_state.json` kept naming the live
+  holder `1421693` running. No probe rows deleted (zero). Live pid
+  undisturbed except the planned swap stop.
+
 ## Live swap `1131270` → `fd7b9b5` plus Telegram proof (2026-10-08)
 
 - Installed checkout fast-forward only, `aca2c85` → `fd7b9b5` (3 commits:
