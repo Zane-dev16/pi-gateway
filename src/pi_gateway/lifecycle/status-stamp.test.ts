@@ -2,7 +2,7 @@
 // bounce must reconverge pid/argv/start_time onto the live identity instead
 // of preserving the dead row from the previous life.
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -68,5 +68,47 @@ describe("runtime status stamp pid convergence", () => {
 		expect(next.start_time).toBe(1234567890);
 		expect(next.argv).toEqual(["gw"]);
 		expect(next.active_agents).toBe(3);
+	});
+
+	it("competing starter never restamps the live holder", () => {
+		const home = mkdtempSync(join(tmpdir(), "pi-stamp-single-writer-"));
+		const bossPid = 424242;
+		const bossStart = 1111111111;
+		const loserPid = 424243;
+		writeFileSync(
+			join(home, "gateway_state.json"),
+			JSON.stringify({
+				pid: bossPid,
+				kind: "pi-gateway",
+				argv: ["boss-gateway"],
+				start_time: bossStart,
+				pi_home: home,
+				gateway_state: "running",
+				exit_reason: null,
+				restart_requested: false,
+				active_agents: 0,
+				platforms: {},
+				updated_at: new Date().toISOString(),
+				code_sha: null,
+				code_version: null,
+			}),
+		);
+		const before = readFileSync(join(home, "gateway_state.json"), "utf8");
+		const probes = {
+			pidAlive: () => true,
+			liveStartTimeSec: () => bossStart,
+		};
+		const next = writeRuntimeStatus(
+			home,
+			{ exit_reason: "startup_failed:duplicate_guard" },
+			{ pid: loserPid, home },
+			probes,
+		);
+		expect(next.pid).toBe(bossPid);
+		expect(next.exit_reason).toBe(null);
+		expect(readFileSync(join(home, "gateway_state.json"), "utf8")).toBe(
+			before,
+		);
+		expect(readRuntimeStatus(home)?.pid).toBe(bossPid);
 	});
 });

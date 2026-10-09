@@ -181,9 +181,32 @@ export function writeRuntimeStatus(
 	home: string,
 	patch: RuntimeStatusPatch,
 	identity: StatusIdentity,
+	probes: RuntimePidProbes = {},
 ): RuntimeStatusRecord {
 	const path = runtimeStatusPath(home);
 	const existing = existsSync(path) ? readJson(path) : null;
+	// Single-writer guard (DEC-086): a live holder keeps the file. A
+	// competing starter with a different pid never restamps it — the
+	// loser returns the winner's record byte-identical instead of
+	// reconverging pid/argv/start_time onto itself. Dead holders still
+	// reconverge below, so bounces and takeovers keep working.
+	if (existing !== null) {
+		const holder = existing as Partial<RuntimeStatusRecord>;
+		const holderPid = holder.pid;
+		const callerPid = identity.pid ?? holderPid ?? process.pid;
+		if (
+			typeof holderPid === "number" &&
+			Number.isInteger(holderPid) &&
+			holderPid > 0 &&
+			holderPid !== callerPid &&
+			runtimeStatusPidIsLive(
+				holder as Pick<RuntimeStatusRecord, "pid" | "start_time">,
+				probes,
+			)
+		) {
+			return holder as RuntimeStatusRecord;
+		}
+	}
 	const base =
 		existing !== null
 			? (existing as Partial<RuntimeStatusRecord>)
