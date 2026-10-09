@@ -63,17 +63,34 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			const resolvedHome = home ?? resolvePiHome();
 			let turnRunnerFactory: TurnRunnerFactory | undefined;
 			if (platforms.length > 0) {
-				const [{ ChatProcRegistry: Registry }, { RpcTurnRunner }] =
-					await Promise.all([
-						import("../src/pi_agent_core/chat-proc-registry.js"),
-						import("../src/pi_agent_core/rpc-turn-runner.js"),
-					]);
+				const [
+					{ ChatProcRegistry: Registry },
+					{ RpcTurnRunner },
+					{
+						buildDiscoveryIndex,
+						listDiscoveryPaths,
+						mostRecentSessionAtPath,
+						resolveAgentDir,
+					},
+				] = await Promise.all([
+					import("../src/pi_agent_core/chat-proc-registry.js"),
+					import("../src/pi_agent_core/rpc-turn-runner.js"),
+					import("../src/pi_gateway/discovery.js"),
+				]);
 				if (chatRegistry === null) chatRegistry = new Registry();
 				const registry = chatRegistry;
+				const agentDir = resolveAgentDir();
 				turnRunnerFactory = ({ store }) =>
 					new RpcTurnRunner({
 						registry,
 						resolveHome: () => resolvedHome,
+						listDiscoveryPaths: () =>
+							listDiscoveryPaths(buildDiscoveryIndex(agentDir)),
+						findSessionFileAtPath: (_homeDir, rawPath) =>
+							mostRecentSessionAtPath(
+								buildDiscoveryIndex(agentDir),
+								rawPath,
+							)?.file ?? null,
 						...(store !== null ? { store } : {}),
 					});
 			}
