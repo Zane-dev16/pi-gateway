@@ -844,21 +844,22 @@ export class PollingAdapterCore
 					!self.cancelRequested()
 				) {
 					this.recoveryAttempts += 1;
-					if (this.recoveryAttempts > MAX_CONFLICT_RETRIES) {
-						this.recoveryLog.push(
-							`recovery-exhausted-after-${MAX_CONFLICT_RETRIES}-attempts`,
-						);
-						this.lifecycle.markFatal({
-							kind: "config_invalid",
-							detail:
-								`transport unreachable after ${MAX_CONFLICT_RETRIES} recovery attempts ` +
-								"— handing off to the gateway reconnector",
-						});
-						this.discardHeldExplicitly();
-						return;
-					}
+					// Transient-class recovery NEVER goes fatal: a blip longer than
+					// the conflict budget must keep polling, not strand the adapter
+					// with a growing server queue. Backoff caps at the top rung so
+					// long outages retry every minute. Only the 409-conflict ladder
+					// keeps its bounded-to-fatal shape (rival consumer needs an
+					// operator). Progress resets the count, held inbound is kept.
+					this.logger?.warn?.(
+						`polling recovery attempt ${this.recoveryAttempts}: ${reason}`,
+					);
 					// Growing delay before the fresh generation takes the poll.
-					await this.clock.sleep(conflictRetryDelayMs(this.recoveryAttempts));
+					await this.clock.sleep(
+						Math.min(
+							conflictRetryDelayMs(this.recoveryAttempts),
+							conflictRetryDelayMs(MAX_CONFLICT_RETRIES),
+						),
+					);
 					if (!this.connected || this.teardownStarted) return;
 					if (!this.lifecycle.isActive) return;
 					const gen = ++this.generation;

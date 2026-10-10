@@ -286,6 +286,47 @@ describe("heartbeat stuck-probe escalation ladder (injected clock)", () => {
 	});
 });
 
+describe("transient poll outage — recovery never goes fatal (live-stall parity)", () => {
+	// Manual-clock sleeps resolve instantly, so an unbounded ladder would
+	// livelock the wall timers `eventually` rides. This clock breathes one
+	// macrotask per sleep, modeling wall passage with zero virtual cost.
+	class BreathClock extends ManualPollingClock {
+		override readonly sleep = async (ms: number): Promise<void> => {
+			this.sleeps.push(ms);
+			this.nowVal += ms;
+			await new Promise<void>((r) => {
+				const t = setTimeout(r, 0);
+				t.unref?.();
+			});
+		};
+	}
+	it("an outage longer than the conflict budget still heals once the server returns", async () => {
+		const breath = new BreathClock();
+		const { engine, tg, clock } = makeEngine({
+			name: "outage-heals",
+			clock: breath,
+		});
+		void clock;
+		await waitConnectedCycle(engine);
+		tg.setReachable(false, "poll");
+		await eventually(
+			() =>
+				engine.lifecycleSnapshot().state === "fatal" ||
+				clock.sleeps.length > MAX_CONFLICT_RETRIES + 1,
+			5_000,
+		);
+		expect(engine.lifecycleSnapshot().state).not.toBe("fatal");
+		tg.setReachable(true, "poll");
+		tg.pushUpdate("chat-1", "after-outage");
+		await eventually(() => engine.turnLog.includes("after-outage"), 5_000);
+		expect(engine.turnLog.filter((t) => t === "after-outage")).toEqual([
+			"after-outage",
+		]);
+		expect(engine.lifecycleSnapshot().state).not.toBe("fatal");
+		engine.disconnect();
+	});
+});
+
 describe("reconnect queue preservation vs cold-boot drop", () => {
 	it("is_reconnect=true preserves the server-side queue; cold boot drops stale updates", async () => {
 		const fixture = makeRealPollingFixture();
