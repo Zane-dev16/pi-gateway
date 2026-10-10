@@ -1,5 +1,33 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Live swap `afe462e` → `28433a1` plus Telegram round 2 (2026-10-10)
+
+- Installed checkout fast-forward only, `afe462e` → `28433a1` (contains
+  `5682a68`). Tree clean before merge. No force. Old pid `1421693`
+  (sha `afe462ee46`) stopped via `bin/pi-gateway`, state
+  `stopped`/`planned_stop`. Relaunched on the identical production boot
+  path, log appended to `gateway-live.log`. New pid `1632198`
+  (sha `28433a1556`), READY at log line 119. Doctor HEALTHY before
+  and after, new pid alive, 12 tables ok, cwd is the installed
+  checkout. Zero conflict lines after the launch mark. One old 409 hit
+  is a UUID fragment at line 47, not a Bot API conflict.
+- Live Telegram proof (whoami Irell id 8469032365, peer ZanishPiBot,
+  doctor HEALTHY on `/root/.pi` pid `1632198` before first send):
+  `/help` send 3434 drew replies 3435-3442 within 8s. Pineapple send
+  3443 with token `pineapplesierra10101926` drew reply 3444 echoing the
+  token within 5s. `/new` send 3445 drew reply 3446 starting session
+  `01a12747`. Window 19:23:45Z-19:26:18Z had no interleaving send.
+  `state.db` messages 56 → 62 with rows 57-62 holding the three new
+  user plus assistant pairs, sessions 1 → 1. Live was never restarted,
+  stopped, or cleaned during proof.
+- Gates at tip `28433a1`: `tsc` zero errors, vitest 193 files 2573
+  tests zero failures, layering downward only, secret scope clean.
+  Sanity round 2 on a disposable home passed boot HEALTHY plus CLI
+  status plus headless 44 green plus stop `planned_stop`, then cleaned.
+- Correction: the prior entry cited `artifacts/fix-unit1/`. Verified
+  this session that path does not exist in the tree, so treat that
+  citation as disposable logs outside the repo, not committed evidence.
+
 ## Fix live ingress stall plus live doctor path (2026-10-10)
 
 - Root cause (read-only live proof, no restart): the poll recovery ladder
