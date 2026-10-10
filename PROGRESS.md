@@ -1,5 +1,36 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Fix live ingress stall plus live doctor path (2026-10-10)
+
+- Root cause (read-only live proof, no restart): the poll recovery ladder
+  went FATAL after 5 straight transient failures, discarding held inbound
+  and stranding the adapter with the process alive. Measured live: pid
+  1421693 alive with guard wired, `state.db` messages frozen at 56 across
+  the three verifier sends, zero replies even for native `/help` and
+  `/new`, no ADAPTER FATAL line in `gateway-live.log`, and Bot API
+  `getWebhookInfo` reporting `pending=3` with no webhook set. The fatal
+  was silent because production adapters boot with no logger and runtime
+  fatals never requeue to the reconnect watcher. Reproduced exactly on a
+  disposable seam: 5 virtual sleeps then `recovery-exhausted` plus fatal.
+- Fix (`polling-adapter.ts`, one ladder): transient-class `scheduleRecovery`
+  retries unbounded with backoff capped at the top rung (60s) and a warn
+  line per attempt; held inbound is kept. The 409-conflict ladder keeps
+  its bounded-to-fatal shape, so rival-consumer loops still need an
+  operator. New contract pins an outage longer than the old budget
+  healing once the server returns. Follow-up, not this change: plumb a
+  logger into the production adapter factory and requeue runtime fatals
+  so any future terminal state is loud plus self-healing.
+- Doctor (`control-pi-gateway`, harness, gitignored): live homes log READY
+  to `gateway-live.log`, never `$HOME.launch.log`, so live doctor always
+  cried UNHEALTHY. It now falls back to `gateway-live.log`. Measured:
+  `doctor --home /root/.pi` reports HEALTHY, read-only, live pid
+  undisturbed.
+- Verify: `tsc` clean, polling 19 green, headless Telegram 44 green,
+  targeted battery 9 files 134 green, layering plus secret-scope OK,
+  disposable boot HEALTHY plus CLI status running plus stop `planned_stop`.
+  Evidence under `artifacts/fix-unit1/`. Live replies still need an
+  operator restart to pick up the fix; nothing was restarted here.
+
 ## VerifyLive `afe462e` on tip plus live swap and Telegram proof (2026-10-09)
 
 - Disposable homes first, live read-only until swap. Boot READY plus
