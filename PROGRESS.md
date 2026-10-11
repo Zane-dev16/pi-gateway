@@ -1,5 +1,31 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Observability: loud long-outage alerts plus runtime-fatal requeue (2026-10-11)
+
+- Shape: consecutive-transient counter (`recoveryAttempts`) plus alert
+  threshold (`TRANSIENT_RECOVERY_ALERT_THRESHOLD = MAX_CONFLICT_RETRIES`)
+  plus the ladder-owned logger sink. Option B (adapter imports the
+  reconnect queue directly) rejected: layering bans platforms from
+  `pi_gateway/lifecycle`, larger diff. 409-conflict ladder untouched
+  bounded-to-fatal.
+- Behavior: past the threshold every retry emits
+  `polling transport still down after N recovery attempts: <reason>`;
+  conflict exhaustion keeps FATAL, pushes
+  `conflict-fatal-requeued-for-reconnect`, and hands its literal detail
+  to `onRuntimeFatal`, which stage 9 wires to
+  `failedPlatforms.enqueue` plus a `reconnect_queued` warn. Production
+  factories (`resolveConfiguredPlatforms`) take the gateway logger and
+  forward it to Telegram plus Matrix (Matrix newly accepts `logger`), so
+  runtime fatals are loud on both boot paths.
+- Contracts (literals, no call shapes): long outage contains the attempt-6
+  still-down line with one loud line per attempt past threshold; conflict
+  exhaustion stays fatal with the requeue literal plus the identical
+  payload; production factories emit two literal `ADAPTER FATAL` lines;
+  runner requeue lands the literal detail in the failed-platform queue.
+- Verify: `tsc` clean, polling 21 green, Telegram 44 green,
+  platform-hosting plus gateway-run 18 green, layering plus secret-scope
+  OK. Uncommitted by instruction.
+
 ## Live swap `afe462e` → `28433a1` plus Telegram round 2 (2026-10-10)
 
 - Installed checkout fast-forward only, `afe462e` → `28433a1` (contains
