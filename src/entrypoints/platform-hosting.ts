@@ -31,6 +31,8 @@ import type {
 	PluginContext,
 } from "../pi_platforms/kit/index.js";
 import type { PlatformHosting } from "./gateway-run.js";
+import type { Logger } from "../pi_gateway/lifecycle/shutdown.js";
+import type { StreamLogger } from "../pi_gateway/streaming/adapter-seam.js";
 
 /**
  * Boundary cast: gateway-run's structural mirror hands builders its
@@ -87,7 +89,17 @@ export const PI_GATEWAY_PLATFORMS_ENV = "PI_GATEWAY_PLATFORMS";
 export function resolveConfiguredPlatforms(
 	allowlist: string | undefined,
 	secrets: (name: string) => string | undefined = kitScopedSecretReader(),
+	logger?: Logger | undefined,
 ): PlatformHosting[] {
+	const adapterLogger: StreamLogger | undefined =
+		logger !== undefined
+			? {
+					debug() {},
+					warn: (m, meta) => logger.warn(m, meta),
+					error: (m, meta) => logger.error(m, meta),
+					info: (m, meta) => logger.info(m, meta),
+				}
+			: undefined;
 	const seen = new Set<string>();
 	const out: PlatformHosting[] = [];
 	for (const raw of (allowlist ?? "").split(",")) {
@@ -105,6 +117,9 @@ export function resolveConfiguredPlatforms(
 					const adapter = new TelegramAdapter({
 						wire: client,
 						secretReader: secrets,
+						...(adapterLogger !== undefined
+							? { logger: adapterLogger }
+							: {}),
 					});
 					bindTelegramProductionTransport(adapter, client);
 					return adapter;
@@ -126,6 +141,9 @@ export function resolveConfiguredPlatforms(
 					const adapter = new MatrixAdapterCore({
 						hs: client,
 						secretReader: secrets,
+						...(adapterLogger !== undefined
+							? { logger: adapterLogger }
+							: {}),
 					});
 					bindMatrixProductionTransport(adapter, client);
 					return adapter;

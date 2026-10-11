@@ -71,6 +71,10 @@ import {
 export const HELD_INBOUND_MAX = 64;
 /** adapter.py:MAX_CONFLICT_RETRIES. */
 export const MAX_CONFLICT_RETRIES = 5;
+/** Consecutive transient-recovery attempts before each retry turns LOUD: a
+ * permanently dead transport polls forever by design (5682a68), so past
+ * this many attempts every retry also emits the still-down alert line. */
+export const TRANSIENT_RECOVERY_ALERT_THRESHOLD = MAX_CONFLICT_RETRIES;
 /** RETRY_DELAY = 10 + conflictCount·10 seconds (15s, 25s, … 65s). */
 export function conflictRetryDelayMs(conflictCount: number): number {
 	return (10 + conflictCount * 10) * 1000;
@@ -105,6 +109,11 @@ export interface PollingEngineDeps {
 	scalarMaxUnits?: number | undefined;
 	manifestName?: string | undefined;
 	logger?: ConstructorParameters<typeof BasePlatformAdapter>[0]["logger"];
+	/** Runner requeue seam (IRC onFatalNotify precedent): invoked with the
+	 * literal fatal detail when the 409-conflict ladder exhausts to FATAL,
+	 * so the composition root can queue the platform for the reconnect
+	 * watcher. Plain callback keeps platforms below the runner layer. */
+	onRuntimeFatal?: ((detail: string) => void) | undefined;
 }
 
 /**
@@ -149,6 +158,11 @@ export class PollingAdapterCore
 	polledOnce = false;
 
 	hooks: PollingHooks | undefined;
+
+	/** Runner-assigned requeue hook (see PollingEngineDeps.onRuntimeFatal).
+	 * Mutable so the composition root can attach AFTER the zero-arg factory
+	 * builds the adapter — factories never see the reconnect queue. */
+	onRuntimeFatal?: ((detail: string) => void) | undefined;
 
 	private heldInbound: IncomingEvent[] = [];
 	private readonly heldIdentity = new Set<IncomingEvent>();
@@ -218,6 +232,7 @@ export class PollingAdapterCore
 		this.longPollTimeoutMs = deps.longPollTimeoutMs ?? 10_000;
 		this.secretReader = deps.secretReader;
 		this.tg = deps.wire;
+		this.onRuntimeFatal = deps.onRuntimeFatal;
 
 		// §11 step 3/4 + §8 identity rows: missing required secret ⇒ LOUD
 		// disable at construction, never silent skip.
@@ -690,15 +705,21 @@ export class PollingAdapterCore
 		}
 
 		// Exhausted all retries — declare FATAL so the runner surfaces it.
+		// The ladder keeps its bounded-to-fatal shape: the detail below is
+		// ALSO handed to the reconnect watcher through onRuntimeFatal, so a
+		// rival that later goes away heals via a fresh adapter episode.
 		this.recoveryLog.push(
 			`conflict-exhausted-after-${MAX_CONFLICT_RETRIES}-retries`,
 		);
+		const fatalDetail =
+			`polling could not recover after ${MAX_CONFLICT_RETRIES} conflict retries ` +
+			"— another consumer still holds this bot token's poll stream";
 		this.lifecycle.markFatal({
 			kind: "config_invalid",
-			detail:
-				`polling could not recover after ${MAX_CONFLICT_RETRIES} conflict retries ` +
-				"— another consumer still holds this bot token's poll stream",
+			detail: fatalDetail,
 		});
+		this.recoveryLog.push("conflict-fatal-requeued-for-reconnect");
+		this.onRuntimeFatal?.(fatalDetail);
 		const discarded = this.discardHeldExplicitly();
 		void discarded;
 	}
@@ -822,10 +843,15 @@ export class PollingAdapterCore
 	 * THE reconnect ladder every escalation feeds: a FRESH generation that
 	 * PRESERVES the server-side queue (is_reconnect=true parity).
 	 *
-	 * Bounded like Hermes' ladder: single-flight (stacked escalations never
-	 * spawn duplicate ladders), growing RETRY_DELAY per attempt, exhaustion ⇒
-	 * FATAL so the gateway runner surfaces it (adapter.py escalates instead of
-	 * looping silently). Recorded progress resets the attempt budget.
+	 * Transient-class recovery retries UNBOUNDED with backoff capped at the
+	 * top rung (a blip longer than the conflict budget must keep polling,
+	 * not strand the adapter with a growing server queue). Past
+	 * TRANSIENT_RECOVERY_ALERT_THRESHOLD consecutive attempts every retry
+	 * also emits the still-down alert line through the ladder-owned logger,
+	 * so a permanently dead transport is loud instead of quietly polling
+	 * forever. Single-flight (stacked escalations never spawn duplicate
+	 * ladders). Recorded progress resets the attempt budget. The
+	 * 409-conflict ladder below keeps its own bounded-to-fatal shape.
 	 */
 	private recovering = false;
 	private recoveryAttempts = 0;
@@ -850,9 +876,19 @@ export class PollingAdapterCore
 					// long outages retry every minute. Only the 409-conflict ladder
 					// keeps its bounded-to-fatal shape (rival consumer needs an
 					// operator). Progress resets the count, held inbound is kept.
+					// Past the alert threshold each attempt is LOUD through the
+					// ladder-owned logger sink, so a dead transport never polls
+					// quietly forever.
 					this.logger?.warn?.(
 						`polling recovery attempt ${this.recoveryAttempts}: ${reason}`,
 					);
+					if (
+						this.recoveryAttempts > TRANSIENT_RECOVERY_ALERT_THRESHOLD
+					) {
+						this.logger?.warn?.(
+							`polling transport still down after ${this.recoveryAttempts} recovery attempts: ${reason}`,
+						);
+					}
 					// Growing delay before the fresh generation takes the poll.
 					await this.clock.sleep(
 						Math.min(

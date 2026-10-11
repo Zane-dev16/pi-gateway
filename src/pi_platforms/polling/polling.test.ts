@@ -30,6 +30,7 @@ function makeEngine(
 		clock?: ManualPollingClock;
 		tg?: FakeTelegramServer;
 		wire?: FakePlatformWire;
+		logger?: ConstructorParameters<typeof PollingAdapterCore>[0]["logger"];
 	} = {},
 ): {
 	engine: PollingAdapterCore;
@@ -47,6 +48,7 @@ function makeEngine(
 		longPollTimeoutMs: 25,
 		manifestName: opts.name ?? "telegram-polling",
 		secretReader: (k) => (k === "TELEGRAM_BOT_TOKEN" ? "tok" : undefined),
+		...(opts.logger !== undefined ? { logger: opts.logger } : {}),
 	});
 	engine.attachStandardGuard(); // production wiring: ingress needs the L1 guard
 	engine.wireTransmitSend = (chatId, content, metadata) =>
@@ -323,6 +325,75 @@ describe("transient poll outage — recovery never goes fatal (live-stall parity
 			"after-outage",
 		]);
 		expect(engine.lifecycleSnapshot().state).not.toBe("fatal");
+		engine.disconnect();
+	});
+
+	it("a long outage past the alert threshold emits one loud warn per attempt", async () => {
+		const warns: string[] = [];
+		class AlertBreathClock extends ManualPollingClock {
+			override readonly sleep = async (ms: number): Promise<void> => {
+				this.sleeps.push(ms);
+				this.nowVal += ms;
+				await new Promise<void>((r) => {
+					const t = setTimeout(r, 0);
+					t.unref?.();
+				});
+			};
+		}
+		const breath = new AlertBreathClock();
+		const { engine, tg, clock } = makeEngine({
+			name: "outage-alert",
+			clock: breath,
+			logger: {
+				debug() {},
+				warn: (m: string) => {
+					warns.push(m);
+				},
+				error() {},
+			},
+		});
+		void clock;
+		await waitConnectedCycle(engine);
+		tg.setReachable(false, "poll");
+		await eventually(
+			() => breath.sleeps.length > MAX_CONFLICT_RETRIES + 2,
+			5_000,
+		);
+		expect(warns).toContain(
+			"polling transport still down after 6 recovery attempts: poll-network-error: getUpdates: getaddrinfo ENOTFOUND api.fake.telegram.example",
+		);
+		const snapshot = [...warns];
+		const loud = snapshot.filter((w) =>
+			w.startsWith("polling transport still down after"),
+		);
+		const perAttempt = snapshot.filter((w) =>
+			w.startsWith("polling recovery attempt "),
+		);
+		expect(loud.length).toBe(perAttempt.length - MAX_CONFLICT_RETRIES);
+		tg.setReachable(true, "poll");
+		engine.disconnect();
+	});
+
+	it("conflict exhaustion stays fatal AND requeues its literal detail to the reconnect watcher", async () => {
+		const { engine, tg } = makeEngine({ name: "conflict-requeue" });
+		const seen: string[] = [];
+		engine.onRuntimeFatal = (detail: string) => {
+			seen.push(detail);
+		};
+		await waitConnectedCycle(engine);
+		tg.setUnkillableZombie(true);
+		tg.stealHolderAsZombie();
+		await eventually(
+			() => engine.lifecycleSnapshot().state === "fatal",
+			5_000,
+		);
+		expect(engine.lifecycleSnapshot().state).toBe("fatal");
+		expect(engine.recoveryLog).toContain(
+			"conflict-fatal-requeued-for-reconnect",
+		);
+		expect(seen).toEqual([
+			"polling could not recover after 5 conflict retries — another consumer still holds this bot token's poll stream",
+		]);
 		engine.disconnect();
 	});
 });

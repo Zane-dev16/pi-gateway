@@ -161,6 +161,9 @@ export interface MatrixAdapterDeps {
 	requireMention?: boolean | undefined;
 	processNotices?: boolean | undefined;
 	streamIsMessageChatIds?: ReadonlySet<string> | undefined;
+	/** Ladder-owned logger sink (production passes the gateway logger so
+	 * runtime fatals are loud; tests omit it). */
+	logger?: ConstructorParameters<typeof BasePlatformAdapter>[0]["logger"];
 }
 
 interface EngineOptions {
@@ -318,6 +321,7 @@ export class MatrixAdapterCore
 			capabilities: { typedCommandPrefix: "/", splitsLongMessages: true },
 			lengthUnit: "chars", // Python len() parity — code points (04 §6.3)
 			scalarMaxUnits: deps.scalarMaxUnits ?? 16000,
+			...(deps.logger !== undefined ? { logger: deps.logger } : {}),
 		});
 		this.hs = deps.hs;
 		const real = realPollingClock();

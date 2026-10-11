@@ -116,6 +116,31 @@ describe("resolveConfiguredPlatforms — explicit boot list (DEC-072)", () => {
 			expect(typeof surface.disconnect).toBe("function");
 		}
 	});
+
+	it("production factories forward the gateway logger so runtime fatals stay loud", () => {
+		const spy = spyLogger();
+		const entries = resolveConfiguredPlatforms(
+			"telegram,matrix",
+			() => "cred",
+			spy.log,
+		);
+		expect(entries).toHaveLength(2);
+		for (const entry of entries) {
+			const adapter = entry.factory() as unknown as {
+				lifecycle: { markFatal(reason: unknown): void };
+			};
+			adapter.lifecycle.markFatal({
+				kind: "config_invalid",
+				detail: "boom-test-fatal",
+			});
+		}
+		const fatals = spy.calls.filter(
+			(c) =>
+				c.level === "error" &&
+				c.message === "ADAPTER FATAL: boom-test-fatal",
+		);
+		expect(fatals).toHaveLength(2);
+	});
 });
 
 describe("matrixHosting builder", () => {

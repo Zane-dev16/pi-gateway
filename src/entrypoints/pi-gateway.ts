@@ -165,7 +165,11 @@ export async function runCommand(
 		const raw = (process.env["PI_GATEWAY_PLATFORMS"] ?? "").trim();
 		if (raw !== "") {
 			const hosting = await import("./platform-hosting.js");
-			const platforms = hosting.resolveConfiguredPlatforms(raw);
+			const platforms = hosting.resolveConfiguredPlatforms(
+				raw,
+				undefined,
+				logger,
+			);
 			if (platforms.length > 0) {
 				input.platforms = platforms;
 				// DEC-084 turns: one shared registry per process plus one

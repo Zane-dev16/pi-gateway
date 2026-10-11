@@ -347,7 +347,10 @@ function firstMissingSecret(
  * degrades LOUDLY to the local enablement walk (lazy-load posture of
  * lifecycle.ts:loadBuiltinCommandRegistry).
  */
-function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
+function deriveAdapterEntries(
+	input: GatewayRunInput,
+	onRuntimeFatal?: (platform: string, detail: string) => void,
+): DerivedAdapters {
 	const platforms = input.platforms ?? [];
 	const secrets = input.secretReader ?? kitScopedSecretReader();
 	const log = input.logger ?? stderrLogger();
@@ -511,6 +514,20 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 	};
 
 	/** construct → wire handlers → connect({isReconnect:false}) → stoppable disconnect handle. */
+	const attachRuntimeFatalRequeue = (platform: string, adapter: unknown): void => {
+		if (onRuntimeFatal === undefined) return;
+		const hook = adapter as unknown as {
+			onRuntimeFatal?: unknown;
+		};
+		if (
+			typeof hook === "object" &&
+			hook !== null &&
+			"onRuntimeFatal" in hook
+		) {
+			(hook as { onRuntimeFatal: (detail: string) => void }).onRuntimeFatal =
+				(detail: string) => onRuntimeFatal(platform, detail);
+		}
+	};
 	const startOne = async (
 		hosting: PlatformHosting,
 		ctx: StageContext,
@@ -533,6 +550,10 @@ function deriveAdapterEntries(input: GatewayRunInput): DerivedAdapters {
 				reason: `adapter for ${hosting.platform} exposes no connect()`,
 			};
 		}
+		// Runtime-fatals (e.g. the polling 409-conflict exhaustion) requeue
+		// into the reconnect watcher instead of staying down until restart.
+		// Attached BEFORE connect: the poll stream can go fatal at any time.
+		attachRuntimeFatalRequeue(hosting.platform, adapter);
 		// DEC-074: wire the production guard BEFORE connect (Hermes
 		// _create_adapter parity: handler attached at creation, never
 		// after). Wiring NEVER fails the entry — a skip degrades to
@@ -834,11 +855,21 @@ export function composeGatewayLifecycle(
 	input: GatewayRunInput,
 ): ComposedGateway {
 	const logger = input.logger ?? stderrLogger();
-	const derived = deriveAdapterEntries(input);
+	// The lifecycle owns the failed-platform queue; entries are derived
+	// BEFORE it exists, so the runtime-fatal requeue closes over this box
+	// (the storeOf pattern below) — a fatal can only fire after startup,
+	// by which time the box is set.
+	const box: { lifecycle: GatewayLifecycle | null } = { lifecycle: null };
+	const derived = deriveAdapterEntries(input, (platform, detail) => {
+		box.lifecycle?.failedPlatforms.enqueue(platform, { reason: detail });
+		logger.warn(
+			`platform adapter ${platform} runtime fatal — queued for reconnection: ${detail}`,
+			{ platform, reason_code: "reconnect_queued" },
+		);
+	});
 
 	// The store opens at engine stage 6 — overlays reach it lazily through
 	// this box rather than pretending it exists at composition time.
-	const box: { lifecycle: GatewayLifecycle | null } = { lifecycle: null };
 	const storeOf = (): { db: Database } | null => box.lifecycle?.store ?? null;
 
 	const lifecycle = new GatewayLifecycle({

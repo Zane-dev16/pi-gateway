@@ -54,9 +54,39 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			// DEC-072: explicit boot platform list — the allowlist resolves to
 			// hosted platforms with production factories, so stage 9 derives
 			// real adapter entries for listed platforms. Unset/empty ⇒ [] ⇒
-			// current no-platform behavior, unchanged.
+			// current no-platform behavior, unchanged. The shared stderr
+			// logger rides BOTH the adapters (runtime fatals stay loud) and
+			// the lifecycle (reconnect-queue lines land in one sink).
+			const extLogger = {
+				info: (m: string, meta?: Record<string, unknown>) => {
+					try {
+						process.stderr.write(`[pi-gateway] INFO ${m}\n`);
+					} catch {
+						/* stderr unavailable */
+					}
+					void meta;
+				},
+				warn: (m: string, meta?: Record<string, unknown>) => {
+					try {
+						process.stderr.write(`[pi-gateway] WARN ${m}\n`);
+					} catch {
+						/* stderr unavailable */
+					}
+					void meta;
+				},
+				error: (m: string, meta?: Record<string, unknown>) => {
+					try {
+						process.stderr.write(`[pi-gateway] ERROR ${m}\n`);
+					} catch {
+						/* stderr unavailable */
+					}
+					void meta;
+				},
+			};
 			const platforms = resolveConfiguredPlatforms(
 				process.env[PI_GATEWAY_PLATFORMS_ENV],
+				undefined,
+				extLogger,
 			);
 			// DEC-084: embedded turn factory dissolved; per-chat RPC children
 			// own turns through the production factory below.
@@ -96,6 +126,7 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			}
 			gateway = composeGatewayLifecycle({
 				home: resolvedHome,
+				logger: extLogger,
 				platforms,
 				...(turnRunnerFactory !== undefined ? { turnRunnerFactory } : {}),
 			});

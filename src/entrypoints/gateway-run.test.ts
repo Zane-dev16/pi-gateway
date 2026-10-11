@@ -204,6 +204,57 @@ describe("composeGatewayLifecycle — production stage entries", () => {
 		expect(composed.lifecycle.failedPlatforms.get("driver")).not.toBeNull();
 		expect(composed.lifecycle.failedPlatforms.get("driver")?.attempts).toBe(1);
 	});
+
+	it("runtime fatal requeues its literal detail into the failed-platform queue", async () => {
+		const events: DriverAdapterEvents = { connects: [], disconnects: [] };
+		const spy = spyLogger();
+		let created: {
+			onRuntimeFatal?: ((detail: string) => void) | undefined;
+		} | null = null;
+		const composed = composeGatewayLifecycle({
+			home,
+			logger: spy.log,
+			platforms: [
+				driverHosting(events, () => {
+					const stub = {
+						async connect() {
+							events.connects.push(1);
+							return true;
+						},
+						async disconnect() {
+							events.disconnects.push(1);
+						},
+						onRuntimeFatal: (_detail: string) => {},
+					};
+					created = stub;
+					return stub as unknown as AdapterConnectSurface;
+				}),
+			],
+			secretReader: () => "tok",
+		});
+		await composed.lifecycle.startup();
+		expect(composed.lifecycle.failedPlatforms.get("driver")).toBeNull();
+		expect(created).not.toBeNull();
+		(
+			created as unknown as {
+				onRuntimeFatal?: ((detail: string) => void) | undefined;
+			} | null
+		)?.onRuntimeFatal?.(
+			"polling could not recover after 5 conflict retries — another consumer still holds this bot token's poll stream",
+		);
+		expect(
+			composed.lifecycle.failedPlatforms.get("driver")?.reason,
+		).toBe(
+			"polling could not recover after 5 conflict retries — another consumer still holds this bot token's poll stream",
+		);
+		const queued = spy.calls.find(
+			(c) => c.meta?.reason_code === "reconnect_queued",
+		);
+		expect(queued?.level).toBe("warn");
+		expect(queued?.message).toContain("runtime fatal — queued for reconnection");
+		await composed.lifecycle.requestShutdown("planned_stop");
+		await composed.lifecycle.waitShutdown();
+	});
 });
 
 describe("production drain overlays", () => {
