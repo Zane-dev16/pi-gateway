@@ -94,6 +94,7 @@ export const LINE_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({
 		supportsAsyncDelivery: false,
 		interactiveResume: false,
+		interactiveModel: false,
 		splitsLongMessages: true,
 	});
 

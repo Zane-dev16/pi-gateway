@@ -14,6 +14,7 @@ import {
 	buildModelCommitCallback,
 	buildModelGroupNavCallback,
 	buildModelMemberCallback,
+	buildModelPageCallback,
 	buildModelPageNavCallback,
 	buildModelProviderCallback,
 	buildModelProviderGroupCallback,
@@ -110,6 +111,12 @@ describe("builder→parser round-trip for EVERY prefix family", () => {
 			buildModelGroupNavCallback("anthropic"),
 			() => ({ family: "mg", groupId: "anthropic" }),
 		],
+		[
+			"mg-page",
+			buildModelPageCallback(2),
+			() => ({ family: "mg", page: 2 }),
+		],
+		["mx-bare", "mx", () => ({ family: "mx" })],
 		[
 			"appr/approve",
 			buildWhatsappApprovalCallback(21, "approve"),
@@ -230,6 +237,7 @@ function makeRouter(
 	const overriddenExec = overrides.onExecApproval;
 	const overriddenSlash = overrides.onSlashConfirm;
 	const overriddenClarify = overrides.onClarifyChoice;
+	const overriddenOther = overrides.onClarifyOther;
 	const overriddenAppr = overrides.onWhatsappApproval;
 	const router = new CallbackQueryRouter({
 		stores: { approvals, slashConfirms, appr, clarify },
@@ -249,6 +257,13 @@ function makeRouter(
 				? overriddenClarify(s, id, idx)
 				: `answer-${idx}`;
 		},
+		onClarifyOther:
+			overriddenOther !== undefined
+				? async (s, id) => {
+						resolvedChoices.push(`cl:${id}:other`);
+						return overriddenOther(s, id);
+					}
+				: undefined,
 		onWhatsappApproval: async (s, id, approve) => {
 			resolvedChoices.push(`appr:${id}:${approve}`);
 			return overriddenAppr ? overriddenAppr(s, id, approve) : "ok";
@@ -424,6 +439,99 @@ describe("stale/expired taps always answered, NEVER dispatched as turns", () => 
 		const numeric = await router.route(buildClarifyCallback(51, 0), AUTHORIZED);
 		expect(numeric.kind).toBe("stale");
 		expect(resolvedChoices).toEqual([]);
+	});
+
+	describe("picker rebinding plus clarify-stale keyboard strip (pickers parity)", () => {
+		it("stale clarify taps strip the dead keyboard; one-shot stale stays answer-only", async () => {
+			const { router, approvals } = makeRouter();
+			const staleClarify = await router.route(buildClarifyCallback(77, 0), AUTHORIZED);
+			expect(staleClarify.kind).toBe("stale");
+			if (staleClarify.kind === "stale") {
+				expect(staleClarify.hostEdit).toEqual({
+					text: staleClarify.answerText,
+					keyboardRemoved: true,
+				});
+			}
+			const staleOther = await router.route(buildClarifyCallback(77, "other"), AUTHORIZED);
+			expect(staleOther.kind).toBe("stale");
+			if (staleOther.kind === "stale") {
+				expect(staleOther.hostEdit?.keyboardRemoved).toBe(true);
+			}
+			approvals.register(50, "sess-50", 2000);
+			const staleOneShot = await router.route(buildExecApprovalCallback("once", 50), {
+				...AUTHORIZED,
+			});
+			void staleOneShot;
+			// Fresh (unexpired) one-shot resolves with a strip edit; double-tap is answer-only.
+			approvals.register(51, "sess-51");
+			const first = await router.route(buildExecApprovalCallback("once", 51), AUTHORIZED);
+			expect(first.kind).toBe("resolved");
+			const second = await router.route(buildExecApprovalCallback("once", 51), AUTHORIZED);
+			expect(second.kind).toBe("stale");
+			if (second.kind === "stale") expect(second.hostEdit).toBeNull();
+		});
+
+		it("setResolvers rebinds tap resolution without rebuilding the router", async () => {
+			const seen: string[] = [];
+			const { router, slashConfirms } = makeRouter({
+				onSlashConfirm: async (sessionKey, id, choice) => {
+					seen.push(`orig:${sessionKey}:${id}:${choice}`);
+					return "orig";
+				},
+			});
+			slashConfirms.register(70, "sess-70");
+			const first = await router.route(buildSlashConfirmCallback("once", 70), AUTHORIZED);
+			expect(first.kind).toBe("resolved");
+			expect(seen).toEqual(["orig:sess-70:70:once"]);
+			// Rebind: later taps resolve through the new hook (the shared
+			// picker service in production); audit keeps appending.
+			router.setResolvers({
+				onSlashConfirm: async () => "rebound-label",
+				onPickerNav: async (parsed) => ({ answerText: `rebound:${parsed.family}` }),
+			});
+			slashConfirms.register(71, "sess-71");
+			const second = await router.route(buildSlashConfirmCallback("cancel", 71), AUTHORIZED);
+			expect(second.kind).toBe("resolved");
+			expect(second.answerText).toBe("❌ Cancelled");
+			expect(seen).toEqual(["orig:sess-70:70:once"]);
+			const nav = await router.route(buildChoicePickerCallback(3), AUTHORIZED);
+			expect(nav.answerText).toBe("rebound:cp");
+			expect(router.audit.length).toBe(3);
+		});
+
+		it("nav answers carry opaque replyMarkup through to the adapter", async () => {
+			const { router } = makeRouter({
+				onPickerNav: async (parsed) => ({
+					answerText: `nav:${parsed.family}`,
+					hostEditText: "screen text",
+					replyMarkup: { inline_keyboard: [[{ text: "x", callback_data: "mx:noop" }]] },
+				}),
+			});
+			const answer = await router.route(buildChoicePickerCallback(0), AUTHORIZED);
+			expect(answer.kind).toBe("nav");
+			if (answer.kind === "nav" && answer.hostEdit !== null) {
+				expect(answer.hostEdit.text).toBe("screen text");
+				expect(answer.hostEdit.keyboardRemoved).toBe(false);
+				expect(answer.hostEdit.replyMarkup).toEqual({
+					inline_keyboard: [[{ text: "x", callback_data: "mx:noop" }]],
+				});
+			}
+		});
+	});
+
+	it("cl:other flip calls the gateway onClarifyOther hook with the entry id", async () => {
+		const seen: Array<{ sessionKey: string; id: number }> = [];
+		const { router, clarify } = makeRouter({
+			onClarifyOther: async (sessionKey, id) => {
+				seen.push({ sessionKey, id });
+				return "flipped";
+			},
+		});
+		clarify.register(88, "sess-88");
+		const answer = await router.route(buildClarifyCallback(88, "other"), AUTHORIZED);
+		expect(answer.kind).toBe("resolved");
+		expect(seen).toEqual([{ sessionKey: "sess-88", id: 88 }]);
+		expect(clarify.isAwaitingText(88)).toBe(true);
 	});
 
 	it("EVERY route produces an answer text (spinner always clears)", async () => {

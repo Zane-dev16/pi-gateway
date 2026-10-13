@@ -45,7 +45,7 @@ function harness(opts?: { isMessage?: boolean }): Harness {
 				messageId,
 				content,
 				finalize: o.finalize,
-				metadata: undefined,
+				metadata: o.metadata,
 				platform,
 			});
 			return { success: true, messageId };
@@ -478,5 +478,80 @@ describe("draft-frame admission (relay send_draft delegation)", () => {
 			cp2h.cp.draftAdmission({ chatId: "chat", draftId: 1000 }).swallow,
 		).toBe(false); // evicted tombstone no longer swallows
 		expect(cp2h.cp.sealedDraftByKey.has("chat|512")).toBe(true); // newest kept
+	});
+});
+
+describe("picker payload through the both-door chokepoint (pickers §6)", () => {
+	it("reply_markup metadata survives BOTH doors with byte-identical keyboards", async () => {
+		const h = harness();
+		const keyboard = {
+			inline_keyboard: [
+				[{ text: "Red", callback_data: "cp:0" }],
+				[{ text: "Green", callback_data: "cp:1" }],
+			],
+		};
+		await h.cp.admit({
+			door: "send",
+			chatId: "chat-1",
+			content: "Pick a color",
+			metadata: { reply_markup: keyboard },
+		});
+		await h.cp.admit({
+			door: "send_for_platform",
+			chatId: "chat-2",
+			content: "Pick a color",
+			metadata: { reply_markup: keyboard },
+			platform: "telegram",
+		});
+		expect(h.ops.length).toBe(2);
+		for (const op of h.ops) {
+			expect(op.op).toBe("send");
+			if (op.op === "send") {
+				expect(op.metadata?.["reply_markup"]).toEqual(keyboard);
+			}
+		}
+		// Both admissions audited (the property holds per door).
+		expect(h.cp.audit.map((entry) => entry.door)).toEqual(["send", "send_for_platform"]);
+	});
+
+	it("same-lane second picker reconciles by edit WITH the new keyboard", async () => {
+		// Invariant 4 working as designed: two picker sends sharing one
+		// turn lane do not duplicate — the second reconciles by edit and
+		// the replacement keyboard rides the edit (never a stale board).
+		const h = harness();
+		const first = { inline_keyboard: [[{ text: "Red", callback_data: "cp:0" }]] };
+		const second = { inline_keyboard: [[{ text: "Yes", callback_data: "sc:once:2" }]] };
+		await h.cp.admit({
+			door: "send",
+			chatId: "chat-1",
+			content: "Pick a color",
+			metadata: { reply_markup: first },
+		});
+		await h.cp.admit({
+			door: "send",
+			chatId: "chat-1",
+			content: "Sure?",
+			metadata: { reply_markup: second },
+		});
+		expect(h.ops.map((op) => op.op)).toEqual(["send", "edit"]);
+		const edit = h.ops[1];
+		if (edit === undefined || edit.op !== "edit") throw new Error("expected edit");
+		expect(edit.metadata?.["reply_markup"]).toEqual(second);
+	});
+
+	it("the interim pop never eats picker keyboards", async () => {
+		const h = harness();
+		const keyboard = { inline_keyboard: [[{ text: "1", callback_data: "cl:1:0" }]] };
+		await h.cp.admit({
+			door: "send",
+			chatId: "chat-1",
+			content: "draft",
+			metadata: { reply_markup: keyboard, [INTERIM_SEND_MARKER]: true },
+		});
+		expect(h.ops.length).toBe(1);
+		const op = h.ops[0];
+		if (op?.op !== "send") throw new Error("expected send");
+		expect(op.metadata?.["reply_markup"]).toEqual(keyboard);
+		expect(op.metadata?.[INTERIM_SEND_MARKER]).toBeUndefined();
 	});
 });

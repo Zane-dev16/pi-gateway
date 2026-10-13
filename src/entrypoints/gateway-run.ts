@@ -80,11 +80,15 @@ import type { CommandRegistry as GuardCommandRegistry } from "../pi_gateway/guar
 import {
 	buildAdapterSendReply,
 	buildProductionMessageHandler,
+	hasPickerSenderSurface,
 	toGuardRegistry,
+	tryAttachPickerHooks,
 	tryAttachProductionGuard,
 	type ChatTurnRunner,
+	type PickerHooksSet,
 	type TurnRunnerFactory,
 } from "./guard-wiring.js";
+import type { PickerService } from "../pi_gateway/pickers/service.js";
 
 import type {
 	EmbeddedServiceEntry,
@@ -247,6 +251,13 @@ export interface GatewayRunInput {
 	 * attached` throw contract.
 	 */
 	turnRunnerFactory?: TurnRunnerFactory;
+	/**
+	 * Shared picker service (chat-native select/confirm/model/resume).
+	 * Stage 9 binds it per adapter: keyboard sender late-binding, tap
+	 * hooks, Lane C predicate, and the typed-text consumer on the shared
+	 * messageHandler. Absent means pickers stay text-only as before.
+	 */
+	pickerService?: PickerService | null;
 	/** Host hook after READY, before parking on shutdown (see StartupOkHook). */
 	onStartupOk?: StartupOkHook;
 }
@@ -402,6 +413,50 @@ function deriveAdapterEntries(
 		messageHandler: ReturnType<typeof buildProductionMessageHandler>;
 	} | null = null;
 
+	/**
+	 * Shared picker composition (one service per process — Hermes
+	 * one-runner parity extended to pickers): tap hooks bound once, the
+	 * sender bound to the first keyboard-capable adapter, Lane C plus the
+	 * text consumer derived for every attach. Null when no service was
+	 * composed (pickers stay text-only as before).
+	 */
+	const pickerService = input.pickerService ?? null;
+	const pickerHooks: PickerHooksSet | null =
+		pickerService === null
+			? null
+			: {
+					choiceTap: (pickerId, index) => pickerService.choiceTap(pickerId, index),
+					confirmTap: (pickerId, choice) => pickerService.confirmTap(pickerId, choice),
+					clarifyChoice: (pickerId, idx) => pickerService.clarifyTap(pickerId, idx),
+					clarifyOther: (pickerId) => pickerService.clarifyTap(pickerId, "other"),
+					modelTap: (pickerId, action) => pickerService.modelTap(pickerId, action),
+				};
+	const bindPickerSender = (platform: string, adapter: unknown): void => {
+		if (pickerService === null || pickerService.hasSender) return;
+		if (!hasPickerSenderSurface(adapter)) return;
+		pickerService.setSender(
+			adapter as unknown as Parameters<PickerService["setSender"]>[0],
+		);
+		log.info(`platform adapter ${platform} bound as picker sender`, { platform });
+	};
+	const attachPickerWiring = (platform: string, adapter: unknown): void => {
+		bindPickerSender(platform, adapter);
+		if (pickerHooks !== null) {
+			if (tryAttachPickerHooks(adapter, pickerHooks)) {
+				log.info(`platform adapter ${platform} picker taps wired`, { platform });
+			}
+		}
+	};
+	const pickerGuardOpts = (): {
+		hasPendingClarify?: ((sessionKey: string) => boolean) | undefined;
+	} =>
+		pickerService === null
+			? {}
+			: {
+					hasPendingClarify: (sessionKey: string) =>
+						pickerService.hasPendingTextCapture(sessionKey),
+				};
+
 	const getRunner = (
 		store: StateStore | null,
 	): Promise<ChatTurnRunner | null> => {
@@ -465,16 +520,26 @@ function deriveAdapterEntries(
 					runner,
 					...(ctx.store !== null ? { store: ctx.store } : {}),
 					log,
+					...(pickerService !== null
+						? {
+								consumePendingText: (sessionKey: string, text: string) =>
+									pickerService.takeText(sessionKey, text),
+							}
+						: {}),
 				}),
 			};
 			wiredBase = base;
 		}
 		if (
-			!tryAttachProductionGuard(adapter, {
-				registry: base.registry,
-				messageHandler: base.messageHandler,
-				sendReply,
-			})
+			!tryAttachProductionGuard(
+				adapter,
+				{
+					registry: base.registry,
+					messageHandler: base.messageHandler,
+					sendReply,
+				},
+				pickerGuardOpts(),
+			)
 		) {
 			log.warn(
 				`platform adapter ${platform} exposes no guard slot — ingress stays unwired`,
@@ -482,6 +547,7 @@ function deriveAdapterEntries(
 			);
 			return;
 		}
+		attachPickerWiring(platform, adapter);
 		log.info(`platform adapter ${platform} guard wired`, {
 			platform,
 		});
@@ -498,11 +564,16 @@ function deriveAdapterEntries(
 			);
 			return false;
 		}
-		const ok = tryAttachProductionGuard(adapter, {
-			registry: wiredBase.registry,
-			messageHandler: wiredBase.messageHandler,
-			sendReply,
-		});
+		const ok = tryAttachProductionGuard(
+			adapter,
+			{
+				registry: wiredBase.registry,
+				messageHandler: wiredBase.messageHandler,
+				sendReply,
+			},
+			pickerGuardOpts(),
+		);
+		if (ok) attachPickerWiring(platform, adapter);
 		if (ok)
 			log.info(`platform adapter ${platform} guard re-wired`, { platform });
 		else

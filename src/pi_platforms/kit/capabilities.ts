@@ -21,6 +21,9 @@ export interface CapabilityManifest {
 	typedCommandPrefix: string;
 	/** webhook/api_server set False (#57056 resume prompt). */
 	interactiveResume: boolean;
+	/** webhook/api_server set False: bare /model renders the text catalog
+	 * instead of the provider drill-down keyboard (pickers parity). */
+	interactiveModel: boolean;
 	supportsInchannelContinuable: boolean;
 	/** DingTalk AI-Cards class: explicit close required. Checked `is True`. */
 	requiresEditFinalize: boolean;
@@ -32,6 +35,7 @@ export const DEFAULT_CAPABILITIES: Readonly<CapabilityManifest> = Object.freeze(
 		splitsLongMessages: false,
 		typedCommandPrefix: "/",
 		interactiveResume: true,
+		interactiveModel: true,
 		supportsInchannelContinuable: false,
 		requiresEditFinalize: false,
 	},

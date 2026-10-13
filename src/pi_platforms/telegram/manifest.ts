@@ -393,6 +393,7 @@ export const TELEGRAM_MANIFEST: PluginManifest = {
 		splitsLongMessages: false,
 		typedCommandPrefix: "/",
 		interactiveResume: true,
+		interactiveModel: true,
 		supportsInchannelContinuable: false,
 		// adapter.py:REQUIRES_EDIT_FINALIZE = True — stream_consumer short-
 		// circuits unchanged final edits, skipping MarkdownV2 conversion, so

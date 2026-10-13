@@ -149,6 +149,7 @@ export const PHOTON_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({
 		supportsAsyncDelivery: true,
 		interactiveResume: false,
+		interactiveModel: false,
 	});
 
 /**

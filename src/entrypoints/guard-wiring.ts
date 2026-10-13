@@ -32,6 +32,7 @@ export interface ChatTurnRunner {
 		sessionId: string;
 		routingKey: string;
 		text: string;
+		chatId?: string | undefined;
 	}): Promise<TurnOutcome>;
 }
 
@@ -65,6 +66,14 @@ export interface ProductionMessageHandlerDeps {
 	/** Authz override (tests); default is the ported decision chain. */
 	isAuthorized?: ((source: AuthzSource) => AuthzDecisionRecord) | undefined;
 	log?: GuardWiringLogger | undefined;
+	/**
+	 * Pending-picker text consumer (the shared picker service takeText).
+	 * Runs after authz, before the turn: a non-null reply consumes the
+	 * message as picker input and NO turn dispatches (run_inbound typed
+	 * text-resolves parity — the parked waiter, not a second turn, owns
+	 * the answer). Absent means every message drives a turn as before.
+	 */
+	consumePendingText?: ((sessionKey: string, text: string) => string | null) | undefined;
 }
 
 /**
@@ -121,10 +130,17 @@ export function buildProductionMessageHandler(
 			return null;
 		}
 		const text = event.text ?? "";
+		if (deps.consumePendingText !== undefined && driveSessionId !== "") {
+			const picked = deps.consumePendingText(driveSessionId, text);
+			if (picked !== null) return picked;
+		}
 		const outcome = await runner.handleTurn({
 			sessionId: driveSessionId,
 			routingKey: sessionKey,
 			text,
+			...(source?.chatId != null && source.chatId !== ""
+				? { chatId: source.chatId }
+				: {}),
 		});
 		if (outcome.exitReason === "error") {
 			throw new Error(outcome.errorMessage ?? "turn error");
@@ -138,6 +154,7 @@ export interface ProductionGuardDeps {
 	messageHandler: MessageHandler;
 	sendReply: (chatId: string, text: string) => Promise<void>;
 }
+
 
 /**
  * Project the frozen class registry onto the guard's row subset (07 §9 —
@@ -162,7 +179,12 @@ export function toGuardRegistry(
 
 /** Structural guard slot (kit BasePlatformAdapter.attachGuard, detected). */
 interface GuardSlot {
-	attachGuard(deps: ProductionGuardDeps): void;
+	attachGuard(
+		deps: ProductionGuardDeps,
+		opts?: {
+			hasPendingClarify?: ((sessionKey: string) => boolean) | undefined;
+		},
+	): void;
 }
 
 function asGuardSlot(adapter: unknown): GuardSlot | null {
@@ -219,9 +241,90 @@ export function buildAdapterSendReply(
 export function tryAttachProductionGuard(
 	adapter: unknown,
 	deps: ProductionGuardDeps,
+	opts: {
+		/** Lane C clarify-intercept predicate (the shared picker service). */
+		hasPendingClarify?: ((sessionKey: string) => boolean) | undefined;
+	} = {},
 ): boolean {
 	const slot = asGuardSlot(adapter);
 	if (slot === null) return false;
-	slot.attachGuard(deps);
+	slot.attachGuard(
+		deps,
+		opts.hasPendingClarify !== undefined ? { hasPendingClarify: opts.hasPendingClarify } : {},
+	);
+	return true;
+}
+
+/** Structural picker-hooks slot (telegram setPickerHooks, detected). */
+interface PickerHooksSlot {
+	setPickerHooks(hooks: PickerHooksSet): void;
+}
+
+/**
+ * Tap-resolution hook set the composition root builds from the shared
+ * picker service (structural mirror of the telegram seam — declared here
+ * so this module never imports the adapter).
+ */
+export interface PickerHooksSet {
+	choiceTap(
+		pickerId: number,
+		index: number,
+	): { status: "resolved"; value: string } | { status: "awaiting-text" } | { status: "stale" };
+	confirmTap(
+		pickerId: number,
+		choice: "once" | "always" | "cancel",
+	): { label: string | null };
+	clarifyChoice(
+		pickerId: number,
+		idx: number,
+	): { status: "resolved"; value: string } | { status: "awaiting-text" } | { status: "stale" };
+	clarifyOther(
+		pickerId: number,
+	): { status: "resolved"; value: string } | { status: "awaiting-text" } | { status: "stale" };
+	modelTap(
+		pickerId: number,
+		action:
+			| { kind: "provider"; slug: string }
+			| { kind: "providerPage"; page: number }
+			| { kind: "modelPage"; page: number }
+			| { kind: "model"; index: number }
+			| { kind: "confirm"; index: number }
+			| { kind: "back" }
+			| { kind: "cancel" },
+	): Promise<
+		| { answer: string; screen: unknown }
+		| { answer: string; stale: true }
+	>;
+}
+
+/**
+ * Attach tap-resolution hooks to one constructed adapter. TRUE when the
+ * surface exposes the picker slot; FALSE otherwise (non-picker adapters
+ * keep answering expiry — today's behavior).
+ */
+export function tryAttachPickerHooks(adapter: unknown, hooks: PickerHooksSet): boolean {
+	const candidate = adapter as Partial<PickerHooksSlot>;
+	if (typeof candidate.setPickerHooks !== "function") return false;
+	(candidate as PickerHooksSlot).setPickerHooks(hooks);
+	return true;
+}
+
+/**
+ * Whether the adapter exposes the picker sender surface (keyboard senders
+ * plus the text lane) for late binding into the shared service. Text-only
+ * adapters report false and the service keeps the numbered-text lane.
+ */
+export function hasPickerSenderSurface(adapter: unknown): boolean {
+	if (typeof adapter !== "object" || adapter === null) return false;
+	const candidate = adapter as Record<string, unknown>;
+	for (const key of [
+		"sendChoicePicker",
+		"sendSlashConfirm",
+		"sendClarify",
+		"sendModelPicker",
+		"sendPickerText",
+	]) {
+		if (typeof candidate[key] !== "function") return false;
+	}
 	return true;
 }

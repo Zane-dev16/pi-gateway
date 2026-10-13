@@ -210,6 +210,25 @@ export function listDiscoveryPaths(index: DiscoveryIndex): string[] {
 	return [...index.keys()].sort();
 }
 
+/**
+ * Recent sessions across ALL paths, newest-first (the bare /resume picker
+ * source — _handle_resume_command listing parity). Labels carry the working
+ * directory plus the short session id, exactly what the picker shows.
+ */
+export function listRecentSessions(
+	index: DiscoveryIndex,
+): Array<{ id: string; cwd: string; file: string; label: string }> {
+	const all: DiscoveredSession[] = [];
+	for (const list of index.values()) all.push(...list);
+	all.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	return all.map((row) => ({
+		id: row.id,
+		cwd: row.cwd,
+		file: row.file,
+		label: `${row.cwd} — ${row.id.slice(0, 8)}`,
+	}));
+}
+
 /** Newest session rooted at a path, or null when the path holds none. */
 export function mostRecentSessionAtPath(
 	index: DiscoveryIndex,

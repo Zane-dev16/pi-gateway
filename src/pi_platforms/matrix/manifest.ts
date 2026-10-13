@@ -386,6 +386,7 @@ export const MATRIX_MANIFEST: PluginManifest = {
 		splitsLongMessages: true,
 		typedCommandPrefix: "/",
 		interactiveResume: true,
+		interactiveModel: true,
 		supportsInchannelContinuable: false,
 		requiresEditFinalize: false,
 	},

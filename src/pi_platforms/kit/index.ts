@@ -9,11 +9,14 @@ export {
 	EXEC_APPROVAL_CHOICES,
 	SLASH_CONFIRM_CHOICES,
 	FAMILY_PREFIXES,
+	MODEL_BACK_CALLBACK,
+	MODEL_NOOP_CALLBACK,
 	buildChoicePickerCallback,
 	buildClarifyCallback,
 	buildExecApprovalCallback,
 	buildModelCommitCallback,
 	buildModelGroupNavCallback,
+	buildModelPageCallback,
 	buildModelMemberCallback,
 	buildModelPageNavCallback,
 	buildModelProviderCallback,
@@ -158,7 +161,12 @@ export {
 	BasePlatformAdapter,
 	MAX_MESSAGE_LENGTH_DEFAULT,
 } from "./base-adapter.js";
-export type { BaseAdapterDeps } from "./base-adapter.js";
+export type {
+	BaseAdapterDeps,
+	ModelProviderInput,
+	ModelProvidersScreenInput,
+	PickerChoiceInput,
+} from "./base-adapter.js";
 
 export {
 	DELIVERY_FAILED_NOTICE,

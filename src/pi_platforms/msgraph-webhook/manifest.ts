@@ -74,6 +74,7 @@ export const MSGRAPH_WEBHOOK_CAPABILITIES: Readonly<
 > = Object.freeze({
 	supportsAsyncDelivery: false,
 	interactiveResume: false,
+	interactiveModel: false,
 });
 
 /**

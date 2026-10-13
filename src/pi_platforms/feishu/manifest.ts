@@ -302,6 +302,7 @@ export const FEISHU_MANIFEST: PluginManifest = {
 		splitsLongMessages: false,
 		typedCommandPrefix: "/",
 		interactiveResume: true,
+		interactiveModel: true,
 		supportsInchannelContinuable: false,
 		requiresEditFinalize: false,
 	},

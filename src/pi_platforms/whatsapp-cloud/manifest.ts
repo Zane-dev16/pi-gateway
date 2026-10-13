@@ -295,6 +295,7 @@ export const WHATSAPP_CLOUD_CAPABILITIES: Readonly<
 > = Object.freeze({
 	supportsAsyncDelivery: false,
 	interactiveResume: false,
+	interactiveModel: false,
 	splitsLongMessages: true,
 });
 

@@ -72,7 +72,11 @@ export interface DoorTransport {
 		metadata: Metadata,
 		platform?: string | undefined,
 	): Promise<SendResult>;
-	/** Wire edit (reconcile-by-edit lane). */
+	/**
+	 * Wire edit (reconcile-by-edit lane). The admission metadata rides
+	 * along (replacement keyboards on picker reconciles) — transports
+	 * that ignore it keep their current wire shape.
+	 */
 	transmitEdit(
 		chatId: string,
 		messageId: string,
@@ -235,7 +239,7 @@ export class EgressChokepoint {
 						input.chatId,
 						editTarget,
 						input.content,
-						{ finalize: !interim },
+						{ finalize: !interim, metadata: wireMetadata },
 						input.platform,
 					);
 					if (edited.success) {

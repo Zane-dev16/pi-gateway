@@ -1,0 +1,32 @@
+// pi_gateway/pickers — public surface (store + service only; no kit,
+// no runner, no adapter imports — layering rank 3).
+
+export {
+	PickerStore,
+	type PickerEntrySnapshot,
+	type PickerKind,
+	type PickerOutcome,
+} from "./store.js";
+export {
+	PickerService,
+	MODEL_PAGE_SIZE,
+	MODEL_PROVIDER_PAGE_SIZE,
+	RESUME_LIST_LIMIT,
+	type AskClarifyOpts,
+	type AskConfirmOpts,
+	type AskModelOpts,
+	type AskResumeOpts,
+	type AskSelectOpts,
+	type AskTextOpts,
+	type ModelPickOutcome,
+	type ModelProviderRow,
+	type ModelScreen,
+	type ModelTapAction,
+	type PickerChoice,
+	type PickerCommit,
+	type PickerRespond,
+	type PickerSender,
+	type ResumePickOutcome,
+	type ResumeSessionRow,
+	type TapClaim,
+} from "./service.js";

@@ -71,6 +71,7 @@ export const WEBHOOK_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({
 		supportsAsyncDelivery: false,
 		interactiveResume: false,
+		interactiveModel: false,
 	});
 
 /** All five DEC-017 schemes, declared as data (scheme-specific handlers differ legitimately). */

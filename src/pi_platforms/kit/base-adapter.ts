@@ -71,6 +71,37 @@ export interface BaseAdapterDeps {
 }
 
 /**
+ * Sender input shapes for the §9 picker senders. Kit-owned (adapters and
+ * the gateway picker service satisfy them structurally from opposite sides
+ * of the layer boundary, so neither imports the other's module).
+ */
+
+/** One flat choice row (Hermes {"value","label","is_current"} parity). */
+export interface PickerChoiceInput {
+	value: string;
+	label: string;
+	isCurrent?: boolean | undefined;
+}
+
+/** One provider row for the model drill-down first screen. */
+export interface ModelProviderInput {
+	slug: string;
+	name: string;
+	models: string[];
+	totalModels: number;
+	isCurrent: boolean;
+}
+
+/** First screen of the model drill-down (providers page). */
+export interface ModelProvidersScreenInput {
+	kind: "providers";
+	text: string;
+	providers: ModelProviderInput[];
+	page: number;
+	totalPages: number;
+}
+
+/**
  * Abstract base. Concrete adapters implement TRANSPORT only; everything
  * policy-shaped lives here or in the kit modules it composes.
  */
@@ -149,6 +180,12 @@ export abstract class BasePlatformAdapter {
 		return capabilityFlag(
 			this.caps.interactiveResume,
 			DEFAULT_CAPABILITIES.interactiveResume,
+		);
+	}
+	get interactiveModel(): boolean {
+		return capabilityFlag(
+			this.caps.interactiveModel,
+			DEFAULT_CAPABILITIES.interactiveModel,
 		);
 	}
 	get requiresEditFinalize(): boolean {
@@ -413,6 +450,94 @@ export abstract class BasePlatformAdapter {
 			return this.wireSend(chatId, plainTextFallbackBody(chunk), metadata);
 		}
 		return outcome;
+	}
+
+	// ── interactive picker senders (§9; pickers parity) ────────────────────
+	//
+	// Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
+	//   gateway/platforms/base.py:send_exec_approval/send_slash_confirm/
+	//     send_clarify (defaults: Not-supported except clarify, which sends
+	//     the numbered list and flips mark_awaiting_text).
+	// Shapes reuse the established adapter conventions (photon sendClarify,
+	// wa-cloud sendSlashConfirm — same names, same parameter order) so every
+	// existing override keeps compiling: the numeric picker id rides AFTER
+	// the session key (optional in the base, required in keyboard overrides
+	// that must emit it into 64-byte callback_data). Button adapters
+	// (Telegram) override with native keyboards; text-only platforms inherit
+	// these defaults and the picker service falls back to the numbered-text
+	// lane on Not-supported (capability miss latches). The SERVICE owns
+	// entries/resolution — senders only render.
+
+	/**
+	 * Clarify prompt. The default IS the Hermes base fallback, byte-exact
+	 * with the photon numbered-text render: `❓ question`, blank, two-space
+	 * indented options, blank, reply hint — through DOOR 1 (the service
+	 * flips awaiting-text itself, so the next message resolves). Button
+	 * adapters render one button per choice plus Other instead.
+	 */
+	async sendClarify(
+		chatId: string,
+		question: string,
+		choices: readonly string[] | undefined,
+		_sessionKey: string,
+		_pickerId?: number | undefined,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		if (choices === undefined || choices.length === 0) {
+			return this.send(chatId, `❓ ${question}`, undefined, metadata);
+		}
+		const lines = [`❓ ${question}`, ""];
+		for (let i = 0; i < choices.length; i += 1) {
+			lines.push(`  ${i + 1}. ${choices[i]}`);
+		}
+		lines.push("");
+		lines.push("Reply with the number, the option text, or your own answer.");
+		return this.send(chatId, lines.join("\n"), undefined, metadata);
+	}
+
+	/**
+	 * Flat choice prompt (RPC select, /reasoning, /fast, /resume). Default
+	 * Not-supported — the service falls back to the numbered-text lane.
+	 */
+	async sendChoicePicker(
+		_chatId: string,
+		_title: string,
+		_choices: readonly PickerChoiceInput[],
+		_sessionKey: string,
+		_pickerId: number,
+		_metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		return { success: false, error: "Not supported" };
+	}
+
+	/**
+	 * Three-option slash-command confirmation (Approve Once / Always /
+	 * Cancel). Default Not-supported — the service falls back to yes/no
+	 * text (gateway text fallback /approve//always//cancel parity).
+	 */
+	async sendSlashConfirm(
+		_chatId: string,
+		_title: string,
+		_message: string,
+		_sessionKey: string,
+		_confirmId: number,
+		_metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		return { success: false, error: "Not supported" };
+	}
+
+	/**
+	 * Model drill-down (provider → model, paginated). Default Not-supported
+	 * — the service falls back to the text catalog.
+	 */
+	async sendModelPicker(
+		_chatId: string,
+		_screen: ModelProvidersScreenInput,
+		_sessionKey: string,
+		_pickerId: number,
+		_metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		return { success: false, error: "Not supported" };
 	}
 
 	// ── fatal/disable surfaces ───────────────────────────────────────────────

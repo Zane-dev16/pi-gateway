@@ -182,22 +182,38 @@ export async function runCommand(
 				const [
 					{ ChatProcRegistry },
 					{ RpcTurnRunner },
+					{ PickerService },
 					{
 						buildDiscoveryIndex,
 						listDiscoveryPaths,
+						listRecentSessions,
 						mostRecentSessionAtPath,
 						resolveAgentDir,
 					},
 				] = [
 					await import("../pi_agent_core/chat-proc-registry.js"),
 					await import("../pi_agent_core/rpc-turn-runner.js"),
+					await import("../pi_gateway/pickers/service.js"),
 					await import("../pi_gateway/discovery.js"),
 				];
 				const registry = new ChatProcRegistry();
 				const home = opts.home;
 				const agentDir = resolveAgentDir();
-				input.turnRunnerFactory = ({ store }) =>
-					new RpcTurnRunner({
+				// Shared picker service (rank-3 PickerService through the
+				// runner's structural seam): commit closures forward-ref the
+				// runner assigned below — taps only land post-boot.
+				let pickerRunner: InstanceType<typeof RpcTurnRunner>;
+				const pickerService = new PickerService({
+					commit: {
+						commitModel: (sessionKey, provider, id) =>
+							pickerRunner.commitPickerModel(sessionKey, provider, id),
+						commitResume: (sessionKey, file) =>
+							pickerRunner.commitPickerResume(sessionKey, file),
+					},
+				});
+				input.pickerService = pickerService;
+				input.turnRunnerFactory = ({ store }) => {
+					pickerRunner = new RpcTurnRunner({
 						registry,
 						resolveHome: () => home,
 						listDiscoveryPaths: () =>
@@ -207,8 +223,13 @@ export async function runCommand(
 								buildDiscoveryIndex(agentDir),
 								rawPath,
 							)?.file ?? null,
+						listRecentSessions: () =>
+							listRecentSessions(buildDiscoveryIndex(agentDir)),
+						pickers: pickerService,
 						...(store !== null ? { store } : {}),
 					});
+					return pickerRunner;
+				};
 			}
 		}
 	}

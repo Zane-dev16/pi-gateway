@@ -92,26 +92,42 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 			// own turns through the production factory below.
 			const resolvedHome = home ?? resolvePiHome();
 			let turnRunnerFactory: TurnRunnerFactory | undefined;
+			let pickerServiceForLifecycle: unknown = null;
 			if (platforms.length > 0) {
 				const [
 					{ ChatProcRegistry: Registry },
 					{ RpcTurnRunner },
+					{ PickerService },
 					{
 						buildDiscoveryIndex,
 						listDiscoveryPaths,
+						listRecentSessions,
 						mostRecentSessionAtPath,
 						resolveAgentDir,
 					},
 				] = await Promise.all([
 					import("../src/pi_agent_core/chat-proc-registry.js"),
 					import("../src/pi_agent_core/rpc-turn-runner.js"),
+					import("../src/pi_gateway/pickers/service.js"),
 					import("../src/pi_gateway/discovery.js"),
 				]);
 				if (chatRegistry === null) chatRegistry = new Registry();
 				const registry = chatRegistry;
 				const agentDir = resolveAgentDir();
-				turnRunnerFactory = ({ store }) =>
-					new RpcTurnRunner({
+				// Shared picker service (forward-ref commit parity with the
+				// standalone factory above — taps only land post-boot).
+				let pickerRunner: InstanceType<typeof RpcTurnRunner>;
+				const pickerService = new PickerService({
+					commit: {
+						commitModel: (sessionKey, provider, id) =>
+							pickerRunner.commitPickerModel(sessionKey, provider, id),
+						commitResume: (sessionKey, file) =>
+							pickerRunner.commitPickerResume(sessionKey, file),
+					},
+				});
+				pickerServiceForLifecycle = pickerService;
+				turnRunnerFactory = ({ store }) => {
+					pickerRunner = new RpcTurnRunner({
 						registry,
 						resolveHome: () => resolvedHome,
 						listDiscoveryPaths: () =>
@@ -121,14 +137,27 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 								buildDiscoveryIndex(agentDir),
 								rawPath,
 							)?.file ?? null,
+						listRecentSessions: () =>
+							listRecentSessions(buildDiscoveryIndex(agentDir)),
+						pickers: pickerService,
 						...(store !== null ? { store } : {}),
 					});
+					return pickerRunner;
+				};
 			}
 			gateway = composeGatewayLifecycle({
 				home: resolvedHome,
 				logger: extLogger,
 				platforms,
 				...(turnRunnerFactory !== undefined ? { turnRunnerFactory } : {}),
+				...(pickerServiceForLifecycle !== null
+					? {
+							pickerService:
+								pickerServiceForLifecycle as NonNullable<
+									Parameters<typeof composeGatewayLifecycle>[0]["pickerService"]
+								>,
+						}
+					: {}),
 			});
 			const res = await gateway.lifecycle.startup();
 			if (!res.ok) {

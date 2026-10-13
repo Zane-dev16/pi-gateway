@@ -199,6 +199,7 @@ export const SIMPLEX_CAPABILITIES: Readonly<Partial<CapabilityManifest>> =
 	Object.freeze({
 		supportsAsyncDelivery: true,
 		interactiveResume: true,
+		interactiveModel: true,
 	});
 
 // ── plugin manifest (kit registration shape) ────────────────────────────────

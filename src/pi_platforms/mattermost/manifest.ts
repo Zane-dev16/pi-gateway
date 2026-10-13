@@ -126,6 +126,7 @@ export const MATTERMOST_MANIFEST: PluginManifest = {
 		splitsLongMessages: true,
 		typedCommandPrefix: "/",
 		interactiveResume: true,
+		interactiveModel: true,
 		supportsInchannelContinuable: false,
 		requiresEditFinalize: false,
 	},

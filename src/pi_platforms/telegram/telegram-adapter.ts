@@ -54,13 +54,28 @@ import type { EditOptions } from "../../pi_gateway/streaming/adapter-seam.js";
 import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
 import type { ProcessingOutcome } from "../../pi_gateway/guards/index.js";
 import {
+	buildChoicePickerCallback,
+	buildClarifyCallback,
 	buildExecApprovalCallback,
+	buildModelCommitCallback,
+	buildModelMemberCallback,
+	buildModelPageCallback,
+	buildModelPageNavCallback,
+	buildModelProviderCallback,
+	buildSlashConfirmCallback,
 	chunkWithFenceCarry,
 	codePointLen,
 	extractRetryAfterSeconds,
+	MODEL_BACK_CALLBACK,
+	MODEL_NOOP_CALLBACK,
+	parseCallbackData,
 	PLAIN_TEXT_FALLBACK_PREFIX,
 	type CallbackAnswer,
 	type CallbackTapContext,
+	type ModelProviderInput,
+	type ModelProvidersScreenInput,
+	type ParsedCallback,
+	type PickerChoiceInput,
 	type PluginContext,
 } from "../kit/index.js";
 import {
@@ -112,6 +127,11 @@ import {
 	STICKER_VISION_PROMPT,
 } from "./sticker-cache.js";
 import type {
+	ModelScreen,
+	ModelTapAction,
+	TapClaim,
+} from "../../pi_gateway/pickers/service.js";
+import type {
 	TgWireCallbackQuery,
 	TgWireMessage,
 	TgWireSticker,
@@ -148,6 +168,26 @@ export interface DmTopicConfigEntry {
 export interface TypingVariant {
 	statusText?: string | undefined;
 	threadId?: string | undefined;
+}
+
+/**
+ * Tap-resolution hooks into the shared gateway picker service
+ * (pi_gateway/pickers). The adapter owns wire grammar plus keyboards; the
+ * service owns entries plus commits. Production passes the service's bound
+ * methods; without hooks every picker tap answers expiry (fail-closed).
+ */
+export interface TelegramPickerHooks {
+	choiceTap(pickerId: number, index: number): TapClaim;
+	confirmTap(
+		pickerId: number,
+		choice: "once" | "always" | "cancel",
+	): { label: string | null };
+	clarifyChoice(pickerId: number, idx: number): TapClaim;
+	clarifyOther(pickerId: number): TapClaim;
+	modelTap(
+		pickerId: number,
+		action: ModelTapAction,
+	): Promise<{ answer: string; screen: ModelScreen } | { answer: string; stale: true }>;
 }
 
 export interface TelegramAdapterDeps<
@@ -314,6 +354,18 @@ export class TelegramAdapter<
 	/** Monotonic approval ids (64-byte callback_data ⇒ ints, never uuids). */
 	private approvalSeq = 1000;
 
+	/**
+	 * Per-chat picker bindings (Hermes _choice_picker_state /
+	 * _model_picker_state parity, keyed by host chat id): the tap payload
+	 * carries no picker id (cp:<i>, mp:…), so the send side binds
+	 * chat → {pickerId, sessionKey} and the tap side resolves through it.
+	 * One live picker per chat per kind; a new send overwrites the binding
+	 * and the service settles the displaced entry cancelled.
+	 */
+	private readonly choiceBindings = new Map<string, { pickerId: number; sessionKey: string }>();
+	private readonly modelBindings = new Map<string, { pickerId: number; sessionKey: string }>();
+	private pickerHooks: TelegramPickerHooks | null = null;
+
 	/** tg2-6 capability latches (adapter.py:_rich_send_disabled /
 	 * _rich_draft_disabled): set once per process by capability errors. */
 	private richSendDisabled = false;
@@ -378,6 +430,47 @@ export class TelegramAdapter<
 			// 4096 UTF-16 units). Conformance subjects override smaller.
 			void this.overrideScalarMaxUnits(TELEGRAM_MAX_MESSAGE_UNITS);
 		}
+	}
+
+	/**
+	 * Manifest-honest keyboard support for the picker sender seam
+	 * (interactiveModel manifest data — text-only shapes report false and
+	 * the service skips the keyboard attempt outright).
+	 */
+	get interactivePickers(): boolean {
+		return this.interactiveModel;
+	}
+
+	/** Plain-text picker lane through DOOR 1 (sender-seam surface). */
+	async sendPickerText(
+		chatId: string,
+		text: string,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		return this.send(chatId, text, undefined, metadata);
+	}
+
+	/**
+	 * Point tap resolution at the shared picker service (composition root
+	 * calls this once the service exists — the service's sender side
+	 * already points back at this adapter). The ea: family keeps the
+	 * inherited conformance resolvers (exec approvals are not picker scope).
+	 */
+	setPickerHooks(hooks: TelegramPickerHooks): void {
+		this.pickerHooks = hooks;
+		this.router.setResolvers({
+			onSlashConfirm: async (_sessionKey, confirmId, choice) =>
+				hooks.confirmTap(confirmId, choice).label,
+			onClarifyChoice: async (_sessionKey, clarifyId, idx) => {
+				const claim = hooks.clarifyChoice(clarifyId, idx);
+				return claim.status === "resolved" ? claim.value : null;
+			},
+			onClarifyOther: async (_sessionKey, clarifyId) => {
+				const claim = hooks.clarifyOther(clarifyId);
+				return claim.status === "awaiting-text" ? "✏️ Type your answer in the chat." : null;
+			},
+			onPickerNav: async (parsed, ctx) => this.handlePickerNav(parsed, ctx),
+		});
 	}
 
 	/** Test/subject seam for the scalar budget (core field is private). */
@@ -828,22 +921,58 @@ export class TelegramAdapter<
 			callback_query_id: cbq.id,
 			text: answer.answerText,
 		});
-		if (answer.kind === "resolved" && cbq.message !== undefined) {
-			// tg2-2 (adapter.py:_handle_callback_query :7280 / choice-picker
-			// :6687): resolved taps edit the host message TEXT with the
-			// resolution label — format_message-style MarkdownV2 under
-			// parse_mode=MarkdownV2 with reply_markup REMOVED — so the
-			// approval/choice outcome lands in chat, not just the spinner.
-			try {
-				await this.bot.editMessageText({
-					chat_id: normalizeTelegramChatId(cbq.message.chat.id),
-					message_id: numericOrRaw(cbq.message.message_id),
-					text: toTelegramMarkdownV2Full(answer.hostEdit.text),
-					parse_mode: "MarkdownV2",
-					reply_markup: null,
-				});
-			} catch {
-				// non-fatal if edit fails (Hermes swallows this too)
+		if (cbq.message !== undefined) {
+			if (answer.kind === "resolved") {
+				// tg2-2 (adapter.py:_handle_callback_query :7280 / choice-picker
+				// :6687): resolved taps edit the host message TEXT with the
+				// resolution label — format_message-style MarkdownV2 under
+				// parse_mode=MarkdownV2 with reply_markup REMOVED — so the
+				// approval/choice outcome lands in chat, not just the spinner.
+				try {
+					await this.bot.editMessageText({
+						chat_id: normalizeTelegramChatId(cbq.message.chat.id),
+						message_id: numericOrRaw(cbq.message.message_id),
+						text: toTelegramMarkdownV2Full(answer.hostEdit.text),
+						parse_mode: "MarkdownV2",
+						reply_markup: null,
+					});
+				} catch {
+					// non-fatal if edit fails (Hermes swallows this too)
+				}
+			} else if (
+				(answer.kind === "stale" || answer.kind === "unknown") &&
+				answer.hostEdit !== null
+			) {
+				// Clarify expiry strips the dead keyboard so an expired prompt
+				// stops looking tappable (_notify_clarify_expired parity).
+				try {
+					await this.bot.editMessageText({
+						chat_id: normalizeTelegramChatId(cbq.message.chat.id),
+						message_id: numericOrRaw(cbq.message.message_id),
+						text: toTelegramMarkdownV2Full(answer.hostEdit.text),
+						parse_mode: "MarkdownV2",
+						reply_markup: null,
+					});
+				} catch {
+					// non-fatal if edit fails (Hermes swallows this too)
+				}
+			} else if (answer.kind === "nav" && answer.hostEdit !== null) {
+				// Picker drill-down re-render IN PLACE with the next keyboard
+				// (_picker_edit parity); a null markup strips on terminal
+				// screens. An absent markup keeps the current keyboard.
+				try {
+					await this.bot.editMessageText({
+						chat_id: normalizeTelegramChatId(cbq.message.chat.id),
+						message_id: numericOrRaw(cbq.message.message_id),
+						text: toTelegramMarkdownV2Full(answer.hostEdit.text),
+						parse_mode: "MarkdownV2",
+						...("replyMarkup" in answer.hostEdit
+							? { reply_markup: answer.hostEdit.replyMarkup ?? null }
+							: {}),
+					});
+				} catch {
+					// non-fatal if edit fails (Hermes swallows this too)
+				}
 			}
 		}
 	}
@@ -1983,6 +2112,190 @@ export class TelegramAdapter<
 		});
 		return { ...result, approvalId };
 	}
+
+	// ══════════════════════════════════════════════════════════════════════
+	// Picker senders (§9; pickers parity — chat-native select/confirm/model)
+	// ══════════════════════════════════════════════════════════════════════
+	//
+	// Hermes anchors (READ-ONLY reference; semantics ported, no code vendored):
+	//   plugins/platforms/telegram/adapter.py:send_slash_confirm (sc: 3-button)
+	//   adapter.py:send_clarify (numbered buttons + Other flips to text)
+	//   adapter.py:send_choice_picker (flat cp: buttons, rows of two)
+	//   adapter.py:send_model_picker (provider → model drill-down, in place)
+	//   adapter.py:_build_provider_keyboard/_build_model_keyboard
+	//   adapter.py:_handle_callback_query (prefix dispatch; answer every tap)
+	//
+	// Every send rides DOOR 1 with reply_markup metadata (both-door
+	// chokepoint parity — the keyboard is wire metadata, never a side
+	// channel). Taps resolve through the kit router rebound to the shared
+	// picker service (constructor); without hooks every tap answers expiry.
+
+	/**
+	 * Flat choice keyboard (RPC select, /resume): one tap → one value.
+	 * Binds chat → picker for the cpl payload (which carries no id).
+	 */
+	override async sendChoicePicker(
+		chatId: string,
+		title: string,
+		choices: readonly PickerChoiceInput[],
+		sessionKey: string,
+		pickerId: number,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		if (choices.length === 0) {
+			return { success: false, error: "No choices" };
+		}
+		this.choiceBindings.set(String(chatId), { pickerId, sessionKey });
+		const buttons = choices.map((choice, index) => ({
+			text: choice.isCurrent === true ? `✓ ${choice.label}` : choice.label,
+			callback_data: buildChoicePickerCallback(index),
+		}));
+		return this.send(chatId, toTelegramMarkdownV2Full(title), undefined, {
+			...(metadata ?? {}),
+			reply_markup: { inline_keyboard: rowsOfTwo(buttons) },
+		});
+	}
+
+	/**
+	 * Slash-confirm keyboard (RPC confirm): Approve Once / Always / Cancel
+	 * resolving through the sc: router family into the service entry.
+	 */
+	override async sendSlashConfirm(
+		chatId: string,
+		title: string,
+		message: string,
+		sessionKey: string,
+		confirmId: number,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		this.slashConfirms.register(confirmId, sessionKey);
+		const keyboard = {
+			inline_keyboard: [
+				[
+					{ text: "Approve Once", callback_data: buildSlashConfirmCallback("once", confirmId) },
+					{ text: "Always", callback_data: buildSlashConfirmCallback("always", confirmId) },
+				],
+				[{ text: "Cancel", callback_data: buildSlashConfirmCallback("cancel", confirmId) }],
+			],
+		};
+		return this.send(
+			chatId,
+			toTelegramMarkdownV2Full(`${title}\n\n${message}`),
+			undefined,
+			{ ...(metadata ?? {}), reply_markup: keyboard },
+		);
+	}
+
+	/**
+	 * Clarify keyboard: full option text in the body (mobile truncates
+	 * button labels), numeric buttons plus the Other escape hatch flipping
+	 * to text capture. Without choices, the plain question (the gateway
+	 * text-intercept captures the reply).
+	 */
+	override async sendClarify(
+		chatId: string,
+		question: string,
+		choices: readonly string[] | undefined,
+		sessionKey: string,
+		pickerId?: number | undefined,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		const id = pickerId ?? ++this.approvalSeq;
+		if (choices === undefined || choices.length === 0) {
+			return this.send(chatId, toTelegramMarkdownV2Full(`❓ ${question}`), undefined, metadata);
+		}
+		this.clarify.register(id, sessionKey);
+		const body = [`❓ ${question}`, ""];
+		for (let i = 0; i < choices.length; i += 1) {
+			body.push(`${i + 1}. ${choices[i]}`);
+		}
+		const rows = choices.map((_, index) => [
+			{ text: String(index + 1), callback_data: buildClarifyCallback(id, index) },
+		]);
+		rows.push([{ text: "✏️ Other (type answer)", callback_data: buildClarifyCallback(id, "other") }]);
+		return this.send(chatId, toTelegramMarkdownV2Full(body.join("\n")), undefined, {
+			...(metadata ?? {}),
+			reply_markup: { inline_keyboard: rows },
+		});
+	}
+
+	/**
+	 * Model drill-down first screen (provider page). Binds chat → picker
+	 * for the mp:/mpv:/mm:/mc:/mb/mx/mg: nav taps handled in place.
+	 */
+	override async sendModelPicker(
+		chatId: string,
+		screen: ModelProvidersScreenInput,
+		sessionKey: string,
+		pickerId: number,
+		metadata?: Metadata | undefined,
+	): Promise<SendResult> {
+		this.throwIfDisabled();
+		this.modelBindings.set(String(chatId), { pickerId, sessionKey });
+		return this.send(chatId, toTelegramMarkdownV2Full(screen.text), undefined, {
+			...(metadata ?? {}),
+			reply_markup: renderProvidersKeyboard(screen),
+		});
+	}
+
+	/**
+	 * Kit-router picker-nav producer: cp: taps claim choice entries, model
+	 * families drive the service drill-down, and every tap answers (the
+	 * router guarantees the answer; this producer supplies host edits).
+	 * Taps with no binding, no hooks, or a settled entry answer expiry and
+	 * never dispatch a turn.
+	 */
+	private async handlePickerNav(
+		parsed: ParsedCallback,
+		ctx: CallbackTapContext,
+	): Promise<{ answerText: string; hostEditText?: string; replyMarkup?: unknown }> {
+		const chatId = ctx.chatId ?? "";
+		if (this.pickerHooks === null) {
+			return { answerText: "This picker has expired — send the command again." };
+		}
+		if (parsed.family === "cp") {
+			const binding = this.choiceBindings.get(chatId);
+			if (binding === undefined) {
+				return { answerText: "This picker has expired — send the command again." };
+			}
+			const claim = this.pickerHooks.choiceTap(binding.pickerId, parsed.index);
+			if (claim.status !== "resolved") {
+				return { answerText: "This prompt has already been resolved." };
+			}
+			this.choiceBindings.delete(chatId);
+			return {
+				answerText: `✓ ${claim.value.slice(0, 60)}`,
+				hostEditText: `✓ ${claim.value}`,
+				replyMarkup: null,
+			};
+		}
+		const action = toModelTapAction(parsed);
+		if (action === null) {
+			// Provider-group taps (mpg:, never emitted — families unfolded)
+			// and any other nav shape answer without rendering.
+			return { answerText: " " };
+		}
+		const binding = this.modelBindings.get(chatId);
+		if (binding === undefined) {
+			return { answerText: "This picker has expired — run /model again." };
+		}
+		const result = await this.pickerHooks.modelTap(binding.pickerId, action);
+		if (!("screen" in result)) {
+			this.modelBindings.delete(chatId);
+			return { answerText: result.answer };
+		}
+		if (result.screen.kind === "result" || action.kind === "cancel") {
+			this.modelBindings.delete(chatId);
+		}
+		return {
+			answerText: result.answer,
+			hostEditText: result.screen.text,
+			replyMarkup: renderModelScreen(result.screen),
+		};
+	}
 }
 
 // ── media-family helpers (tg-9) ────────────────────────────────────────────
@@ -2055,6 +2368,109 @@ function defaultTelegramMenuCommands(): TelegramMenuCommand[] {
 	return BUILTIN_COMMAND_ROWS.filter((row) => row.cliOnly !== true).map(
 		(row) => ({ command: row.name, description: row.description }),
 	);
+}
+
+// ── picker keyboard helpers (§9; _rows_of_two/_picker_nav_row parity) ────
+
+interface PickerButton {
+	text: string;
+	callback_data: string;
+}
+
+function rowsOfTwo(buttons: PickerButton[]): PickerButton[][] {
+	const rows: PickerButton[][] = [];
+	for (let i = 0; i < buttons.length; i += 2) {
+		rows.push(buttons.slice(i, i + 2));
+	}
+	return rows;
+}
+
+function providerButton(p: ModelProviderInput): PickerButton {
+	const label = `${p.isCurrent ? "✓ " : ""}${p.name} (${p.totalModels})`;
+	return { text: label, callback_data: buildModelProviderCallback(p.slug) };
+}
+
+function shortModelLabel(modelId: string): string {
+	const short = modelId.includes("/")
+		? (modelId.split("/").slice(-1)[0] ?? modelId)
+		: modelId;
+	return short.length > 38 ? `${short.slice(0, 35)}...` : short;
+}
+
+function pickerNavRow(page: number, totalPages: number, prefix: "mpv" | "mg"): PickerButton[] {
+	const row: PickerButton[] = [];
+	const nav = (target: number): string =>
+		prefix === "mpv" ? buildModelPageNavCallback(target) : buildModelPageCallback(target);
+	if (page > 0) row.push({ text: "◀ Prev", callback_data: nav(page - 1) });
+	row.push({ text: `${page + 1}/${totalPages}`, callback_data: MODEL_NOOP_CALLBACK });
+	if (page < totalPages - 1) row.push({ text: "Next ▶", callback_data: nav(page + 1) });
+	return row;
+}
+
+const PICKER_CANCEL_BUTTON: PickerButton = { text: "Cancel", callback_data: "mx" };
+const PICKER_BACK_CANCEL_ROW: PickerButton[] = [
+	{ text: "Back", callback_data: MODEL_BACK_CALLBACK },
+	PICKER_CANCEL_BUTTON,
+];
+
+function renderProvidersKeyboard(screen: ModelProvidersScreenInput): { inline_keyboard: PickerButton[][] } {
+	const rows = rowsOfTwo(screen.providers.map(providerButton));
+	if (screen.totalPages > 1) {
+		rows.push(pickerNavRow(screen.page, screen.totalPages, "mpv"));
+	}
+	rows.push([PICKER_CANCEL_BUTTON]);
+	return { inline_keyboard: rows };
+}
+
+/** Render a service model screen to wire keyboard data (null ⇒ strip). */
+function renderModelScreen(screen: ModelScreen): { inline_keyboard: PickerButton[][] } | null {
+	switch (screen.kind) {
+		case "providers":
+			return renderProvidersKeyboard(screen);
+		case "models": {
+			const buttons = screen.models.map((modelId, offset) => ({
+				text: shortModelLabel(modelId),
+				callback_data: buildModelMemberCallback(screen.start + offset),
+			}));
+			const rows = rowsOfTwo(buttons);
+			if (screen.totalPages > 1) {
+				rows.push(pickerNavRow(screen.page, screen.totalPages, "mg"));
+			}
+			rows.push([...PICKER_BACK_CANCEL_ROW]);
+			return { inline_keyboard: rows };
+		}
+		case "warn":
+			return {
+				inline_keyboard: [
+					[{ text: "Switch anyway", callback_data: buildModelCommitCallback(screen.index) }],
+					[...PICKER_BACK_CANCEL_ROW],
+				],
+			};
+		case "result":
+			return null;
+	}
+}
+
+/** Map a parsed nav tap to the service drill-down action (null ⇒ answer-only). */
+function toModelTapAction(parsed: ParsedCallback): ModelTapAction | null {
+	switch (parsed.family) {
+		case "mp":
+			return { kind: "provider", slug: parsed.slug };
+		case "mpv":
+			return { kind: "providerPage", page: parsed.page };
+		case "mg":
+			return parsed.page !== undefined ? { kind: "modelPage", page: parsed.page } : null;
+		case "mm":
+			return { kind: "model", index: parsed.absIndex };
+		case "mc":
+			return { kind: "confirm", index: parsed.idx };
+		case "mb":
+			return { kind: "back" };
+		case "mx":
+			return { kind: "cancel" };
+		default:
+			return null;
+	}
 }
 
 // ── registration path (04 §4.2) ────────────────────────────────────

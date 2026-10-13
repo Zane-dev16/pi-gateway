@@ -140,6 +140,7 @@ export const IRC_PLUGIN_MANIFEST: PluginManifest = {
 		splitsLongMessages: true,
 		typedCommandPrefix: "/",
 		interactiveResume: false,
+		interactiveModel: false,
 		supportsInchannelContinuable: false,
 		requiresEditFinalize: false,
 	},

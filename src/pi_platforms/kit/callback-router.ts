@@ -37,18 +37,24 @@ export type CallbackAnswer =
 			hostEdit: { text: string; keyboardRemoved: true };
 	  }
 	/** Unauthorized / stale / expired / garbage — answered so the spinner
-	 * always clears, host message untouched, NEVER dispatched as a turn. */
+	 * always clears, NEVER dispatched as a turn. Host message untouched
+	 * EXCEPT clarify expiry, which strips the dead keyboard (visible
+	 * consumed state; _notify_clarify_expired parity). */
 	| {
 			kind: "unauthorized" | "stale" | "unknown";
 			answerText: string;
-			hostEdit: null;
+			hostEdit: { text: string; keyboardRemoved: true } | null;
 	  }
 	/** Picker navigation — adapter-owned state machine may re-render WITH its
-	 * keyboard (navigation continues); never a resolution. */
+	 * keyboard (navigation continues); never a resolution. The keyboard is
+	 * opaque adapter data (the router never inspects it); adapters that
+	 * render nothing pass hostEdit null and only the answer lands. */
 	| {
 			kind: "nav";
 			answerText: string;
-			hostEdit: { text: string; keyboardRemoved: false } | null;
+			hostEdit:
+				| { text: string; keyboardRemoved: false; replyMarkup?: unknown }
+				| null;
 	  };
 
 export interface CallbackTapContext {
@@ -276,13 +282,18 @@ export interface CreateRouterOptions {
 	/**
 	 * Model-picker / choice-picker navigation hook — the adapter owns its own
 	 * picker state machine; the router hands over parsed nav callbacks. Return
-	 * the label to answer with (host edit optional via outcome).
+	 * the label to answer with (host edit optional via outcome; replyMarkup
+	 * is opaque adapter keyboard data for the in-place re-render).
 	 */
 	onPickerNav?:
 		| ((
 				parsed: ParsedCallback,
 				ctx: CallbackTapContext,
-		  ) => Promise<{ answerText: string; hostEditText?: string }>)
+		  ) => Promise<{
+				answerText: string;
+				hostEditText?: string;
+				replyMarkup?: unknown;
+		  }>)
 		| undefined;
 }
 
@@ -316,6 +327,33 @@ export class CallbackQueryRouter {
 		this.clarify = opts.stores?.clarify ?? new ClarifyPendingStore();
 		this.authorizer = opts.authorizer;
 		this.nowMs = opts.nowMs ?? (() => Date.now());
+	}
+
+	/**
+	 * Rebind gateway-side resolvers after construction (the composition
+	 * root points tap resolution at the shared picker service; default
+	 * conformance resolvers stay until rebound). Partial merge — omitted
+	 * hooks keep their current binding.
+	 */
+	setResolvers(
+		resolvers: Partial<
+			Pick<
+				CreateRouterOptions,
+				| "onExecApproval"
+				| "onSlashConfirm"
+				| "onClarifyChoice"
+				| "onClarifyOther"
+				| "onWhatsappApproval"
+				| "onPickerNav"
+			>
+		>,
+	): void {
+		for (const key of Object.keys(resolvers) as Array<keyof typeof resolvers>) {
+			const value = resolvers[key];
+			if (value !== undefined) {
+			(this.opts as unknown as Record<string, unknown>)[key] = value;
+			}
+		}
 	}
 
 	storeViews(): RouterStores {
@@ -433,7 +471,13 @@ export class CallbackQueryRouter {
 						answerText: nav.answerText,
 						hostEdit:
 							nav.hostEditText !== undefined
-								? { text: nav.hostEditText, keyboardRemoved: false }
+								? {
+										text: nav.hostEditText,
+										keyboardRemoved: false as const,
+										...(nav.replyMarkup !== undefined
+											? { replyMarkup: nav.replyMarkup }
+											: {}),
+									}
 								: null,
 					});
 				}
@@ -498,7 +542,7 @@ export class CallbackQueryRouter {
 				return this.finish(data, "stale", {
 					kind: "stale",
 					answerText: CLARIFY_EXPIRED_TEXT,
-					hostEdit: null,
+					hostEdit: { text: CLARIFY_EXPIRED_TEXT, keyboardRemoved: true },
 				});
 			}
 			const flipped = this.clarify.markAwaitingText(
@@ -511,8 +555,16 @@ export class CallbackQueryRouter {
 				return this.finish(data, "stale", {
 					kind: "stale",
 					answerText: CLARIFY_EXPIRED_TEXT,
-					hostEdit: null,
+					hostEdit: { text: CLARIFY_EXPIRED_TEXT, keyboardRemoved: true },
 				});
+			}
+			// The gateway-side entry flips too (mark_awaiting_text parity):
+			// without this the next message would never resolve the waiter.
+			// A raising hook still answers — the flip already landed.
+			try {
+				await this.opts.onClarifyOther?.(sessionKey, parsed.clarifyId);
+			} catch {
+				/* hook failures never wedge the tap */
 			}
 			// Flip edits the host prompt (awaiting-typed-response notice) and
 			// strips its keyboard — Hermes parity (_handle_callback_query cl:other).
@@ -531,7 +583,7 @@ export class CallbackQueryRouter {
 			return this.finish(data, "stale", {
 				kind: "stale",
 				answerText: CLARIFY_EXPIRED_TEXT,
-				hostEdit: null,
+				hostEdit: { text: CLARIFY_EXPIRED_TEXT, keyboardRemoved: true },
 			});
 		}
 		const popped = this.clarify.pop(parsed.clarifyId, this.nowMs());
@@ -539,7 +591,7 @@ export class CallbackQueryRouter {
 			return this.finish(data, "stale", {
 				kind: "stale",
 				answerText: CLARIFY_EXPIRED_TEXT,
-				hostEdit: null,
+				hostEdit: { text: CLARIFY_EXPIRED_TEXT, keyboardRemoved: true },
 			});
 		}
 		const label = this.opts.onClarifyChoice

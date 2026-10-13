@@ -43,6 +43,7 @@ export const SLACK_CAPABILITIES: Readonly<CapabilityManifest> = Object.freeze({
 	splitsLongMessages: true,
 	typedCommandPrefix: "!",
 	interactiveResume: true,
+	interactiveModel: true,
 	supportsInchannelContinuable: false,
 	requiresEditFinalize: false,
 });

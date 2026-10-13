@@ -174,6 +174,28 @@ export function renderSessionExportHtml(jsonl: string): string {
 	return `<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>Session export</title></head><body>\n${cards}\n</body></html>\n`;
 }
 
+/**
+ * Trimmed provider/id pair (gateway/session.py:sanitize_model_override
+ * parity — blank halves are not a model). Null when either half is blank.
+ */
+function sanitizeModelOverride(
+	provider: string,
+	modelId: string,
+): { provider: string; id: string } | null {
+	const cleanProvider = provider.trim();
+	const cleanId = modelId.trim();
+	if (cleanProvider === "" || cleanId === "") return null;
+	return { provider: cleanProvider, id: cleanId };
+}
+
+function titleOf(event: TurnRpcEvent, fallback: string): string {
+	const title = event["title"];
+	if (typeof title === "string" && title.trim() !== "") return title;
+	const message = event["message"];
+	if (typeof message === "string" && message.trim() !== "") return message;
+	return fallback;
+}
+
 /** Parse the registry's ProcClient at this module's boundary. Null when the
  * wired client cannot drive a turn (a composition bug, reported as an error
  * outcome, never a TypeError). */
@@ -194,6 +216,140 @@ export interface TurnRequest {
 	sessionId: string;
 	routingKey: string;
 	text: string;
+	/** Transport chat id for picker egress (guard messageHandler fills it
+	 * from the event source; absent means pickers render text-only). */
+	chatId?: string | undefined;
+}
+
+/**
+ * Picker outcome shapes (mirrors pi_gateway/pickers outcomes WITHOUT
+ * importing upward — this module is rank 2, the service is rank 3).
+ */
+export type TurnPickerOutcome =
+	| { kind: "value"; value: string }
+	| { kind: "confirmed"; confirmed: boolean }
+	| { kind: "cancelled" };
+
+export type TurnModelPickOutcome =
+	| { status: "switched"; provider: string; id: string; text: string }
+	| { status: "cancelled" };
+
+export type TurnResumePickOutcome =
+	| { status: "resumed"; id: string; text: string }
+	| { status: "cancelled" };
+
+export interface TurnRecentSession {
+	id: string;
+	file: string;
+	label: string;
+}
+
+/**
+ * Structural picker-service seam (the rank-3 PickerService satisfies this;
+ * tests inject fakes). Asks settle exactly one outcome each — value,
+ * confirmed, or cancelled on timeout/abort — so no extension_ui_request
+ * ever hangs the turn.
+ */
+export interface TurnPickerService {
+	askSelect(opts: {
+		chatId?: string | undefined;
+		sessionKey: string;
+		uiId: string;
+		title: string;
+		options: string[];
+		timeoutMs?: number | null | undefined;
+		signal?: AbortSignal | undefined;
+		respond: (uiId: string, body: Record<string, unknown>) => Promise<void>;
+	}): Promise<TurnPickerOutcome>;
+	askConfirm(opts: {
+		chatId?: string | undefined;
+		sessionKey: string;
+		uiId: string;
+		title: string;
+		message: string;
+		timeoutMs?: number | null | undefined;
+		signal?: AbortSignal | undefined;
+		respond: (uiId: string, body: Record<string, unknown>) => Promise<void>;
+	}): Promise<TurnPickerOutcome>;
+	askText(opts: {
+		chatId?: string | undefined;
+		sessionKey: string;
+		uiId: string;
+		title: string;
+		hint?: string | undefined;
+		timeoutMs?: number | null | undefined;
+		signal?: AbortSignal | undefined;
+		respond: (uiId: string, body: Record<string, unknown>) => Promise<void>;
+	}): Promise<TurnPickerOutcome>;
+	askModel(opts: {
+		chatId?: string | undefined;
+		sessionKey: string;
+		catalog: Array<{ provider: string; id: string }>;
+		current: { provider: string; id: string } | null;
+		timeoutMs?: number | null | undefined;
+		signal?: AbortSignal | undefined;
+	}): Promise<TurnModelPickOutcome>;
+	askResume(opts: {
+		chatId?: string | undefined;
+		sessionKey: string;
+		sessions: TurnRecentSession[];
+		timeoutMs?: number | null | undefined;
+		signal?: AbortSignal | undefined;
+	}): Promise<TurnResumePickOutcome>;
+	/**
+	 * Drop every live picker for a session (parked-picker takeover: a new
+	 * turn aborts the parked wait so the chat never wedges behind a picker
+	 * nobody taps). Returns how many were live.
+	 */
+	cancelSession(sessionKey: string): number;
+}
+
+/**
+ * extension_ui_response writer (DEC-088). The default writes a raw JSONL
+ * line preserving the host-issued id through the RpcClient-owned child
+ * stdin (the only write path that keeps server correlation — send()
+ * overwrites id). Tests inject a capturing fake.
+ */
+export type ExtensionUIResponder = (
+	client: TurnClient,
+	response: Record<string, unknown>,
+) => Promise<void>;
+
+export function defaultExtensionUIResponder(
+	client: TurnClient,
+	response: Record<string, unknown>,
+): Promise<void> {
+	const proc = client as unknown as {
+		process?: { stdin?: { write(chunk: string): boolean } | null } | null;
+	};
+	const stdin = proc.process?.stdin;
+	if (stdin === undefined || stdin === null) {
+		return Promise.reject(new Error("extension_ui_response has no child stdin handle"));
+	}
+	return new Promise<void>((resolve, reject) => {
+		try {
+			writeResponseLine(stdin, `${JSON.stringify(response)}\n`, (err?: Error | null) => {
+				if (err !== undefined && err !== null) reject(err);
+				else resolve();
+			});
+		} catch (err) {
+			reject(err);
+		}
+	});
+}
+
+function writeResponseLine(
+	stdin: { write(chunk: string): boolean },
+	line: string,
+	done: (err?: Error | null) => void,
+): void {
+	try {
+		const flushed = stdin.write(line);
+		void flushed;
+		done();
+	} catch (err) {
+		done(err instanceof Error ? err : new Error(String(err)));
+	}
 }
 
 export interface RpcTurnRunnerOpts {
@@ -223,6 +379,21 @@ export interface RpcTurnRunnerOpts {
 	turnTimeoutMs?: number | undefined;
 	/** Per-event sink for future streaming delivery. Absent means count only. */
 	onTurnEvent?: ((event: TurnRpcEvent) => void) | undefined;
+	/**
+	 * Shared picker service (rank-3 PickerService through the structural
+	 * seam above). Absent means extension_ui_requests go unanswered and the
+	 * agent auto-resolves on its own timeout; bare /resume|/model keep the
+	 * legacy text renders.
+	 */
+	pickers?: TurnPickerService | undefined;
+	/** extension_ui_response writer. Absent keeps the DEC-088 default. */
+	extensionUIResponder?: ExtensionUIResponder | undefined;
+	/**
+	 * Recent sessions newest-first for the bare /resume picker. Production
+	 * flattens the discovery index (injected here so this module never
+	 * imports upward). Absent means bare /resume renders usage.
+	 */
+	listRecentSessions?: ((homeDir: string) => TurnRecentSession[]) | undefined;
 }
 
 export class RpcTurnRunner {
@@ -243,6 +414,21 @@ export class RpcTurnRunner {
 	private readonly onTurnEvent:
 		| ((event: TurnRpcEvent) => void)
 		| undefined;
+	private readonly pickers: TurnPickerService | undefined;
+	private readonly extensionUIResponder: ExtensionUIResponder;
+	private readonly listRecentSessions:
+		| ((homeDir: string) => TurnRecentSession[])
+		| undefined;
+	/**
+	 * Per-chat model override from picker commits (sanitize_model_override
+	 * parity — trimmed provider/id pairs). Reads at spawn so RESPAWNS keep
+	 * the picked model (override write-through); the live child switches
+	 * via setModel with no evict (DEC-084: the child owns its session and
+	 * model natively — there is no gateway agent cache to drop, and the
+	 * commit text it returns rides the turn reply, so no pending-note
+	 * prepend is needed either).
+	 */
+	private readonly chatModel = new Map<string, { provider: string; id: string }>();
 
 	constructor(opts: RpcTurnRunnerOpts) {
 		this.registry = opts.registry;
@@ -254,11 +440,72 @@ export class RpcTurnRunner {
 		this.model = opts.model;
 		this.turnTimeoutMs = opts.turnTimeoutMs;
 		this.onTurnEvent = opts.onTurnEvent;
+		this.pickers = opts.pickers;
+		this.extensionUIResponder = opts.extensionUIResponder ?? defaultExtensionUIResponder;
+		this.listRecentSessions = opts.listRecentSessions;
+	}
+
+	/** Picker commit seam the service drives (tap → setModel on the child). */
+	async commitPickerModel(sessionKey: string, provider: string, modelId: string): Promise<string> {
+		const clean = sanitizeModelOverride(provider, modelId);
+		if (clean === null) throw new Error(`unknown model "${provider}/${modelId}"`);
+		const entry = this.registry.get(sessionKey);
+		if (entry === undefined) throw new Error("chat child is gone");
+		const turn = asTurnClient(entry.client);
+		const session = turn !== null ? asSessionClient(turn) : null;
+		if (session === null) throw new Error("chat child cannot switch models");
+		const switched = await session.setModel(clean.provider, clean.id);
+		this.chatModel.set(sessionKey, { provider: switched.provider, id: switched.id });
+		return `Model: ${switched.provider}/${switched.id}`;
+	}
+
+	/** Picker commit seam the service drives (tap → switchSession). */
+	async commitPickerResume(sessionKey: string, file: string): Promise<string> {
+		const entry = this.registry.get(sessionKey);
+		if (entry === undefined) throw new Error("chat child is gone");
+		const turn = asTurnClient(entry.client);
+		const session = turn !== null ? asSessionClient(turn) : null;
+		if (session === null) throw new Error("chat child cannot resume sessions");
+		await session.switchSession(file);
+		const state = (await session.getState()) as { sessionId: string };
+		return `Resumed session (${state.sessionId}). The next turn replays its history.`;
+	}
+
+	/**
+	 * The rank-3 PickerCommit surface bound to this runner (the composition
+	 * root feeds it to the PickerService constructor next to this runner).
+	 */
+	pickerCommitSurface(): {
+		commitModel(sessionKey: string, provider: string, modelId: string): Promise<string>;
+		commitResume(sessionKey: string, file: string): Promise<string>;
+	} {
+		return {
+			commitModel: (sessionKey, provider, id) => this.commitPickerModel(sessionKey, provider, id),
+			commitResume: (sessionKey, file) => this.commitPickerResume(sessionKey, file),
+		};
 	}
 
 	/** Chat cwd for one routing key. Absent means the gateway home. */
 	cwdFor(routingKey: string, homeDir: string): string {
 		return this.chatCwd.get(routingKey) ?? homeDir;
+	}
+
+	/**
+	 * Bounded wait for a parked turn to release its entry after its picker
+	 * was cancelled (the parked waiter settles on microtasks plus the
+	 * response write plus row persists — dozens of setImmediate yields is
+	 * plenty; a genuinely running turn never reaches here because
+	 * cancelSession settled nothing for it). Undefined when still held.
+	 */
+	private async waitForEntryRelease(
+		routingKey: string,
+	): Promise<ReturnType<ChatProcRegistry["get"]> | undefined> {
+		for (let i = 0; i < 200; i += 1) {
+			await new Promise((resolve) => setImmediate(resolve));
+			const live = this.registry.get(routingKey);
+			if (live !== undefined && live.state === "ready") return live;
+		}
+		return undefined;
 	}
 
 	/**
@@ -287,12 +534,18 @@ export class RpcTurnRunner {
 				homeDir,
 			);
 		}
+		const override = this.chatModel.get(request.routingKey);
 		const spawnOpts: ChatProcSpawnOpts = {
 			homeDir,
 			cwd: this.cwdFor(request.routingKey, homeDir),
 		};
-		if (this.provider !== undefined) spawnOpts.provider = this.provider;
-		if (this.model !== undefined) spawnOpts.model = this.model;
+		if (override !== undefined) {
+			spawnOpts.provider = override.provider;
+			spawnOpts.model = override.id;
+		} else {
+			if (this.provider !== undefined) spawnOpts.provider = this.provider;
+			if (this.model !== undefined) spawnOpts.model = this.model;
+		}
 
 		let entry;
 		try {
@@ -305,11 +558,28 @@ export class RpcTurnRunner {
 			);
 		}
 		if (entry.state !== "ready") {
-			return RpcTurnRunner.errorOutcome(
-				"turn already in progress for this chat",
-				null,
-				null,
-			);
+			// Parked-picker takeover: a picker nobody taps must never wedge
+			// the chat behind busy. Abort it, let the parked turn release
+			// the entry, then take over when free (one re-check, bounded).
+			const cancelled = this.pickers?.cancelSession(request.routingKey) ?? 0;
+			if (cancelled > 0) {
+				const freed = await this.waitForEntryRelease(request.routingKey);
+				if (freed !== undefined) {
+					entry = freed;
+				} else {
+					return RpcTurnRunner.errorOutcome(
+						"turn already in progress for this chat",
+						null,
+						null,
+					);
+				}
+			} else {
+				return RpcTurnRunner.errorOutcome(
+					"turn already in progress for this chat",
+					null,
+					null,
+				);
+			}
 		}
 		const client = asTurnClient(entry.client);
 		if (client === null) {
@@ -347,12 +617,19 @@ export class RpcTurnRunner {
 				slash.name,
 				slash.args,
 				userRowId,
+				homeDir,
 			);
 		}
 
 		let turnStarts = 0;
+		// Per-turn abort: parked picker waits settle cancelled when the turn
+		// settles or fails, so no extension_ui_request ever dangles past it.
+		const pickerAbort = new AbortController();
 		const unsubscribe = client.onEvent((event) => {
 			if (event.type === "turn_start") turnStarts += 1;
+			if (event.type === "extension_ui_request") {
+				void this.handleExtensionUI(client, request, event, pickerAbort.signal);
+			}
 			this.onTurnEvent?.(event);
 		});
 		try {
@@ -381,7 +658,10 @@ export class RpcTurnRunner {
 			}
 			let finalText: string;
 			try {
-				finalText = await client.getLastAssistantText();
+				// The real client resolves undefined when the turn left no
+				// assistant text (handled extension command): coerce at the
+				// boundary so downstream persist/delivery never see null.
+				finalText = (await client.getLastAssistantText()) ?? "";
 			} catch (error) {
 				return await this.fail(
 					request.routingKey,
@@ -418,7 +698,103 @@ export class RpcTurnRunner {
 				usage: null,
 			};
 		} finally {
+			pickerAbort.abort();
 			unsubscribe();
+		}
+	}
+
+	/**
+	 * One extension_ui_request parked on this turn: forward select/confirm
+	 * to the picker service (chat-native controls + extension_ui_response),
+	 * everything else (input/editor/unknown incl. any future custom
+	 * payload) to the numbered-text fallback lane. Fire-and-forget from the
+	 * event callback — waitForIdle settles once the child consumes the
+	 * response. Without a picker service the request goes unanswered and
+	 * the agent auto-resolves on its own timeout (rpc-extension-ui.md).
+	 * Never throws: a raising forward still settles cancelled inside the
+	 * service, and the event loop must never break on a UI tap.
+	 */
+	private async handleExtensionUI(
+		client: TurnClient,
+		request: TurnRequest,
+		event: TurnRpcEvent,
+		signal: AbortSignal,
+	): Promise<void> {
+		const pickers = this.pickers;
+		if (pickers === undefined) return;
+		const uiId = event["id"];
+		if (typeof uiId !== "string" || uiId === "") return;
+		const method = event["method"];
+		const methodName = typeof method === "string" ? method : "";
+		// Fire-and-forget methods (rpc-extension-ui.md) carry information,
+		// never a waiter: answering or prompting on them would render bogus
+		// chat noise (a "question" the agent never asked) and send a
+		// response the server drops (no pending entry). Only dialogs park.
+		if (
+			methodName === "notify" ||
+			methodName === "setStatus" ||
+			methodName === "setWidget" ||
+			methodName === "setTitle" ||
+			methodName === "set_editor_text"
+		) {
+			return;
+		}
+		const timeout = event["timeout"];
+		const timeoutMs = typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0 ? timeout : null;
+		const respond = (responseId: string, body: Record<string, unknown>): Promise<void> =>
+			this.extensionUIResponder(client, { type: "extension_ui_response", id: responseId, ...body });
+		const base = {
+			...(request.chatId !== undefined ? { chatId: request.chatId } : {}),
+			sessionKey: request.routingKey,
+			signal,
+			...(timeoutMs !== null ? { timeoutMs } : {}),
+		};
+		try {
+			if (methodName === "select") {
+				const raw = event["options"];
+				const options = Array.isArray(raw) ? raw.filter((o): o is string => typeof o === "string") : [];
+				await pickers.askSelect({
+					...base,
+					uiId,
+					title: titleOf(event, "Select"),
+					options,
+					respond,
+				});
+			} else if (methodName === "confirm") {
+				await pickers.askConfirm({
+					...base,
+					uiId,
+					title: titleOf(event, "Confirm"),
+					message: typeof event["message"] === "string" ? event["message"] : "",
+					respond,
+				});
+			} else {
+				// input/editor/unknown: numbered-text fallback when options
+				// ride along, open-text question otherwise. Either way the
+				// turn completes on the typed reply.
+				const raw = event["options"];
+				const options = Array.isArray(raw) ? raw.filter((o): o is string => typeof o === "string") : [];
+				if (options.length > 0) {
+					await pickers.askSelect({
+						...base,
+						uiId,
+						title: titleOf(event, "Select"),
+						options,
+						respond,
+					});
+				} else {
+					const placeholder = typeof event["placeholder"] === "string" ? event["placeholder"] : undefined;
+					await pickers.askText({
+						...base,
+						uiId,
+						title: titleOf(event, "Input requested"),
+						...(placeholder !== undefined ? { hint: placeholder } : {}),
+						respond,
+					});
+				}
+			}
+		} catch {
+			/* the service settles cancelled on every failure path already */
 		}
 	}
 
@@ -635,6 +1011,7 @@ export class RpcTurnRunner {
 		name: string,
 		args: string,
 		userRowId: number | null,
+		homeDir: string,
 	): Promise<TurnOutcome> {
 		const session = asSessionClient(client);
 		if (session === null) {
@@ -652,10 +1029,10 @@ export class RpcTurnRunner {
 					reply = await this.runNewSession(session);
 					break;
 				case "resume":
-					reply = await this.runResume(session, args);
+					reply = await this.runResume(session, request, args, homeDir);
 					break;
 				case "model":
-					reply = await this.runModel(session, args);
+					reply = await this.runModel(session, request, args);
 					break;
 				case "compact":
 					reply = await this.runCompact(session, args);
@@ -723,13 +1100,36 @@ export class RpcTurnRunner {
 		return `Started a new session (${state.sessionId}).`;
 	}
 
-	/** Rebind onto a session file path. Empty args render usage. */
+	/**
+	 * Rebind onto a session file path. Bare with a picker service plus a
+	 * session lister routes to the resume picker (≤10 recent sessions; tap
+	 * switches plus clears scope); otherwise empty args render usage.
+	 */
 	private async runResume(
 		client: SessionRpcClient,
+		request: TurnRequest,
 		args: string,
+		homeDir: string,
 	): Promise<string> {
 		const target = args.trim().split(/\s+/, 1)[0] ?? "";
 		if (target === "") {
+			if (
+				this.pickers !== undefined &&
+				request.chatId !== undefined &&
+				this.listRecentSessions !== undefined
+			) {
+				const sessions = this.listRecentSessions(homeDir);
+				if (sessions.length === 0) {
+					return "No recent sessions to resume.";
+				}
+				const outcome = await this.pickers.askResume({
+					chatId: request.chatId,
+					sessionKey: request.routingKey,
+					sessions,
+				});
+				if (outcome.status === "resumed") return outcome.text;
+				return "Resume cancelled.";
+			}
 			return "Usage: /resume <session-id> — rebinds this chat onto that session's history.";
 		}
 		await client.switchSession(target);
@@ -739,13 +1139,39 @@ export class RpcTurnRunner {
 		return `Resumed session (${state.sessionId}). The next turn replays its history.`;
 	}
 
-	/** Bare lists current plus catalog; a ref switches provider/model. */
+	/**
+	 * Bare routes to the model picker (provider drill-down; tap commits
+	 * through setModel with the override written through for respawns).
+	 * A ref switches provider/model directly as before. Without a picker
+	 * service (or chat id) bare lists current plus catalog as before.
+	 */
 	private async runModel(
 		client: SessionRpcClient,
+		request: TurnRequest,
 		args: string,
 	): Promise<string> {
 		const ref = args.trim();
 		if (ref === "") {
+			if (this.pickers !== undefined && request.chatId !== undefined) {
+				const [state, catalog] = await Promise.all([
+					client.getState() as Promise<{
+						model?: { provider?: string; id?: string } | null;
+					}>,
+					client.getAvailableModels(),
+				]);
+				const current =
+					state.model?.provider !== undefined && state.model?.id !== undefined
+						? { provider: state.model.provider, id: state.model.id }
+						: null;
+				const outcome = await this.pickers.askModel({
+					chatId: request.chatId,
+					sessionKey: request.routingKey,
+					catalog,
+					current,
+				});
+				if (outcome.status === "switched") return outcome.text;
+				return "Model picker cancelled.";
+			}
 			const [state, available] = await Promise.all([
 				client.getState() as Promise<{
 					model?: { provider?: string; id?: string } | null;

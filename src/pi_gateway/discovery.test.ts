@@ -19,6 +19,7 @@ import {
 	bindingFromRoutingEntry,
 	buildDiscoveryIndex,
 	listDiscoveryPaths,
+	listRecentSessions,
 	mostRecentSessionAtPath,
 	readDiscoveryHeader,
 	resolveAgentDir,
@@ -118,6 +119,21 @@ describe("buildDiscoveryIndex", () => {
 	it("returns an empty index when the sessions root is missing", () => {
 		rmSync(join(agentDir, "sessions"), { recursive: true, force: true });
 		expect(listDiscoveryPaths(buildDiscoveryIndex(agentDir))).toEqual([]);
+	});
+
+	it("listRecentSessions flattens newest-first with picker labels", () => {
+		const now = Date.now();
+		writeSession("--proj-a--", "old.jsonl", [sessionLine("id-old-aaaa", "/proj/a")], now - 60_000);
+		writeSession("--proj-b--", "mid.jsonl", [sessionLine("id-mid-bbbb", "/proj/b")], now - 30_000);
+		writeSession("--proj-a--", "new.jsonl", [sessionLine("id-new-cccc", "/proj/a")], now);
+		const index = buildDiscoveryIndex(agentDir);
+		const recent = listRecentSessions(index);
+		expect(recent.map((r) => r.id)).toEqual(["id-new-cccc", "id-mid-bbbb", "id-old-aaaa"]);
+		expect(recent[0]).toMatchObject({
+			id: "id-new-cccc",
+			label: "/proj/a — id-new-c",
+		});
+		expect(recent[0]?.file).toContain("new.jsonl");
 	});
 
 	it("mostRecentSessionAtPath misses on unknown paths", () => {

@@ -151,6 +151,19 @@ export function buildModelGroupNavCallback(groupId: string): string {
 	return data;
 }
 
+/**
+ * Model-page navigation (`mg:<page>`, Hermes _picker_nav_row "mg" prefix
+ * parity — model pages ride mg:, provider pages ride mpv:). Numeric mg:
+ * payloads parse as page taps; non-numeric payloads keep the legacy group
+ * parse (never emitted — provider families are unfolded, so a group-shaped
+ * mg: tap answers expiry).
+ */
+export function buildModelPageCallback(page: number): string {
+	const data = `mg:${Math.trunc(page)}`;
+	assertFits(data);
+	return data;
+}
+
 /** WhatsApp-Cloud reply-button variant into the SAME approval resolver (§9). */
 export type WhatsappApprovalChoice = "approve" | "deny";
 export function buildWhatsappApprovalCallback(
@@ -176,7 +189,7 @@ export type ParsedCallback =
 	| { family: "mc"; idx: number }
 	| { family: "mb" }
 	| { family: "mx" }
-	| { family: "mg"; groupId: string }
+	| { family: "mg"; page?: number | undefined; groupId?: string | undefined }
 	| { family: "appr"; id: number; choice: WhatsappApprovalChoice }
 	| { family: "unknown" };
 
@@ -187,7 +200,7 @@ export type ParsedCallback =
  */
 export function parseCallbackData(data: string): ParsedCallback {
 	if (data === "mb") return { family: "mb" };
-	if (data === "mx:noop") return { family: "mx" };
+	if (data === "mx:noop" || data === "mx") return { family: "mx" };
 
 	const colon = data.indexOf(":");
 	if (colon <= 0) return { family: "unknown" };
@@ -244,10 +257,15 @@ export function parseCallbackData(data: string): ParsedCallback {
 				? { family: "mp", slug: rest }
 				: { family: "unknown" };
 		case "mpg":
-		case "mg":
 			return rest.length > 0
-				? { family: prefix === "mpg" ? "mpg" : "mg", groupId: rest }
+				? { family: "mpg", groupId: rest }
 				: { family: "unknown" };
+		case "mg": {
+			if (rest.length === 0) return { family: "unknown" };
+			return INT_RE.test(rest)
+				? { family: "mg", page: Number(rest) }
+				: { family: "mg", groupId: rest };
+		}
 		case "mpv":
 			return INT_RE.test(rest)
 				? { family: "mpv", page: Number(rest) }

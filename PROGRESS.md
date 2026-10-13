@@ -1,5 +1,41 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Pickers: chat-native select/confirm/model/resume over RPC (2026-10-13)
+
+- Shape: new `src/pi_gateway/pickers/` (store: monotonic-int entries plus
+  session index, clarify_gateway parity; service: askSelect/askConfirm/
+  askText/askClarify/askModel/askResume, tap claims, text intercept, miss
+  latch). Kit: `interactiveModel` data flag (all manifests mirror their
+  resume value), base `sendChoicePicker/sendSlashConfirm/sendModelPicker`
+  (Not-supported) plus `sendClarify` (adopts the photon byte-exact text
+  fallback), router `setResolvers`, clarify-stale keyboard strip, nav
+  `replyMarkup` carrier, `onClarifyOther` wired, bare-`mx` parse,
+  `mg:` model-page ints (Hermes parity, group parse kept). Telegram:
+  four keyboard senders, drill-down nav with in-place edits, per-chat
+  bindings, `setPickerHooks` + sender surface. Runner: UI forwarding with
+  per-turn abort, bare `/model|/resume` via service, model override map,
+  busy-takeover on parked pickers, fire-and-forget ignore, null-text
+  coerce. Composition: service + hooks + sender + Lane C + text consumer
+  in both factories and stage 9. Egress: metadata rides the edit lane.
+- DEC-088 (before code): `extension_ui_response` needs the host id, but
+  `RpcClient.send()` overwrites it — reply is a raw JSONL stdin write
+  through the client-owned handle (the host example's own pattern).
+- Contracts: 22 service + 7 telegram fake-server round-trips + 9
+  runner/service integration + 5 guard-wiring + 2 egress + discovery +
+  router/grammar rows. Live probe (real child, probe extension, no model):
+  select rendered, typed `2` resolved, uuid-preserved response correlated,
+  turn finalized — plus 2 probe-caught fixes (notify-as-dialog, null
+  finalText). Full suite 197 files 2630→2632 green, tsc/layering/secrets
+  clean. Disposable-home launch READY plus doctor HEALTHY plus headless
+  44 green; live pid untouched (409-exclusive, no token drive).
+- Laziest fills (noted, not DECs — Hermes-with-null-warning parity):
+  no provider folding (flat paginated list), no pricing warner in prod
+  (hook only), single-sender binding, invalid text-lane model refs settle
+  cancelled, `mg:` group taps toast expiry.
+- Residual: live-Telegram tap drive still needs a token window; webhook/
+  slack/discord render text-only until native buttons land (Block Kit /
+  Views later per plan).
+
 ## Observability: loud long-outage alerts plus runtime-fatal requeue (2026-10-11)
 
 - Shape: consecutive-transient counter (`recoveryAttempts`) plus alert
