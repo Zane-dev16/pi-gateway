@@ -426,6 +426,7 @@ function deriveAdapterEntries(
 			? null
 			: {
 					choiceTap: (pickerId, index) => pickerService.choiceTap(pickerId, index),
+					choicePageTap: (pickerId, page) => pickerService.choicePageTap(pickerId, page),
 					confirmTap: (pickerId, choice) => pickerService.confirmTap(pickerId, choice),
 					clarifyChoice: (pickerId, idx) => pickerService.clarifyTap(pickerId, idx),
 					clarifyOther: (pickerId) => pickerService.clarifyTap(pickerId, "other"),

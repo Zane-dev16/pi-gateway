@@ -40,6 +40,7 @@ function makeHookedWorld(opts: {
 	let service: PickerService;
 	const hooks = {
 		choiceTap: (id: number, index: number) => service.choiceTap(id, index),
+		choicePageTap: (id: number, page: number) => service.choicePageTap(id, page),
 		confirmTap: (id: number, choice: "once" | "always" | "cancel") =>
 			service.confirmTap(id, choice),
 		clarifyChoice: (id: number, idx: number) => service.clarifyTap(id, idx),
@@ -333,5 +334,108 @@ describe("answer-every-tap over the fake server", () => {
 			expect(answer.text.length).toBeGreaterThan(0);
 		}
 		expect(tg.editKwargs.length).toBe(0);
+	});
+});
+
+describe("choice pagination over the fake server (DEC-089)", () => {
+	it("25-option select pages 10 per screen; nav re-renders in place; absolute tap commits once", async () => {
+		const { adapter, tg, service, responses } = makeHookedWorld();
+		const options = Array.from({ length: 25 }, (_, i) => `Option ${i + 1}`);
+		const asked = service.askSelect({
+			chatId: "42",
+			sessionKey: "sess-p",
+			uiId: "ui-p",
+			title: "Pick one",
+			options,
+			respond: async (uiId, body) => {
+				responses.push({ uiId, body });
+			},
+		});
+		await flushSends(tg, 1);
+		const page0 = keyboardData(tg, 0);
+		// 10 cp: + counter + Next (no Cancel — flat shape preserved).
+		expect(page0.filter((d) => d.startsWith("cp:")).length).toBe(10);
+		expect(page0).toContain("mx:noop");
+		expect(page0).toContain("cpv:1");
+		expect(page0).not.toContain("cp:10");
+		for (const payload of page0) {
+			expect(Buffer.byteLength(payload, "utf8")).toBeLessThanOrEqual(CALLBACK_DATA_MAX_BYTES);
+		}
+		const sendText = String((tg.sendKwargs[0] as { text: string }).text);
+		expect(sendText).toContain("1–10 of 25");
+		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
+
+		// Forward to page 1: in-place edit with absolute cp:10–19.
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:1" });
+		expect(tg.editKwargs.length).toBe(1);
+		const page1 = editKeyboardData(tg, 0);
+		expect(page1.filter((d) => d.startsWith("cp:")).length).toBe(10);
+		expect(page1).toContain("cp:10");
+		expect(page1).toContain("cp:19");
+		expect(page1).toContain("cpv:0");
+		expect(page1).toContain("cpv:2");
+		expect(String((tg.editKwargs[0] as { text: string }).text)).toContain("11–20 of 25");
+
+		// Back to page 0 round-trips byte-identical.
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:0" });
+		expect(editKeyboardData(tg, 1)).toEqual(page0);
+
+		// Last page has 5 buttons.
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:2" });
+		expect(editKeyboardData(tg, 2).filter((d) => d.startsWith("cp:")).length).toBe(5);
+
+		// Absolute tap on the last row commits exactly once.
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cp:24" });
+		expect(await asked).toEqual({ kind: "value", value: "Option 25" });
+		expect(responses).toEqual([{ uiId: "ui-p", body: { value: "Option 25" } }]);
+		expect(tg.editKwargs.length).toBe(4);
+		expect(tg.editKwargs[3]).toMatchObject({ reply_markup: null });
+
+		// Double-tap: expiry, no second resolve, no extra edit.
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cp:24" });
+		expect(tg.callbackAnswers[tg.callbackAnswers.length - 1]?.text).toMatch(/expired|already been resolved/i);
+		expect(tg.editKwargs.length).toBe(4);
+	});
+
+	it("single-page select keeps the flat keyboard (no nav, no counter)", async () => {
+		const { adapter, tg, service } = makeHookedWorld();
+		void adapter;
+		const asked = service.askSelect({
+			chatId: "42",
+			sessionKey: "sess-1",
+			uiId: "ui-1",
+			title: "Pick",
+			options: ["A", "B"],
+			respond: async () => {},
+		});
+		await flushSends(tg, 1);
+		expect(keyboardData(tg, 0)).toEqual(["cp:0", "cp:1"]);
+		service.cancelSession("sess-1");
+		await asked;
+	});
+
+	it("resume with 22 sessions pages; stale nav after resolve expires", async () => {
+		const { adapter, tg, service, commits } = makeHookedWorld();
+		const sessions = Array.from({ length: 22 }, (_, i) => ({
+			id: `sess-${i + 1}`,
+			file: `/agent/sessions/sess-${i + 1}.jsonl`,
+			label: `/work/dir-${i + 1} — sess-${i + 1}`,
+		}));
+		const asked = service.askResume({ chatId: "42", sessionKey: "sess-r", sessions });
+		await flushSends(tg, 1);
+		const page0 = keyboardData(tg, 0);
+		expect(page0.filter((d) => d.startsWith("cp:")).length).toBe(10);
+		expect(page0).toContain("cpv:1");
+		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:2" });
+		const last = editKeyboardData(tg, 0);
+		expect(last.filter((d) => d.startsWith("cp:")).length).toBe(2);
+		expect(last).toContain("cp:20");
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cp:21" });
+		expect(await asked).toMatchObject({ status: "resumed", id: "sess-22" });
+		expect(commits.length).toBe(1);
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:0" });
+		expect(tg.callbackAnswers[tg.callbackAnswers.length - 1]?.text).toMatch(/expired/i);
+		expect(commits.length).toBe(1);
 	});
 });

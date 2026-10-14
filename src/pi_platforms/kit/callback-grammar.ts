@@ -113,6 +113,16 @@ export function buildChoicePickerCallback(index: number): string {
 	return data;
 }
 
+/**
+ * Choice-page navigation (`cpv:<page>`, DEC-089 — `mpv:`/`mg:` parity
+ * for the paginated `cp:` keyboard; numeric page only, 64B-safe).
+ */
+export function buildChoicePageCallback(page: number): string {
+	const data = `cpv:${Math.trunc(page)}`;
+	assertFits(data);
+	return data;
+}
+
 export function buildModelProviderCallback(slug: string): string {
 	const data = `mp:${slug}`;
 	assertFits(data);
@@ -182,6 +192,7 @@ export type ParsedCallback =
 	| { family: "sc"; choice: SlashConfirmChoice; confirmId: number }
 	| { family: "cl"; clarifyId: number; idx: number | "other" }
 	| { family: "cp"; index: number }
+	| { family: "cpv"; page: number }
 	| { family: "mp"; slug: string }
 	| { family: "mpg"; groupId: string }
 	| { family: "mpv"; page: number }
@@ -252,6 +263,10 @@ export function parseCallbackData(data: string): ParsedCallback {
 			return INT_RE.test(rest)
 				? { family: "cp", index: Number(rest) }
 				: { family: "unknown" };
+		case "cpv":
+			return INT_RE.test(rest)
+				? { family: "cpv", page: Number(rest) }
+				: { family: "unknown" };
 		case "mp":
 			return rest.length > 0
 				? { family: "mp", slug: rest }
@@ -301,6 +316,7 @@ export const FAMILY_PREFIXES: readonly string[] = [
 	"sc:",
 	"cl:",
 	"cp:",
+	"cpv:",
 	"mp:",
 	"mpg:",
 	"mpv:",

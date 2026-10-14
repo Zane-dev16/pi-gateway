@@ -1,5 +1,12 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Paginated choice/resume pickers (DEC-089, 2026-10-14)
+
+- Shape: `cp:` stays absolute, new `cpv:<page>` nav (`mpv:`/`mg:` parity) plus `mx:noop` counter, in-place edits, ` (N–M of T)` titles (`_format_choice_page` parity), no More button. Page size 10 both lanes (`CHOICE_PAGE_SIZE`; `RESUME_LIST_LIMIT` now a page, all rows kept). Keyboard max 12 payloads/6 rows for any N; text fallback paged 10 rows with absolute numbers plus `next`/`more`/`prev`/`back` page turns; typed numbers absolute so every row stays reachable.
+- DEC-089 (before code): Hermes `send_choice_picker` is flat and resume is text-only `[:10]` — pagination reuses the shared clamp/slice plus nav-row plus in-place mechanics, new `cpv:` family joins the disjoint table.
+- Contracts: +7 service (nav round-trip, clamp, absolute tap, paged fallback, text next/prev, single-page flat, resume 22-row) +3 telegram wire (25-option paging, flat single-page, 22-session resume) +1 grammar (cpv round-trip plus disjoint). Full suite 197 files 2632→2643 green, tsc/layering/secrets clean.
+- Stress (disposable home, real `pi --mode rpc` live, READY+HEALTHY, `platforms=[none]`, zero model calls): (a) model 150 PASS unchanged; (b) resume 200 paged PASS (12 payloads, `cpv:1`→`cp:10–19`, `cpv:19`→`cp:199` resolves, fallback 10 rows, typed 11 resolves, typed next pages); (c) select 100 paged PASS (12 payloads/6 rows, `cpv:9`→`cp:99` commits once, fallback 10 rows <1525 chars); (d) nav/double-tap/stale PASS plus choice nav. Evidence in `artifacts/stress-large-lists/` (transcript, vitest 4 passed, db 0/0/0, launch, doctor, gateway-state, source).
+
 ## Pickers: chat-native select/confirm/model/resume over RPC (2026-10-13)
 
 - Shape: new `src/pi_gateway/pickers/` (store: monotonic-int entries plus

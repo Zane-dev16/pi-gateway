@@ -551,3 +551,170 @@ describe("takeText never steals commands and never double-dispatches", () => {
 		expect(await asked).toEqual({ kind: "value", value: "Green" });
 	});
 });
+
+describe("choice pagination: cpv nav, absolute taps, paged text lane (DEC-089)", () => {
+	const options25 = Array.from({ length: 25 }, (_, i) => `Option ${i + 1}`);
+
+	it("select pages 10 per screen with page info; nav round-trips; absolute tap resolves", async () => {
+		const { service } = makeService();
+		const asked = service.askSelect({
+			chatId: "chat-1",
+			sessionKey: "sess-p",
+			uiId: "ui-p",
+			title: "Pick one",
+			options: options25,
+			respond: async () => {},
+		});
+		await Promise.resolve();
+		const p1 = service.choicePageTap(1, 1);
+		if (!("screen" in p1)) throw new Error("expected screen");
+		expect(p1.screen.page).toBe(1);
+		expect(p1.screen.totalPages).toBe(3);
+		expect(p1.screen.start).toBe(10);
+		expect(p1.screen.total).toBe(25);
+		expect(p1.screen.choices.length).toBe(10);
+		expect(p1.screen.title).toContain("(11–20 of 25)");
+		const back = service.choicePageTap(1, 0);
+		if (!("screen" in back)) throw new Error("expected screen");
+		expect(back.screen.page).toBe(0);
+		expect(back.screen.choices[0]?.value).toBe("Option 1");
+		expect(back.screen.title).toContain("(1–10 of 25)");
+		// Absolute tap on the last row resolves even though it is on page 2.
+		expect(service.choiceTap(1, 24)).toEqual({ status: "resolved", value: "Option 25" });
+		expect(await asked).toEqual({ kind: "value", value: "Option 25" });
+		// Stale nav after resolve.
+		expect(service.choicePageTap(1, 1)).toMatchObject({ stale: true });
+	});
+
+	it("out-of-range page clamps; unknown picker is stale", async () => {
+		const { service } = makeService();
+		const asked = service.askSelect({
+			chatId: "chat-1",
+			sessionKey: "sess-p",
+			uiId: "ui-p",
+			title: "Pick one",
+			options: options25,
+			respond: async () => {},
+		});
+		await Promise.resolve();
+		const far = service.choicePageTap(1, 99);
+		if (!("screen" in far)) throw new Error("expected screen");
+		expect(far.screen.page).toBe(2);
+		expect(far.screen.choices.length).toBe(5);
+		expect(far.screen.title).toContain("(21–25 of 25)");
+		expect(service.choicePageTap(999, 0)).toMatchObject({ stale: true });
+		service.cancelSession("sess-p");
+		await asked;
+	});
+
+	it("text fallback stays paged; typed 11 resolves; next turns the page", async () => {
+		const sender = new FakeSender();
+		sender.keyboardFails = true;
+		const { service } = makeService(sender);
+		const asked = service.askSelect({
+			chatId: "chat-1",
+			sessionKey: "sess-t",
+			uiId: "ui-t",
+			title: "Pick one",
+			options: options25,
+			respond: async () => {},
+		});
+		await Promise.resolve();
+		const fallback = sender.texts[0]?.text ?? "";
+		expect(fallback).toContain("(1–10 of 25)");
+		expect(fallback.split("\n").filter((l) => /^\d+\. /.test(l)).length).toBe(10);
+		expect(fallback).toContain("1. Option 1");
+		expect(fallback).not.toContain("Option 11");
+		// Rows past 10 stay reachable by absolute number (no nag).
+		expect(service.takeText("sess-t", "11")).toBe("✓ Option 11");
+		expect(await asked).toEqual({ kind: "value", value: "Option 11" });
+	});
+
+	it("typed next/prev turns the text page without settling", async () => {
+		const sender = new FakeSender();
+		sender.keyboardFails = true;
+		const { service } = makeService(sender);
+		const asked = service.askSelect({
+			chatId: "chat-1",
+			sessionKey: "sess-n",
+			uiId: "ui-n",
+			title: "Pick one",
+			options: options25,
+			respond: async () => {},
+		});
+		await Promise.resolve();
+		const page2 = service.takeText("sess-n", "next");
+		expect(page2).toContain("(11–20 of 25)");
+		expect(page2).toContain("11. Option 11");
+		expect(service.hasPending("sess-n")).toBe(true);
+		const back = service.takeText("sess-n", "prev");
+		expect(back).toContain("(1–10 of 25)");
+		expect(service.takeText("sess-n", "25")).toBe("✓ Option 25");
+		expect(await asked).toEqual({ kind: "value", value: "Option 25" });
+	});
+
+	it("single-page select keeps the exact flat fallback (no page info)", async () => {
+		const sender = new FakeSender();
+		sender.keyboardFails = true;
+		const { service } = makeService(sender);
+		const asked = service.askSelect({
+			chatId: "chat-1",
+			sessionKey: "sess-1",
+			uiId: "ui-1",
+			title: "Pick",
+			options: ["Red", "Green"],
+			respond: async () => {},
+		});
+		await Promise.resolve();
+		expect(sender.texts[0]?.text).not.toContain(" of ");
+		expect(service.takeText("sess-1", "hello there")).toBe("Reply with a number 1–2.");
+		expect(service.takeText("sess-1", "2")).toBe("✓ Green");
+		expect(await asked).toEqual({ kind: "value", value: "Green" });
+	});
+});
+
+describe("resume pagination: all rows kept, 10 per page (DEC-089)", () => {
+	const sessions = Array.from({ length: 22 }, (_, index) => ({
+		id: `sess-${index + 1}`,
+		file: `/agent/sessions/sess-${index + 1}.jsonl`,
+		label: `/work/dir-${index + 1} — sess-${index + 1}`,
+	}));
+
+	it("keyboard pages; absolute tap resolves row 22; typed 11 resolves (no nag)", async () => {
+		const { service, commits } = makeService();
+		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-r", sessions });
+		await Promise.resolve();
+		const p1 = service.choicePageTap(1, 1);
+		if (!("screen" in p1)) throw new Error("expected screen");
+		expect(p1.screen.total).toBe(22);
+		expect(p1.screen.totalPages).toBe(3);
+		expect(p1.screen.title).toContain("(11–20 of 22)");
+		const p2 = service.choicePageTap(1, 2);
+		if (!("screen" in p2)) throw new Error("expected screen");
+		expect(p2.screen.choices.length).toBe(2);
+		expect(service.choiceTap(1, 21)).toEqual({
+			status: "resolved",
+			value: "/work/dir-22 — sess-22",
+		});
+		expect(await asked).toMatchObject({ status: "resumed", id: "sess-22" });
+		expect(commits[0]).toMatchObject({ kind: "resume", ref: "/agent/sessions/sess-22.jsonl" });
+	});
+
+	it("text fallback lists the first 10 with page info; next pages the text", async () => {
+		const sender = new FakeSender();
+		sender.keyboardFails = true;
+		const { service } = makeService(sender);
+		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-r", sessions });
+		await Promise.resolve();
+		const text = sender.texts[0]?.text ?? "";
+		expect(text).toContain("(1–10 of 22)");
+		expect(text.split("\n").filter((l) => /^\d+\. /.test(l)).length).toBe(10);
+		expect(text).not.toContain("sess-11");
+		const page2 = service.takeText("sess-r", "next");
+		expect(page2).toContain("(11–20 of 22)");
+		expect(page2).toContain("11. /work/dir-11");
+		// Absolute number reaches past the first page without paging first.
+		expect(service.takeText("sess-r", "11")).toBe("✓ /work/dir-11 — sess-11");
+		expect(await asked).toMatchObject({ status: "resumed", id: "sess-11" });
+	});
+});

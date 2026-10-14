@@ -9,6 +9,7 @@ export {
 } from "./store.js";
 export {
 	PickerService,
+	CHOICE_PAGE_SIZE,
 	MODEL_PAGE_SIZE,
 	MODEL_PROVIDER_PAGE_SIZE,
 	RESUME_LIST_LIMIT,
@@ -18,6 +19,8 @@ export {
 	type AskResumeOpts,
 	type AskSelectOpts,
 	type AskTextOpts,
+	type ChoiceNavScreen,
+	type ChoicePageInfo,
 	type ModelPickOutcome,
 	type ModelProviderRow,
 	type ModelScreen,

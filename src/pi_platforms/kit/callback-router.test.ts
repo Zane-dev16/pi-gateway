@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
 	CALLBACK_DATA_MAX_BYTES,
 	CallbackDataOverflowError,
+	buildChoicePageCallback,
 	buildClarifyCallback,
 	buildChoicePickerCallback,
 	buildExecApprovalCallback,
@@ -87,6 +88,7 @@ describe("builder→parser round-trip for EVERY prefix family", () => {
 			() => ({ family: "cl", clarifyId: 11, idx: "other" }),
 		],
 		["cp", buildChoicePickerCallback(1), () => ({ family: "cp", index: 1 })],
+		["cpv", buildChoicePageCallback(2), () => ({ family: "cpv", page: 2 })],
 		[
 			"mp",
 			buildModelProviderCallback("gpt-5"),
@@ -188,6 +190,7 @@ describe("namespace collisions impossible", () => {
 			buildSlashConfirmCallback("cancel", 1),
 			buildClarifyCallback(1, 0),
 			buildChoicePickerCallback(0),
+			buildChoicePageCallback(0),
 			buildModelProviderCallback("p"),
 			buildModelProviderGroupCallback("g"),
 			buildModelPageNavCallback(0),
@@ -204,6 +207,7 @@ describe("namespace collisions impossible", () => {
 				"sc:",
 				"cl:",
 				"cp:",
+				"cpv:",
 				"mp:",
 				"mpg:",
 				"mpv:",
@@ -222,6 +226,8 @@ describe("namespace collisions impossible", () => {
 		// differ at the second character or beyond.
 		expect(parseCallbackData("mpg:g").family).not.toBe("mp");
 		expect(parseCallbackData("mg:g").family).not.toBe("mpg");
+		expect(parseCallbackData("cpv:1").family).toBe("cpv");
+		expect(parseCallbackData("cp:1").family).toBe("cp");
 	});
 });
 

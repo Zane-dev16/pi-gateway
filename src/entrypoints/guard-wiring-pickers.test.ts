@@ -123,6 +123,7 @@ describe("guard attach picker options", () => {
 		};
 		const hooks = {
 			choiceTap: () => ({ status: "stale" as const }),
+			choicePageTap: () => ({ answer: "x", stale: true as const }),
 			confirmTap: () => ({ label: null }),
 			clarifyChoice: () => ({ status: "stale" as const }),
 			clarifyOther: () => ({ status: "stale" as const }),

@@ -498,6 +498,8 @@ export abstract class BasePlatformAdapter {
 	/**
 	 * Flat choice prompt (RPC select, /reasoning, /fast, /resume). Default
 	 * Not-supported — the service falls back to the numbered-text lane.
+	 * DEC-089: paged keyboards ride the optional page info (slice plus
+	 * absolute start); text-only defaults ignore it.
 	 */
 	async sendChoicePicker(
 		_chatId: string,
@@ -506,6 +508,7 @@ export abstract class BasePlatformAdapter {
 		_sessionKey: string,
 		_pickerId: number,
 		_metadata?: Metadata | undefined,
+		_page?: { page: number; totalPages: number; start: number; total: number } | undefined,
 	): Promise<SendResult> {
 		return { success: false, error: "Not supported" };
 	}

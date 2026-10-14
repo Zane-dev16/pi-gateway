@@ -54,6 +54,7 @@ import type { EditOptions } from "../../pi_gateway/streaming/adapter-seam.js";
 import type { IncomingEvent } from "../../pi_gateway/guards/index.js";
 import type { ProcessingOutcome } from "../../pi_gateway/guards/index.js";
 import {
+	buildChoicePageCallback,
 	buildChoicePickerCallback,
 	buildClarifyCallback,
 	buildExecApprovalCallback,
@@ -127,6 +128,7 @@ import {
 	STICKER_VISION_PROMPT,
 } from "./sticker-cache.js";
 import type {
+	ChoiceNavScreen,
 	ModelScreen,
 	ModelTapAction,
 	TapClaim,
@@ -178,6 +180,10 @@ export interface TypingVariant {
  */
 export interface TelegramPickerHooks {
 	choiceTap(pickerId: number, index: number): TapClaim;
+	choicePageTap(
+		pickerId: number,
+		page: number,
+	): { answer: string; screen: ChoiceNavScreen } | { answer: string; stale: true };
 	confirmTap(
 		pickerId: number,
 		choice: "once" | "always" | "cancel",
@@ -2131,8 +2137,10 @@ export class TelegramAdapter<
 	// picker service (constructor); without hooks every tap answers expiry.
 
 	/**
-	 * Flat choice keyboard (RPC select, /resume): one tap → one value.
-	 * Binds chat → picker for the cpl payload (which carries no id).
+	 * Paginated choice keyboard (RPC select, /resume — DEC-089): page slice
+	 * with absolute cp:<abs> payloads, cpv: nav plus mx:noop counter plus
+	 * Cancel when paged, in-place edits on nav. Single-page sends keep the
+	 * exact flat shape (no nav row).
 	 */
 	override async sendChoicePicker(
 		chatId: string,
@@ -2141,19 +2149,25 @@ export class TelegramAdapter<
 		sessionKey: string,
 		pickerId: number,
 		metadata?: Metadata | undefined,
+		page?: { page: number; totalPages: number; start: number; total: number } | undefined,
 	): Promise<SendResult> {
 		this.throwIfDisabled();
 		if (choices.length === 0) {
 			return { success: false, error: "No choices" };
 		}
 		this.choiceBindings.set(String(chatId), { pickerId, sessionKey });
-		const buttons = choices.map((choice, index) => ({
+		const start = page?.start ?? 0;
+		const buttons = choices.map((choice, offset) => ({
 			text: choice.isCurrent === true ? `✓ ${choice.label}` : choice.label,
-			callback_data: buildChoicePickerCallback(index),
+			callback_data: buildChoicePickerCallback(start + offset),
 		}));
+		const rows = rowsOfTwo(buttons);
+		if (page !== undefined && page.totalPages > 1) {
+			rows.push(pickerNavRow(page.page, page.totalPages, "cpv"));
+		}
 		return this.send(chatId, toTelegramMarkdownV2Full(title), undefined, {
 			...(metadata ?? {}),
-			reply_markup: { inline_keyboard: rowsOfTwo(buttons) },
+			reply_markup: { inline_keyboard: rows },
 		});
 	}
 
@@ -2270,6 +2284,23 @@ export class TelegramAdapter<
 				answerText: `✓ ${claim.value.slice(0, 60)}`,
 				hostEditText: `✓ ${claim.value}`,
 				replyMarkup: null,
+			};
+		}
+		if (parsed.family === "cpv") {
+			// DEC-089: paged choice nav — re-render in place, binding kept.
+			const binding = this.choiceBindings.get(chatId);
+			if (binding === undefined) {
+				return { answerText: "This picker has expired — send the command again." };
+			}
+			const result = this.pickerHooks.choicePageTap(binding.pickerId, parsed.page);
+			if ("stale" in result) {
+				this.choiceBindings.delete(chatId);
+				return { answerText: result.answer };
+			}
+			return {
+				answerText: result.answer,
+				hostEditText: result.screen.title,
+				replyMarkup: renderChoiceScreen(result.screen),
 			};
 		}
 		const action = toModelTapAction(parsed);
@@ -2397,10 +2428,10 @@ function shortModelLabel(modelId: string): string {
 	return short.length > 38 ? `${short.slice(0, 35)}...` : short;
 }
 
-function pickerNavRow(page: number, totalPages: number, prefix: "mpv" | "mg"): PickerButton[] {
+function pickerNavRow(page: number, totalPages: number, prefix: "mpv" | "mg" | "cpv"): PickerButton[] {
 	const row: PickerButton[] = [];
 	const nav = (target: number): string =>
-		prefix === "mpv" ? buildModelPageNavCallback(target) : buildModelPageCallback(target);
+		prefix === "mpv" ? buildModelPageNavCallback(target) : prefix === "mg" ? buildModelPageCallback(target) : buildChoicePageCallback(target);
 	if (page > 0) row.push({ text: "◀ Prev", callback_data: nav(page - 1) });
 	row.push({ text: `${page + 1}/${totalPages}`, callback_data: MODEL_NOOP_CALLBACK });
 	if (page < totalPages - 1) row.push({ text: "Next ▶", callback_data: nav(page + 1) });
@@ -2449,6 +2480,19 @@ function renderModelScreen(screen: ModelScreen): { inline_keyboard: PickerButton
 		case "result":
 			return null;
 	}
+}
+
+/** Render a paged choice screen (DEC-089 — absolute cp:<abs>, cpv: nav, no Cancel). */
+function renderChoiceScreen(screen: ChoiceNavScreen): { inline_keyboard: PickerButton[][] } {
+	const buttons = screen.choices.map((choice, offset) => ({
+		text: choice.isCurrent === true ? `✓ ${choice.label}` : choice.label,
+		callback_data: buildChoicePickerCallback(screen.start + offset),
+	}));
+	const rows = rowsOfTwo(buttons);
+	if (screen.totalPages > 1) {
+		rows.push(pickerNavRow(screen.page, screen.totalPages, "cpv"));
+	}
+	return { inline_keyboard: rows };
 }
 
 /** Map a parsed nav tap to the service drill-down action (null ⇒ answer-only). */

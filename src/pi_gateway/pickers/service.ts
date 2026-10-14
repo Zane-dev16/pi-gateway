@@ -93,6 +93,23 @@ export type TapClaim =
  * (egress-door capability-miss parity). Senders register nothing — the
  * service owns entries; adapters only render.
  */
+export interface ChoicePageInfo {
+	page: number;
+	totalPages: number;
+	start: number;
+	total: number;
+}
+
+/** Paginated choice screen (DEC-089 — model-screen parity for `cp:`). */
+export interface ChoiceNavScreen {
+	title: string;
+	choices: PickerChoice[];
+	page: number;
+	totalPages: number;
+	start: number;
+	total: number;
+}
+
 export interface PickerSender {
 	/** Manifest data fast-path (interactiveModel:false ⇒ text at once). */
 	readonly interactivePickers?: boolean | undefined;
@@ -103,6 +120,7 @@ export interface PickerSender {
 		sessionKey: string,
 		pickerId: number,
 		metadata?: Metadata | undefined,
+		page?: ChoicePageInfo | undefined,
 	): Promise<SendResult>;
 	sendSlashConfirm(
 		chatId: string,
@@ -217,7 +235,10 @@ export type ResumePickOutcome =
 export const MODEL_PROVIDER_PAGE_SIZE = 10;
 export const MODEL_PAGE_SIZE = 8;
 
-/** Bare /resume lists at most this many sessions (_handle_resume_command parity). */
+/** Choice-keyboard page size (DEC-089 — provider-page parity, 10 per page). */
+export const CHOICE_PAGE_SIZE = 10;
+
+/** Bare /resume page size (DEC-089 — was a total cap, now a page; all rows kept). */
 export const RESUME_LIST_LIMIT = 10;
 
 interface ModelPickerState {
@@ -242,6 +263,11 @@ function pageOf<T>(items: readonly T[], page: number, perPage: number): { slice:
 	const clamped = clampPage(page, totalPages);
 	const start = clamped * perPage;
 	return { slice: items.slice(start, start + perPage), page: clamped, totalPages, start };
+}
+
+/** Title plus ` (N–M of T)` page info when paged (DEC-089 — _format_choice_page parity). */
+function pageTitle(base: string, start: number, shown: number, total: number, totalPages: number): string {
+	return totalPages > 1 ? `${base} (${start + 1}–${start + shown} of ${total})` : base;
 }
 
 const NOT_SUPPORTED_SENDER: PickerSender = {
@@ -326,6 +352,9 @@ export class PickerService {
 				this.resumeStates.delete(id);
 			}
 		}
+		for (const [id, nav] of [...this.choicePages]) {
+			if (nav.sessionKey === sessionKey) this.choicePages.delete(id);
+		}
 		return this.store.cancelSession(sessionKey);
 	}
 
@@ -342,27 +371,44 @@ export class PickerService {
 				? { timeoutMs: opts.timeoutMs }
 				: {}),
 		});
-		const choices: PickerChoice[] = opts.options.map((option, index) => ({
-			value: option,
-			label: index === 0 ? `✓ ${option}` : option,
-			...(index === 0 ? { isCurrent: true as const } : {}),
-		}));
+		// DEC-089: paginate the keyboard (absolute cp:<i>, cpv: nav,
+		// mx:noop counter, in-place edits) — never a 100-button dump.
+		const paged = pageOf(opts.options, 0, CHOICE_PAGE_SIZE);
+		this.choicePages.set(id, { sessionKey: opts.sessionKey, page: paged.page });
+		const choices: PickerChoice[] = paged.slice.map((option, offset) => {
+			const abs = paged.start + offset;
+			return {
+				value: option,
+				label: abs === 0 ? `✓ ${option}` : option,
+				...(abs === 0 ? { isCurrent: true as const } : {}),
+			};
+		});
+		const title = pageTitle(opts.title, paged.start, paged.slice.length, opts.options.length, paged.totalPages);
+		const pageInfo: ChoicePageInfo = {
+			page: paged.page,
+			totalPages: paged.totalPages,
+			start: paged.start,
+			total: opts.options.length,
+		};
 		await this.sendKeyboardOrText(
 			opts.chatId,
 			() =>
 				this.sender.sendChoicePicker(
 					opts.chatId ?? "",
-					opts.title,
+					title,
 					choices,
 					opts.sessionKey,
 					id,
 					opts.metadata,
+					pageInfo,
 				),
-			() => this.selectFallbackText(opts.title, opts.options),
+			() => this.selectFallbackText(opts.title, opts.options, 0),
 		);
-		return await this.waitAndRespond(id, opts, (outcome) =>
-			outcome.kind === "value" ? { value: outcome.value } : { cancelled: true as const },
+		const outcome = await this.waitAndRespond(id, opts, (result) =>
+			result.kind === "value" ? { value: result.value } : { cancelled: true as const },
 		);
+		this.choicePages.delete(id);
+		return outcome;
 	}
 
 	/** RPC confirm → slash-confirm keyboard, else yes/no text fallback. */
@@ -504,9 +550,11 @@ export class PickerService {
 		return { status: "cancelled" };
 	}
 
-	/** Bare /resume → ≤10 recent sessions; tap switches plus clears scope. */
+	/** Bare /resume → paged recent sessions (DEC-089); tap switches plus clears scope. */
 	async askResume(opts: AskResumeOpts): Promise<ResumePickOutcome> {
-		const rows = opts.sessions.slice(0, RESUME_LIST_LIMIT);
+		// DEC-089: keep ALL rows (no slice cap) — page 10 at a time so
+		// rows 11+ stay tappable via cpv: nav and typed absolute numbers.
+		const rows = [...opts.sessions];
 		if (rows.length === 0) return { status: "cancelled" };
 		const id = this.store.register({
 			sessionKey: opts.sessionKey,
@@ -518,27 +566,41 @@ export class PickerService {
 				: {}),
 		});
 		this.resumeStates.set(id, { sessionKey: opts.sessionKey, rows, settled: false });
-		const choices: PickerChoice[] = rows.map((row, index) => ({
-			value: row.label,
-			label: index === 0 ? `✓ ${row.label}` : row.label,
-			...(index === 0 ? { isCurrent: true as const } : {}),
-		}));
+		const paged = pageOf(rows, 0, RESUME_LIST_LIMIT);
+		this.choicePages.set(id, { sessionKey: opts.sessionKey, page: paged.page });
+		const choices: PickerChoice[] = paged.slice.map((row, offset) => {
+			const abs = paged.start + offset;
+			return {
+				value: row.label,
+				label: abs === 0 ? `✓ ${row.label}` : row.label,
+				...(abs === 0 ? { isCurrent: true as const } : {}),
+			};
+		});
+		const title = pageTitle("Resume session", paged.start, paged.slice.length, rows.length, paged.totalPages);
+		const pageInfo: ChoicePageInfo = {
+			page: paged.page,
+			totalPages: paged.totalPages,
+			start: paged.start,
+			total: rows.length,
+		};
 		await this.sendKeyboardOrText(
 			opts.chatId,
 			() =>
 				this.sender.sendChoicePicker(
 					opts.chatId ?? "",
-					"Resume session",
+					title,
 					choices,
 					opts.sessionKey,
 					id,
 					opts.metadata,
+					pageInfo,
 				),
-			() => this.resumeFallbackText(rows),
+			() => this.resumeFallbackText(rows, 0),
 		);
 		const outcome = await this.store.waitFor(id, signalOf(opts));
 		const state = this.resumeStates.get(id);
 		this.resumeStates.delete(id);
+		this.choicePages.delete(id);
 		if (outcome.kind === "value" && state !== undefined) {
 			const row = matchResumeRow(state.rows, outcome.value);
 			if (row === null) return { status: "cancelled" };
@@ -556,6 +618,8 @@ export class PickerService {
 
 	private readonly modelStates = new Map<number, ModelPickerState>();
 	private readonly resumeStates = new Map<number, { sessionKey: string; rows: ResumeSessionRow[]; settled: boolean }>();
+	/** Current keyboard page per paged choice picker (DEC-089; select plus resume). */
+	private readonly choicePages = new Map<number, { sessionKey: string; page: number }>();
 	/** Tap-lane commit results, consumed once by the askModel waiter
 	 * (single-commit ownership: the tap commits for its result screen,
 	 * the waiter commits only for the text lane). */
@@ -563,7 +627,7 @@ export class PickerService {
 
 	// ── tap entry points (adapter-parsed; sync claim ⇒ exactly-once) ─────
 
-	/** Choice tap cp:<index> for a select or resume entry. */
+	/** Choice tap cp:<index> for a select or resume entry (absolute index). */
 	choiceTap(pickerId: number, index: number): TapClaim {
 		const resume = this.resumeStates.get(pickerId);
 		if (resume !== undefined && !resume.settled) {
@@ -571,6 +635,7 @@ export class PickerService {
 			if (row === undefined) return { status: "stale" };
 			resume.settled = true;
 			const ok = this.store.settle(pickerId, { kind: "value", value: row.label });
+			if (ok) this.choicePages.delete(pickerId);
 			return ok ? { status: "resolved", value: row.label } : { status: "stale" };
 		}
 		const entry = this.store.get(pickerId);
@@ -580,7 +645,71 @@ export class PickerService {
 		const option = entry.options[index];
 		if (option === undefined) return { status: "stale" };
 		const ok = this.store.settle(pickerId, { kind: "value", value: option });
+		if (ok) this.choicePages.delete(pickerId);
 		return ok ? { status: "resolved", value: option } : { status: "stale" };
+	}
+
+	/**
+	 * Choice page tap cpv:<page> (DEC-089 — never settles; re-renders the
+	 * keyboard in place with the page slice plus ` (N–M of T)` info).
+	 */
+	choicePageTap(
+		pickerId: number,
+		page: number,
+	): { answer: string; screen: ChoiceNavScreen } | { answer: string; stale: true } {
+		const nav = this.choicePages.get(pickerId);
+		if (nav === undefined || !this.store.has(pickerId)) {
+			return { answer: "This picker has expired — send the command again.", stale: true };
+		}
+		const resume = this.resumeStates.get(pickerId);
+		if (resume !== undefined && !resume.settled) {
+			const paged = pageOf(resume.rows, page, RESUME_LIST_LIMIT);
+			nav.page = paged.page;
+			const choices: PickerChoice[] = paged.slice.map((row, offset) => {
+				const abs = paged.start + offset;
+				return {
+					value: row.label,
+					label: abs === 0 ? `✓ ${row.label}` : row.label,
+					...(abs === 0 ? { isCurrent: true as const } : {}),
+				};
+			});
+			return {
+				answer: " ",
+				screen: {
+					title: pageTitle("Resume session", paged.start, paged.slice.length, resume.rows.length, paged.totalPages),
+					choices,
+					page: paged.page,
+					totalPages: paged.totalPages,
+					start: paged.start,
+					total: resume.rows.length,
+				},
+			};
+		}
+		const entry = this.store.get(pickerId);
+		if (entry === null || entry.kind !== "select") {
+			return { answer: "This picker has expired — send the command again.", stale: true };
+		}
+		const paged = pageOf(entry.options, page, CHOICE_PAGE_SIZE);
+		nav.page = paged.page;
+		const choices: PickerChoice[] = paged.slice.map((option, offset) => {
+			const abs = paged.start + offset;
+			return {
+				value: option,
+				label: abs === 0 ? `✓ ${option}` : option,
+				...(abs === 0 ? { isCurrent: true as const } : {}),
+			};
+		});
+		return {
+			answer: " ",
+			screen: {
+				title: pageTitle(entry.title, paged.start, paged.slice.length, entry.options.length, paged.totalPages),
+				choices,
+				page: paged.page,
+				totalPages: paged.totalPages,
+				start: paged.start,
+				total: entry.options.length,
+			},
+		};
 	}
 
 	/** Slash-confirm tap sc:<choice>:<id> (once/always ⇒ true, cancel ⇒ false). */
@@ -786,11 +915,52 @@ export class PickerService {
 		const match = matchOption(choice.options, trimmed);
 		if (match !== null) {
 			if (this.store.settle(choice.id, { kind: "value", value: match })) {
+				this.choicePages.delete(choice.id);
 				return `✓ ${match.slice(0, 80)}`;
 			}
 			return null;
 		}
-		return `Reply with a number 1–${choice.options.length}.`;
+		// DEC-089: text-lane paging — `next`/`more`/`prev`/`back` turn the
+		// numbered page without settling (label/number matches win first,
+		// so an option literally named "next" still resolves).
+		const turned = this.turnChoiceTextPage(choice.id, trimmed);
+		if (turned !== null) return turned;
+		const total = choice.options.length;
+		const nav = this.choicePages.get(choice.id);
+		const totalPages = nav !== undefined
+			? Math.max(1, Math.ceil(total / (choice.kind === "resume" ? RESUME_LIST_LIMIT : CHOICE_PAGE_SIZE)))
+			: 1;
+		return totalPages > 1
+			? `Reply with a number 1–${total} (or 'next' for more).`
+			: `Reply with a number 1–${total}.`;
+	}
+
+	/**
+	 * Text-lane page turn (DEC-089): `next`/`more` advances, `prev`/`back`
+	 * retreats, returning the numbered page text with the entry kept alive.
+	 * Null when the word is not a page command or the picker is single-page.
+	 */
+	private turnChoiceTextPage(pickerId: number, word: string): string | null {
+		const lowered = word.toLowerCase();
+		const dir = lowered === "next" || lowered === "more" ? 1 : lowered === "prev" || lowered === "back" ? -1 : 0;
+		if (dir === 0) return null;
+		const nav = this.choicePages.get(pickerId);
+		if (nav === undefined || !this.store.has(pickerId)) return null;
+		const resume = this.resumeStates.get(pickerId);
+		if (resume !== undefined && !resume.settled) {
+			const totalPages = Math.max(1, Math.ceil(resume.rows.length / RESUME_LIST_LIMIT));
+			if (totalPages <= 1) return null;
+			const next = clampPage(nav.page + dir, totalPages);
+			nav.page = next;
+			return this.resumeFallbackText(resume.rows, next);
+		}
+		const entry = this.store.get(pickerId);
+		if (entry === null || entry.kind !== "select") return null;
+		const totalPages = Math.max(1, Math.ceil(entry.options.length / CHOICE_PAGE_SIZE));
+		if (totalPages <= 1) return null;
+		const next = clampPage(nav.page + dir, totalPages);
+		nav.page = next;
+		return this.selectFallbackText(entry.title, entry.options, next);
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────
@@ -845,14 +1015,23 @@ export class PickerService {
 		return outcome;
 	}
 
-	private selectFallbackText(title: string, options: string[]): string {
-		const numbered = options.map((option, index) => `${index + 1}. ${option}`);
-		return `${title}\n\n${numbered.join("\n")}\n\nReply with the number.`;
+	private selectFallbackText(title: string, options: readonly string[], page = 0): string {
+		// DEC-089: paged fallback — absolute 1-based numbers plus page info,
+		// never an unbounded dump.
+		const paged = pageOf(options, page, CHOICE_PAGE_SIZE);
+		const numbered = paged.slice.map((option, offset) => `${paged.start + offset + 1}. ${option}`);
+		const info = paged.totalPages > 1 ? ` (${paged.start + 1}–${paged.start + paged.slice.length} of ${options.length})` : "";
+		const hint = paged.totalPages > 1 ? "Reply with the number (or 'next' for more)." : "Reply with the number.";
+		return `${title}${info}\n\n${numbered.join("\n")}\n\n${hint}`;
 	}
 
-	private resumeFallbackText(rows: ResumeSessionRow[]): string {
-		const numbered = rows.map((row, index) => `${index + 1}. ${row.label}`);
-		return `Resume session\n\n${numbered.join("\n")}\n\nReply with the number.`;
+	private resumeFallbackText(rows: ResumeSessionRow[], page = 0): string {
+		// DEC-089: paged fallback — absolute numbers plus page info.
+		const paged = pageOf(rows, page, RESUME_LIST_LIMIT);
+		const numbered = paged.slice.map((row, offset) => `${paged.start + offset + 1}. ${row.label}`);
+		const info = paged.totalPages > 1 ? ` (${paged.start + 1}–${paged.start + paged.slice.length} of ${rows.length})` : "";
+		const hint = paged.totalPages > 1 ? "Reply with the number (or 'next' for more)." : "Reply with the number.";
+		return `Resume session${info}\n\n${numbered.join("\n")}\n\n${hint}`;
 	}
 
 	private modelFallbackText(

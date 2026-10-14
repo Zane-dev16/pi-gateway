@@ -12,6 +12,7 @@ export {
 	MODEL_BACK_CALLBACK,
 	MODEL_NOOP_CALLBACK,
 	buildChoicePickerCallback,
+	buildChoicePageCallback,
 	buildClarifyCallback,
 	buildExecApprovalCallback,
 	buildModelCommitCallback,

@@ -270,6 +270,22 @@ export interface PickerHooksSet {
 		pickerId: number,
 		index: number,
 	): { status: "resolved"; value: string } | { status: "awaiting-text" } | { status: "stale" };
+	choicePageTap(
+		pickerId: number,
+		page: number,
+	):
+		| {
+				answer: string;
+				screen: {
+					title: string;
+					choices: Array<{ value: string; label: string; isCurrent?: boolean | undefined }>;
+					page: number;
+					totalPages: number;
+					start: number;
+					total: number;
+				};
+		  }
+		| { answer: string; stale: true };
 	confirmTap(
 		pickerId: number,
 		choice: "once" | "always" | "cancel",
