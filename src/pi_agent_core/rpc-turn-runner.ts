@@ -188,6 +188,13 @@ function sanitizeModelOverride(
 	return { provider: cleanProvider, id: cleanId };
 }
 
+/**
+ * Bare-select wait bound (DEC-090 parity without importing rank-3:
+ * bare resume and model own the turn with no agent timeout, so the
+ * generic select carries the same 120s expiry the bespoke asks had).
+ */
+const BARE_SELECT_TIMEOUT_MS = 120_000;
+
 function titleOf(event: TurnRpcEvent, fallback: string): string {
 	const title = event["title"];
 	if (typeof title === "string" && title.trim() !== "") return title;
@@ -1102,8 +1109,9 @@ export class RpcTurnRunner {
 
 	/**
 	 * Rebind onto a session file path. Bare with a picker service plus a
-	 * session lister routes to the resume picker (≤10 recent sessions; tap
-	 * switches plus clears scope); otherwise empty args render usage.
+	 * session lister routes to the generic select (DEC-091): options are
+	 * session labels, tap or typed number resolves, then the runner drives
+	 * switchSession plus getState itself; otherwise empty args render usage.
 	 */
 	private async runResume(
 		client: SessionRpcClient,
@@ -1122,13 +1130,34 @@ export class RpcTurnRunner {
 				if (sessions.length === 0) {
 					return "No recent sessions to resume.";
 				}
-				const outcome = await this.pickers.askResume({
+				const outcome = await this.pickers.askSelect({
 					chatId: request.chatId,
 					sessionKey: request.routingKey,
-					sessions,
+					uiId: "bare-resume",
+					title: "Resume session",
+					options: sessions.map((row) => row.label),
+					timeoutMs: BARE_SELECT_TIMEOUT_MS,
+					respond: async () => {},
 				});
-				if (outcome.status === "resumed") return outcome.text;
-				return "Resume cancelled.";
+				if (outcome.kind !== "value") return "Resume cancelled.";
+				const row =
+					sessions.find((candidate) => candidate.label === outcome.value) ??
+					sessions.find(
+						(candidate) =>
+							candidate.label.toLowerCase() === outcome.value.toLowerCase(),
+					) ??
+					null;
+				if (row === null) return "Resume cancelled.";
+				try {
+					await client.switchSession(row.file);
+				} catch (error) {
+					return `Resume failed: ${RpcTurnRunner.errorText(error)}`;
+				}
+				const state = (await client.getState()) as {
+					sessionId: string;
+				};
+				this.pickers.cancelSession(request.routingKey);
+				return `Resumed session (${state.sessionId}). The next turn replays its history.`;
 			}
 			return "Usage: /resume <session-id> — rebinds this chat onto that session's history.";
 		}
