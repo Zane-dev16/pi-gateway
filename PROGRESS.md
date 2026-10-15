@@ -1,5 +1,11 @@
 # PROGRESS — live gateway answers on RPC build (2026-10-07)
 
+## Bounded bare-picker wait (DEC-090, 2026-10-15)
+
+- Root cause: bare `/resume` parked the turn on `askResume` with no `timeoutMs`, so the store armed no timer and the chat held `busy` until the next command's takeover cancelled it. Measured 239s of `state.db` silence (rows 95 to 96) on the live gateway. `askModel` shared the shape.
+- Fix: `BARE_PICKER_TIMEOUT_MS = 120_000` default in `askResume`/`askModel` when the caller passes no `timeoutMs`; explicit caller values still win. Expiry settles `cancelled` through the existing store timer, so the turn finalizes with `Resume cancelled.` / `Model picker cancelled.` plus the persisted row and a freed entry.
+- Contracts: +2 expiry (untapped bare `/resume` and `/model` settle cancelled, persist the reply row, free the entry; pre-fix probe held the picker parked after a simulated hour). Touched-area suites green (pickers, turn-pickers, rpc-turn-runner, telegram-pickers), `tsc --noEmit` clean. Live gateway untouched; operator relaunches per runbook.
+
 ## Paginated choice/resume pickers (DEC-089, 2026-10-14)
 
 - Shape: `cp:` stays absolute, new `cpv:<page>` nav (`mpv:`/`mg:` parity) plus `mx:noop` counter, in-place edits, ` (N–M of T)` titles (`_format_choice_page` parity), no More button. Page size 10 both lanes (`CHOICE_PAGE_SIZE`; `RESUME_LIST_LIMIT` now a page, all rows kept). Keyboard max 12 payloads/6 rows for any N; text fallback paged 10 rows with absolute numbers plus `next`/`more`/`prev`/`back` page turns; typed numbers absolute so every row stays reachable.

@@ -241,6 +241,12 @@ export const CHOICE_PAGE_SIZE = 10;
 /** Bare /resume page size (DEC-089 — was a total cap, now a page; all rows kept). */
 export const RESUME_LIST_LIMIT = 10;
 
+/** Bare-picker wait bound (DEC-090). Bare /resume and /model own the turn
+ * with no agent timeout and no per-turn abort, so an untapped picker would
+ * hold the chat busy forever; the next-command takeover covers only the
+ * user who sends another command. An explicit caller timeoutMs still wins. */
+export const BARE_PICKER_TIMEOUT_MS = 120_000;
+
 interface ModelPickerState {
 	pickerId: number;
 	sessionKey: string;
@@ -506,9 +512,7 @@ export class PickerService {
 			sessionKey: opts.sessionKey,
 			kind: "model",
 			title: "Select model",
-			...(opts.timeoutMs !== undefined && opts.timeoutMs !== null
-				? { timeoutMs: opts.timeoutMs }
-				: {}),
+			timeoutMs: opts.timeoutMs ?? BARE_PICKER_TIMEOUT_MS,
 		});
 		const state: ModelPickerState = {
 			pickerId: id,
@@ -561,9 +565,7 @@ export class PickerService {
 			kind: "resume",
 			title: "Resume session",
 			options: rows.map((row) => row.label),
-			...(opts.timeoutMs !== undefined && opts.timeoutMs !== null
-				? { timeoutMs: opts.timeoutMs }
-				: {}),
+			timeoutMs: opts.timeoutMs ?? BARE_PICKER_TIMEOUT_MS,
 		});
 		this.resumeStates.set(id, { sessionKey: opts.sessionKey, rows, settled: false });
 		const paged = pageOf(rows, 0, RESUME_LIST_LIMIT);
