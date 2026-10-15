@@ -110,20 +110,12 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 				if (chatRegistry === null) chatRegistry = new Registry();
 				const registry = chatRegistry;
 				const agentDir = resolveAgentDir();
-				// Shared picker service (forward-ref commit parity with the
-				// standalone factory above — taps only land post-boot).
-				let pickerRunner: InstanceType<typeof RpcTurnRunner>;
-				const pickerService = new PickerService({
-					commit: {
-						commitModel: (sessionKey, provider, id) =>
-							pickerRunner.commitPickerModel(sessionKey, provider, id),
-						commitResume: (sessionKey, file) =>
-							pickerRunner.commitPickerResume(sessionKey, file),
-					},
-				});
+				// Shared picker service (generic askSelect transport for bare
+				// resume and model — no commit closures needed).
+				const pickerService = new PickerService({});
 				pickerServiceForLifecycle = pickerService;
 				turnRunnerFactory = ({ store }) => {
-					pickerRunner = new RpcTurnRunner({
+					const runner = new RpcTurnRunner({
 						registry,
 						resolveHome: () => resolvedHome,
 						listDiscoveryPaths: () =>
@@ -138,7 +130,7 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 						pickers: pickerService,
 						...(store !== null ? { store } : {}),
 					});
-					return pickerRunner;
+					return runner;
 				};
 			}
 			gateway = composeGatewayLifecycle({

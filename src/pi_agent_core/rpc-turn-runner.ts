@@ -193,7 +193,7 @@ function sanitizeModelOverride(
  * bare resume and model own the turn with no agent timeout, so the
  * generic select carries the same 120s expiry the bespoke asks had).
  */
-const BARE_SELECT_TIMEOUT_MS = 120_000;
+export const BARE_SELECT_TIMEOUT_MS = 120_000;
 
 function titleOf(event: TurnRpcEvent, fallback: string): string {
 	const title = event["title"];
@@ -236,14 +236,6 @@ export type TurnPickerOutcome =
 	| { kind: "value"; value: string }
 	| { kind: "confirmed"; confirmed: boolean }
 	| { kind: "cancelled" };
-
-export type TurnModelPickOutcome =
-	| { status: "switched"; provider: string; id: string; text: string }
-	| { status: "cancelled" };
-
-export type TurnResumePickOutcome =
-	| { status: "resumed"; id: string; text: string }
-	| { status: "cancelled" };
 
 export interface TurnRecentSession {
 	id: string;
@@ -288,21 +280,6 @@ export interface TurnPickerService {
 		signal?: AbortSignal | undefined;
 		respond: (uiId: string, body: Record<string, unknown>) => Promise<void>;
 	}): Promise<TurnPickerOutcome>;
-	askModel(opts: {
-		chatId?: string | undefined;
-		sessionKey: string;
-		catalog: Array<{ provider: string; id: string }>;
-		current: { provider: string; id: string } | null;
-		timeoutMs?: number | null | undefined;
-		signal?: AbortSignal | undefined;
-	}): Promise<TurnModelPickOutcome>;
-	askResume(opts: {
-		chatId?: string | undefined;
-		sessionKey: string;
-		sessions: TurnRecentSession[];
-		timeoutMs?: number | null | undefined;
-		signal?: AbortSignal | undefined;
-	}): Promise<TurnResumePickOutcome>;
 	/**
 	 * Drop every live picker for a session (parked-picker takeover: a new
 	 * turn aborts the parked wait so the chat never wedges behind a picker
@@ -450,46 +427,6 @@ export class RpcTurnRunner {
 		this.pickers = opts.pickers;
 		this.extensionUIResponder = opts.extensionUIResponder ?? defaultExtensionUIResponder;
 		this.listRecentSessions = opts.listRecentSessions;
-	}
-
-	/** Picker commit seam the service drives (tap → setModel on the child). */
-	async commitPickerModel(sessionKey: string, provider: string, modelId: string): Promise<string> {
-		const clean = sanitizeModelOverride(provider, modelId);
-		if (clean === null) throw new Error(`unknown model "${provider}/${modelId}"`);
-		const entry = this.registry.get(sessionKey);
-		if (entry === undefined) throw new Error("chat child is gone");
-		const turn = asTurnClient(entry.client);
-		const session = turn !== null ? asSessionClient(turn) : null;
-		if (session === null) throw new Error("chat child cannot switch models");
-		const switched = await session.setModel(clean.provider, clean.id);
-		this.chatModel.set(sessionKey, { provider: switched.provider, id: switched.id });
-		return `Model: ${switched.provider}/${switched.id}`;
-	}
-
-	/** Picker commit seam the service drives (tap → switchSession). */
-	async commitPickerResume(sessionKey: string, file: string): Promise<string> {
-		const entry = this.registry.get(sessionKey);
-		if (entry === undefined) throw new Error("chat child is gone");
-		const turn = asTurnClient(entry.client);
-		const session = turn !== null ? asSessionClient(turn) : null;
-		if (session === null) throw new Error("chat child cannot resume sessions");
-		await session.switchSession(file);
-		const state = (await session.getState()) as { sessionId: string };
-		return `Resumed session (${state.sessionId}). The next turn replays its history.`;
-	}
-
-	/**
-	 * The rank-3 PickerCommit surface bound to this runner (the composition
-	 * root feeds it to the PickerService constructor next to this runner).
-	 */
-	pickerCommitSurface(): {
-		commitModel(sessionKey: string, provider: string, modelId: string): Promise<string>;
-		commitResume(sessionKey: string, file: string): Promise<string>;
-	} {
-		return {
-			commitModel: (sessionKey, provider, id) => this.commitPickerModel(sessionKey, provider, id),
-			commitResume: (sessionKey, file) => this.commitPickerResume(sessionKey, file),
-		};
 	}
 
 	/** Chat cwd for one routing key. Absent means the gateway home. */

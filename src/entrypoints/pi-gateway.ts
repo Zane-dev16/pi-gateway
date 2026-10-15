@@ -200,20 +200,12 @@ export async function runCommand(
 				const home = opts.home;
 				const agentDir = resolveAgentDir();
 				// Shared picker service (rank-3 PickerService through the
-				// runner's structural seam): commit closures forward-ref the
-				// runner assigned below — taps only land post-boot.
-				let pickerRunner: InstanceType<typeof RpcTurnRunner>;
-				const pickerService = new PickerService({
-					commit: {
-						commitModel: (sessionKey, provider, id) =>
-							pickerRunner.commitPickerModel(sessionKey, provider, id),
-						commitResume: (sessionKey, file) =>
-							pickerRunner.commitPickerResume(sessionKey, file),
-					},
-				});
+				// runner's structural seam): bare resume and model ride the
+				// generic askSelect transport, so no commit closures needed.
+				const pickerService = new PickerService({});
 				input.pickerService = pickerService;
 				input.turnRunnerFactory = ({ store }) => {
-					pickerRunner = new RpcTurnRunner({
+					const runner = new RpcTurnRunner({
 						registry,
 						resolveHome: () => home,
 						listDiscoveryPaths: () =>
@@ -228,7 +220,7 @@ export async function runCommand(
 						pickers: pickerService,
 						...(store !== null ? { store } : {}),
 					});
-					return pickerRunner;
+					return runner;
 				};
 			}
 		}

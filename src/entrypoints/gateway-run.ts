@@ -430,7 +430,10 @@ function deriveAdapterEntries(
 					confirmTap: (pickerId, choice) => pickerService.confirmTap(pickerId, choice),
 					clarifyChoice: (pickerId, idx) => pickerService.clarifyTap(pickerId, idx),
 					clarifyOther: (pickerId) => pickerService.clarifyTap(pickerId, "other"),
-					modelTap: (pickerId, action) => pickerService.modelTap(pickerId, action),
+					modelTap: async () => ({
+						answer: "This picker has expired — run /model again.",
+						stale: true as const,
+					}),
 				};
 	const bindPickerSender = (platform: string, adapter: unknown): void => {
 		if (pickerService === null || pickerService.hasSender) return;

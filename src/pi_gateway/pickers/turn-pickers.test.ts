@@ -15,7 +15,8 @@ import {
 	type TurnPickerService,
 	type TurnRpcEvent,
 } from "../../pi_agent_core/rpc-turn-runner.js";
-import { BARE_PICKER_TIMEOUT_MS, PickerService, type PickerSender } from "./service.js";
+import { PickerService, type PickerSender } from "./service.js";
+import { BARE_SELECT_TIMEOUT_MS } from "../../pi_agent_core/rpc-turn-runner.js";
 import type { SendResult } from "../streaming/adapter-seam.js";
 import { StateStore } from "../../pi_state/index.js";
 
@@ -208,8 +209,6 @@ function makePickerRunner(
 		askSelect: (o) => service.askSelect(o),
 		askConfirm: (o) => service.askConfirm(o),
 		askText: (o) => service.askText(o),
-		askModel: (o) => service.askModel(o),
-		askResume: (o) => service.askResume(o),
 		cancelSession: (sessionKey) => service.storeRef.cancelSession(sessionKey),
 	};
 	const runner = new RpcTurnRunner({
@@ -226,7 +225,6 @@ function makePickerRunner(
 	});
 	service = new PickerService({
 		sender,
-		commit: runner.pickerCommitSurface(),
 	});
 	return { runner, service, sender, fakes };
 }
@@ -592,7 +590,7 @@ describe("untapped bare pickers expire on their own", () => {
 			});
 			await pump(20);
 			expect(service.hasPending("chat-1")).toBe(true);
-			await vi.advanceTimersByTimeAsync(BARE_PICKER_TIMEOUT_MS);
+			await vi.advanceTimersByTimeAsync(BARE_SELECT_TIMEOUT_MS);
 			expect(service.hasPending("chat-1")).toBe(false);
 			const outcome = await turned;
 			expect(outcome.exitReason).toBe("finalized");
@@ -623,7 +621,7 @@ describe("untapped bare pickers expire on their own", () => {
 			});
 			await pump(20);
 			expect(service.hasPending("chat-1")).toBe(true);
-			await vi.advanceTimersByTimeAsync(BARE_PICKER_TIMEOUT_MS);
+			await vi.advanceTimersByTimeAsync(BARE_SELECT_TIMEOUT_MS);
 			expect(service.hasPending("chat-1")).toBe(false);
 			const outcome = await turned;
 			expect(outcome.exitReason).toBe("finalized");

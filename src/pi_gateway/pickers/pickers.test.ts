@@ -60,29 +60,16 @@ function makeService(sender?: FakeSender): {
 	service: PickerService;
 	sender: FakeSender;
 	responses: Array<{ uiId: string; body: Record<string, unknown> }>;
-	commits: Array<{ kind: string; sessionKey: string; ref: string }>;
 } {
 	const real = sender ?? new FakeSender();
 	const responses: Array<{ uiId: string; body: Record<string, unknown> }> = [];
-	const commits: Array<{ kind: string; sessionKey: string; ref: string }> = [];
 	const service = new PickerService({
 		sender: real,
-		commit: {
-			commitModel: async (sessionKey, provider, id) => {
-				commits.push({ kind: "model", sessionKey, ref: `${provider}/${id}` });
-				return `Model: ${provider}/${id}`;
-			},
-			commitResume: async (sessionKey, file) => {
-				commits.push({ kind: "resume", sessionKey, ref: file });
-				return `Resumed session (${file}).`;
-			},
-		},
 	});
 	return {
 		service,
 		sender: real,
 		responses,
-		commits,
 	};
 }
 
@@ -367,156 +354,9 @@ describe("timeout and abort settle cancelled with exactly one response", () => {
 	});
 });
 
-describe("model drill-down: providers, warn/confirm, commit, abort", () => {
-	const catalog = [
-		{ provider: "acme", id: "model-a" },
-		{ provider: "acme", id: "model-b" },
-		{ provider: "other", id: "model-c" },
-	];
 
-	it("provider tap shows models; model tap commits and resolves the waiter", async () => {
-		const { service, commits } = makeService();
-		const asked = service.askModel({
-			chatId: "chat-1",
-			sessionKey: "sess-1",
-			catalog,
-			current: { provider: "acme", id: "model-a" },
-		});
-		await Promise.resolve();
-		const providers = await service.modelTap(1, { kind: "provider", slug: "other" });
-		expect(providers).toMatchObject({ answer: " " });
-		if (!("screen" in providers) || providers.screen.kind !== "models") {
-			throw new Error("expected models screen");
-		}
-		expect(providers.screen.models).toEqual(["model-c"]);
-		const done = await service.modelTap(1, { kind: "model", index: 0 });
-		if (!("screen" in done) || done.screen.kind !== "result") {
-			throw new Error("expected result screen");
-		}
-		expect(done.screen.text).toBe("Model: other/model-c");
-		expect(await asked).toEqual({
-			status: "switched",
-			provider: "other",
-			id: "model-c",
-			text: "Model: other/model-c",
-		});
-		expect(commits).toEqual([{ kind: "model", sessionKey: "sess-1", ref: "other/model-c" }]);
-		// Second tap after commit is stale and commits nothing more.
-		expect(await service.modelTap(1, { kind: "model", index: 0 })).toMatchObject({ stale: true });
-		expect(commits.length).toBe(1);
-	});
 
-	it("expensive-model warning routes mm to the mc confirm screen", async () => {
-		const sender = new FakeSender();
-		const { responses } = makeService(sender);
-		void responses;
-		const service = new PickerService({
-			sender,
-			commit: {
-				commitModel: async (_s, p, id) => `Model: ${p}/${id}`,
-				commitResume: async () => "resumed",
-			},
-			warnForModel: (provider, id) =>
-				provider === "acme" && id === "model-b" ? "This model is expensive." : null,
-		});
-		const asked = service.askModel({
-			chatId: "chat-1",
-			sessionKey: "sess-1",
-			catalog,
-			current: null,
-		});
-		await Promise.resolve();
-		await service.modelTap(1, { kind: "provider", slug: "acme" });
-		const warned = await service.modelTap(1, { kind: "model", index: 1 });
-		if (!("screen" in warned) || warned.screen.kind !== "warn") {
-			throw new Error("expected warn screen");
-		}
-		expect(warned.screen.text).toContain("expensive");
-		expect(warned.screen.index).toBe(1);
-		const done = await service.modelTap(1, { kind: "confirm", index: 1 });
-		if (!("screen" in done) || done.screen.kind !== "result") {
-			throw new Error("expected result screen");
-		}
-		expect(await asked).toMatchObject({ status: "switched", id: "model-b" });
-	});
 
-	it("cancel is abort-cache-safe: no commit, waiter settles cancelled", async () => {
-		const { service, commits } = makeService();
-		const asked = service.askModel({
-			chatId: "chat-1",
-			sessionKey: "sess-1",
-			catalog,
-			current: null,
-		});
-		await Promise.resolve();
-		const cancelled = await service.modelTap(1, { kind: "cancel" });
-		if (!("screen" in cancelled)) throw new Error("expected screen");
-		expect(cancelled.screen).toEqual({ kind: "result", text: "Model picker cancelled." });
-		expect(await asked).toEqual({ status: "cancelled" });
-		expect(commits).toEqual([]);
-	});
-
-	it("text lane accepts provider/id and commits", async () => {
-		const sender = new FakeSender();
-		sender.keyboardFails = true;
-		const { service } = makeService(sender);
-		const asked = service.askModel({
-			chatId: "chat-1",
-			sessionKey: "sess-1",
-			catalog,
-			current: { provider: "acme", id: "model-a" },
-		});
-		await Promise.resolve();
-		expect(sender.texts[0]?.text).toContain("acme/model-a");
-		expect(service.takeText("sess-1", "other/model-c")).toBe("✓ other/model-c");
-		expect(await asked).toMatchObject({ status: "switched", id: "model-c" });
-	});
-});
-
-describe("resume picker lists at most ten and tap clears scope", () => {
-	const sessions = Array.from({ length: 12 }, (_, index) => ({
-		id: `sess-${index + 1}`,
-		file: `/agent/sessions/sess-${index + 1}.jsonl`,
-		label: `/work/dir-${index + 1} — sess-${index + 1}`,
-	}));
-
-	it("only the first ten rows are offered", async () => {
-		const sender = new FakeSender();
-		sender.keyboardFails = true;
-		const { service } = makeService(sender);
-		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-0", sessions });
-		await Promise.resolve();
-		const text = sender.texts[0]?.text ?? "";
-		expect(text).toContain("sess-10");
-		expect(text).not.toContain("sess-11");
-		expect(text).not.toContain("sess-12");
-		expect(service.takeText("sess-0", "3")).toBe("✓ /work/dir-3 — sess-3");
-		expect(await asked).toMatchObject({ status: "resumed", id: "sess-3" });
-	});
-
-	it("tap switches and clears every other pending picker for the session", async () => {
-		const { service, commits } = makeService();
-		const stale = service.askText({
-			chatId: "chat-1",
-			sessionKey: "sess-0",
-			uiId: "ui-stale",
-			title: "Old question?",
-			respond: async () => {},
-		});
-		await Promise.resolve();
-		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-0", sessions });
-		await Promise.resolve();
-		expect(service.choiceTap(2, 0)).toEqual({
-			status: "resolved",
-			value: "/work/dir-1 — sess-1",
-		});
-		expect(await asked).toMatchObject({ status: "resumed", id: "sess-1" });
-		expect(commits[0]).toMatchObject({ kind: "resume", ref: "/agent/sessions/sess-1.jsonl" });
-		// Scope cleared: the older picker settled cancelled, not left armed.
-		expect(await stale).toEqual({ kind: "cancelled" });
-		expect(service.hasPending("sess-0")).toBe(false);
-	});
-});
 
 describe("takeText never steals commands and never double-dispatches", () => {
 	it("leading-slash bytes are not picker input", async () => {
@@ -673,48 +513,4 @@ describe("choice pagination: cpv nav, absolute taps, paged text lane (DEC-089)",
 	});
 });
 
-describe("resume pagination: all rows kept, 10 per page (DEC-089)", () => {
-	const sessions = Array.from({ length: 22 }, (_, index) => ({
-		id: `sess-${index + 1}`,
-		file: `/agent/sessions/sess-${index + 1}.jsonl`,
-		label: `/work/dir-${index + 1} — sess-${index + 1}`,
-	}));
 
-	it("keyboard pages; absolute tap resolves row 22; typed 11 resolves (no nag)", async () => {
-		const { service, commits } = makeService();
-		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-r", sessions });
-		await Promise.resolve();
-		const p1 = service.choicePageTap(1, 1);
-		if (!("screen" in p1)) throw new Error("expected screen");
-		expect(p1.screen.total).toBe(22);
-		expect(p1.screen.totalPages).toBe(3);
-		expect(p1.screen.title).toContain("(11–20 of 22)");
-		const p2 = service.choicePageTap(1, 2);
-		if (!("screen" in p2)) throw new Error("expected screen");
-		expect(p2.screen.choices.length).toBe(2);
-		expect(service.choiceTap(1, 21)).toEqual({
-			status: "resolved",
-			value: "/work/dir-22 — sess-22",
-		});
-		expect(await asked).toMatchObject({ status: "resumed", id: "sess-22" });
-		expect(commits[0]).toMatchObject({ kind: "resume", ref: "/agent/sessions/sess-22.jsonl" });
-	});
-
-	it("text fallback lists the first 10 with page info; next pages the text", async () => {
-		const sender = new FakeSender();
-		sender.keyboardFails = true;
-		const { service } = makeService(sender);
-		const asked = service.askResume({ chatId: "chat-1", sessionKey: "sess-r", sessions });
-		await Promise.resolve();
-		const text = sender.texts[0]?.text ?? "";
-		expect(text).toContain("(1–10 of 22)");
-		expect(text.split("\n").filter((l) => /^\d+\. /.test(l)).length).toBe(10);
-		expect(text).not.toContain("sess-11");
-		const page2 = service.takeText("sess-r", "next");
-		expect(page2).toContain("(11–20 of 22)");
-		expect(page2).toContain("11. /work/dir-11");
-		// Absolute number reaches past the first page without paging first.
-		expect(service.takeText("sess-r", "11")).toBe("✓ /work/dir-11 — sess-11");
-		expect(await asked).toMatchObject({ status: "resumed", id: "sess-11" });
-	});
-});

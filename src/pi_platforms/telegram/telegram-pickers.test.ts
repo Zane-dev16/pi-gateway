@@ -12,14 +12,11 @@ import { TelegramAdapter } from "./telegram-adapter.js";
 import { TelegramBotApiFake } from "./telegram-fake-server.js";
 import { CALLBACK_DATA_MAX_BYTES } from "../kit/index.js";
 
-function makeHookedWorld(opts: {
-	warnForModel?: ((provider: string, modelId: string) => string | null) | undefined;
-} = {}): {
+function makeHookedWorld(): {
 	adapter: TelegramAdapter;
 	tg: TelegramBotApiFake;
 	service: PickerService;
 	responses: Array<{ uiId: string; body: Record<string, unknown> }>;
-	commits: Array<{ kind: string; sessionKey: string; ref: string }>;
 } {
 	const tg = new TelegramBotApiFake();
 	const adapter = new TelegramAdapter({
@@ -34,7 +31,6 @@ function makeHookedWorld(opts: {
 	adapter.wireTransmitSend = async (chatId, content, metadata) =>
 		bindSend(tg, chatId, content, metadata);
 	const responses: Array<{ uiId: string; body: Record<string, unknown> }> = [];
-	const commits: Array<{ kind: string; sessionKey: string; ref: string }> = [];
 	// The adapter satisfies the sender seam structurally (keyboard senders
 	// plus sendPickerText through DOOR 1); taps resolve back through hooks.
 	let service: PickerService;
@@ -45,27 +41,16 @@ function makeHookedWorld(opts: {
 			service.confirmTap(id, choice),
 		clarifyChoice: (id: number, idx: number) => service.clarifyTap(id, idx),
 		clarifyOther: (id: number) => service.clarifyTap(id, "other"),
-		modelTap: (
-			id: number,
-			action: Parameters<PickerService["modelTap"]>[1],
-		) => service.modelTap(id, action),
+		modelTap: async () => ({
+			answer: "This picker has expired — run /model again.",
+			stale: true as const,
+		}),
 	};
 	adapter.setPickerHooks(hooks);
 	service = new PickerService({
 		sender: adapter,
-		commit: {
-			commitModel: async (sessionKey, provider, id) => {
-				commits.push({ kind: "model", sessionKey, ref: `${provider}/${id}` });
-				return `Model: ${provider}/${id}`;
-			},
-			commitResume: async (sessionKey, file) => {
-				commits.push({ kind: "resume", sessionKey, ref: file });
-				return `Resumed session (${file}).`;
-			},
-		},
-		...(opts.warnForModel !== undefined ? { warnForModel: opts.warnForModel } : {}),
 	});
-	return { adapter, tg, service, responses, commits };
+	return { adapter, tg, service, responses };
 }
 
 async function bindSend(
@@ -247,67 +232,6 @@ describe("clarify round-trip over the fake server", () => {
 	});
 });
 
-describe("model drill-down over the fake server", () => {
-	const catalog = [
-		{ provider: "acme", id: "model-a" },
-		{ provider: "acme", id: "model-b" },
-		{ provider: "other", id: "model-c" },
-	];
-
-	it("provider tap re-renders models in place; model tap commits once", async () => {
-		const { adapter, tg, service, commits } = makeHookedWorld();
-		const asked = service.askModel({
-			chatId: "42",
-			sessionKey: "sess-1",
-			catalog,
-			current: { provider: "acme", id: "model-a" },
-		});
-		await flushSends(tg, 1);
-		const first = keyboardData(tg, 0);
-		expect(first).toEqual(["mp:acme", "mp:other", "mx"]);
-		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
-
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mp:other" });
-		// In-place re-render with the model page (mm: absolute index).
-		expect(tg.editKwargs.length).toBe(1);
-		expect(editKeyboardData(tg, 0)).toEqual(["mm:0", "mb", "mx"]);
-
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mm:0" });
-		expect(await asked).toMatchObject({ status: "switched", id: "model-c" });
-		expect(commits).toEqual([{ kind: "model", sessionKey: "sess-1", ref: "other/model-c" }]);
-		expect(tg.editKwargs.length).toBe(2);
-		expect(tg.editKwargs[1]).toMatchObject({ reply_markup: null });
-
-		// Second tap: stale toast, no second commit, no further edit.
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mm:0" });
-		expect(commits.length).toBe(1);
-		expect(tg.editKwargs.length).toBe(2);
-		expect(tg.callbackAnswers[tg.callbackAnswers.length - 1]?.text).toContain("expired");
-	});
-
-	it("expensive-model warning routes mm to the mc confirm screen", async () => {
-		const { adapter, tg, service } = makeHookedWorld({
-			warnForModel: (provider, id) =>
-				provider === "acme" && id === "model-b" ? "This model is expensive." : null,
-		});
-		const asked = service.askModel({
-			chatId: "42",
-			sessionKey: "sess-1",
-			catalog,
-			current: null,
-		});
-		await flushSends(tg, 1);
-		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mp:acme" });
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mm:1" });
-		// Warn screen with the mc: confirm button, keyboard kept.
-		const warnButtons = editKeyboardData(tg, 1);
-		expect(warnButtons).toEqual(["mc:1", "mb", "mx"]);
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "mc:1" });
-		expect(await asked).toMatchObject({ status: "switched", id: "model-b" });
-	});
-});
-
 describe("answer-every-tap over the fake server", () => {
 	it("garbage, unauthorized, and stale taps all clear the spinner and never turn", async () => {
 		const tg = new TelegramBotApiFake();
@@ -414,28 +338,4 @@ describe("choice pagination over the fake server (DEC-089)", () => {
 		await asked;
 	});
 
-	it("resume with 22 sessions pages; stale nav after resolve expires", async () => {
-		const { adapter, tg, service, commits } = makeHookedWorld();
-		const sessions = Array.from({ length: 22 }, (_, i) => ({
-			id: `sess-${i + 1}`,
-			file: `/agent/sessions/sess-${i + 1}.jsonl`,
-			label: `/work/dir-${i + 1} — sess-${i + 1}`,
-		}));
-		const asked = service.askResume({ chatId: "42", sessionKey: "sess-r", sessions });
-		await flushSends(tg, 1);
-		const page0 = keyboardData(tg, 0);
-		expect(page0.filter((d) => d.startsWith("cp:")).length).toBe(10);
-		expect(page0).toContain("cpv:1");
-		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:2" });
-		const last = editKeyboardData(tg, 0);
-		expect(last.filter((d) => d.startsWith("cp:")).length).toBe(2);
-		expect(last).toContain("cp:20");
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cp:21" });
-		expect(await asked).toMatchObject({ status: "resumed", id: "sess-22" });
-		expect(commits.length).toBe(1);
-		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:0" });
-		expect(tg.callbackAnswers[tg.callbackAnswers.length - 1]?.text).toMatch(/expired/i);
-		expect(commits.length).toBe(1);
-	});
 });
