@@ -29,6 +29,7 @@ import { matrixHosting } from "./platform-hosting.js";
 import type { ChatTurnRunner } from "./guard-wiring.js";
 import {
 	LOCK_HELD_MESSAGE,
+	parseCliArgs,
 	piGatewayMain,
 	statusCommand,
 	stopCommand,
@@ -249,6 +250,29 @@ describe("pi-gateway status/stop", () => {
 		});
 		expect(result.exitCode).toBe(2);
 		expect(result.output[0]).toContain("usage:");
+	});
+
+	it("usage names the setup subcommand", async () => {
+		const result = await piGatewayMain(["frobnicate"], {
+			out: () => undefined,
+		});
+		expect(result.output[0]).toContain("setup");
+	});
+
+	it("setup keeps --home for home resolution and forwards the rest", () => {
+		expect(
+			parseCliArgs(["setup", "--platform", "telegram", "--yes"]),
+		).toEqual({
+			command: "setup",
+			replace: false,
+			rest: ["--platform", "telegram", "--yes"],
+		});
+		expect(parseCliArgs(["setup", "--home", "/tmp/x", "--list"])).toEqual({
+			command: "setup",
+			homeFlag: "/tmp/x",
+			replace: false,
+			rest: ["--list"],
+		});
 	});
 
 	it("stop marks the stop planned then signals the recorded live PID", async () => {

@@ -96,6 +96,12 @@ lock, `state.db` open/repair, embedded services), and starts it. The same
 lifecycle is available manually in chat via `/gateway start [home]` →
 `/gateway stop`, with `/gateway` reporting status.
 
+Platform credentials are configured from the terminal, not chat:
+`pi-gateway setup` walks each platform in order and merges values into
+`<home>/.env` (0600). `/gateway setup` only prints this pointer.
+`pi-gateway setup --list` shows required vars per platform without writing
+anything.
+
 What "enabled" looks like:
 
 - The session notice reads

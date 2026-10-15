@@ -23,6 +23,20 @@ window → release leases → flush delivery obligations, token rollups, and
 pending messages → close DB → exit. The process exits non-zero only on failed
 flushes (spec 08 §1.2).
 
+## Configuring platforms
+
+```sh
+pi-gateway setup                  # interactive picker, one platform per round
+pi-gateway setup --list           # required vars per platform (writes nothing)
+pi-gateway setup --status         # configured / partial / missing per platform
+pi-gateway setup --platform telegram --token 123:abc --allowlist 111,222 --yes
+```
+
+Setup merges into `<home>/.env` (0600, home dir 0700) with a single write
+per completed platform flow, so reruns and Ctrl-C aborts converge. Reads
+are process-env-first with `.env` fallback: an exported var wins for that
+process, the file stays the durable default.
+
 ## Signals and exit codes
 
 | Signal / event                   | Behavior                                                 |
