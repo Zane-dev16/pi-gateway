@@ -7,7 +7,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatProcRegistry } from "../../pi_agent_core/chat-proc-registry.js";
 import {
 	RpcTurnRunner,
@@ -15,7 +15,7 @@ import {
 	type TurnPickerService,
 	type TurnRpcEvent,
 } from "../../pi_agent_core/rpc-turn-runner.js";
-import { PickerService, type PickerSender } from "./service.js";
+import { BARE_PICKER_TIMEOUT_MS, PickerService, type PickerSender } from "./service.js";
 import type { SendResult } from "../streaming/adapter-seam.js";
 import { StateStore } from "../../pi_state/index.js";
 
@@ -563,5 +563,73 @@ describe("parked-picker takeover never wedges the chat", () => {
 		expect(takingOutcome.exitReason).toBe("finalized");
 		expect(takingOutcome.finalText).toBe("turn done");
 		expect(fake.setModelCalls).toEqual([]);
+	});
+});
+
+describe("untapped bare pickers expire on their own", () => {
+	const sessions = [{ id: "aaa", file: "/agent/sessions/aaa.jsonl", label: "/work/a — aaa" }];
+
+	async function pump(rounds: number): Promise<void> {
+		for (let i = 0; i < rounds; i += 1) {
+			await vi.advanceTimersByTimeAsync(0);
+		}
+	}
+
+	it("bare /resume settles cancelled and frees the chat with no tap", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const sender = new FakeSender();
+		const fake = new FakeUiClient();
+		const { runner, service } = makePickerRunner([fake], s, { sender, recentSessions: sessions });
+		vi.useFakeTimers();
+		try {
+			const turned = runner.handleTurn({
+				sessionId: "sess-1",
+				routingKey: "chat-1",
+				chatId: "42",
+				text: "/resume",
+			});
+			await pump(20);
+			expect(service.hasPending("chat-1")).toBe(true);
+			await vi.advanceTimersByTimeAsync(BARE_PICKER_TIMEOUT_MS);
+			expect(service.hasPending("chat-1")).toBe(false);
+			const outcome = await turned;
+			expect(outcome.exitReason).toBe("finalized");
+			expect(outcome.finalText).toBe("Resume cancelled.");
+			const rows = s.listMessages("sess-1");
+			expect(rows.map((r) => [r.role, r.content])).toEqual([
+				["user", "/resume"],
+				["assistant", "Resume cancelled."],
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("bare /model settles cancelled and frees the chat with no tap", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const sender = new FakeSender();
+		const fake = new FakeUiClient();
+		const { runner, service } = makePickerRunner([fake], s, { sender });
+		vi.useFakeTimers();
+		try {
+			const turned = runner.handleTurn({
+				sessionId: "sess-1",
+				routingKey: "chat-1",
+				chatId: "42",
+				text: "/model",
+			});
+			await pump(20);
+			expect(service.hasPending("chat-1")).toBe(true);
+			await vi.advanceTimersByTimeAsync(BARE_PICKER_TIMEOUT_MS);
+			expect(service.hasPending("chat-1")).toBe(false);
+			const outcome = await turned;
+			expect(outcome.exitReason).toBe("finalized");
+			expect(outcome.finalText).toBe("Model picker cancelled.");
+			expect(fake.setModelCalls).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
