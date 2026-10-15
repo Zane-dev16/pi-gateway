@@ -5,7 +5,10 @@
 // from var presence: all required present means configured, some means
 // partially configured, none means not configured. No fake validators.
 
-import { PLATFORM_ALLOW_ALL_ENV } from "../security/authz/platform-tables.js";
+import {
+	PLATFORM_ALLOW_ALL_ENV,
+	PLATFORM_ALLOWED_USERS_ENV,
+} from "../security/authz/platform-tables.js";
 
 export interface PlatformVarSpec {
 	readonly name: string;
