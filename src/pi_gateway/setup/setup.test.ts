@@ -53,7 +53,6 @@ function scriptedIO(
 	opts: { confirm?: boolean } = {},
 ): SetupIO {
 	return {
-		selectPlatform: async (platforms) => platforms[0],
 		inputVar: async (_platform, spec) => answers[spec.name] ?? "",
 		confirmSave: async () => opts.confirm ?? true,
 		notify: (message) => {
@@ -84,7 +83,7 @@ describe("setup flow against a loopback validator", () => {
 		const log: string[] = [];
 		const res = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: scriptedIO({
 				TELEGRAM_BOT_TOKEN: TOKEN,
 				TELEGRAM_ALLOWED_USERS: ALLOW,
@@ -117,7 +116,7 @@ describe("setup flow against a loopback validator", () => {
 		const io1 = scriptedIO({ TELEGRAM_BOT_TOKEN: TOKEN });
 		const r1 = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: io1,
 			validate: loopbackValidator,
 			write: writeSetupVars,
@@ -127,7 +126,7 @@ describe("setup flow against a loopback validator", () => {
 		lines = [];
 		const r2 = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: scriptedIO({ TELEGRAM_BOT_TOKEN: TOKEN_ROTATED }),
 			validate: loopbackValidator,
 			write: writeSetupVars,
@@ -148,7 +147,7 @@ describe("setup flow against a loopback validator", () => {
 		});
 		const res = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: scriptedIO({ TELEGRAM_BOT_TOKEN: "bad-token-xyz" }),
 			validate: failing,
 			write: writeSetupVars,
@@ -165,7 +164,7 @@ describe("setup flow against a loopback validator", () => {
 	it("missing required value fails without writing", async () => {
 		const res = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: scriptedIO({ TELEGRAM_BOT_TOKEN: "" }),
 			validate: loopbackValidator,
 			write: writeSetupVars,
@@ -177,7 +176,7 @@ describe("setup flow against a loopback validator", () => {
 	it("declined confirm cancels without writing", async () => {
 		const res = await runSetupFlow({
 			home,
-			platforms: [TELEGRAM_LIKE],
+			platform: TELEGRAM_LIKE,
 			io: scriptedIO({ TELEGRAM_BOT_TOKEN: TOKEN }, { confirm: false }),
 			validate: loopbackValidator,
 			write: writeSetupVars,
@@ -189,7 +188,7 @@ describe("setup flow against a loopback validator", () => {
 	it("same machine drives a second platform table with no telegram code", async () => {
 		const res = await runSetupFlow({
 			home,
-			platforms: [SECOND_PLATFORM],
+			platform: SECOND_PLATFORM,
 			io: scriptedIO({ SIGNAL_API_KEY: "signal-key-7" }),
 			validate: loopbackValidator,
 			write: writeSetupVars,

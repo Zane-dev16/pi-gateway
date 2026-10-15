@@ -314,12 +314,14 @@ export interface ParsedCli {
 	command: string;
 	homeFlag?: string;
 	replace: boolean;
+	rest: string[];
 }
 
 export function parseCliArgs(argv: string[]): ParsedCli {
 	let command = "";
 	let homeFlag: string | undefined;
 	let replace = false;
+	const rest: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const token = argv[i];
 		if (token === undefined) continue;
@@ -334,17 +336,62 @@ export function parseCliArgs(argv: string[]): ParsedCli {
 			homeFlag = token.slice("--home=".length);
 		} else if (token === "--replace") {
 			replace = true;
+		} else if (command !== "") {
+			rest.push(token);
 		}
 	}
 	return {
 		command,
 		...(homeFlag !== undefined ? { homeFlag } : {}),
 		replace,
+		rest,
 	};
 }
 
 function usageLine(): string {
-	return "usage: pi-gateway <run|status|stop> [--home <dir>] [--replace]";
+	return "usage: pi-gateway <run|status|stop|setup> [--home <dir>] [--replace]";
+}
+
+function setupUsage(): string {
+	return "usage: pi-gateway setup [--home <dir>] [--list|--status|--platform <name> ...]";
+}
+
+/** Entry shape Owner A's setup CLI provides (arg parsing plus exit codes). */
+export type SetupCommandFn = (
+	argv: string[],
+	ctx: { home: string; out: (line: string) => void },
+) => Promise<CliResult> | CliResult;
+
+/**
+ * Setup dispatch: the terminal setup CLI (setup-cli.ts) owns arg parsing
+ * and exit codes. This layer only resolves --home and forwards the rest
+ * of argv. The variable-path import keeps tsc green until setup-cli
+ * lands; afterwards the unavailable fallbacks below are dead code.
+ */
+async function setupCommand(
+	rest: string[],
+	opts: PiGatewayCliOptions,
+): Promise<CliResult> {
+	const lines: string[] = [];
+	const print = printer(opts.out, lines);
+	let mod: unknown;
+	try {
+		const path = "./setup-cli.js";
+		mod = await import(path);
+	} catch {
+		print("gateway setup: terminal setup is unavailable (setup CLI not installed)");
+		print(setupUsage());
+		return { exitCode: 2, output: lines };
+	}
+	const fn =
+		(mod as { runSetupCommand?: SetupCommandFn }).runSetupCommand ??
+		(mod as { default?: SetupCommandFn }).default;
+	if (typeof fn !== "function") {
+		print("gateway setup: terminal setup is unavailable (setup CLI has no entry)");
+		print(setupUsage());
+		return { exitCode: 2, output: lines };
+	}
+	return fn([...rest], { home: opts.home, out: print });
 }
 
 type CommandFn = (
@@ -358,18 +405,12 @@ const COMMANDS: Record<string, CommandFn> = {
 	stop: (opts) => stopCommand(opts),
 };
 
-/** `pi-gateway run|status|stop` — argv in, exit code plus printed lines out. */
+/** `pi-gateway run|status|stop|setup` — argv in, exit code plus printed lines out. */
 export async function piGatewayMain(
 	argv: string[],
 	ctx: { out?: (line: string) => void; overrides?: RunOverrides } = {},
 ): Promise<CliResult> {
 	const parsed = parseCliArgs(argv);
-	const fn = COMMANDS[parsed.command];
-	if (fn === undefined) {
-		const lines = [usageLine()];
-		(ctx.out ?? ((l: string) => console.log(l)))(lines[0] as string);
-		return { exitCode: 2, output: lines };
-	}
 	const home =
 		parsed.homeFlag !== undefined && parsed.homeFlag !== ""
 			? parsed.homeFlag
@@ -379,6 +420,15 @@ export async function piGatewayMain(
 		...(parsed.replace ? { replace: true as const } : {}),
 		...(ctx.out !== undefined ? { out: ctx.out } : {}),
 	};
+	if (parsed.command === "setup") {
+		return setupCommand(parsed.rest, opts);
+	}
+	const fn = COMMANDS[parsed.command];
+	if (fn === undefined) {
+		const lines = [usageLine()];
+		(ctx.out ?? ((l: string) => console.log(l)))(lines[0] as string);
+		return { exitCode: 2, output: lines };
+	}
 	return fn(opts, ctx.overrides ?? {});
 }
 

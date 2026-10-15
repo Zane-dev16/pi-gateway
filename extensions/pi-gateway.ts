@@ -32,10 +32,6 @@ import {
 	PI_GATEWAY_PLATFORMS_ENV,
 	resolveConfiguredPlatforms,
 } from "../src/entrypoints/platform-hosting.js";
-import {
-	allSetupSpecs,
-	runTuiSetup,
-} from "../src/entrypoints/setup-wiring.js";
 
 export default function piGatewayExtension(pi: ExtensionAPI) {
 	let gateway: ComposedGateway | null = null;
@@ -205,34 +201,18 @@ export default function piGatewayExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("gateway", {
 		description:
-			"pi-gateway — status / start / stop / setup (Hermes parity, pi host loop)",
+			"pi-gateway — status / start / stop (setup lives in the `pi-gateway setup` CLI)",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const parts = args.trim().split(/\s+/).filter((p) => p !== "");
 			const sub = parts[0] ?? "";
 			if (sub === "setup") {
-				if (!ctx.hasUI) {
-					ctx.ui.notify("gateway setup needs TUI dialogs — run inside pi TUI", "warning");
-					return;
-				}
-				const want = parts[1];
-				const specs = allSetupSpecs().filter(
-					(s) => want === undefined || s.name === want,
+				// Chat setup is removed. The terminal CLI owns platform
+				// setup now: no chat state, plain readline, one write at
+				// completion. Point the operator there and do nothing else.
+				ctx.ui.notify(
+					"gateway setup moved to the terminal: run `pi-gateway setup` (try `pi-gateway setup --list` first)",
+					"info",
 				);
-				if (specs.length === 0) {
-					ctx.ui.notify(`gateway setup: unknown platform ${JSON.stringify(want ?? "")}`, "warning");
-					return;
-				}
-				// DEC-081 renderer one: the same state machine through TUI
-				// dialogs. Values travel dialog-to-writer only, never into
-				// notify lines or transcripts.
-				const res = await runTuiSetup(resolvePiHome(), ctx.ui, { specs });
-				if (res.ok) {
-					ctx.ui.notify(`gateway setup: ${res.platform} saved ${res.vars.length} vars (${res.vars.join(", ")})`, "info");
-				} else if ("cancelled" in res) {
-					ctx.ui.notify("gateway setup: cancelled", "info");
-				} else {
-					ctx.ui.notify(`gateway setup failed: ${res.error}`, "error");
-				}
 				return;
 			}
 			if (sub === "start") {

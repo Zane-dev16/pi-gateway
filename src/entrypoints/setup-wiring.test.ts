@@ -4,17 +4,13 @@
 // table. Live validator cases drive loopback getMe stubs or no network at
 // all. Assertions cover redaction and fail-closed behavior, not transport.
 
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { TELEGRAM_MANIFEST } from "../pi_platforms/telegram/manifest.js";
 import {
 	allSetupSpecs,
 	buildTelegramSetupSpec,
 	manifestToSetupSpec,
-	runTuiSetup,
 	validateSetupLive,
 	validateTelegramToken,
 } from "./setup-wiring.js";
@@ -138,122 +134,5 @@ describe("live validation", () => {
 		}
 		const empty = await validateSetupLive("signal", new Map());
 		expect(empty.ok).toBe(false);
-	});
-});
-
-describe("TUI run end to end with scripted dialogs", () => {
-	let home = "";
-	afterEach(() => {
-		if (home !== "") rmSync(home, { recursive: true, force: true });
-		home = "";
-	});
-
-	it("drives prompts through TUI dialogs and writes 0600", async () => {
-		home = mkdtempSync(join(tmpdir(), "setup-wiring-"));
-		const seen: string[] = [];
-		const secret = "tui-dialog-token-77ab";
-		const ui = {
-			select: async (_t: string, o: string[]) => o[0],
-			input: async (_t: string, _p?: string) => secret,
-			confirm: async (_t: string, m: string) => {
-				seen.push(m);
-				return true;
-			},
-			notify: (m: string) => {
-				seen.push(m);
-			},
-		};
-		const res = await runTuiSetup(home, ui, {
-			validate: async () => ({ ok: true as const }),
-		});
-		expect(res.ok).toBe(true);
-		const body = readFileSync(join(home, ".env"), "utf8");
-		expect(body).toContain(secret);
-		expect(statSync(join(home, ".env")).mode & 0o777).toBe(0o600);
-		expect(seen.join("\n")).not.toContain(secret);
-	});
-
-	it("marks secret prompts with the password flag", async () => {
-		home = mkdtempSync(join(tmpdir(), "setup-wiring-mask-"));
-		const secret = "mask-me-token-3f9c";
-		const seen: string[] = [];
-		const inputCalls: {
-			title: string;
-			opts:
-				| { password?: boolean; signal?: AbortSignal; timeout?: number }
-				| undefined;
-		}[] = [];
-		const ui = {
-			select: async (_t: string, o: string[]) => o[0],
-			input: async (
-				t: string,
-				_p?: string,
-				opts?: { password?: boolean; signal?: AbortSignal; timeout?: number },
-			) => {
-				inputCalls.push({ title: t, opts });
-				if (t.includes("TELEGRAM_BOT_TOKEN")) return secret;
-				return "222";
-			},
-			confirm: async (_t: string, m: string) => {
-				seen.push(m);
-				return true;
-			},
-			notify: (m: string) => {
-				seen.push(m);
-			},
-		};
-		const res = await runTuiSetup(home, ui, {
-			specs: [
-				{
-					name: "telegram",
-					required: [{ name: "TELEGRAM_BOT_TOKEN", password: true as const }],
-					optional: [
-						{ name: "TELEGRAM_ALLOWED_USERS", optional: true as const },
-					],
-				},
-			],
-			validate: async () => ({ ok: true as const }),
-		});
-		expect(res.ok).toBe(true);
-		const tokenCall = inputCalls.find((c) =>
-			c.title.includes("TELEGRAM_BOT_TOKEN"),
-		);
-		const allowCall = inputCalls.find((c) =>
-			c.title.includes("TELEGRAM_ALLOWED_USERS"),
-		);
-		expect(tokenCall?.opts).toEqual({ password: true });
-		expect(allowCall?.opts).toBeUndefined();
-		expect(seen.join("\n")).not.toContain(secret);
-	});
-
-	it("dialog requests carry names, never values (masking starts here)", async () => {
-		home = mkdtempSync(join(tmpdir(), "setup-wiring-titles-"));
-		const secret = "title-scope-token-51de";
-		const titles: string[] = [];
-		const ui = {
-			select: async (_t: string, o: string[]) => o[0],
-			input: async (t: string, p?: string) => {
-				titles.push(`${t} ${p ?? ""}`);
-				return t.includes("TELEGRAM_BOT_TOKEN") ? secret : "222";
-			},
-			confirm: async () => true,
-			notify: (_m: string) => {},
-		};
-		const res = await runTuiSetup(home, ui, {
-			specs: [
-				{
-					name: "telegram",
-					required: [{ name: "TELEGRAM_BOT_TOKEN", password: true as const }],
-					optional: [
-						{ name: "TELEGRAM_ALLOWED_USERS", optional: true as const },
-					],
-				},
-			],
-			validate: async () => ({ ok: true as const }),
-		});
-		expect(res.ok).toBe(true);
-		// The host dialog echoes keystrokes (see the setup-wiring NOTE);
-		// the adapter side holds the line: no value in any dialog arg.
-		expect(titles.join("\n")).not.toContain(secret);
 	});
 });

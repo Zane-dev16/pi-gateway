@@ -1,33 +1,27 @@
-// entrypoints/setup-wiring — DEC-081 wiring: manifest → setup spec,
-// live telegram validation, TUI IO adapter (rank 6 owns all imports).
+// entrypoints/setup-wiring — DEC-081 wiring: manifest → setup spec plus
+// live telegram validation for the terminal setup CLI.
 //
-// The setup MACHINE stays generic (pi_gateway/setup); this module binds it
-// to real manifests, the real Bot API getMe check, and the pi TUI dialogs.
-// Secrets discipline: error strings never carry values — the telegram
-// validator redacts the token from transport messages before surfacing.
+// The CLI owns all prompting (plain readline, no TUI); this module binds the
+// platform manifests and the real Bot API getMe check. Secrets discipline:
+// error strings never carry values — the telegram validator redacts the
+// token from transport messages before surfacing.
 
 import { HttpTelegramBotApi } from "../pi_platforms/telegram/bot-api-client.js";
 import { TELEGRAM_MANIFEST } from "../pi_platforms/telegram/manifest.js";
 import type { PluginManifest } from "../pi_platforms/kit/index.js";
 import { PLATFORM_ALLOWED_USERS_ENV } from "../pi_gateway/security/authz/platform-tables.js";
-import {
-	runSetupFlow,
-	writeSetupVars,
-	type SetupIO,
-	type SetupPlatformSpec,
-	type SetupResult,
-	type SetupValidation,
-	type SetupValidator,
-	type SetupWriter,
+import type {
+	SetupPlatformSpec,
+	SetupValidation,
+	SetupValidator,
+	SetupVarSpec,
 } from "../pi_gateway/setup/index.js";
 
 export type {
-	SetupIO,
 	SetupPlatformSpec,
-	SetupResult,
 	SetupValidation,
 	SetupValidator,
-	SetupWriter,
+	SetupVarSpec,
 };
 
 /** Manifest requires/optional rows → setup table (relation both sides share). */
@@ -134,69 +128,4 @@ export async function validateSetupLive(
 		return { ok: false, error: `no live validator for ${platform}` };
 	}
 	return validator(values, opts);
-}
-
-/** Minimal TUI surface the setup IO needs (subset of ExtensionUIContext). */
-export interface TuiDialogs {
-	select(title: string, options: string[]): Promise<string | undefined>;
-	input(
-		title: string,
-		placeholder?: string,
-		opts?: { password?: boolean; signal?: AbortSignal; timeout?: number },
-	): Promise<string | undefined>;
-	confirm(title: string, message: string): Promise<boolean>;
-	notify(message: string, type?: "info" | "warning" | "error"): void;
-}
-
-export function buildTuiSetupIO(ui: TuiDialogs): SetupIO {
-	return {
-		selectPlatform: (platforms) =>
-			ui.select("setup — choose platform", [...platforms]),
-		// NOTE (host gap, not a gateway defect): ExtensionUIDialogOptions
-		// (host dist/core/extensions/types.d.ts) carries signal + timeout
-		// only — no password/masking flag — and ExtensionUIContext.input
-		// renders plain echo. The password flag below is forwarded so a
-		// future masking dialog hides secrets; today the host ignores it
-		// and the token echoes while typing. Secrets still travel only
-		// through the returned value into the writer, never into notify
-		// or log lines.
-		inputVar: (platform, spec) =>
-			spec.password === true
-				? ui.input(
-						`setup ${platform} — ${spec.name}`,
-						spec.description ?? spec.name,
-						{ password: true },
-					)
-				: ui.input(
-						`setup ${platform} — ${spec.name}`,
-						spec.description ?? spec.name,
-					),
-		confirmSave: (platform, varNames) =>
-			ui.confirm(
-				`setup ${platform} — save`,
-				`Save ${varNames.length} vars (${varNames.join(", ")}) to <home>/.env?`,
-			),
-		notify: (message) => ui.notify(message, "info"),
-	};
-}
-
-export interface TuiSetupOptions {
-	readonly specs?: readonly SetupPlatformSpec[] | undefined;
-	readonly validate?: SetupValidator | undefined;
-	readonly write?: SetupWriter | undefined;
-}
-
-/** One-call TUI setup: dialogs in, .env out, values never notified. */
-export async function runTuiSetup(
-	home: string,
-	ui: TuiDialogs,
-	opts: TuiSetupOptions = {},
-): Promise<SetupResult> {
-	return runSetupFlow({
-		home,
-		platforms: opts.specs ?? allSetupSpecs(),
-		io: buildTuiSetupIO(ui),
-		validate: opts.validate ?? validateSetupLive,
-		write: opts.write ?? writeSetupVars,
-	});
 }

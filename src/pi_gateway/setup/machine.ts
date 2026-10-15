@@ -2,11 +2,12 @@
 //
 // Data shape first: the flow is a state machine over a per-platform var
 // declaration table, not scattered conditionals. States are implicit in the
-// driver's sequence (platform → prompt* → validate → confirm → write → done)
-// with cancellation and validation failure as terminal arms. The table is
-// SetupPlatformSpec (required + optional vars); the driver never imports a
-// platform manifest so layering stays downward-only — entrypoints adapt
-// PluginManifest rows into this shape.
+// driver's sequence (prompt* → validate → confirm → write → done) with
+// cancellation and validation failure as terminal arms. Platform picking
+// lives in the CLI loop (setup-cli), not here — this engine runs one
+// platform per call. The table is SetupPlatformSpec (required + optional
+// vars); the driver never imports a platform manifest so layering stays
+// downward-only — entrypoints adapt PluginManifest rows into this shape.
 //
 // Secrets discipline: values flow only through `values` and the injected
 // writer. `notify`/`log` receive platform names, var NAMES, and counts —
@@ -26,9 +27,8 @@ export interface SetupPlatformSpec {
 	readonly optional?: readonly SetupVarSpec[] | undefined;
 }
 
-/** TUI/chat-agnostic prompts. Implementations render via TUI dialogs. */
+/** Terminal-agnostic prompts. The CLI renders them via plain readline. */
 export interface SetupIO {
-	selectPlatform(platforms: readonly string[]): Promise<string | undefined>;
 	inputVar(platform: string, spec: SetupVarSpec): Promise<string | undefined>;
 	confirmSave(platform: string, varNames: readonly string[]): Promise<boolean>;
 	notify(message: string): void;
@@ -52,7 +52,7 @@ export type SetupWriter = (
 
 export interface SetupRequest {
 	readonly home: string;
-	readonly platforms: readonly SetupPlatformSpec[];
+	readonly platform: SetupPlatformSpec;
 	readonly io: SetupIO;
 	readonly validate: SetupValidator;
 	readonly write: SetupWriter;
@@ -87,32 +87,7 @@ function emit(log: SetupRequest["log"], io: SetupIO, message: string): void {
 }
 
 export async function runSetupFlow(req: SetupRequest): Promise<SetupResult> {
-	if (req.platforms.length === 0) {
-		return { ok: false, error: "no platforms available for setup" };
-	}
-	let spec: SetupPlatformSpec | undefined;
-	if (req.platforms.length === 1) {
-		spec = req.platforms[0] as SetupPlatformSpec | undefined;
-		if (spec === undefined) {
-			return { ok: false, error: "no platforms available for setup" };
-		}
-	} else {
-		const names = req.platforms.map((p) => p.name);
-		let picked: string | undefined;
-		try {
-			picked = await req.io.selectPlatform(names);
-		} catch (err) {
-			return {
-				ok: false,
-				error: `platform select failed: ${(err as Error)?.message ?? String(err)}`,
-			};
-		}
-		if (picked === undefined) return { ok: false, cancelled: true };
-		spec = req.platforms.find((p) => p.name === picked);
-		if (spec === undefined) {
-			return { ok: false, error: `unknown platform ${JSON.stringify(picked)}` };
-		}
-	}
+	const spec = req.platform;
 	const platform = spec.name;
 	emit(
 		req.log,
