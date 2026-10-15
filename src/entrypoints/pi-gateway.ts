@@ -352,46 +352,21 @@ function usageLine(): string {
 	return "usage: pi-gateway <run|status|stop|setup> [--home <dir>] [--replace]";
 }
 
-function setupUsage(): string {
-	return "usage: pi-gateway setup [--home <dir>] [--list|--status|--platform <name> ...]";
-}
-
-/** Entry shape Owner A's setup CLI provides (arg parsing plus exit codes). */
-export type SetupCommandFn = (
-	argv: string[],
-	ctx: { home: string; out: (line: string) => void },
-) => Promise<CliResult> | CliResult;
-
 /**
  * Setup dispatch: the terminal setup CLI (setup-cli.ts) owns arg parsing
  * and exit codes. This layer only resolves --home and forwards the rest
- * of argv. The variable-path import keeps tsc green until setup-cli
- * lands; afterwards the unavailable fallbacks below are dead code.
+ * of argv. Lazily imported so platform-less runs never load adapter chains.
  */
 async function setupCommand(
 	rest: string[],
 	opts: PiGatewayCliOptions,
 ): Promise<CliResult> {
-	const lines: string[] = [];
-	const print = printer(opts.out, lines);
-	let mod: unknown;
-	try {
-		const path = "./setup-cli.js";
-		mod = await import(path);
-	} catch {
-		print("gateway setup: terminal setup is unavailable (setup CLI not installed)");
-		print(setupUsage());
-		return { exitCode: 2, output: lines };
-	}
-	const fn =
-		(mod as { runSetupCommand?: SetupCommandFn }).runSetupCommand ??
-		(mod as { default?: SetupCommandFn }).default;
-	if (typeof fn !== "function") {
-		print("gateway setup: terminal setup is unavailable (setup CLI has no entry)");
-		print(setupUsage());
-		return { exitCode: 2, output: lines };
-	}
-	return fn([...rest], { home: opts.home, out: print });
+	const { runSetupCommand } = await import("./setup-cli.js");
+	return runSetupCommand({
+		home: opts.home,
+		argv: [...rest],
+		...(opts.out !== undefined ? { out: opts.out } : {}),
+	});
 }
 
 type CommandFn = (
