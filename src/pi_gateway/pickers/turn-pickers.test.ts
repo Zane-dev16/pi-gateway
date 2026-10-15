@@ -464,12 +464,13 @@ describe("bare /model routes to the picker", () => {
 			text: "/model",
 		});
 		await flush();
-		expect(sender.choiceCalls).toBe(0);
-		// Keyboard model picker went out (sender keyboard ok).
-		const providers = await service.modelTap(1, { kind: "provider", slug: "acme" });
-		expect(providers).toMatchObject({ answer: " " });
-		const done = await service.modelTap(1, { kind: "model", index: 1 });
-		expect(done).toMatchObject({ answer: "Switched." });
+		// First generic select lists providers (single acme row here).
+		expect(sender.choiceCalls).toBe(1);
+		expect(service.choiceTap(1, 0)).toEqual({ status: "resolved", value: "acme" });
+		await flush();
+		// Second generic select lists models of the chosen provider.
+		expect(sender.choiceCalls).toBe(2);
+		expect(service.choiceTap(2, 1)).toEqual({ status: "resolved", value: "model-b" });
 		const outcome = await turned;
 		expect(outcome.exitReason).toBe("finalized");
 		expect(outcome.finalText).toBe("Model: acme/model-b");

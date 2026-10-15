@@ -1169,9 +1169,10 @@ export class RpcTurnRunner {
 	}
 
 	/**
-	 * Bare routes to the model picker (provider drill-down; tap commits
-	 * through setModel with the override written through for respawns).
-	 * A ref switches provider/model directly as before. Without a picker
+	 * Bare routes to two sequential generic selects (DEC-091): first the
+	 * provider, then a model of that provider; each tap commits through
+	 * setModel with the override written through for respawns. A ref
+	 * switches provider/model directly as before. Without a picker
 	 * service (or chat id) bare lists current plus catalog as before.
 	 */
 	private async runModel(
@@ -1182,24 +1183,57 @@ export class RpcTurnRunner {
 		const ref = args.trim();
 		if (ref === "") {
 			if (this.pickers !== undefined && request.chatId !== undefined) {
-				const [state, catalog] = await Promise.all([
-					client.getState() as Promise<{
-						model?: { provider?: string; id?: string } | null;
-					}>,
-					client.getAvailableModels(),
-				]);
-				const current =
-					state.model?.provider !== undefined && state.model?.id !== undefined
-						? { provider: state.model.provider, id: state.model.id }
-						: null;
-				const outcome = await this.pickers.askModel({
+				const catalog = await client.getAvailableModels();
+				const providers: string[] = [];
+				for (const row of catalog) {
+					if (!providers.includes(row.provider)) providers.push(row.provider);
+				}
+				if (providers.length === 0) return "Model picker cancelled.";
+				const pickedProvider = await this.pickers.askSelect({
 					chatId: request.chatId,
 					sessionKey: request.routingKey,
-					catalog,
-					current,
+					uiId: "bare-model-provider",
+					title: "Select provider",
+					options: providers,
+					timeoutMs: BARE_SELECT_TIMEOUT_MS,
+					respond: async () => {},
 				});
-				if (outcome.status === "switched") return outcome.text;
-				return "Model picker cancelled.";
+				if (pickedProvider.kind !== "value") return "Model picker cancelled.";
+				const provider =
+					providers.find((slug) => slug === pickedProvider.value) ??
+					providers.find(
+						(slug) => slug.toLowerCase() === pickedProvider.value.toLowerCase(),
+					) ??
+					null;
+				if (provider === null) return "Model picker cancelled.";
+				const models: string[] = [];
+				for (const row of catalog) {
+					if (row.provider === provider && !models.includes(row.id)) models.push(row.id);
+				}
+				if (models.length === 0) return "Model picker cancelled.";
+				const pickedModel = await this.pickers.askSelect({
+					chatId: request.chatId,
+					sessionKey: request.routingKey,
+					uiId: "bare-model",
+					title: `Select model (${provider})`,
+					options: models,
+					timeoutMs: BARE_SELECT_TIMEOUT_MS,
+					respond: async () => {},
+				});
+				if (pickedModel.kind !== "value") return "Model picker cancelled.";
+				const modelId =
+					models.find((id) => id === pickedModel.value) ??
+					models.find((id) => id.toLowerCase() === pickedModel.value.toLowerCase()) ??
+					null;
+				if (modelId === null) return "Model picker cancelled.";
+				try {
+					const switched = await client.setModel(provider, modelId);
+					const clean = sanitizeModelOverride(switched.provider, switched.id);
+					if (clean !== null) this.chatModel.set(request.routingKey, clean);
+					return `Model: ${switched.provider}/${switched.id}`;
+				} catch (error) {
+					return `Model switch failed: ${RpcTurnRunner.errorText(error)}`;
+				}
 			}
 			const [state, available] = await Promise.all([
 				client.getState() as Promise<{
