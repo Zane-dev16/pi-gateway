@@ -1218,6 +1218,8 @@ export class RpcTurnRunner {
 		}
 		try {
 			const switched = await client.setModel(provider, id);
+			const clean = sanitizeModelOverride(switched.provider, switched.id);
+			if (clean !== null) this.chatModel.set(request.routingKey, clean);
 			return `Model: ${switched.provider}/${switched.id}`;
 		} catch (error) {
 			return `Model switch failed: ${RpcTurnRunner.errorText(error)}`;

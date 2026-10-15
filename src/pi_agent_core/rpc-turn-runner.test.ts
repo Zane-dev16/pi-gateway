@@ -777,6 +777,50 @@ describe("RpcTurnRunner native sessions", () => {
 		expect(registry.get("chat-1")?.generation).toBe(1);
 	});
 
+	it("with-args /model writes the override so the respawn boots the picked model", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const spawned: Array<{ provider: string | undefined; model: string | undefined }> = [];
+		const first = new FakeTurnClient();
+		const second = new FakeTurnClient();
+		let calls = 0;
+		const fakes = [first, second];
+		const registry = new ChatProcRegistry({
+			makeClient: (opts) => {
+				spawned.push({ provider: opts.provider, model: opts.model });
+				const fake = fakes[calls];
+				calls += 1;
+				if (fake === undefined) throw new Error("no fake left");
+				return fake;
+			},
+		});
+		const runner = new RpcTurnRunner({
+			registry,
+			resolveHome: () => "/tmp/fake-home",
+			store: s,
+		});
+
+		const switched = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "/model acme/model-b",
+		});
+		expect(switched.exitReason).toBe("finalized");
+		expect(switched.finalText).toBe("Model: acme/model-b");
+		expect(first.setModelCalls).toEqual([{ provider: "acme", id: "model-b" }]);
+
+		await registry.stop("chat-1");
+		const next = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			text: "hello",
+		});
+		expect(next.exitReason).toBe("finalized");
+		expect(next.finalText).toBe("hello back");
+		expect(spawned.length).toBe(2);
+		expect(spawned[1]).toEqual({ provider: "acme", model: "model-b" });
+	});
+
 	it("renderSessionExportHtml escapes entry text", () => {
 		const jsonl = `${JSON.stringify({ role: "user", content: "<b>hi</b>" })}\n`;
 		const html = renderSessionExportHtml(jsonl);
