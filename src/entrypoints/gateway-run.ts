@@ -458,7 +458,7 @@ function deriveAdapterEntries(
 			? {}
 			: {
 					hasPendingClarify: (sessionKey: string) =>
-						pickerService.hasPendingTextCapture(sessionKey),
+						pickerService.hasPending(sessionKey),
 				};
 
 	const getRunner = (
