@@ -195,6 +195,14 @@ function sanitizeModelOverride(
  */
 export const BARE_SELECT_TIMEOUT_MS = 120_000;
 
+/**
+ * Bare /model catalog bound (fail-fast parity with 450847d: a slow or
+ * hanging getAvailableModels must never park the turn with zero egress.
+ * Past this budget the turn settles "Model picker cancelled." with no
+ * picker rendered, exactly like an untapped select).
+ */
+export const BARE_CATALOG_TIMEOUT_MS = 5_000;
+
 function titleOf(event: TurnRpcEvent, fallback: string): string {
 	const title = event["title"];
 	if (typeof title === "string" && title.trim() !== "") return title;
@@ -1120,7 +1128,8 @@ export class RpcTurnRunner {
 		const ref = args.trim();
 		if (ref === "") {
 			if (this.pickers !== undefined && request.chatId !== undefined) {
-				const catalog = await client.getAvailableModels();
+				const catalog = await this.boundedModelCatalog(client);
+				if (catalog === null) return "Model picker cancelled.";
 				const providers: string[] = [];
 				for (const row of catalog) {
 					if (!providers.includes(row.provider)) providers.push(row.provider);
@@ -1223,6 +1232,26 @@ export class RpcTurnRunner {
 			return `Model: ${switched.provider}/${switched.id}`;
 		} catch (error) {
 			return `Model switch failed: ${RpcTurnRunner.errorText(error)}`;
+		}
+	}
+
+	/**
+	 * Catalog fetch with a fail-fast bound. Null on timeout: the bare
+	 * picker branch settles "Model picker cancelled." with zero egress
+	 * instead of parking the turn. Rejections propagate to the
+	 * session-command fail() path unchanged (they settle, never park).
+	 */
+	private async boundedModelCatalog(
+		client: SessionRpcClient,
+	): Promise<Array<{ provider: string; id: string }> | null> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const timeout = new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), BARE_CATALOG_TIMEOUT_MS);
+			});
+			return await Promise.race([client.getAvailableModels(), timeout]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 	}
 

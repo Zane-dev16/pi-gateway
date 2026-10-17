@@ -16,7 +16,10 @@ import {
 	type TurnRpcEvent,
 } from "../../pi_agent_core/rpc-turn-runner.js";
 import { PickerService, type PickerSender } from "./service.js";
-import { BARE_SELECT_TIMEOUT_MS } from "../../pi_agent_core/rpc-turn-runner.js";
+import {
+	BARE_CATALOG_TIMEOUT_MS,
+	BARE_SELECT_TIMEOUT_MS,
+} from "../../pi_agent_core/rpc-turn-runner.js";
 import type { SendResult } from "../streaming/adapter-seam.js";
 import { StateStore } from "../../pi_state/index.js";
 
@@ -630,5 +633,86 @@ describe("untapped bare pickers expire on their own", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("bare /model catalog fetch is bounded", () => {
+	it("hanging catalog settles cancelled fast with zero egress", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const sender = new FakeSender();
+		const fake = new FakeUiClient();
+		fake.getAvailableModels = () =>
+			new Promise<Array<{ provider: string; id: string }>>(() => {});
+		const { runner, service } = makePickerRunner([fake], s, { sender });
+
+		const started = Date.now();
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			chatId: "42",
+			text: "/model",
+		});
+		const elapsed = Date.now() - started;
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Model picker cancelled.");
+		expect(sender.choiceCalls).toBe(0);
+		expect(service.hasPending("chat-1")).toBe(false);
+		expect(fake.setModelCalls).toEqual([]);
+		expect(elapsed).toBeLessThan(BARE_CATALOG_TIMEOUT_MS + 10_000);
+		const rows = s.listMessages("sess-1");
+		expect(rows.map((r) => [r.role, r.content])).toEqual([
+			["user", "/model"],
+			["assistant", "Model picker cancelled."],
+		]);
+	});
+
+	it("empty catalog cancels without rendering a picker", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const sender = new FakeSender();
+		const fake = new FakeUiClient();
+		fake.catalog = [];
+		const { runner, service } = makePickerRunner([fake], s, { sender });
+
+		const outcome = await runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			chatId: "42",
+			text: "/model",
+		});
+
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Model picker cancelled.");
+		expect(sender.choiceCalls).toBe(0);
+		expect(service.hasPending("chat-1")).toBe(false);
+		expect(fake.setModelCalls).toEqual([]);
+	});
+
+	it("healthy catalog still renders the provider picker", async () => {
+		const s = await openStore();
+		await ensureSession(s, "sess-1");
+		const sender = new FakeSender();
+		const fake = new FakeUiClient();
+		const { runner, service } = makePickerRunner([fake], s, { sender });
+
+		const turned = runner.handleTurn({
+			sessionId: "sess-1",
+			routingKey: "chat-1",
+			chatId: "42",
+			text: "/model",
+		});
+		await flush();
+		expect(sender.choiceCalls).toBe(1);
+		expect(service.hasPending("chat-1")).toBe(true);
+		expect(service.choiceTap(1, 0)).toEqual({ status: "resolved", value: "acme" });
+		await flush();
+		expect(sender.choiceCalls).toBe(2);
+		expect(service.choiceTap(2, 1)).toEqual({ status: "resolved", value: "model-b" });
+		const outcome = await turned;
+		expect(outcome.exitReason).toBe("finalized");
+		expect(outcome.finalText).toBe("Model: acme/model-b");
+		expect(fake.setModelCalls).toEqual([{ provider: "acme", id: "model-b" }]);
 	});
 });
