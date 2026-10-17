@@ -316,7 +316,7 @@ export class PickerService {
 			start: paged.start,
 			total: opts.options.length,
 		};
-		await this.sendKeyboardOrText(
+		const sent = await this.sendKeyboardOrText(
 			opts.chatId,
 			() =>
 				this.sender.sendChoicePicker(
@@ -330,6 +330,7 @@ export class PickerService {
 				),
 			() => this.selectFallbackText(opts.title, opts.options, 0),
 		);
+		if (!sent) this.store.settle(id, { kind: "cancelled" });
 		const outcome = await this.waitAndRespond(id, opts, (result) =>
 			result.kind === "value" ? { value: result.value } : { cancelled: true as const },
 		);
@@ -347,7 +348,7 @@ export class PickerService {
 				? { timeoutMs: opts.timeoutMs }
 				: {}),
 		});
-		await this.sendKeyboardOrText(
+		const sent = await this.sendKeyboardOrText(
 			opts.chatId,
 			() =>
 				this.sender.sendSlashConfirm(
@@ -360,6 +361,7 @@ export class PickerService {
 				),
 			() => `${opts.title}\n${opts.message}\n\nReply yes or no.`,
 		);
+		if (!sent) this.store.settle(id, { kind: "cancelled" });
 		return await this.waitAndRespond(id, opts, (outcome) =>
 			outcome.kind === "confirmed" ? { confirmed: outcome.confirmed } : { cancelled: true as const },
 		);
@@ -380,10 +382,17 @@ export class PickerService {
 				? { timeoutMs: opts.timeoutMs }
 				: {}),
 		});
+		let sent = false;
 		if (opts.chatId !== undefined && opts.chatId !== "") {
 			const hint = opts.hint !== undefined && opts.hint !== "" ? `\n${opts.hint}` : "";
-			await this.sender.sendPickerText(opts.chatId, `❓ ${opts.title}${hint}`, opts.metadata).catch(() => ({ success: false as const }));
+			try {
+				const result = await this.sender.sendPickerText(opts.chatId, `❓ ${opts.title}${hint}`, opts.metadata);
+				sent = result.success;
+			} catch {
+				sent = false;
+			}
 		}
+		if (!sent) this.store.settle(id, { kind: "cancelled" });
 		return await this.waitAndRespond(id, opts, (outcome) =>
 			outcome.kind === "value" ? { value: outcome.value } : { cancelled: true as const },
 		);
@@ -404,7 +413,7 @@ export class PickerService {
 				? { timeoutMs: opts.timeoutMs }
 				: {}),
 		});
-		await this.sendKeyboardOrText(
+		const sent = await this.sendKeyboardOrText(
 			opts.chatId,
 			() =>
 				this.sender.sendClarify(
@@ -417,6 +426,7 @@ export class PickerService {
 				),
 			() => this.selectFallbackText(opts.question, opts.options),
 		);
+		if (!sent) this.store.settle(id, { kind: "cancelled" });
 		return await this.waitAndRespond(id, opts, (outcome) =>
 			outcome.kind === "value" ? { value: outcome.value } : { cancelled: true as const },
 		);
@@ -595,11 +605,10 @@ export class PickerService {
 		chatId: string | undefined,
 		sendKeyboard: () => Promise<SendResult>,
 		fallbackText: () => string,
-	): Promise<void> {
+	): Promise<boolean> {
 		if (this.textFallback || chatId === undefined || chatId === "" || this.sender.interactivePickers === false) {
 			this.textFallback ||= this.sender.interactivePickers === false;
-			await this.sendText(chatId, fallbackText());
-			return;
+			return this.sendText(chatId, fallbackText());
 		}
 		let result: SendResult;
 		try {
@@ -609,13 +618,19 @@ export class PickerService {
 		}
 		if (!result.success) {
 			this.textFallback = true;
-			await this.sendText(chatId, fallbackText());
+			return this.sendText(chatId, fallbackText());
 		}
+		return true;
 	}
 
-	private async sendText(chatId: string | undefined, text: string): Promise<void> {
-		if (chatId === undefined || chatId === "") return;
-		await this.sender.sendPickerText(chatId, text).catch(() => ({ success: false as const }));
+	private async sendText(chatId: string | undefined, text: string): Promise<boolean> {
+		if (chatId === undefined || chatId === "") return false;
+		try {
+			const result = await this.sender.sendPickerText(chatId, text);
+			return result.success;
+		} catch {
+			return false;
+		}
 	}
 
 	private async waitAndRespond(
