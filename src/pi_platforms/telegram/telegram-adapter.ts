@@ -2165,7 +2165,11 @@ export class TelegramAdapter<
 		if (page !== undefined && page.totalPages > 1) {
 			rows.push(pickerNavRow(page.page, page.totalPages, "cpv"));
 		}
-		return this.send(chatId, toTelegramMarkdownV2Full(title), undefined, {
+		// Title-only leaves a dead message when the client never renders the
+		// keyboard: keep the absolute numbered list in the body (clarify /
+		// text-fallback parity) so typed numbers stay usable without it.
+		const body = formatChoiceKeyboardText(title, choices, start, page?.totalPages ?? 1);
+		return this.send(chatId, toTelegramMarkdownV2Full(body), undefined, {
 			...(metadata ?? {}),
 			reply_markup: { inline_keyboard: rows },
 		});
@@ -2299,7 +2303,12 @@ export class TelegramAdapter<
 			}
 			return {
 				answerText: result.answer,
-				hostEditText: result.screen.title,
+				hostEditText: formatChoiceKeyboardText(
+					result.screen.title,
+					result.screen.choices,
+					result.screen.start,
+					result.screen.totalPages,
+				),
 				replyMarkup: renderChoiceScreen(result.screen),
 			};
 		}
@@ -2480,6 +2489,28 @@ function renderModelScreen(screen: ModelScreen): { inline_keyboard: PickerButton
 		case "result":
 			return null;
 	}
+}
+
+/**
+ * Choice-keyboard body (DEC-089 render parity): title plus the absolute
+ * numbered page slice plus the typed-number hint (text-fallback wording).
+ * The keyboard buttons keep the short labels; the body keeps the list
+ * visible when the client never renders the keyboard, so the live picker
+ * stays usable through takeText numbers / next / prev.
+ */
+function formatChoiceKeyboardText(
+	title: string,
+	choices: readonly { value: string }[],
+	start: number,
+	totalPages: number,
+): string {
+	const lines = [title, ""];
+	for (let i = 0; i < choices.length; i += 1) {
+		lines.push(`${start + i + 1}. ${choices[i]?.value ?? ""}`);
+	}
+	lines.push("");
+	lines.push(totalPages > 1 ? "Reply with the number (or 'next' for more)." : "Reply with the number.");
+	return lines.join("\n");
 }
 
 /** Render a paged choice screen (DEC-089 — absolute cp:<abs>, cpv: nav, no Cancel). */

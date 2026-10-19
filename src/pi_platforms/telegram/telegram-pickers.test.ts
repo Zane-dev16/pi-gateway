@@ -339,3 +339,68 @@ describe("choice pagination over the fake server (DEC-089)", () => {
 	});
 
 });
+
+describe("choice keyboard keeps the numbered body without the keyboard", () => {
+	it("single-page send carries the absolute numbered list plus the typed hint", async () => {
+		const { tg, service } = makeHookedWorld();
+		const asked = service.askSelect({
+			chatId: "42",
+			sessionKey: "sess-body-1",
+			uiId: "ui-body-1",
+			title: "Pick a color",
+			options: ["Red", "Green"],
+			respond: async () => {},
+		});
+		await flushSends(tg, 1);
+		// Keyboard still rides the wire.
+		expect(keyboardData(tg, 0)).toEqual(["cp:0", "cp:1"]);
+		// Body stays usable when the client never renders that keyboard:
+		// title plus absolute numbers plus the typed-number hint.
+		// Backslashes stripped: sends ride the clarify double-escape lane
+		// (pre-convert plus wireSend), nav edits single — assert the raw
+		// numbered shape either way.
+		const text = String((tg.sendKwargs[0] as { text: string }).text);
+		const clean = text.replace(/\\/g, "");
+		expect(clean).toContain("Pick a color");
+		expect(clean).toContain("1. Red");
+		expect(clean).toContain("2. Green");
+		expect(clean).toContain("Reply with the number");
+		service.cancelSession("sess-body-1");
+		await asked;
+	});
+
+	it("paged send and nav edits keep the page slice numbered absolutely", async () => {
+		const { adapter, tg, service } = makeHookedWorld();
+		const options = Array.from({ length: 25 }, (_, i) => `Option ${i + 1}`);
+		const asked = service.askSelect({
+			chatId: "42",
+			sessionKey: "sess-body-p",
+			uiId: "ui-body-p",
+			title: "Pick one",
+			options,
+			respond: async () => {},
+		});
+		await flushSends(tg, 1);
+		const sendText = String((tg.sendKwargs[0] as { text: string }).text);
+		const sendClean = sendText.replace(/\\/g, "");
+		expect(sendClean).toContain("1–10 of 25");
+		expect(sendClean).toContain("1. Option 1");
+		expect(sendClean).toContain("10. Option 10");
+		expect(sendClean).not.toContain("11. Option 11");
+		expect(sendClean).toContain("Reply with the number");
+		expect(sendClean).toContain("next");
+		const hostMessageId = tg.sentMessages[0]?.message_id ?? 1;
+		await tap(adapter, tg, { hostChatId: 42, hostMessageId, data: "cpv:1" });
+		expect(tg.editKwargs.length).toBe(1);
+		const editText = String((tg.editKwargs[0] as { text: string }).text);
+		const editClean = editText.replace(/\\/g, "");
+		expect(editClean).toContain("11–20 of 25");
+		expect(editClean).toContain("11. Option 11");
+		expect(editClean).toContain("20. Option 20");
+		expect(editClean).not.toContain("10. Option 10");
+		expect(editClean).toContain("Reply with the number");
+		// Typed numbers stay live while the keyboard body is on screen.
+		expect(service.takeText("sess-body-p", "25")).toBe("✓ Option 25");
+		await asked;
+	});
+});
