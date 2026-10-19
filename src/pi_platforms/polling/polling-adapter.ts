@@ -255,8 +255,8 @@ export class PollingAdapterCore
 				this.isMessageChats.has(String(chatId)),
 			transmitSend: async (chatId, content, metadata) =>
 				this.wireSend(chatId, content, metadata),
-			transmitEdit: async (chatId, messageId, content) =>
-				this.editTransmit(chatId, messageId, content),
+			transmitEdit: async (chatId, messageId, content, opts) =>
+				this.editTransmit(chatId, messageId, content, opts?.metadata),
 			transmitSeal: async (_k, chatId, draftId, content, metadata) => {
 				if (metadata["forceSealFailure"] === true) {
 					return { success: false, error: "forced seal failure" };

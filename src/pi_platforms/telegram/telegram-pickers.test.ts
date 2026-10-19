@@ -404,3 +404,71 @@ describe("choice keyboard keeps the numbered body without the keyboard", () => {
 		await asked;
 	});
 });
+
+describe("picker reconcile keeps the keyboard on the edit (both lanes bound)", () => {
+	it("second choice send on the same chat edits with the replacement keyboard", async () => {
+		const tg = new TelegramBotApiFake();
+		const adapter = new TelegramAdapter({
+			wire: tg,
+			clock: new ManualPollingClock(),
+			secretReader: () => "tok",
+		});
+		adapter.setClickerAuthorization(true);
+		// Production-shaped binding: BOTH lanes reach the fake Bot API with
+		// their full wire arg sets (text plus reply_markup when present).
+		adapter.wireTransmitSend = async (chatId, content, metadata) =>
+			bindSend(tg, chatId, content, metadata);
+		adapter.editTransmit = async (chatId, messageId, content, metadata) => {
+			const record = (metadata ?? {}) as Record<string, unknown>;
+			await tg.editMessageText({
+				chat_id: Number(chatId),
+				message_id: Number(messageId),
+				text: content,
+				...(typeof record["parse_mode"] === "string"
+					? { parse_mode: record["parse_mode"] as string }
+					: {}),
+				...(record["reply_markup"] !== undefined
+					? { reply_markup: record["reply_markup"] }
+					: {}),
+			});
+			return { success: true, messageId: String(messageId) };
+		};
+		await adapter.sendChoicePicker(
+			"42",
+			"Pick one",
+			[
+				{ value: "Red", label: "Red" },
+				{ value: "Green", label: "Green" },
+			],
+			"sess-reconcile",
+			101,
+		);
+		expect(tg.sendKwargs.length).toBe(1);
+		expect(tg.editKwargs.length).toBe(0);
+		expect(adapter.doorAudit()[0]?.action).toBe("plain-send");
+		await adapter.sendChoicePicker(
+			"42",
+			"Pick two",
+			[
+				{ value: "Blue", label: "Blue" },
+				{ value: "Yellow", label: "Yellow" },
+			],
+			"sess-reconcile",
+			102,
+		);
+		// Second send reconciles by edit instead of duplicating.
+		expect(tg.sendKwargs.length).toBe(1);
+		expect(tg.editKwargs.length).toBe(1);
+		expect(adapter.doorAudit()[1]?.action).toBe("reconcile-edit");
+		// The replacement keyboard rides the edit lane.
+		const edit = tg.editKwargs[0] as { text: string; reply_markup?: unknown };
+		expect(String(edit.text).replace(/\\/g, "")).toContain("Pick two");
+		const markup = edit.reply_markup as {
+			inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+		};
+		expect(markup).toBeDefined();
+		expect(
+			markup.inline_keyboard.flatMap((row) => row.map((button) => button.callback_data)),
+		).toEqual(["cp:0", "cp:1"]);
+	});
+});
